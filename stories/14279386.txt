@@ -1,0 +1,74 @@
+In part 1 of the series, we discussed the following:
+
+I did however gloss over essential server implementation details, which we will focus on in this article.
+
+Disclaimer: I am not a professional game developer, most of the knowledge shared is based on what I read and my experience of small hobby projects. The main goal of this article is to provide an easy to understand introduction for networking in a multiplayer game.
+
+Let's start by defining what a server should do, typically a server should serve as
+
+In a multiplayer game, players need to access a common endpoint to reach each other, this is one of the roles of a server program, even in the P2P communication model, there will be a connection point for players to exchange their network information before a P2P connection can be established.
+
+In many cases, the server runs the game simulation code, process all inputs from player and updates the game state. Note that this is not always the case, some modern games offload lots of processing to the client side. In this article we will assume it's the erver's responsibility to process the game, ie. Make the game tick.
+
+In many multiplayer games, the server program also has authority on game state, the main reason is to prevent cheating, and it's also easier to reason about when there's is a single point to get the correct game state.
+
+Let's start to implement the server in the most straightforward fashion, then improve from there.
+
+The core of the game server is a loop that keeps updating the GameState using a player's input, commonly know as a TICK, the function signature is as follows:
+
+A simplified server code snippet would looks like this
+
+I hope the code snippets look intuitive and straightforward, the server simply take all inputs from the buffer and applies them in the next function to get new GameState. Let's call this approach the , as it tries to process things as fast as it could. It is all good, until we think about our lovely universe where sunlight takes 8 minutes to reach the earth.
+
+The fact that the server processes all input from buffer in every  , means the GameState will depends on network latency. Diagram below illustrates why this is a problem
+
+The image shows 2 clients sending inputs to server, we observe 2 interesting facts.
+
+In short, latency is inconsistent, even on the same connection.
+
+Inconsistent latency combined with  gives several problems, let look at these further.
+
+There is a simple solution to mitigate inconsistent latency, Lockstep State Update that we discussed in the previous article. The idea is that server does not proceed until it received input from all players, it has 2 benefits:
+
+However, it does not work for fast-paced action games as the responsiveness is low. (More details can be found on previous article, thus I will not repeat here.)
+
+Next section, we will talk about how to make the server side work for fast paced games.
+
+To solve the problem of inaccurate client side predictions, we need to make the client-server interaction more predictable from the client point of view. When a Player presses a key on client side, the client program needs to know when this input would being processed on server side.
+
+One possible way is to let the client suggest when the input should be applied, this way, client side would be able to predict it reliably. The term `suggest` is used as server might reject the suggestion if it's invalid, for example trying to cast a magic when your magic power is empty.
+
+The input should be applied shortly after user input, ie. T + X, where X is the delay. The exact value depends on game, normally less than 100ms to be responsive. Note X can also be zero, in this case it should happen immediately after user provides input.
+
+Let's say we choose X = 30ms, which translates into roughly 1 frame for 30fps (frame per second), and it takes 150ms for input to travel to server, there's a good chance when input reaches the server, the target frame for input had passed.
+
+Looking at the diagram, User A pressed a key at T, which supposed to be processed at T + 30ms , but the input is received by server at T + 150ms, due to latency, which already passed T + 30ms. This is the problem we are going to solve in this section
+
+You might have recalled client side prediction has a similar issue of incorrect predictions due to lacking information of opponents, and the incorrect predictions will later be corrected by state updates from server using Reconcilation. The same technique can be used here, the only difference is that we are correcting the GameState on server using user input from clients.
+
+All user input needs to be tagged with a timestamp, this timestamp will then be used to tell the server when to process this input.
+
+Note: On the first dotted line, it's Time X on Client side, but Time Y on Server side, this is an interesting nature of multiplayer game (and many other distributed system), as client and server runs independently, the time of client and server typically will be different,  our algorithm will handle the difference.
+
+Diagram above shows interaction between 1 Client and the Server,
+
+Server side reconcilation suffers similar problems as client side reconcilation, when we reconcile, it means we did something wrong, and we are correcting by changing history. This means we cannot apply irreversible outcomes, i.e, killing a players, such irreversible outcomes will only be applied when it goes out of the GameStateHistory, ie. when it cannot be rewriten anymore.
+
+In addition, the incorrect GameState sometime causes awful UI jump. Diagram below illustrate how it happens
+
+Entity starts at top left corner, it is moving toward right hand side, 5 ticks later, it shifted towards right, but then server received the user input saying that the entity changed direction on Tick N, so the server reconciles the game state, and now suddenly the entity jumps to the bottom left on the canvas.
+
+I might be exaggerating the effect, sometimes entity does not move that much, thus the jump would less obvious, but it is still noticeable in many cases. We can control the jump by changing the size of GameStateHistory, UnprocessedUserInput and ProcessedUserInput, the smaller the buffer size, the less jump there would be, because we would be less tolerant on input that arrives late, eg. If Input that is late for more than 100ms is ignored, player with ping > 200ms wont be able to play the game.
+
+One popular technique to overcome the problem of inaccurate Game State is Entity Interpolation, the idea is to smoothen the jump by spreading it out within a short amount of time.
+
+I will not include implementation details of Entity Interpolation in this article, however some references will be provided at the bottom of article.
+
+We have talked about how both client and server might work in a multiplayer game.
+
+In general, a multiplayer game has 3 loosely coupled loops, Server Game Loop, Client side prediction Loop, and Client side UI Rendering Loop. By having some sort of buffer in between them, their execution can be decoupled, giving us flexibility to create better gaming experience.
+
+Here ends my article on Multiplayer games, I learned much of this knowledge from experts in this field, building a simple multiplayer game also helps a lot. I've only show one way to implement a multiplayer server, there are more other ways, depending on what kind of game you're building, I encourage you to explore some of those ideas by building a simple game.|||
+
+How multiplayer game works?
+Programming, network

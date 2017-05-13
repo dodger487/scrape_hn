@@ -1,0 +1,57 @@
+This post follows up part 1. It documents my experience and process building a reliable test process for our helm chart. The general idea is that the “clean-build-test-install-verify” flow should work consistently across parallel success/failed runs without impacting subsequent runs.
+
+Part 1 covered the general setup, process, and analysis for experiment run 1. This post covers the analysis for runs 2–8.
+
+This run was a complete failure. There wasn’t a tiller throughout the entire run. Various helm commands failed with “transport closed” or “connection refused” type errors. The was not a single success across 10 hours. Unfortunately there was nothing in the tiller logs to debug.
+
+The results were similar to run 1. There were consecutive successes followed by consecutive failures. There was a single alert regarding failing Kublet PLEG (Pod Lifecycle Event Generator) from our monitoring system which coincided with the failures. All failing pods were confined to a failing node (visible by ). This made me conclude that this is a node issue and not something in helm/tiller.
+
+Luckily I remembered to check as part of the follow up on my periodic Docker daemon lock up issue. The logs revealed killed process for out of memory errors. The node had 98% memory utilization. That’s not good for anything. This lead me to conclude that pod/node density is too high. The next run needed to address this. It also made me wonder: what is the kubelet’s memory pressure check and why didn’t it alert in this case?
+
+Changes focus on memory pressure and monitoring. Changes:
+
+The first change ensures that pods are evicted (moved to another node) in memory high pressure scenarios. Our cluster uses instances with 8gb memory. This eviction policy kicks in at roughly ~95% memory utilization.
+
+The second change minimizes the possibility that the eviction policy is triggered. Declaring resource requests ensures pods only go where they fit. Declaring resource limits caps containers resource utilization to prevent unexpected growth which may trigger evictions or downtime.
+
+These two changes should keep nodes in a healthier state and perhaps minimize the chance of a Docker daemon lock up. Computers don’t like it when they run out of memory — especially when there’s no swap!
+
+The results are encouraging! The experiment ran for 12 hours with a high success rate. There were 51 successes and 3 failures. There were no alarms during the experiment as well. There were also failures, but that did not impact future runs. There were successful runs after failed runs. Here’s a snippet from the log:
+
+The failures are internal errors from . Here’s an example:
+
+These errors indicate that some containers where not ready when the test executes. This is provable because the step blocks until all pods are ready. Readiness and liveness probes are defined for all containers. One of the following reasons likely caused the problem:
+
+There is no way to know the cause at the time of this analysis. The script requires more logging in the failed test condition.
+
+it seems (curiously) that there is a relation between successive failures. Consider this log snippet:
+
+There was 48 successful executions, followed by 2 failures, 2 successes, and another failure. The test log shows the same error (the earlier log snippet) for all failing runs. This leads me to think there is something fishy going on with the specific containers in question, but there is no supporting evidence at this time. Hopefully the next run provides more data.
+
+This run’s goal is to acquire more data around pod state after failed test runs. This should provide enough data to correctly determine the failure reason. I’ve made the following changes for run 5:
+
+The experiment ran for approximately 18 hours. The results are encouraging! There were 90 runs with 85 successes and 5 failures. Again, failures in one run are not impacting subsequent runs. The results show failed liveness probes did cause some of the previous failures. Here’s the log grepping for specific or messages. Note that the output also captures useful bits of to debug such failures:
+
+This runs provides useful data for analyzing the 5 failures. Here’s the analysis for each failure from log data.
+
+These results lead me to conclude that:
+
+This run’s goal is to debug issues in . Changes in this run:
+
+I’ve not changed anything regarding timeouts or liveness probes in this run. I have a feeling that probes themselves are configured with appropriate delays and timeouts. It’s more likely that pods were never ready in the first place, thus invalidating prerequisites for
+
+I started the experiment and monitored it until failures occured. I noticed two failures. I terminated the run when it was clear that the changes were not reducing the failures.
+
+The log shows that there is some strange behavior in . The following gist shows the problem area along with a log snippet. The log shows that the script detects everything is “running”, but the following lines show the text ran against. You can see the log shows pods in and states. The script should not have counted this as OK.
+
+My only guess is strange behavior at this point.
+
+The goal for this run is further debug failures in . I’ve made a single change: to print all commands. This allows debugging variable state and what string ran against.
+
+I eagerly baby sat the test runs and waited for a failure. I got one after 10 hours or so. Here’s the overall result before analyzing each individual result:
+
+There are two failures in this run. The first one is the most interesting. incorrectly exited before everything was ready. Here’s a gist with and log from last inner loop.
+
+The log text has long line. There are annotations at end of each line to help understanding and analisys. Unfortunately Medium’s default width is too small so scroll right to pick them up or open the Gist on Github.com.|||
+
+This post follows up part 1 .Part 1 covered the setup, process, with the first execution. Part 2 covers the final 6 runs along with final analysis and lessons learned.

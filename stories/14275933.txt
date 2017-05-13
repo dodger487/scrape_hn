@@ -1,0 +1,39 @@
+I was prompted by a couple of high-profile database incidents including GitLab and Instapaper.
+
+I already felt pretty good about the backup system I had in place. I had tested backup recovery manually and felt the tools were solid.
+
+However, if for some reason the database backup was failing or my restore procedure had a mistake, I would not know until I actually had to recover the database.
+
+Feedbin uses WAL-E from Heroku to continually back up the database. WAL-E, and the PostgreSQL architecture that enables it, gives you offsite backups that can be recovered to any specified point in time.
+
+WAL-E is set to back up the full database every day via Cron.
+
+This command pushes the database to S3. This functions as a base backup that when combined with the WAL archives, that are continuously uploaded, can be restored to any point after the base backup started.
+
+WAL-E offers a counterpart command, , to actually restore the data from a . To test the backups I needed to build in an automated way to restore the database.
+
+Feedbin already uses Digital Ocean for a few things, so my first thought was to use Digital Ocean for this. I wrote a script to provision a Digital Ocean server, restore the backup to it and then delete the server after the backup completed.
+
+This turned out to be too expensive. Sending data to S3 is free, but reading it back out will cost you. For Feedbin’s database this worked out to be about $40 every time I restored the database. I wanted to test backups daily but the data transfer cost would quickly add up to about $1,200/month.
+
+While I was looking at S3 pricing, I found out that reading from S3 is free when it is read by an EC2 instance in the same region as your S3 bucket. It was also possible to save money on the EC2 instance itself by using Spot Instances instead of on-demand. With Spot Instances you bid on your instance and AWS tells you if you can have it for that price or not.
+
+Critically, no matter what your bid is, you never pay more than the spot price which is “The current market price of a Spot instance per hour.” With this in mind you don’t have to guess what to bid and since your bid matches the on-demand price, your instance will never be terminated early due to the price exceeding your bid.
+
+The instance I want costs $0.78/hr so I bid $0.78/hr, but only end up paying the spot price of ~$0.18/hr.
+
+I was new to the AWS CLI, but once I figured out the right data to send, it turned out to be a fairly simple script.
+
+This puts in a request to launch a instance with 800GB of storage. It also specifies which is executed by the instance after it boots up, which is a perfect fit for the script that configures the machine to run postgres and restore the database backup.
+
+This is all that is needed to stand-up a fully functioning PostgreSQL server and restore the database. No Chef, Ansible or any other provisioning tools required.
+
+The important part here is that postgres lets you specify a command to run once recovery is complete, the .
+
+Here I have it send me an email and shut down the server, which terminates the EC2 instance so it’s no longer incurring cost.
+
+If the email goes missing, then I know the restore never completed and I can go figure out what went wrong. AWS helps you out here too. The results of the UserData script are automatically logged to So you can seen exactly where the restore went wrong.
+
+I would be interested in hearing any questions or comments about this.|||
+
+I spent some time revisiting and improving Feedbin’s backup strategy recently.

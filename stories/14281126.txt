@@ -1,0 +1,107 @@
+If you’ve used Jenkins for a while in production, then you will be aware that Jenkins frequently publishes updates to its server for security and functionality changes.
+
+On a dedicated, non-dockerized host, this is generally managed for you through package management. With Docker it can get slightly more complicated to reason about upgrades, as you’ve likely separated out the context of the server from its data.
+
+You want to reliably upgrade your Jenkins server.
+
+This technique is delivered as a Docker image composed of a number of parts. First we will outline the Dockerfile that builds the image. This Dockerfile draws from the library docker image (which contains a docker client) and adds a script that manages the upgrade.
+
+The image is run in a docker command that mounts the docker items on the host, giving it the ability to manage any required Jenkins upgrade.
+
+We start with the Dockerfile:
+
+<2> – Add in the ‘jenkins_updater.sh’ script (see below)
+
+<3> – Ensure that the ‘jenkins_updater.sh’ script is runnable
+
+<4> – Set the default entrypoint for the image to be the ‘jenkins_updater.sh’ script
+
+The above Dockerfile encapsulates the requirements to back up Jenkins in a runnable Docker image. It uses the ‘docker’ standard library image. We use this to get a Docker client to run within a container. This container will run the script in the next listing to manage any required upgrade of Jenkins on the host.
+
+NOTE: If your docker daemon version differs from the version in the ‘docker’ Docker image, then you may run into problems. Try to use the same version.
+
+This is the shell script that manages the upgrade within the container:
+
+<1> – This script uses the ‘sh’ shell (not the ‘/bin/bash’ shell) because only ‘sh’ is available on the ‘docker’ Docker image
+
+<2> – This ‘set’ command ensures the script will fail if any of the commands within it fail
+
+<3> – This ‘set’ command logs all the commands run in the script to standard output
+
+<4> – The ‘if’ block only fires if ‘docker pull jenkins’ does not output ‘up to date’
+
+<5> – When upgrading, begin by stopping the jenkins container
+
+<6> – Once stopped, rename the jenkins container to ‘jenkins.bak.’ followed by the time to the minute
+
+<8> – Run the docker command to start up Jenkins, and run it as a daemon
+
+<9> – Set the jenkins container to always restart
+
+<11> – Give the container the name ‘jenkins’ to prevent multiple of these containers running simultaneously by accident
+
+<12> – Publish the 8080 port in the container to the 8080 port on the host
+
+<13> – Finally, the jenkins image name to run is given to the docker command
+
+The above script tries to pull jenkins from the docker hub with the ‘docker pull’ command. If the output contains the phrase ‘up to date’, then the ‘docker pull | grep …’ command returns true. However, we only want to upgrade when we did _not_ see ‘up to date’ in the output. This is why the ‘if’ statement is negated with a ‘!’ sign after the ‘if’.
+
+The result is that the code in the ‘if’ block is only fired if we downloaded a new version of the ‘latest’ Jenkins image. Within this block, the running Jenkins container is stopped and renamed. We rename it rather than delete it in case the upgrade did not work and we need to reinstate the previous version.
+
+Further to this rollback strategy, the mount folder on the host containing Jenkins’ state is backed up also.
+
+Finally, the latest-downloaded Jenkins image is started up using the docker run command.
+
+NOTE: You may want to change the host mount folder and/or the name of the running Jenkins container based on personal preference.
+
+The attentive reader might be wondering how this Jenkins image is connected to the host’s Docker daemon. To achieve this, the image is run using a commonly-used method in the book:
+
+<2> – You want the container to be removed when it has completed its job
+
+<3> – Run the container in the background
+
+<4> – Mount the host’s docker daemon folder to the container
+
+<5> – Mount the host’s docker socket to the container so the docker command will work within the container
+
+<6> – Mount the host’s docker mount folder where the Jenkins data is stored, so that the jenkins_updater.sh script can copy the files
+
+<7> – The dockerinpractice/jenkins-updater image is the image to be run
+
+This one-liner makes it easy to run within a crontab. We run this on our home
+
+servers. The crontab line looks like this:
+
+NOTE: The above is all on one line because crontab does not ignore newlines if there is a backslash in front in the way that shellscripts do.
+
+The end result is that a single crontab entry can safely manage the upgrade of your Jenkins instance without you having to worry about it. The task of automating the cleanup of old backed up containers and volume mounts is left as an exercise for the reader.
+
+This technique exemplifies a few things which we come across throughout the book which can be applied in similar contexts to situations other than Jenkins.
+
+First, it uses the core docker image to communicate with the Docker daemon on the host. Other portable scripts might be written to manage Docker daemons in other ways. For example, you might want to write scripts to remove old volumes, or report on the activity on your daemon.
+
+More specifically, the ‘if’ block pattern could be used to update and restart other images when a new one is available. It is not uncommon for images to be updated for security reasons, or to make minor upgrades.
+
+If you are concerned with difficulties in upgrading versions, it’s also worth pointing out that you need not take the ‘latest’ image tag (which this technique does). Many images have different tags that track different version numbers.
+
+For example, your image ‘exampleimage’ might have a exampleimage:latest tag, as well as an exampleimage:v1.1 tag, and a exampleimage:v1. Any of these might be updated at any time, but the :v1.1 tag is less likely to move to a new version than the :latest one. The :latest one could move to the same version as a new  :v1.2 one (which might require steps to upgrade) or even a :v2.1 one, where the new major version ‘2’ indicates a change more likely to be disruptive to any upgrade process.
+
+This technique also outlines a rollback strategy for docker upgrades. The separation of container and data (using volume mounts) can create tension about the stability of any upgrade. By retaining the old container and a copy of the old data at the point where the service was working, it is easier to recover  from failure.
+
+Database upgrades are a particular context in which these stability concerns are germane.
+
+If you want to upgrade your database to a new version, you have to consider whether the upgrade requires a change to the data structures and storage of the database’s data. It’s not enough simply to run the new version’s image as a container and expect it to work.
+
+It gets a bit more complicated if the database is ‘smart’ enough to know which version of the data it is ‘seeing’, and can perform the upgrade itself accordingly. In these cases, you might be more comfortable upgrading.
+
+Many factors feed into your upgrade strategy. Your app might tolerate an ‘optimistic’ approach (as we see here in the Jenkins example) which assumes everything will be OK, and prepares for failure when (not if) it occurs. On the other hand, you might demand 100% uptime, and not tolerate failure of any kind at all. In such cases, a fully-tested upgrade plan and a deeper knowledge of the platform than running ‘docker pull’ is generally desired (with or without the involvement of Docker).
+
+Although Docker does not remove the upgrade problem, the immutability of the versioned images can make it simpler to reason about them. Docker can also help you prepare for failure in two ways: backing up state in host volumes, and making testing predictable state more easy. The hit you take in managing and  understanding what Docker is doing can give you more control and certainty  about the upgrade process.
+
+This technique is taken from the upcoming second edition of my book Docker in Practice:
+
+Get 39% off with the code: 39miell
+
+Buying the print or ebook editions will get you ebook updates as they are published.|||
+
+Introduction If you've used Jenkins for a while in production, then you will be aware that Jenkins frequently publishes updates to its server for security and functionality changes. On a dedicated, non-dockerized host, this is generally managed for you through package management. With Docker it can get slightly more complicated to reason about upgrades, as you've likely separated out…

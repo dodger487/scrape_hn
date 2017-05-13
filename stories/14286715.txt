@@ -1,0 +1,32 @@
+A problem I’m quite interested in, primarily from my work on Hypothesis, is test case reduction: Taking an example that produces a bug, and producing a smaller version that triggers the same bug.
+
+Typically a “test-case” here means a file that when fed to a program triggers a crash or some other wrong behaviour. In the abstract, I usually think of sequences as the prototypical target for test case reduction. You can view a file as a sequence in a number of usefully different ways – e.g. as bytes, as lines, etc. and they all are amenable to broadly similar algorithms.
+
+The seminal work on test-case reduction is Zeller and Hildebrant’s “Simplifying and Isolating Failure-Inducing Input“, in which they introduce delta debugging. Delta-debugging is essentially an optimisation to the greedy algorithm which removes one item at a time from the sequence and sees if that still triggers the bug. It repeatedly applies this greedy algorithm to increasingly fine partitions of the test case, until the partition is maximally fine.
+
+Unfortunately the greedy algorithm as described in their paper, and as widely implemented, contains an accidentally quadratic bug. This problem is not present in the reference implementation, but it is present in many implementations of test case reduction found in the wild, including Berkeley delta and QuickCheck. Hypothesis gets this right, and has for so long that I forgot until quite recently that this wasn’t more widely known.
+
+To see the problem, lets look at a concrete implementation. In Python, the normal implementation of the greedy algorithm looks something like this:
+
+We try deleting each index in turn. If that succeeds, we start again. If not, we’re done: No single item can be deleted from the list.
+
+But consider what happens if our list is, say, the numbers from 1 through 10, and we succeed at deleting a number from the list if and only if it’s even.
+
+When we run this algorithm we try the following sequence of deletes:
+
+Every time we succeed in deleting an element, we start again from scratch. As a result, we have a classic accidentally quadratic bug.
+
+This is easy to avoid though. Instead of starting again from scratch, we continue at our current index:
+
+At each stage we either successfully reduce the size of the test case by 1 or we advance the loop counter by one, so this loop makes progress. It stops in the same case as before (when we make it all the way through with no deletions), so it still achieves the same minimality guarantee that we can’t delete any single element.
+
+The reason this is only linear time “ish” is that you might need to make up to n iterations of the loop (this is also true with the original algorithm) because deleting an element might unlock another element. Consider e.g. the predicate that our sequence must consist of the numbers 1, …, k for some k – we can only every delete the last element, so we must make k passes through the list. Additionally, if we consider the opposite where it must be the numbers from k to n for some k, this algorithm is quadratic while the original one is linear!
+
+I believe the quadratic case to be essential, and it’s certainly essential if you consider only algorithms that are allowed to delete at most one element at a time (just always make the last one they try in any given sequence succeed), but anecdotally most test cases found in the wild don’t have nearly this high a degree of dependency among them, and indexes that previously failed to delete tend to continue to fail to delete.
+
+A model with a strong version of this as its core assumption shows up the complexity difference: Suppose you have \(k\) indices out of \(n\) which are essential, and every other index can be deleted. Then this algorithm will always run in \(n + k\) steps (\(n\) steps through the list the first time, \(k\) steps at the end to verify), while the classic greedy algorithm will always run in \(O(k^2 + n)\) steps.
+
+Although this model is overly simplistic, anecdotally examples found in the wild tend to have something like this which acts as an “envelope” of the test case – there’s some large easily deletable set and a small essential core. Once you’re down to the core you have to do more work to find deletions, but getting down to the core is often the time consuming part of the process.
+
+As a result I would be very surprised to find any instances in the wild where switching to this version of the algorithm was a net loss.|||
+

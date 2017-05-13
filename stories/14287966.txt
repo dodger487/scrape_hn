@@ -1,0 +1,82 @@
+The forthcoming OpenSSL 1.1.1 release will include support for TLSv1.3. The new release will be binary and API compatible with OpenSSL 1.1.0. In theory, if your application supports OpenSSL 1.1.0, then all you need to do to upgrade is to drop in the new version of OpenSSL when it becomes available and you will automatically start being able to use TLSv1.3. However there are some issues that application developers and deployers need to be aware of. In this blog post I am going to cover some of those things.
+
+TLSv1.3 is a major rewrite of the specification. There was some debate as to whether it should really be called TLSv2.0 - but TLSv1.3 it is. There are major changes and some things work very differently. A brief, incomplete, summary of some things that you are likely to notice follows:
+
+Note that at this stage only TLSv1.3 is supported. DTLSv1.3 is still in the early days of specification and there is no OpenSSL support for it at this time.
+
+As of the time of writing TLSv1.3 is still in draft. Periodically a new version of the draft standard is published by the TLS Working Group. Implementations of the draft are required to identify the specific draft version that they are using. This means that implementations based on different draft versions do not interoperate with each other.
+
+OpenSSL 1.1.1 will not be released until (at least) TLSv1.3 is finalised. In the meantime the OpenSSL git master branch contains our development TLSv1.3 code which can be used for testing purposes (i.e. it is not for production use). You can check which draft TLSv1.3 version is implemented in any particular OpenSSL checkout by examining the value of the TLS1_3_VERSION_DRAFT_TXT macro in the tls1.h header file. This macro will be removed when the final version of the standard is released.
+
+In order to compile OpenSSL with TLSv1.3 support you must use the “enable-tls1_3” option to “config” or “Configure”.
+
+Currently OpenSSL has implemented the “draft-20” version of TLSv1.3. Many other libraries are still using older draft versions in their implementations. Notably many popular browsers are using “draft-18”. This is a common source of interoperability problems. Interoperability of the draft-18 version has been tested with BoringSSL, NSS and picotls.
+
+Within the OpenSSL git source code repository there are two branches: “tls1.3-draft-18” and “tls1.3-draft-19”, which implement the older TLSv1.3 draft versions. In order to test interoperability with other TLSv1.3 implementations you may need to use one of those branches. Note that those branches are considered temporary and are likely to be removed in the future when they are no longer needed.
+
+OpenSSL has implemented support for five TLSv1.3 ciphersuites as follows:
+
+Of these the first three are in the ciphersuite group. This means that if you have no explicit ciphersuite configuration then you will automatically use those three and will be able to negotiate TLSv1.3.
+
+All the TLSv1.3 ciphersuites also appear in the ciphersuite alias. The , , , , , and ciphersuite aliases include a subset of these ciphersuites as you would expect based on their names. Key exchange and authentication properties were part of the ciphersuite definition in TLSv1.2 and below. This is no longer the case in TLSv1.3 so ciphersuite aliases such as , , and other similar aliases do not contain any TLSv1.3 ciphersuites.
+
+If you explicitly configure your ciphersuites then care should be taken to ensure that you are not inadvertently excluding all TLSv1.3 compatible ciphersuites. If a client has TLSv1.3 enabled but no TLSv1.3 ciphersuites configured then it will immediately fail (even if the server does not support TLSv1.3) with an error message like this:
+
+Similarly if a server has TLSv1.3 enabled but no TLSv1.3 ciphersuites it will also immediately fail, even if the client does not support TLSv1.3, with an error message like this:
+
+For example, setting a ciphersuite selection string of will work in OpenSSL 1.1.0 and will only select those ciphersuites that are in DEFAULT and also use ECDHE for key exchange. However no TLSv1.3 ciphersuites are in the ECDHE group so this ciphersuite configuration will fail in OpenSSL 1.1.1 if TLSv1.3 is enabled.
+
+You may want to explicitly list the TLSv1.3 ciphersuites you want to use to avoid problems. For example:
+
+You can test which ciphersuites are included in a given ciphersuite selection string using the command:
+
+Ensure that at least one ciphersuite supports TLSv1.3
+
+In TLSv1.3 the client selects a “group” that it will use for key exchange. At the time of writing, OpenSSL only supports ECDHE groups for this (it is possible that DHE groups will also be supported by the time OpenSSL 1.1.1 is actually released). The client then sends “key_share” information to the server for its selected group in the ClientHello.
+
+The list of supported groups is configurable. It is possible for a client to select a group that the server does not support. In this case the server requests that the client sends a new key_share that it does support. While this means a connection will still be established (assuming a mutually supported group exists), it does introduce an extra server round trip - so this has implications for performance. In the ideal scenario the client will select a group that the server supports in the first instance.
+
+In practice most clients will use X25519 or P-256 for their initial key_share. For maximum performance it is recommended that servers are configured to support at least those two groups and clients use one of those two for its initial key_share. This is the default case (OpenSSL clients will use X25519).
+
+The group configuration also controls the allowed groups in TLSv1.2 and below. If applications have previously configured their groups in OpenSSL 1.1.0 then you should review that configuration to ensure that it still makes sense for TLSv1.3. The first named (i.e. most preferred group) will be the one used by an OpenSSL client in its intial key_share.
+
+Applications can configure the group list by using or a similar function (see here for further details). Alternatively, if applications use style configuration files then this can be configured using the or command (see here).
+
+In TLSv1.2 and below a session is established as part of the handshake. This session can then be used in a subsequent connection to achieve an abbreviated handshake. Applications might typically obtain a handle on the session after a handshake has completed using the function (or similar). See here for further details.
+
+In TLSv1.3 sessions are not established until after the main handshake has completed. The server sends a separate post-handshake message to the client containing the session details. Typically this will happen soon after the handshake has completed, but it could be sometime later (or not at all).
+
+The specification recommends that applications only use a session once (although this is not enforced). For this reason some servers send multiple session messages to a client. To enforce the “use once” recommendation applications could use to mark a session as non-resumable (and remove it from the cache) once it has been used.
+
+The old and similar APIs may not operate as expected for client applications written for TLSv1.2 and below. Specifically if a client application calls before the server message containing session details has been received then an object will still be returned, but any attempt to resume with it will not succeed and a full handshake will occur instead. In the case where multiple sessions have been sent by the server then only the last session will be returned by .
+
+Client application developers should consider using the API instead (see here). This provides a callback mechanism which gets invoked every time a new session is established. This can get invoked multiple times for a single connection if a server sends multiple session messages.
+
+Note that was also available in OpenSSL 1.1.0. Applications that already used that API will still work, but they may find that the callback is invoked at unexpected times, i.e. post-handshake.
+
+An OpenSSL server will immediately attempt to send session details to a client after the main handshake has completed. To server applications this post-handshake stage will appear to be part of the main handshake, so calls to should continue to work as before.
+
+In TLSv1.2 and below the initial ClientHello and ServerHello messages can contain “extensions”. This allows the base specifications to be extended with additional features and capabilities that may not be applicable in all scenarios or could not be foreseen at the time that the base specifications were written. OpenSSL provides support for a number of “built-in” extensions.
+
+Additionally the custom extensions API provides some basic capabilities for application developers to add support for new extensions that are not built-in to OpenSSL.
+
+Built on top of the custom extensions API is the “serverinfo” API. This provides an even more basic interface that can be configured at run time. One use case for this is Certificate Transparency. OpenSSL provides built-in support for the client side of Certificate Transparency but there is no built-in server side support. However this can easily be achieved using “serverinfo” files. A serverinfo file containing the Certificate Transparency information can be configured within OpenSSL and it will then be sent back to the client as appropriate.
+
+In TLSv1.3 the use of extensions is expanded significantly and there are many more messages that can include them. Additionally some extensions that were applicable to TLSv1.2 and below are no longer applicable in TLSv1.3 and some extensions are moved from the ServerHello message to the EncryptedExtensions message. The old custom extensions API does not have the ability to specify which messages the extensions should be associated with. For that reason a new custom extensions API was required.
+
+The old API will still work, but the custom extensions will only be added where TLSv1.2 or below is negotiated. To add custom extensions that work for all TLS versions application developers will need to update their applications to the new API (see here for details).
+
+The “serverinfo” data format has also been updated to include additional information about which messages the extensions are relevant to. Applications using “serverinfo” files may need to update to the “version 2” file format to be able to operate in TLSv1.3 (see here and here for details).
+
+TLSv1.3 does not have renegotiation so calls to or will immediately fail if invoked on a connection that has negotiated TLSv1.3.
+
+The most common use case for renegotiation is to update the connection keys. The function can be used for this purpose in TLSv1.3 (see https://www.openssl.org/docs/manmaster/man3/SSL_key_update.html).
+
+DSA certificates are no longer allowed in TLSv1.3. If your server application is using a DSA certificate then TLSv1.3 connections will fail with an error message similar to the following:
+
+Please use an ECDSA or RSA certificate instead.
+
+TLSv1.3 represents a significant step forward and has some exciting new features but there are some hazards for the unwary when upgrading. Mostly these issues have relatively straight forward solutions. Application developers should review their code and consider whether anything should be updated in order to work more effectively with TLSv1.3. Similarly application deployers should review their configuration.|||
+
+The forthcoming OpenSSL 1.1.1 release will include support for TLSv1.3. The new
+release will be binary and API compatible with OpenSSL 1.1.0. In …
