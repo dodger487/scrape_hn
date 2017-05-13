@@ -1,0 +1,52 @@
+In this blog post, we once again demonstrate that excessive reliance on automated tools can hide significant risks from the eyes of defense. Meanwhile, we discuss technical details of critical vulnerabilities of Oracle Golden Gate and show another disappointing example of the security industries approach to product quality.
+
+Some time ago during an internal vulnerability assessment we started noticing Nmap showing unrecognized services with a fingerprint similar to the following:
+
+Trained eyes can easily recognize the “MGR Did Not Recognize Command” error message returned to standard service discovery requests. A quick internet search revealed some forum posts complaining about this message appearing in Oracle Golden Gate’s error log. Some further searches showed that port TCP/7809 is also the default port of the Golden Gate manager process, matching the previous result. This gave us confidence about our target.
+
+According to the vendor homepage: “Oracle GoldenGate is a comprehensive software package for real-time data integration and replication in heterogeneous IT environments”. This practically means that you can programmatically define how data from one schema should be transformed into another one, and Golden Gate will move the data for you safely, maintaining data integrity even in during HA switch-overs and other complex cases.
+
+Meanwhile, a Nessus vulnerability scan was completed but it gave no indication of Golden Gate being even recognized. We started digging Google again and found some pretty scary ZDI advisories:
+
+CVSS 10.0 means that these issues can be easily exploited over the network without authentication and even the “affected ports” mentioned in the advisories matched our results. This is the point when we normally start setting up a test system, compare versions, etc. to create an exploit and thus be able to verify the presence of the vulnerabilities. Unfortunately, in this case, our target handled some critical data and we only had really tight windows for testing, and we couldn’t even set the lab up before the next “freeze” kicked in (that’s a lesson for pentest project management too).
+
+All we could do was to include an “informational” issue in our report that described the situation hoping that some quick workarounds or passive monitoring could be set up in the available time. That didn’t happen of course, but the issue was still bugging us (pun intended) so we went on with our test setup.
+
+This was one of those cases when obtaining and installing the product took more time and effort than finding the first vulnerability, partially because the Linux version of the software comes with full debug information compiled to its binaries :) Because of this, we’ll keep this section short, so we can focus on issues beyond the individual vulnerabilities.
+
+The manager process mimics an HTTP server and also implements a custom protocol. Both parts can be reached without authentication, although some level of access control is implemented as we will see later.
+
+The HTTP interface leaks a ton of information about the server setup, including the version number. This is enough to verify if a target is patched or not, but we wanted to go further of course:)
+
+The custom protocol is really simple, the most important details can be deduced from a simple packet dump collected on a test host during initial setup:
+
+A 2-byte prefix encodes the message length, this is followed by TAB separated, human-readable commands. The response is in the same format. This sample request is enough to quickly locate the message parser function of the binary implemented in the check_messages() function.
+
+After checking that the process creation logic invokes execv() in a way that prevents trivial command injection our attention moved to the OBEY command. Aside of the attracting name official documentation showed that GG can be scripted and script files are commonly called “OBEY files”.  These files can include the “SHELL” command that executes it’s parameters in the command interpreter of the OS – a perfect target for exploitation.
+
+The only question is how to place an OBEY file with appropriate contents to the target filesystem? For this we used an age-old trick: The manager process logs invalid commands in the ggserr.log file in the current working directory.  Since we can insert line breaks in the commands sent over the manager port and since the script parser doesn’t stop on invalid lines we can insert a line starting with “SHELL ” in the log and make the manager parse its own log file as an OBEY file, thus achieving command execution.
+
+Meanwhile, details of another vulnerability (ZDI-16-022 – CVE-2016-0451) was published by Claudio allowing arbitrary file uploads, making the exploitation even easier. (One limitation of our method is that script execution is quite slow, so reaching the injected command can take really long).
+
+For more information, see our published exploit. Single-shot exploitation on Windows is an exercise for the reader ;)
+
+Golden Gate performs access checks by invoking the MGRSEC_check_client_access() function during message parsing. This function goes through a list of configured rules to determine if the connecting client is allowed to send messages – this is also true for the vulnerable versions.  The fix published by Oracle adds new default rules that only allow messages from 127.0.0.1 and ::1 to be accepted.
+
+There are of course a couple of problems with this approach: first of all, the fix breaks existing setups relying on remote manager connections. Second, some messages are parsed even if the above check fails – during our testing we could find a couple of unauthenticated DoS issues (NULL pointer dereferences) accidentally. Third, GG exposes a huge attack surface and based on the observed code we would bet that there are other unauthenticated problems (or access check bypasses) to be discovered.
+
+
+
+ Injected new line – The “Access denied message” indicates fixed version
+
+Based on this we strongly recommend applying strict firewall rules to all Golden Gate ports (beware that the software binds itself dynamically to ports above 7800 for file uploads!) preventing any TCP connections from untrusted hosts. During threat modeling, it’s safe to assume that any connecting hosts can easily compromise the GG server.
+
+Beside the problems regarding the software itself we should also note that after 16 months from ZDI’s advisories and Oracle’s patch,  13 months after we notified Tenable about the missing detection and 4 months after the first public exploit appeared we can’t find any signatures for IDS/IPS tools or vulnerability scanners (ZDI/TippingPoint probably has one of course). In our case this hindered the deployment of mitigations significantly.
+
+We understand that due to the lack of information creating detection for every public vulnerability is impossible. Apparent industry-wide ignorance about public exploits, on the other hand, should make us wonder: are these vendors really interested in making us more secure or just making us believe so?
+
+Good that we still get all those high alerts for DTLS bugs and POODLE…
+
+From the other side, this little story once again proves the value of offensive research: without the work of people who actually want to “pwn” (instead of generating tricolor reports…) vulnerabilities like these can hide for years in critical systems. Demonstrating exploitability is also often the divider between resolution and “accepted risk” – especially for critical systems that no one wants to touch.
+
+And while 0-day will be burned into everyone’s retina after the next security trade show, remember: good, 100% reliable old-days like these will wait quietly under the radar until a worthy attacker (or pentester ;) finds them!|||
+
