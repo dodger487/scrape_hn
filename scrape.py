@@ -10,7 +10,7 @@ import pandas as pd
 
 print("DID YOU CHECK YOUR OFFSET?")
 print("Nathan: 0, Dave: 1, Chris: 2")
-OFFSET = 0
+OFFSET = 2
 print("Current offset:", OFFSET)
 
 
@@ -22,7 +22,7 @@ fname = "output_" + str(OFFSET) + ".csv"
 
 with open(fname, 'w') as file:
     csvFile = csv.writer(file)
-    csvFile.write(fields)
+    csvFile.writerow(fields)
 
     current_id = max_id
     num_responses, num_articles = 0, 0
