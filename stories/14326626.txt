@@ -1,0 +1,64 @@
+Understanding the limits of the throughput of Zookeeper is essential for understanding the limits of the scalability of Mesos, Kafka, Hadoop, Spark, Storm and many other systems. All of those heavily rely on Zookeeper for coordination and state management. Unfortunately, Zookeeper has a limited write throughput and does not scale out. So let’s see how far can we push it in a traditional cloud (AWS). 
+
+ (zookeeper.apache.org)
+
+There are two main reasons why we care about Zookeepers performance. First, Zookeeper is responsible for the coordination of the participants in other applications, e.g. Kafka or Hadoop. So, the scalability of those is effectively limited by the throughput of the Zookeeper instance they rely on. Second, the throughput of Zookeeper for write traffic is always limited as it does not scale out1. Moreover, increasing the size of a Zookeeper ensemble cause the decline in the throughput.
+
+Zookeeper can be scaled out for reads but not for writes. Being a key-value database which achieves high availability through replication it employs an atomic broadcast protocol. That protocol requires all the member of the Zookeeper ensemble to agree in order before a transaction is considered to be successfully executed. Consequently, adding more nodes to the ensemble requires longer waiting time before all the participants signal back, and thus, results in slower writes. The slower the writes are, the lesser the throughput of the cluster is. And adding more nodes results in the reduction of the write throughput. 
+
+ In the original paper1 Hunt et. al reported 21k writes/sec in a three server ensemble. So let's see what the maximum write throughput in a more of less typical setup.
+
+I've got really interested in the performance of the Zookeeper with the default configuration, which quite likely to be used in production :) 
+
+ For the test, I decided to use the vanilla Ubuntu Server 16.04 available in the AMI store and run the cluster on the three m3.xlarge nodes. Another m3.xlarge got installed the load testing tool( ) which is described at the end of the post.
+
+The results showed that the ZK cluster handled 10-12k operations per second, with a rather stable latency. All the requests were sent straight the leader, and thus its read performance ("get permanent") was limited to 10k req/sec. If the Zookeeper traffic were balanced to all three nodes the read traffic could have been tripled.
+
+I did not record any data on the key performance counters and just monitored it from time to time using and . In the next post, I will setup some monitoring, probably Prometeus to collect the data on the io, CPU and network utilization during the test. The servers were configured to use GP2 partitions, which have the rather limited iops capacity. All the servers from time to time reported really high io queue size ( ) which made me believe that io throughput was a problem. In the next post, I am going to use local SSDs and see if that makes any substantial difference.
+
+I was pleasantly surprised to discover that "out of the box" Zookeeper can achieve rather high performance and does not require substantial tuning. Even though I was not able to get to the results published in the original paper, as I did not use the bare metal servers, I find the performance level very satisfactory.
+
+Performance testing can look a bit complicated at the first glance and building a setup might take some time. Yet once you have figured out all the bits and pieces and tools are pumping data it may make you feel nothing but in charge of a NASA control center.
+
+In order to replicate the tests I did, you might need the following:
+
+After doing quick research I have found two open source tools which can be used for testing ZK performance:
+
+I used 4 x m3.xlarge instances, three for building a Zookeeper ensemble and one for load generation. I picked m3.xlarge as they are relatively inexpensive and have a lot of memory, which is needed to accommodating the data set. I used vanilla Ubuntu 16.04 AMI available in the AMI store. There is number of good instructions on the web which tell how to put a Zookeeper cluster together. I followed these steps. The only thing, which gave me some grief was Security Groups. I forgot to allow hosts to talk to other hosts on the same subnet. And, of course, I forgot to set the file correctly.
+
+Once the zookeeper was set up and running, I’ve pointed the zk-smoketest at it with
+
+root@ip-10-0-0-113:/home/ubuntu/zk-smoketest# ./zk-latencies.py --znode_count=1000000 --root_znode="/test3" --servers='10.0.0.20:2181' 
+
+ Connecting to 10.0.0.20:2181 
+
+ Connected in 32 ms, handle is 0 
+
+ Testing latencies on server 10.0.0.20:2181 using asynchronous calls 
+
+ created 1000000 permanent znodes in 81113 ms (0.081114 ms/op 12328.384585/sec) 
+
+ set 1000000 znodes in 87878 ms (0.087878 ms/op 11379.402115/sec) 
+
+ get 1000000 znodes in 95598 ms (0.095598 ms/op 10460.450287/sec) 
+
+ deleted 1000000 permanent znodes in 83274 ms (0.083274 ms/op 12008.532770/sec) 
+
+ created 1000000 ephemeral znodes in 78786 ms (0.078787 ms/op 12692.477925/sec) 
+
+ watched 1000000 znodes in 89901 ms (0.089901 ms/op 11123.334430/sec) 
+
+ deleted 1000000 ephemeral znodes in 83315 ms (0.083316 ms/op 12002.567413/sec) 
+
+ notif 1000000 watches in 0 ms (included in prior) 
+
+ Latency test complete 
+
+
+
+Zookeeper 3.4.8, right out of the box, with the default configuration on a default Ubuntu Server 16.04 image was able to achieve 12k create/update/delete req/sec which is 50% of the performance in the original Zookeeper paper1. 
+
+ The tools available to load testing Zookeeper are easy to setup and use. With the additional tuning I should be able to achieve the claimed 21k req/sec.
+
+In the next posts, I will dive deeper in the resource utilization and will perform some tuning to achieve higher write throughput. I also intend to setup a Mesos cluster and sample traffic hitting Zookeeper. Using that sample I should be able to estimate maximum size of the Mesos cluster that one can run in AWS. Anyway, if liked the post, or hated, or found a typo send me a message or subscribe here.|||
+

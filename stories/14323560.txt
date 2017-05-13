@@ -1,0 +1,34 @@
+In February this year, Dylan McKay wrote in his blog:
+
+I've been watching this from afar, planning to try it out when AVR support is mainlined into Rust; I thought it would be much easier to wait until the dust settles than trying to track the development versions of LLVM and Rust at the same time. However, it's now May, LLVM 4.0 has come out with the new AVR backend and the Rust compiler has been updated to use it; and my interest in Rust has also started to grow: in late March one of my beachside readings on Gili Meno was O'Reilly's , and a Rust meetup group started in Singapore. And so I started to formulate a plan.
+
+Two years ago, Viki and I designed and prototyped a very minimal AVR-based handheld console that can run CHIP-8 programs. It's made up of an Adafruit Trinket (an AVR ATMega328P running on 12MHz@3.3V, with a bit of circuitry to be programmable via serial-over-USB), a serial SRAM chip, an LCD from an old Nokia phone, and a 4x4 keypad.
+
+The 2015 software was, of course, written in C++. So my idea was to rewrite that in Rust, mainly aiming to use Rust's algebraic data type support with pattern matching. Given the way one usually programs microcontrollers, I think pattern matching gives me the most bang for my buck for now, until we start designing and implementing funky Rust libraries that use the borrows checker to enforce all kinds of interesting non-memory-allocation invariants.
+
+And so, while fiddling my thumbs waiting for AVR support to show up in the next Rust release, I got busy reimplementing the CHIP-8 engine in Rust, in two modules: is a library implementing the CHIP-8 machine with all IO done over a trait, and is the executable that links to the library and implements the frontend using SDL. This is the exact same architecture we used back in 2015 to develop the C++ version; this allowed us to debug the CHIP-8 implementation on an x86 computer, only having to worry about running on the device for the IO-specific parts.
+
+Two weeks ago, I decided to take the plunge and build LLVM and the Rust compiler from the dev branch where AVR support is being worked on.
+
+At this point, we have to note a big difference between the development process on C++ vs. Rust. With the C++ version, once the engine was running OK on the computer, we simply recompiled it using an AVR-targeting C++ compiler and linked it with code that communicates with the serial RAM chip, the LCD, and the keypad. On the other hand, at least for now, AVR support in LLVM and Rust is in its infancy, so even if the engine works on x86, there is absolutely no guarantee that it will do remotely the same on AVR as well.
+
+And so the next step was to use simavr to create a simulator for our board. The simulator implements just enough of the PCD8544 protocol to be able to display the pixels of the LCD in an SDL window; implements just enough of the serial SRAM protocol to read/write single bytes; and implements the keypad in the obvious way. I debugged the simulator by running the C++ version of the firmware; then when I decided I trusted the simulator enough, it was time to go back to Rust and see what it takes to compile it to AVR.
+
+First, I tried just compiling the Hello World of microcontrollers: blinking an LED.
+
+Right out the gate, this fails. It fails even before you get to try compiling your program. It fails because the Core library of Rust itself cannot be compiled on AVR due to a compiler bug. So the zeroth thing you have to do, before you even do the first thing, is to start trimming down Rust's until it doesn't contain too much stuff that compiling it triggers the aforementined bug, but still contains enough to be useful. For example, you need to include if you want to do any loops. I've put my version of on GitHub; if you need anything that is not included from the real , just try adding it and hope for the best.
+
+BTW, if you use a custom , there's a bunch of magic Rust incantations you need in your code:
+
+Also the module providing has to jump through a bunch of extra hoops:
+
+Note that just loops, since there's nothing better I could come up with for a microcontroller.
+
+Once you have your own stripped-down , you can start writing programs. Here's my first one, a blinker that uses a timer interrupt instead of busy-waiting:
+
+Again, at first, this failed due to another compiler bug that I've reported here and got fixed in a couple hours; and then for the first weekend, I got into this pattern of compiling something, running it in the simulator, noticing that the MCU gets jammed due to invalid machine code, or LLVM fails to turn IR into AVR assembly, and so on; reporting the issue at hand; then I'd test and confirm that the fix works.
+
+As I dug myself deeper into both LLVM and the Rust compiler, after a while I started not just reporting bugs and reducing test cases, but fixing them as well. In fact, if you want to try Rust on AVR today, I very much recommend using LLVM from my fork since it has all my changes that haven't been upstreamed yet, but are all needed to compile my code.
+
+And so now, two weeks later, I can reasonably claim that I know LLVM (something that I always wanted to learn but haven't gotten around to until now), I have a complete Rust implementation of CHIP-8 that runs on my real hardware board, and there are interesting problems to work on in Rustc and LLVM moving forward. Also, the Rust API to the actual AVR IO functionality that I've implemented is very rudimentary; I know of at least one project already that tries to design a nicer API, and we could probably also reuse some of the ideas from Marten's C++ AVR API to do bundled IO port updates.|||
+

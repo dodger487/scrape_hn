@@ -1,0 +1,230 @@
+"If Google were created from scratch today, much of it would be learned, not coded." —Jeff Dean, Google Senior Fellow, Systems and Infrastructure Group
+
+Machine learning, or ML, is all the rage today, and there are good reasons for that. Models created by machine-learning algorithms for problems such as spam filtering, speech and image recognition, language translation, and text understanding have many advantages over code written by human developers. Machine learning, however, is not as magical as it sounds at first. In fact, it is rather analogous to how human developers create code using test-driven development.4 Given a training set of input-output pairs , guess a function that passes all the given tests but also generalizes to unspecified input values.
+
+A big difference between human-written code and learned models is that the latter are usually not represented by text and hence are not understandable by human developers or manipulable by existing tools. The consequence is that none of the traditional software engineering techniques for conventional programs (such as code reviews, source control, and debugging) are applicable anymore. Since incomprehensibility is not unique to learned code, these aspects are not of concern here.
+
+A more interesting divergence between machines and humans is that machines are less arrogant than humans, and they acknowledge uncertainty in their code by returning a probability distribution or confidence interval of possible answers instead of claiming to know the precise result for every input. For example, a learned image-recognition function by a major cloud provider will predict with 95 percent certainty that I have hair, but is less confident about whether or not I am professional (figure 1).
+
+The implication of incorporating learned models in human-written code is that you cannot get around the fact that the building blocks from which humans compose applications are fundamentally probabilistic. This is a challenge for mainstream programming languages, which all assume that computations are precise and deterministic. Fortunately, the 18th-century Presbyterian minister Thomas Bayes anticipated the need for dealing with uncertainty and formulated Bayes's rule6:
+
+As it turns out, Bayes's rule is exactly what the doctor ordered when it comes to bridging the gap between ML and contemporary programming languages.
+
+Many of the mathematical explanations of Bayes's rule are deeply confusing for the working computer scientist, but, remarkably, when interpreted from a functional programming point of view, Bayes's rule is a theorem about composability and invertibility of monadic functions. Let's break down Bayes's rule piece by piece and rebuild it slowly based on developer intuition.
+
+First let's explore what probability distributions are. The Wikipedia definition, "a probability distribution is a mathematical description of a random phenomenon in terms of the probabilities of events," is rather confusing from a developer perspective. If you click around for a bit, however, it turns out that a discrete distribution is just a generic list of pairs of values and probabilities such that the probabilities add up to . This is the Bayesian representation for distributions. Isomorphically, you can use the frequentist representation of distributions as infinite lists of type such that as gets larger, sampling from the collection and counting the frequencies of each element
+
+from a in dist.Take(n) group by a into g select g.Key↦g.Sum()/n
+
+approximates the Bayesian representation of the distribution. When converting from the Bayesian to the frequentist implementation, the probabilities do not have to add up to , and the sampling process will ensure that the ratios are properly normalized.
+
+Like true mathematicians, we will silently switch between these two representations of distributions whenever convenient. Unlike mathematicians, however, to keep things simple we will not consider continuous distributions. We want our distribution to hold generically for any type , and most of the types we deal with in code are discrete and not "measurable" or real number-like.
+
+Because the values we care about are usually not even comparable, we will also avoid cumulative distributions. One reason that mathematicians like standard continuous distributions— such as Gaussian, beta, binomial, and uniform—is because of their nice algebraic properties, called conjugate priors.2 For example, a uniform prior combined with a binomial likelihood results in a beta posterior. This makes 18th- and 19th-century probabilistic computations using pencil and paper feasible, but that is not necessary now that there are powerful computers that can run millions of simulations per second.
+
+In programming examples, distributions typically come from outside data as discrete frequentist collections of data with an unknown distribution, or they are defined explicitly as a Bayesian representation by enumerating a list of value/probability pairs. For example, here is the distribution of weight of adults in the United States, according to the CDC (Centers for Disease Control):
+
+Efficiently sampling from composed distributions is, indeed, rocket science. Just like database query optimizers, advanced sampling methods leverage properties of the leaf distributions and the structure of the query9 or program3 that computes the distribution. It leverages deep and complex mathematical techniques such as importance sampling, Metropolis-Hastings, Markov chain Monte Carlo, and Gibbs sampling that are far outside the scope of this article but that are important for making real-world computations over probability distributions feasible. As Bayesian analysis consultant John D. Cook remarked "... Bayesian statistics goes back over 200 years, but it didn't take off until the 1980s because that's when people discovered practical numerical methods for computing with it..." To illustrate the sophistication involved in efficiently sampling known discrete distributions, imagine converting the example distribution into a frequentist representation.8 Perhaps the most obvious method stacks the columns for and on top of each other and draws one random number—say, —between and and then checks if yields , and otherwise yields . In general, this search is linear in the number values in the distribution, but using tricks like binary search tree can speed things up. Mathematicians call this the inverse transfer method. Another way is first to select a random integer—say, —to select between and , and then choose a random double between and —say, —and if , then yield , as shown in figure 2. Mathematicians call this algorithm rejection sampling, and as the histogram shows, half of the attempts to sample a value from the distribution will fail (the pink part). This can be improved by picking a tighter envelope distribution, like that in the second histogram, but that still rejects 2 out of 12 samples. The last method pads the lower probabilities by borrowing from the higher probabilities. Amazingly, it is always possible to do this in a way such that every column represents the probabilities for, at most, two values, so we need only one comparison to pick the right value. This comparison can be implemented using a second index table, and hence mathematicians call this sampling algorithm the alias method.
+
+Now that we have explained probability distributions , let's examine conditional probability distributions , which, according to Wikipedia, are "a measure of the probability of an event given that (by assumption, presumption, assertion, or evidence) another event has occurred." To developer ears that sounds exactly like a function that returns a distribution, just like a learned model. The remainder of this article uses the notations and interchangeably.
+
+Going back to the example, we have the following model of food preference, given weight, that we could have obtained by asking patients what kind of food they consume:
+
+As argued in the introduction, these probabilistic functions, such as , , , etc., are increasingly the result of training some ML algorithm or neural net, instead of being coded by expensive and flaky human developers.
+
+Now that you know that conditional probabilities are probabilistic functions, things are starting to get interesting, since this means that multiplication used in Bayes's rule is an operator that applies a probabilistic function to a probability distribution as a parameter—that is, it has the following type signature:
+
+Using the Bayesian representation of distributions, you can implement a probabilistic function application where and , using the following correlated query:
+
+likelihood*prior = 
+
+   from a↦p in prior 
+
+   from b↦q in likelihood(a) 
+
+   select (a,b)↦p*q
+
+Applying this definition to compute the result of , we obtain the table shown in figure 3 for the joint probability distribution .
+
+Because the distributions for and appear in the margins of this table, mathematicians call them marginal probabilities, and similarly the process of summing up the columns/rows is called marginalization. When computing a joint distribution using , mathematicians often use the name likelihood for the function and prior for the argument.
+
+The beauty of the frequentist representation is that there is no need for multiplying probabilities. Sampling ensures that the underlying ratio of occurrence of values in the result will automatically reflect the proper product of values from the prior and likelihood. For example, if we implement the prior by an infinite collection with odds , and the result of by an infinite collection with odds , and, respectively, that of by a collection with odds , then sampling from the infinite collection , which results from applying the prior to the likelihood, will have a ratio .
+
+The keen reader will note that is a slight variation of the well-known monadic bind operator, which, depending on your favorite programming language, is known under the names , , or . Indeed, probability distributions form a monad. Mathematicians call it the Giry monad, but Reverend Bayes beat everyone to it by nearly two centuries.
+
+Note that as formulated, Bayes's rule has a type error that went unnoticed for centuries. The left-hand side returns a distribution of pairs , while the right-hand side returns a distribution of pairs . Not a big deal for mathematicians since is commutative. For brevity we'll be sloppy about this as well. Since we often want to convert from to or by dropping one side of the pair, we prefer the C# variant of that takes a combiner function to post-process the pair of samples from the prior and likelihood:
+
+likelihood*prior = 
+
+   from a↦p in prior 
+
+   from b↦q in likelihood(a) 
+
+   select a⊕b↦p*q
+
+Now that we know that is monadic bind, we can start using syntactic sugar such as LINQ queries or for/monad comprehensions. All that is really saying is that it is safe to drop the explicit tracking of probabilities from any query written over distributions (i.e., the code on the left in figure 4 is simply sugar for the code on the right, which itself can be alternatively implemented with the frequentist approach using sampling).
+
+Another way of saying this is that we can use query comprehensions as a DSL (domain-specific language) for specifying probabilistic functions. This opens the road to explore other standard query operators besides application that can work over distributions and that can be added to our repertoire. The first one that comes to mind is filtering, or projection as the mathematicians prefer to call it.
+
+Given a predicate , we can drop all values in a distribution for which the predicate does not hold using the division operator :
+
+ℙ(A)÷(A➝𝔹)∈ℙ(A) 
+
+prior ÷ condition = from a in prior where condition(a) select a
+
+The traditional division of a distribution by distribution can be defined similarly as
+
+joint ÷ evidence = 
+
+   λb.from (a,b) in joint from b' in evidence where b=b' select (a,b)
+
+We can show that . Applying the latter version to Bayes's rule results in the following equivalence:
+
+In practice, it is most convenient to use query comprehensions directly instead of operators, and write code like this:
+
+posterior∈ℙ(C|B)=B➝ℙ(C) 
+
+posterior(b) = 
+
+   from a in prior 
+
+   from b' in likelihood(a) where b = b' 
+
+   select a⊕b
+
+Whichever way you spin it, this is incredibly cool! Bayes's rule shows how to invert a probabilistic function of type into a probabilistic function of type using conditioning.
+
+When function inversion is applied to the running example, the probabilistic function can be defined as follows:
+
+Removing all syntactic sugar and using the value/probability pairs implementation amounts to the following probabilistic function:
+
+In practice, most monads have an unsafe run function of type that teleports you out of the monad into some concrete container . Mathematicians call this the forgetful functor. For distributions , a common way to exit the monad is by picking the value with the highest probability in . Mathematicians use the higher-order function for this, and call it MLE (maximum likelihood estimator) or MAP (maximum a posteriori). In practice it is often more convenient to return the pair from with the highest probability.
+
+A simple way to find the value with the maximal likelihood from a frequentist representation of a distribution is to blow up the source distribution into a distribution of distributions , where the outer distribution is an infinite frequentist list of inner Bayesian distributions , computed by grouping and summing, that over time will converge to the true underlying distribution. Then you can select the nth inner distribution and take its maximum value.
+
+Using the query-style DSL for composing and conditioning probabilistic functions is great, but it falls short of being a real programming language with arbitrary control flow, loops, try/catch blocks, recursion, etc. Since distributions are a variant of the continuation monad, it is possible to integrate probabilistic computations into a regular imperative language similar to the syntax that is now available in many programming languages. An example of an imperative probabilistic programming language is WebPPL (http://webppl.org), which embeds the distribution monad into regular JavaScript. In WebPPL, the running example looks as follows:
+
+var cdc = function() { 
+
+   return Categorical({ ps: [4, 6], vs: ["obese", "skinny"] }) 
+
+} 
+
+  
+
+var doctor = function(weight) { 
+
+   if("obese" == weight) 
+
+      return Categorical({ ps: [9, 1], vs: ["burger", "celery"] } }) 
+
+   if("skinny" == weight) 
+
+      return Categorical({ ps: [3, 7], vs: ["burger", "celery"] } }) 
+
+} 
+
+  
+
+var predict = function(food) { 
+
+   var weight = sample(cdc()) 
+
+   var food_ = sample(doctor(weight)) 
+
+   condition(food == food_) 
+
+   return weight; 
+
+}
+
+is exactly like the query fragment
+
+from a in prior 
+
+... rest of the query ...
+
+and randomly picks a value from a distribution . The statement corresponds to a clause in a query.
+
+To "run" this program, we pass the function into the WebPPL inference engine as follows:
+
+This samples from the distribution described by the program using the function with the specified sampling method (which includes , , and ) that reifies the resulting distribution into a Bayesian representation.
+
+Suppose ordinary developers had access to a probabilistic programming language. What scenarios would this open up?
+
+If we take a step back and look at a typical web or mobile application, it implements the standard reinforcement learning design pattern shown in figure 5. We have to predict an action to send to the user, based on the user's state and the dollar value extracted from the user, such that the sum of the rewards over time is maximized.
+
+For games such as AlphaGo,10 the agent code is often a neural network, but if we abstract the pattern to apply to applications as a whole, it is likely a combination of ML learned models and regular imperative code. This hybrid situation is true even today, where things such as ad placement and search-result ranking are probabilistic but opaquely embedded into imperative code. Probabilistic programming and machine learning will allow developers to create applications that are highly specialized for each user.
+
+One of the attractions of IDEs (integrated development environments) is autocomplete, where the IDE predicts what a user is going to type, based on what has been typed thus far. In most IDEs, autocomplete is driven by static type information. For example, if the user types , the JetBrains Rider IDE shows all the properties of the type as potential completions, as shown in figure 6.
+
+Note that the completion list is shown in deterministic alphabetical order, rather than being probabilistically ranked using some learned model based on which methods on are the most likely in the given context. Hence, the IDE should implement autocomplete using a probabilistic function that returns a distribution of possible completions based on the current user context.7 Another recent application of ML and probabilistic programming in the compiler space is to infer pretty-print rules by learning from patterns in a large corpus of code .5
+
+For an example application of exposing the representation of distributions, let's revisit the feedback loop between user and application. Assume in this case that we want to determine the optimal title for this article that would maximize click-through on the ACM Queue website. That is, should we use "Probabilistic Programming for Dummies" instead of the current title "Making Money Using Math"?
+
+In this case, we create the model shown in figure 7, the set of all users as a conditional distribution of a user clicking on the article given the title:
+
+Note we do not want to make any a priori assumptions about the underlying distributions other than the frequentist stream of clicks received, given the frequentist stream of titles served to the users.
+
+The agent in this case wants to find out over time which possible title for a story will generate the most clicks from the users, and hence we will model the agent by the higher-order function that takes the users and from that creates a distribution of titles:
+
+Mathematicians call the implementation of a Bayesian bandit,11 and they leverage the fact that Bernoulli and beta distributions are conjugate priors.12 They call the variant of the function we will be using Thompson sampling.1
+
+When viewed from a computer scientist's point of view, the operational solution is relatively straightforward. We convert the user behavior that returns a distribution of clicks into a function that returns a distribution of pairs of titles and clicks using as explained earlier (this corresponds to the beta distribution part of the algorithm. We do not track the "uncertainty" about , but we can easily compute that together with the click probability if that is useful). A small tweak is needed in that we are interested only in clicks that are , and not in those that are (this is the Bernoulli part of the algorithm).
+
+This allows us to observe how the probability that the user will click on each title evolves over time as we see more clicks from the users. Whenever we need to produce a new title, we use the for which the most recent has the highest probability (this is the Thompson sampling part of the algorithm). In other words, the Bayesian bandit is essentially a merge sort over the reified underlying probability distributions of the clicks from the users.
+
+The computational model underneath modern applications such as self-driving cars, speech and image recognition, personalized recommendations, etc. is changing from classical deterministic computations to probabilistic machine-learned models. Currently, building such applications requires deep knowledge and expertise of the underlying details of the ML algorithms using custom tools. 
+
+ 
+
+
+
+Probabilistic programming aims to democratize the application of machine learning by allowing regular programmers to incorporate ML in general-purpose programming languages without friction. As illustrated in this article, from a semantics point of view, a probabilistic language simply adds the probability monad to the set of ambient side effects and leverages Bayes's rule to compose and condition probability distributions. Efficiently implementing probabilistic languages and providing the proper software engineering tooling, however, will keep compiler and programming-language experts busy for a long time.
+
+1. Agrawal, S., Goyal, N. 2012. Analysis of Thompson sampling for the multi-armed bandit problem. Journal of Machine Learning Research: Workshop and Conference Proceedings 23; http://jmlr.org/proceedings/papers/v23/agrawal12/agrawal12.pdf.
+
+3. Goodman, N. D. 2013. The principles and practice of probabilistic programming. Proceedings of the 40th annual ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages; http://dl.acm.org/citation.cfm?id=2429117.
+
+5. Parr, T., Vinju, J. 2016. Towards a universal code formatter through machine learning. Proceedings of the ACM SIGPLAN International Conference on Software Language Engineering; http://dl.acm.org/citation.cfm?id=2997383.
+
+6. Paulos, J. A. 2011. The mathematics of changing your mind. New York Times Sunday Book Review; http://www.nytimes.com/2011/08/07/books/review/the-theory-that-would-not-die-by-sharon-bertsch-mcgrayne-book-review.html.
+
+7. Raychev, V., Bielik, P., Vechev, M. 2016. Probabilistic model for code with decision trees. Proceedings of the ACM SIGPLAN International Conference on Object-oriented Programming, Systems, Languages, and Applications; http://dl.acm.org/citation.cfm?doid=2983990.2984041.
+
+9. Ścibior, A., Ghahramani, Z., Gordon, A. D. 2015. Practical probabilistic programming with monads. Proceedings of the 2015 ACM SIGPLAN Symposium on Haskell; http://dl.acm.org/citation.cfm?id=2804317.
+
+10. Silver, D., et al. 2016. Mastering the game of Go with deep neural networks and tree search; https://gogameguru.com/i/2016/03/deepmind-mastering-go.pdf.
+
+Learning from THE WEB 
+
+The Web has taught us many lessons about distributed computing, but some of the most important ones have yet to fully take hold. 
+
+- Adam Bosworth 
+
+http://queue.acm.org/detail.cfm?id=1103833
+
+Erik Meijer has been working on "democratizing the cloud" for the past 15 years. He is perhaps best known for his work on, amongst others, the Haskell, C#, Visual Basic, and Dart programming languages, as well as for his contributions to LINQ and the Reactive Framework (Rx).
+
+
+
+
+
+ Originally published in Queue vol. 15, no. 1— 
+
+ see this item in the ACM Digital Library
+
+Spence Green, Jeffrey Heer, Christopher D. Manning - Natural Language Translation at the Intersection of AI and HCI 
+
+ Old questions being answered with both AI and HCI
+
+Jeff Barr, Luis Felipe Cabrera - AI Gets a Brain 
+
+ New technology allows software to tap real human intelligence.
+
+Alexander Nareyek - AI in Computer Games 
+
+ If you've been following the game development scene, you've probably heard many remarks such as: "The main role of graphics in computer games will soon be over; artificial intelligence is the next big thing!" Although you should hardly buy into such statements, there is some truth in them. The quality of AI (artificial intelligence) is a high-ranking feature for game fans in making their purchase decisions and an area with incredible potential to increase players' immersion and fun.
+
+Refreshing to learn mathematics in terms of programming constructs.|||
+
