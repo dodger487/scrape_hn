@@ -1,0 +1,110 @@
+The bug affects a kernel if it has AF_PACKET sockets enabled (CONFIG_PACKET=y), which is the case for many Linux kernel distributions. Exploitation requires the CAP_NET_RAW privilege to be able to create such sockets. However it's possible to do that from a user namespace if they are enabled (CONFIG_USER_NS=y) and accessible to unprivileged users.
+
+Since packet sockets are a quite widely used kernel feature, this vulnerability affects a number of popular Linux kernel distributions including Ubuntu and Android. It should be noted, that access to AF_PACKET sockets is expressly disallowed to any untrusted code within Android, although it is available to some privileged components. Updated Ubuntu kernels are already out, Android’s update is scheduled for July.
+
+The usual workflow for finding bugs with syzkaller is as follows:
+
+The syntax is mostly self-explanatory. First, we declare a new type sock_packet. This type is inherited from an existing type sock. That way syzkaller will use syscalls which have arguments of type sock on sock_packet sockets as well.
+
+After that, we declare a new syscall socket$packet. The part before the $ sign tells syzkaller what syscall it should use, and the part after the $ sign is used to differentiate between different kinds of the same syscall. This is particularly useful when dealing with syscalls like ioctl. The socket$packet syscall returns a sock_packet socket.
+
+Then setsockopt$packet_rx_ring and setsockopt$packet_tx_ring are declared. These syscalls set the PACKET_RX_RING and PACKET_TX_RING socket options on a sock_packet socket. I’ll talk about these options in details below. Both of them use the tpacket_req_u union as a socket option value. This union has two struct members tpacket_req and tpacket_req3.
+
+Once the descriptions are added, syzkaller can be instructed to fuzz packet-related syscalls specifically. This is what I provided in the syzkaller manager config:
+
+After a few minutes of running syzkaller with these descriptions I started getting kernel crashes. Here’s one of the syzkaller programs that triggered the mentioned bug:
+
+And here’s one of the KASAN reports. It should be noted, that since the access is quite far past the block bounds, allocation and deallocation stacks don’t correspond to the overflown object.
+
+Write of size 4 at addr ffff880054b70010 by task syz-executor0/30839
+
+Object at ffff880054b70040 belongs to cache names_cache of size 4096
+
+The buggy address belongs to the page:
+
+To better understand the bug, the vulnerability it leads to and how to exploit it, we need to understand what AF_PACKET sockets are and how they are implemented in the kernel.
+
+To send and receive packets on a packet socket, a process can use the send and recv syscalls. However, packet sockets provide a way to do this faster by using a ring buffer, that’s shared between the kernel and the userspace. A ring buffer can be created via the PACKET_TX_RING and PACKET_RX_RING socket options. The ring buffer can then be mmaped by the user and the packet data can then be read or written directly to it.
+
+One of the widely known users of AF_PACKET sockets is the tcpdump utility. This is roughly what happens when tcpdump is used to sniff all packets on a particular interface:
+
+This sequence of syscalls corresponds to the following actions:
+
+After that the kernel will start putting all packets coming through the eth0 interface in the ring buffer and tcpdump will read them from the mmapped region in the userspace.
+
+A ring buffer is a memory region used to store packets. Each packet is stored in a separate frame. Frames are grouped into blocks. In TPACKET_V3 ring buffers frame size is not fixed and can have arbitrary value as long as a frame fits into a block.
+
+Here’s what each field means in the tpacket_req3 struct:
+
+When a block is fully filled with data (a new packet doesn’t fit into the remaining space), it’s closed and released to userspace or “retired” by the kernel. Since the user usually wants to see packets as soon as possible, the kernel can release a block even if it’s not filled with data completely. This is done by setting up a timer that retires current block with a timeout controlled by the tp_retire_blk_tov parameter.
+
+There’s also a way so specify per-block private area, which the kernel won’t touch and the user can use to store any information associated with a block. The size of this area is passed via the tp_sizeof_priv parameter.
+
+Let’s take a quick look at how some of this is implemented in the kernel.
+
+Then, it allocates the ring buffer blocks:
+
+1079         /* first try the current block */
+
+1088         /* Now, try to dispatch the next block */
+
+This is supposed to ensure that the length of the block header together with the per-block private data is not bigger than the size of the block. Which totally makes sense, otherwise we won’t have enough space in the block for them let alone the packet data.
+
+However turns out this check can be bypassed. In case req_u->req3.tp_sizeof_priv has the higher bit set, casting the expression to int results in a big positive value instead of negative. To illustrate this behavior:
+
+Later, when req_u->req3.tp_sizeof_priv is copied to p1->blk_sizeof_priv in init_prb_bdqc() (see the snippet above), it’s clamped to two lower bytes, since the type of the latter is unsigned short. So this bug basically allows us to set the blk_sizeof_priv of the tpacket_kbdq_core struct to arbitrary value bypassing all sanity checks.
+
+That’s not all. Another user of blk_sizeof_priv is prb_open_block(), which initializes a block (the code snippet is above as well). There pkc1->nxt_offset denotes the address, where the kernel will write a new packet when it’s being received. The kernel doesn’t intend to overwrite the block header and per-block private data, so it makes this address to point right after them. Since we control blk_sizeof_priv, we can control the lowest two bytes of nxt_offset. This allows us to control offset of the out-of-bounds write.
+
+To sum up, this bug leads to a kernel heap out-of-bounds write of controlled maximum size and controlled offset up to about 64k bytes.
+
+Let’s see how we can exploit this vulnerability. I’m going to be targeting x86-64 Ubuntu 16.04.2 with 4.8.0-41-generic kernel version with KASLR, SMEP and SMAP enabled. Ubuntu kernel has user namespaces available to unprivileged users (CONFIG_USER_NS=y and no restrictions on it’s usage), so the bug can be exploited to gain root privileges by an unprivileged user. All of the exploitation steps below are performed from within a user namespace.
+
+The Linux kernel has support for a few hardening features that make exploitation more difficult. KASLR (Kernel Address Space Layout Randomization) puts the kernel text at a random offset to make jumping to a particular fixed address useless. SMEP (Supervisor Mode Execution Protection) causes an oops whenever the kernel tries to execute code from the userspace memory and SMAP (Supervisor Mode Access Prevention) does the same whenever the kernel tries to access the userspace memory directly.
+
+The idea of the exploit is to use the heap out-of-bounds write to overwrite a function pointer in the memory adjacent to the overflown block. For that we need to specifically shape the heap, so some object with a triggerable function pointer is placed right after a ring buffer block. I chose the already mentioned packet_sock struct to be this object. We need to find a way to make the kernel allocate a ring buffer block and a packet_sock struct one next to the other.
+
+A packet_sock is allocated via the kmalloc() function by the slab allocator. The slab allocator is mostly used to allocate objects of a smaller-than-one-page size. It uses the page allocator to allocate a big block of memory and splits this block into smaller objects. The big blocks are called slabs, hence the name of the allocator. A set of slabs together with their current state and a set of operations like “allocate an object” and “free an object” is called a cache. The slab allocator creates a set of general purpose caches for objects of size 2^n. Whenever kmalloc(size) is called, the slab allocator rounds size up to the nearest power of 2 and uses the cache of that size.
+
+Since the kernel uses kmalloc() all the time, if we try to allocate an object it will most likely come from one of the slabs already created during previous usage. However, if we start allocating objects of the same size, at some point the slab allocator will run out of slabs for this size and will have to allocate another one via the page allocator.
+
+Keeping all that in mind, this is how we can allocate a kmalloc-2048 slab next to a ring buffer block:
+
+This way we can shape the heap in the following way:
+
+The exact number of allocations to drain freelists and shape the heap the way we want might be different for different setups and depend on the memory usage activity. The numbers above are for a mostly idle Ubuntu machine.
+
+Above I explained that the bug results in a write of a controlled maximum size at a controlled offset out of the bounds of a ring buffer block. Turns out not only we can control the maximum size and offset, we can actually control the exact data (and it’s size) that’s being written. Since the data that’s being stored in a ring buffer block is the packet that’s passing through a particular network interface, we can manually send packets with arbitrary content on a raw socket through the loopback interface. If we’re doing that in an isolated network namespace no external traffic will interfere.
+
+There are a few caveats though.
+
+First, it seems that the size of a packet must be at least 14 bytes (12 bytes for two mac addresses and 2 bytes for the EtherType apparently) for it to be passed to the packet socket layer. That means that we have to overwrite at least 14 bytes. The data in the packet itself can be arbitrary.
+
+Then, the lowest 3 bits of nxt_offset always have the value of 2 due to the alignment. That means that we can’t start overwriting at an 8-byte aligned offset.
+
+Besides that, when a packet is being received and saved into a block, the kernel updates some fields in the block and frame headers. If we point nxt_offset to some particular offset we want to overwrite, some data where the block and frames headers end up will probably be corrupted.
+
+Another issue is that if we make nxt_offset point past the block end, the first block will be immediately closed when the first packet is being received, since the kernel will (correctly) decide that there’s no space left in the first block (see the __packet_lookup_frame_in_block() snippet). This is not really an issue, since we can create a ring buffer with 2 blocks. The first one will be closed, the second one will be overflown.
+
+Now, we need to figure out which function pointers to overwrite. There are a few of function pointers fields in the packet_sock struct, but I ended up using the following two:
+
+To do that we need to put our payload to some executable memory region. One of the possible ways for that is to put the payload in the userspace, either by mmapping an executable memory page or by just defining a global function within our exploit program. However, SMEP & SMAP will prevent the kernel from accessing and executing user memory directly, so we need to deal with them first.
+
+Putting this all together, here are the exploitation steps:
+
+It should be noted, that when we overwrite these two fields in the packet_sock structs, we’ll end up corrupting some of the fields before them (the kernel will write some values to the block and frame headers), which can lead to a kernel crash. However, as long as these other fields don’t get used by the kernel we should be good. I found that one of the fields that caused crashes if we try to close all packet sockets after the exploit finished is the mclist field, but simply zeroing it out helps.
+
+I didn’t bother to come up with some elaborate KASLR bypass technique which exploits the same bug. Since Ubuntu doesn’t restrict dmesg by default, we can just grep the kernel syslog for the “Freeing SMP” string, which contains a kernel pointer, that looks suspiciously similar to the kernel text address:
+
+By doing simple math we can calculate the kernel text address based on the one exposed through dmesg. This way of figuring out the kernel text location works only for some time after boot, as syslog only stores a fixed number of lines and starts dropping them at some point.
+
+When thinking about a way to fix this, the first idea that comes to mind is that we can compare the two values as is without that weird conversion to int:
+
+One of the ways to fix this overflow is to cast tp_sizeof_priv to uint64 before passing it to BLK_PLUS_PRIV. That’s exactly what I did in the fix that was sent upstream.
+
+To disable user namespaces completely you can rebuild your kernel with CONFIG_USER_NS disabled. Restricting user namespaces usage only to privileged users can be done by writing 0 to /proc/sys/kernel/unprivileged_userns_clone in Debian-based kernel. Since version 4.9 the upstream kernel has a similar /proc/sys/user/max_user_namespaces setting.
+
+Right now the Linux kernel has a huge number of poorly tested (from a security standpoint) interfaces and a lot of them are enabled and exposed to unprivileged users in popular Linux distributions like Ubuntu. This is obviously not good and they need to be tested or restricted.
+
+Syzkaller is an amazing tool that allows to test kernel interfaces via fuzzing. Even adding barebone descriptions for another syscall usually uncovers numbers of bugs. We certainly need people writing syscall descriptions and fixing existing ones, since there’s a huge surface that’s still not covered and probably a ton of security bugs buried in the kernel. If you decide to contribute, we’ll be glad to see a pull request.|||
+
