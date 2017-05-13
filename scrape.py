@@ -7,18 +7,11 @@ import json
 import requests
 import pandas as pd
 
-
-print("DID YOU CHECK YOUR OFFSET?")
-print("Nathan: 0, Dave: 1, Chris: 2")
-OFFSET = 1
-print("Current offset:", OFFSET)
-
-
 fields = ["type", "id", "title", "score", "time", "url", "by", "text"]
 url_format = 'https://hacker-news.firebaseio.com/v0/item/%s.json'
-max_id = 14332642 - OFFSET
+max_id = 14269017
 
-fname = "output_" + str(OFFSET) + ".csv"
+fname = "output_1_2.csv"
 
 with open(fname, 'w') as file:
     csvFile = csv.writer(file)
@@ -43,4 +36,5 @@ with open(fname, 'w') as file:
             if content[0] == "story":
                 num_articles += 1
         except Exception as e:
+            current_id = current_id - 3
             print(e)
