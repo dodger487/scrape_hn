@@ -1,0 +1,289 @@
+This is an extension of a paper I wrote which shows how to use the linear texture sampling capabilities of the GPU to calculate points on Bezier curves (also just polynomials in general as well as rational polynomials, and also surfaces and volumes made by tensor products). You store the control points in the texture, then sample along the texture’s diagonal to get points on the curve:
+
+ GPU Texture Sampler Bezier Curve Evaluation
+
+This extension improves on the efficiency of the storage space usage, allowing a higher density of curve data per pixel, but the post also talks about some caveats and limitations.
+
+This post is divided into the following sections:
+
+Let’s talk about the base technique before going into the details of the extension.
+
+The image below shows how bilinear interpolation across the diagonal between pixels can calculate points on curves. Bilinear interpolation is exactly equivalent to the De Casteljau algorithm when the u and v coordinate are the same value.
+
+
+
+Linear interpolation between two values A and B at time t is done with this formula:
+
+
+
+I’ve found useful to replace (1-t) with it’s own symbol s. That makes it become this:
+
+
+
+Now, if you bilinear interpolate between 4 values, you have two rows. One row has A,B in it and the other row has C,D in it. To bilinear interpolate between these four values at time (t,t), the formula is this:
+
+
+
+If you expand that and collect like terms you come up with this equation:
+
+
+
+At this point, the last step is to make B and C the same value (make them both into B) and then rename D to C since that letter is unused. The resulting formula turns out to be the formula for a quadratic Bezier curve. This shows that mathematically, bilinear interpolation can be made to be mathematically the same as the quadratic Bezier formula. (Note: there are extensions to get higher order curves and surfaces as well)
+
+
+
+However, for this extension we are going to take one step back to the prior equation:
+
+
+
+What you may notice is that the two values in the corners of the 2×2 bilinear interpolation don’t have to be the exact value of the middle control point of the quadratic Bezier curve – they only have to AVERAGE to that value.
+
+This is interesting because to encode two different piecewise quadratic curves (C0-C2 and C3-C5) into a 2d texture before this extension, I would do it like this:
+
+That uses 8 pixels to store the 6 control points of the two quadratic curves.
+
+With the ideas of this extension, one way it could look now is this:
+
+The result is that 6 pixels are used instead of 8, for storing the 6 control points of the two quadratic curves.
+
+That isn’t the only result though, so let’s explore the details (:
+
+Let’s start by more formally looking at the 2d texture / quadratic curve case.
+
+We are going to number the pixels by their texture coordinate location (in the form of Pyx) instead of using letters. Later on that will help show a pattern of generalization. We are still using the same notation for control points where C0 is the first control point, C1 is the second control point and so on.
+
+Looking at a single quadratic curve we have this texture which has these constraints on it’s pixel values:
+
+To analyze this, let’s make an augmented matrix. The left matrix is a 3×4 matrix where each column is a pixel and each row is the left side of the equation for a constraint. The right matrix is a 3×3 matrix where each column is a control point and each row is the right side of the equation for a constraint. The first row of the matrix is column labels to help see what’s going on more easily.
+
+Note that i put my pixel columns and control point columns in ascending order in the matrix, but if you put them in a different order, you’d get the same (or equivalent) results as I did. It’s just my convention they are in this order.
+
+The next step would be to put this matrix into reduced row echelon form to solve the equations to see what the values of the pixels need to be, but the matrix is in fact already in rref form! (For more information on rref, check out my last post: Solving N equations and N unknowns: The Fine Print (Gauss Jordan Elimination))
+
+What we can see by looking at the rref of the matrix is that either P01 or P10 can be a free variable – meaning we can choose whatever value we want for it. After we choose a value for either of those variables (pixels), the rest of the pixels are fully defined.
+
+Deciding that P10 is the free variable (just by convention that it isn’t the leading non zero value), the second equation (constraint) becomes P01 = 2*C1-P10.
+
+If we choose the value C1 for P10, that means that P01 must equal C1 too (this is how the original technique worked). If we choose 0 for P10, that means that P01 must equal 2*C1. This is because P01 must always equal 2*C1-P10. We then are in the new territory of this extension, where the pixels representing the middle control point have some freedom about what values they can take on, so long as they average to the middle control point value.
+
+Let’s add a row of pixels and try encoding a second quadratic curve:
+
+Let’s again make an augmented matrix with pixels on the left and control points on the right.
+
+Putting that into rref to solve for the pixel values we get this:
+
+We got the identity matrix on the left, so we don’t have any inconsistencies or free variables.
+
+If we turn that matrix back into equations we get this:
+
+We were successful! We can store two piecewise Bezier curves in 6 pixels by setting the pixel values to these specific values.
+
+The last example we’ll show is the next stage, where it falls apart. We’ll add another row of pixels and try to encode 3 Bezier curves (9 control points) into those 8 pixels.
+
+This is the augmented matrix with pixels on the left and control points on the right:
+
+We have a problem unfortunately! The bottom row says this:
+
+That means that we can only store these curves in this pixel configuration if we limit the values of the control points 2,4,6 to values that make that last equation true.
+
+Since my desire is to be able to store curves in textures without “unusual” restrictions on what the control points can be, I’m going to count this as a failure for a general case solution.
+
+It only gets worse from here for the case of trying to add another row of pixels for each curve you want to add.
+
+It looks like storing two quadratic curves in a 2×6 group of pixels is the most optimal (data dense) storage. If you go any higher, it puts restrictions on the control points. If you go any lower, you have a free variable, which means you aren’t making full use of all of the pixels you have.
+
+This means that if you are storing piecewise quadratic curves in 2d textures, doing it this way will cause you to use 3/4 as many pixels as doing it the other way, and you will be using 1 pixel per control point stored, instead of 1.333 pixels per control point stored.
+
+This isn’t the end of the story though, so let’s continue (:
+
+If we add the requirement that our piecewise curves must be connected (aka that they have C0 continuity), we can actually do something pretty interesting. Take a look at this setup:
+
+Putting this into matrix form looks like this:
+
+In rref it becomes this:
+
+Turning the rref back into equations we get:
+
+P21 is a free variable, so we can set it to whatever we want. Once we choose a value, the pixel values P01 and P10 will be fully defined.
+
+The bottom equation might have you worried, because it looks like an inconsistency (aka restriction) but it is actually expected.
+
+That last equation says 0 = C2-C3 which can be rearranged into C2 = C3. That just means that the end of our first curve has to equal the beginning of our second curve. That is C0 just the continuity we already said we’d agree to.
+
+So, it worked! Let’s try adding a row of pixels and another curve to see what happens.
+
+We see that P30 is a free variable, and the last two rows show us we have the C0 continuity requirements: C2 = C3 and C5 = C6.
+
+The last section without C0 continuity reached it’s limit of storage space efficiency after storing two curves (6 control points) in 6 pixels.
+
+When we add the C0 continuity requirement, we were able to take it further and store 3 curves in 8 pixels. Technically those 3 curves have 9 control points, but because the end point of each curve has to be the same as the start point of the next curve it makes it so in reality there is only 3 control points for the first curve and then 2 additional control points for each additional curve. That makes 8 control points for 3 curves, not 9.
+
+Unlike the last section, using this zigzag pattern with C0 continuity, you can encode any number of curves. I am not sure how to prove it, but from observation, there is no sign of any shrinking of capacity as we increase the number of curves, adding two more rows of pixels for each curve. If you know how to prove this more formally, please let me know!
+
+Note that instead of explicitly having 3 control points per curve, where the first control point of a curve has to equal the last control point of the previous curve, you can instead describe the piecewise curves with fewer control points. You need 3 control points for the first curve, and then 2 control points for each curve after that.
+
+Mathematically both ways are equivelant and you’ll get to the same answer. The accompanying source code works that way, but I show this example in this longer way to more explicitly show how things work.
+
+Let’s compare the storage efficiency of the last two sections to each other, as well as to the original technique.
+
+The tables show that the first method uses fewer pixels per control point, while the second method uses fewer pixels per curve.
+
+The first method can get you to what I believe to be the maximum density of 1 pixel per control point if you store an even number of curves. It can also give you a curve for every 3 pixels of storage.
+
+The second method approaches the 1 pixel per control point as you store more and more curves and also approaches 2 pixels of storage per curve stored. Note that the second method’s table is using the convention of 3 control points are used for the first curve, and 2 additional control points for each curve after that.
+
+The deciding factor for which method to use is probably going to be whether or not you want to force C0 continuity of your curve data. If so, you’d use the second technique, else you’d use the first.
+
+The original technique uses a constant 1.33 pixels per control point, and 4 pixels to store each curve. Those numbers shows how this extension improves on the storage efficiency of the original technique.
+
+This extension has a problem that the original technique does not have unfortunately.
+
+While the stuff above is correct mathematically, there are limitations on the values we can store in actual textures. For instance, if we have 8 bit uint8 color channels we can only store values 0 to 255.
+
+Looking at one of the equations , if C1 is 255 and C3 is 0, we are going to need to store 510 in the 8 bits we have for P01, which we can’t. If C1 is 0 and C3 is not zero, we are going to have to store a negative value in the 8 bits we have for P01, which we can’t.
+
+This becomes less of a problem when using 16 bit floats per color channel, and is basically solved when using 32 bit floats per color channels, but that makes the technique hungrier for storage and less efficient again.
+
+While that limits the usefulness of this extension, there are situations where this would still be appropriate – like if you already have your data stored in 16 or 32 bit color channels like some data (eg position data) would require..
+
+The extension goes further, into 3d textures and beyond though, so let’s explore a little bit more.
+
+The original technique talks about how to use a 2x2x2 3d volume texture to store a cubic Bezier curve (per color channel) and to retrieve it by doing a trilinear interpolated texture read.
+
+If you have four control points A,B,C,D then the first slice of the volume texture will be a 2d texture storing the quadratic Bezier curve defined by A,B,C and the second slice will store B,C,D. You still sample along the diagonal of the texture but this time it’s a 3d diagonal instead of 2d. Here is that setup, where the texture is sampled along the diagonal from from A to D:
+
+Let’s look at what this extension means for 3d textures / cubic curves.
+
+The equation for a cubic Bezier curve looks like this:
+
+If we derive that from trilinear interpolation between 8 points A,B,C,D,E,F,G,H, the second to last step would look like this:
+
+So, similar to our 2d setup, we have some freedom about our values.
+
+In the original technique, B,C,E would have to be equal to the second control point, and D,F,G would have to be equal to the third control point. With the new extension, in both cases, those groups of values only have to AVERAGE to their specific control points. Once again, this gives us some freedoms for the values we can use, and lets us use our pixels more efficiently.
+
+Here is the setup, again using texture coordinates (in the form Pzyx) for the pixels instead of letters.
+
+here’s how the equations look in matrix form, which also happens to already be in rref:
+
+P010 and P100 are free variables and so are P101 and P110, making a total of four free variables. They can be set to any value desired, which will then define the value that P001 and P011 need to be.
+
+Let’s add another piecewise cubic Bezier curve, and another row of pixels to the texture to see what happens.
+
+Here are the equations in matrix form:
+
+Here it is in rref:
+
+Putting that back into equations we have this:
+
+The result is that we still have four free variables: P100, P101, P110 and P120. When we give values to those pixels, we will then be able to calculate the values for P001, P011, P020 and P021.
+
+There is a limit to this pattern though. Where the maximum number of curves to follow the pattern was 2 with the 2d / quadratic case, the maximum number of curves to follow this pattern with the 3d / cubic case is 3. As soon as you try to put 4 curves in this pattern it fails by having constraints. Interestingly, we still have 4 free variables when putting 3 curves in there, so it doesn’t follow the 2d case where free variables disappeared as we put more curves in, indicating when the failure would happen.
+
+If you know how to more formally analyze when these patterns of equations will fail, please let me know!
+
+Looking at the 3d texture case of 2x2x2 storing a single curve, I saw that there were 4 free variables. Since it takes 4 control points to define a cubic curve, I wondered if we could use those 4 free variables to encode another cubic curve.
+
+Here’s a setup where the x axis is flipped for the second curve. It’s a little bit hard to tell from the diagram, but the blue line does still go through the center of the 3d cube. It goes from P001 to P110, while the first curve still goes from P000 to P111.
+
+Here’s what the equations look like:
+
+After putting the matrix in rref to solve the equations, we get this matrix:
+
+Which is this set of equations:
+
+In the end there are 2 free variables, but also 2 constraints on the values that the control points can take. The constraints mean it doesn’t work which is unfortunate. That would have been a nice way to bring the 3d / cubic case to using 1 pixel per control point!
+
+I also tried other variations like flipping y or z along with x (flipping all three just makes the first curve in the reverse direction!) but couldn’t find anything that worked. Too bad!
+
+Since the regular 3d texture / cubic curve pattern has a limit (3 curves), let’s look at the C0 continuity version like we did for the 2d texture / quadratic case where we sample zig zag style.
+
+Since the sampling has to pass through the center of the cube, we need to flip both x and z each curve.
+
+That gives us a setup like this:
+
+Here are the constraints for the pixel values:
+
+Which looks like this in matrix form:
+
+Here is the matrix solved in rref:
+
+And here is that matrix put back into equations form:
+
+It worked! It also has 5 free variables.
+
+This pattern works for as many curves as i tried (21 of them), and each time you add another curve / row of this pattern you gain another free variable.
+
+So, storing 2 curves results in 6 free variables, 3 curves has 7 free variables, 4 curves has 8 free variables and so on.
+
+Let’s compare storage efficiency of these 3d texture / cubic curve techniques like we did for the 2d texture / quadratic curve techniques.
+
+The original technique had a constant 2 pixels per control point and 8 pixels per cubic curve.
+
+The basic extension lets you bring that down to 1.33 pixels per control point, and 5.33 pixels per curve.
+
+If C0 continuity is desired, as you store more and more curves the extension can bring things down towards 1.33 pixels per control point, and 4 pixels per curve. (Remember that with the C0 extension you have 4 control points for the first curve and then 3 more for each subsequent curve, so that 1.33 pixels per control point isn’t exactly an apples to apples comparison vs the basic extension).
+
+The pattern continues for 4D textures and higher (for higher than cubic curves too!), but working through the 2d and 3d cases for quadratic / cubic curves is the most likely usage case both because 4d textures and higher are kind of excessive (probably you’d need to do multiple texture reads to simulate them), but also when fitting curves to data, quadratic and cubic curves tend to do well in that they don’t usually overfit the data or have as many problems with ringing.
+
+Despite that, I do think it’s useful to look at it from an N dimensional point of view to see the larger picture, so let’s do that next.
+
+Let’s ignore the zig zag sampling pattern and storing multiple curves in a texture and just get back to the basic idea.
+
+Given an N dimensional texture that is 2x2x…x2 that you are going to sample across the diagonal to get a degree N Bezier curve from, how do you know what values to put in which control points to use this technique?
+
+You could derive it from N-linear interpolation, but that is a lot of work.
+
+The good news is it turns out there is a simple pattern, that is also pretty interesting.
+
+Let’s check out the 1d, 2d and 3d cases to see what patterns we might be able to see.
+
+The first pattern you might see is that the right side of the equations for an N dimensional hypercube is the identity matrix, but instead of using 1 for the value along the diagonal, it uses values from Pascal’s Triangle (binomial coefficients).
+
+To simplify this a bit though, we could also notice that the number on the right side of the equation equals the sum of the numbers on the left side of the equation. Mathematically it would be the same to say that the numbers on the left side of the equation have to sum up to 1. This would make the matrix on the right just be the identity matrix and we can forget about Pascal’s triangle numbers (they will show up implicitly as divisors of the left side equation coefficients but there’s no need to explicitly calculate them).
+
+But then we are still left with the matrix on the left. How do we know which pixels belong in which rows?
+
+It turns out there is another interesting pattern here. In all the matrices above it follows this pattern:
+
+That pattern continues indefinitely, but don’t forget that the numbers (coefficients) on the left side of the equation must add up to one.
+
+Here is the matrix form of 1d / linear, 2d / quadratic, and 3d / cubic again with the right matrix being the identity matrix, and the equations below them. Notice the pattern about counts of one bits in each row!
+
+Here are the formulas for linear, quadratic and cubic Bezier curves to show a different way of looking at this. Below each is the same formula but with the 1d, 2d and 3d pixels in the formula instead of the control points, using the formulas above which relate pixel values to control point values. Note that I have replaced (1-t) with s for easier reading.
+
+I think it’s really interesting how in the last equation as an example, “3B” literally becomes 3 values which could have the value of B. In the plain vanilla technique they did have the value of B. In this extension, the only requirement is that they average to B.
+
+It’s also interesting to notice that if you have an N bit number and you count how many permutations have each possible number of bits turned on, the resulting counts is the Pascal’s triangle row. That is nothing new, but it seems like there might be a fun way to convert a set of random numbers (white noise) into a Gaussian distribution, just by counting how many one bits there were in each number. That isn’t new either, and there are better algorithms, but still I think it’s an interesting idea, and may be useful in a pinch since it seems pretty computationally inexpensive.
+
+This extension makes storage efficiency a bit better than the plain vanilla technique, especially if you are interested in C0 continuous curves.
+
+The extension does come at a price though, as you may find yourself in a situation where you need to store a value that is outside of the possible values for common data formats to store (such as needing to store a negative number or a larger than 255 number in a uint8).
+
+Even so, if these three criteria are met:
+
+Then this may be an attractive solution for you, even over the plain vanilla technique.
+
+For future work, I think it would be interesting to see how this line of thinking applies to surfaces.
+
+I also think there is probably some fertile ground looking into what happens when sampling off of the diagonal of the textures. Intuitively it seems you might be able to store some special case higher order curves in lower dimension / storage textures, but I haven’t looked into it yet.
+
+A common usage case when encoding data in a texture would probably include putting curves side by side on the x axis of the texture. It could be interesting to look into whether curves need to be completely separate from each other horizontally (aka 2 pixel of width for each track of curves in the texture), or if you could perhaps fit two curves side by side in a 3 pixel width, or any similar ideas.
+
+Lastly, when looking at these groups of points on these N dimensional hyper-cubes, I can’t help but wonder what kinds of shapes they are. Are they simplices? If so, is there a pattern to the dimensions they are of?
+
+It’s a bit hard to visualize, but taking a look at the first few rows of pascal’s triangle / hyper cubes here’s what I found:
+
+Questions, comments, corrections, etc? Post a comment below or hit me up on twitter at @Atrix256.
+
+If you have a usage case for this or any of the related techniques, I’d love to hear about them.
+
+It’s easy to talk about things and claim that everything is correct, when in fact, the moment you try it, everything falls apart.
+
+I made up some simple standalone c++ code that goes through the cases we talked about, doing the math we did, and also verifying that the texture interpolation is equivalent to actually calculating Bezier curves (using Bernstein polynomials).
+
+You can also use this code as a starting point to explore higher curve counts or other storage patterns. It uses only standard includes and no libraries, so it should be real easy to drop this into a compiler and start experimenting.
+
+Here’s some example output, which shows 6 cubic curves stored in a 3d texture using the zig zag sampling pattern.|||
+
+This is an extension of a paper I wrote which shows how to use the linear texture sampling capabilities of the GPU to calculate points on Bezier curves (also

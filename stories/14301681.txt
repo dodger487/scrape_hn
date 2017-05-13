@@ -1,0 +1,78 @@
+With five million plus Uber trips taken daily worldwide, it is important for Uber engineers to ensure that data is accurate. If used correctly, metadata and aggregate data can quickly detect platform abuse, from spam to fake accounts and payment fraud. Amplifying the right data signals makes detection more precise and thus, more reliable.
+
+To address this challenge in our systems and others, Uber Engineering and Databricks worked together to contribute Locality Sensitive Hashing (LSH) to Apache Spark 2.1. LSH is a randomized algorithm and hashing technique commonly used in large-scale machine learning tasks including clustering and approximate nearest neighbor search.
+
+In this article, we will demonstrate how this powerful tool is used by Uber to detect fraudulent trips at scale.
+
+Before Uber Engineering implemented LSH, we used the N^2 approach to sift through trips; while accurate, the N^2 approach was ultimately too time-consuming, volume-intensive, and hardware-reliant for Uber’s size and scale.
+
+The general idea of LSH is to use a family of functions (known as LSH families) to hash data points into buckets so that data points near each other are located in the same buckets with high probability, while data points  far from each other are likely in different buckets. This makes it easier to identify trips with various degrees of overlap.
+
+For reference, LSH is a multi-use technology with myriad applications, including:
+
+The primary LSH use case at Uber is detecting similar trips based on their spatial properties, a method of identifying fraudulent drivers. Uber engineers presented on this use case during Spark Summit 2016, where they discussed our team’s motivations behind using LSH on the Spark framework to broadcast join all trips and sift through fraudulent ones. Our motivations for using LSH on Spark are threefold:
+
+For these reasons, solving the problem by deploying LSH on Spark was the right choice for our business goals: scale, scale, and scale again.
+
+At a high level, our approach to using LSH has three steps. First, we create a feature vector for each trip by breaking it down into area segments of equal size. Then, we hash the vectors by MinHash for Jaccard distance function. Lastly, we either do similarity join in batch or k-Nearest Neighbor search in real-time. Compared to the basic brute-force approach of detecting fraud, our datasets enabled Spark jobs to finish faster by a full order of magnitude (from about 55 hours with the N^2 method to 4 hours using LSH).
+
+To best demonstrate how LSH works, we will walk through an example of using MinHashLSH on the Wikipedia Extraction (WEX) dataset to find similar articles.
+
+Each LSH family is linked to its metric space. In Spark 2.1, there are two LSH estimators:
+
+In this scenario, we use MinHashLSH since we will work with real-valued feature vectors of word counts.
+
+First, we need to launch an EMR (Elastic MapReduce) cluster and mount a WEX dataset as an EBS (Elastic Block Store) volume. Additional details on this process are available via the AWS documentations on EMR and EBS.
+
+After setting up the text environment, we upload a sample of WEX data to HDFS based on the EMR cluster size. In the Spark shell, we load the sample data in HDFS:
+
+Figure 1 shows the results of our previous code, displaying articles by title and subject matter. We will use the content as our hashing keys and approximately find similar Wikipedia articles in the following experiments.
+
+MinHash is a very common LSH technique for quickly estimating how similar two sets are to each other. With MinHashLSH implemented in Spark, we represent each set as a binary sparse vector. In this step, we will convert the contents of Wikipedia articles into vectors.
+
+Using the following code for feature engineering, we split the article content into words (Tokenizer), create feature vectors of word counts (CountVectorizer), and remove empty articles:
+
+// Word count to vector for each wiki content
+
+    val vocabSize = 1000000
+
+    val cvModel: CountVectorizerModel = new CountVectorizer().setInputCol(“words”).setOutputCol(“features”).setVocabSize(vocabSize)
+
+ .setMinDF(10).fit(wordsDf)
+
+    val isNoneZeroVector = udf({v: Vector => v.numNonzeros > 0}, DataTypes.BooleanType)
+
+    val vectorizedDf = cvModel.transform(wordsDf).filter(isNoneZeroVector(col(“features”))).select(col(“title”), col(“features”))
+
+  vectorizedDf.show()
+
+In order to use MinHashLSH, we first fit a MinHashLSH model on our featurized data with the below command:
+
+We can make several types of queries with our LSH model, but for the purposes of this tutorial, we first run a feature transformation on the dataset:
+
+This command provides us with the hash values, which can be useful for manual joins and for feature generation.
+
+Next, we run an approximate nearest neighbor search to find the data point closest to our target.  For the sake of demonstration, we search for articles with content approximately matching the phrase united states.
+
+Finally, we run an approximate similarity join to find similar pairs of articles within the same dataset:
+
+Note that while we use a self join, below, we could also join different datasets to get the same results.
+
+Figure 5 demonstrates how to set the number of hash tables. For the approximate nearest neighbor command and an approximate similarity join, the number of hash tables can be used to trade off between runtime and false positive rate. Adding more hash tables will increase the accuracy (a positive), but also the program’s communication cost and running time. By default, the number of hash tables is set to one.
+
+To gain additional practice using LSH in Spark 2.1, you can also run smaller examples in the Spark distribution for BucketRandomProjectionLSH and MinHashLSH.
+
+In order to gauge performance, we then benchmark our implementations of MinHashLSH on the WEX dataset. Using an AWS cloud, we task 16 executors (m3.xlarge instances) with performing an approximate nearest neighbor search and approximate similarity join on a sample of WEX datasets.
+
+In the tables below, we can see that approximate nearest neighbor ran 2x faster than full scan with the number of hash tables set to five, while approximate similarity join ran 3x-5x faster depending on the number of output rows and hash tables:
+
+Our experiment also shows that despite their short runtime, the algorithms achieved high accuracy compared to the results of brute-force methods like ground truth. Meanwhile, approximate nearest neighbor search achieved 85 percent accuracy for the 40 returned rows, while our approximate similarity join successfully found 93 percent of the nearby row pairs. This speed-accuracy trade-off has made LSH a powerful tool in detecting fraudulent trips daily from mere terabytes of data.
+
+While our LSH model has helped Uber identify fraudulent driver activity, our work is far from complete. During our initial implementation of LSH, we planned a number of features to deploy in future releases. The high priority features include:
+
+We welcome your feedback as we continue to develop and scale our project to incorporate the above features—and many others.
+
+Yun Ni is a software engineer on Uber’s Machine Learning Platform team, Kelvin Chu is technical lead engineer on Uber’s Complex Data Processing/Speak team, and Joseph Bradley is a software engineer on Databricks’ Machine Learning team.
+
+Photo Header Credit: “Identifying Okavango Elephants from the Air” by Conor Myhrvold, Botswana.|||
+
