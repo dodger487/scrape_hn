@@ -1,0 +1,441 @@
+This is an informal spec, but hopefully it's clear.
+
+The primary goal is: keep the semantics (tree structure; set of types; encoding/escaping) from JSON, but make it more convenient as a human-editable config file format.
+
+The following features are desirable, to support human usage:
+
+Implementation-wise, the format should have these properties:
+
+HOCON is significantly harder to specify and to parse than JSON. Think of it as moving the work from the person maintaining the config file to the computer program.
+
+Much of this is defined with reference to JSON; you can find the JSON spec at http://json.org/ of course.
+
+Anything between or and the next newline is considered a comment and ignored, unless the or is inside a quoted string.
+
+JSON documents must have an array or object at the root. Empty files are invalid documents, as are files containing only a non-array non-object value such as a string.
+
+In HOCON, if the file does not begin with a square bracket or curly brace, it is parsed as if it were enclosed with curly braces.
+
+A HOCON file is invalid if it omits the opening but still has a closing ; the curly braces must be balanced.
+
+The character can be used anywhere JSON allows , i.e. to separate keys from values.
+
+If a key is followed by , the or may be omitted. So means
+
+Values in arrays, and fields in objects, need not have a comma between them as long as they have at least one ASCII newline ( , decimal value 10) between them.
+
+The last element in an array or last field in an object may be followed by a single comma. This extra comma is ignored.
+
+The JSON spec simply says "whitespace"; in HOCON whitespace is defined as follows:
+
+In Java, the method covers these characters with the exception of nonbreaking spaces and the BOM.
+
+While all Unicode separators should be treated as whitespace, in this spec "newline" refers only and specifically to ASCII newline 0x000A.
+
+The JSON spec does not clarify how duplicate keys in the same object should be handled. In HOCON, duplicate keys that appear later override those that appear earlier, unless both values are objects. If both values are objects, then the objects are merged.
+
+Note: this would make HOCON a non-superset of JSON if you assume that JSON requires duplicate keys to have a behavior. The assumption here is that duplicate keys are invalid JSON.
+
+Object merge can be prevented by setting the key to another value first. This is because merging is always done two values at a time; if you set a key to an object, a non-object, then an object, first the non-object falls back to the object (non-object always wins), and then the object falls back to the non-object (no merging, object is the new value). So the two objects never see each other.
+
+These two are equivalent:
+
+And these two are equivalent:
+
+The intermediate setting of to prevents the object merge.
+
+A sequence of characters outside of a quoted string is a string value if:
+
+Unquoted strings are used literally, they do not support any kind of escaping. Quoted strings may always be used as an alternative when you need to write a character that is not permitted in an unquoted string.
+
+parses as the boolean token followed by the unquoted string . However, parses as the unquoted string . Similarly, is the number then the unquoted string but is the unquoted string . (In practice, this distinction doesn't matter much because of value concatenation; see later section.)
+
+In general, once an unquoted string begins, it continues until a forbidden character or the two-character string "//" is encountered. Embedded (non-initial) booleans, nulls, and numbers are not recognized as such, they are part of the string.
+
+An unquoted string may not begin with the digits 0-9 or with a hyphen ( , 0x002D) because those are valid characters to begin a JSON number. The initial number character, plus any valid-in-JSON number characters that follow it, must be parsed as a number value. Again, these characters are not special inside an unquoted string; they only trigger number parsing if they appear initially.
+
+Note that quoted JSON strings may not contain control characters (control characters include some whitespace characters, such as newline). This rule is from the JSON spec. However, unquoted strings have no restriction on control characters, other than the ones listed as "forbidden characters" above.
+
+Some of the "forbidden characters" are forbidden because they already have meaning in JSON or HOCON, others are essentially reserved keywords to allow future extensions to this spec.
+
+Multi-line strings are similar to Python or Scala, using triple quotes. If the three-character sequence appears, then all Unicode characters until a closing sequence are used unmodified to create a string value. Newlines and whitespace receive no special treatment. Unlike Scala, and unlike JSON quoted strings, Unicode escapes are not interpreted in triple-quoted strings.
+
+In Python, is a syntax error (a triple-quoted string followed by a dangling unbalanced quote). In Scala, it is a four-character string . HOCON works like Scala; any sequence of at least three quotes ends the multi-line string, and any "extra" quotes are part of the string.
+
+The value of an object field or array element may consist of multiple values which are combined. There are three kinds of value concatenation:
+
+String value concatenation is allowed in field keys, in addition to field values and array elements. Objects and arrays do not make sense as field keys.
+
+Note: Akka 2.0 (and thus Play 2.0) contains an embedded implementation of the config lib which does not support array and object value concatenation; it only supports string value concatenation.
+
+String value concatenation is the trick that makes unquoted strings work; it also supports substitutions ( syntax) in strings.
+
+Only simple values participate in string value concatenation. Recall that a simple value is any value other than arrays and objects.
+
+As long as simple values are separated only by non-newline whitespace, the whitespace between them is preserved and the values, along with the whitespace, are concatenated into a string.
+
+String value concatenations never span a newline, or a character that is not part of a simple value.
+
+A string value concatenation may appear in any place that a string may appear, including object keys, object values, and array elements.
+
+Whenever a value would appear in JSON, a HOCON parser instead collects multiple values (including the whitespace between them) and concatenates those values into a string.
+
+Whitespace before the first and after the last simple value must be discarded. Only whitespace between simple values must be preserved.
+
+So for example parses as three unquoted strings, and the three are value-concatenated into one string. The inner whitespace is kept and the leading and trailing whitespace is trimmed. The equivalent string, written in quoted form, would be .
+
+Value concatenating (two unquoted strings with whitespace) and quoted string would result in the same in-memory representation, seven characters.
+
+For purposes of string value concatenation, non-string values are converted to strings as follows (strings shown as quoted strings):
+
+A single value is never converted to a string. That is, it would be wrong to value concatenate by itself; that should be parsed as a boolean-typed value. Only ( with another simple value on the same line) should be parsed as a value concatenation and converted to a string.
+
+Arrays can be concatenated with arrays, and objects with objects, but it is an error if they are mixed.
+
+For purposes of concatenation, "array" also means "substitution that resolves to an array" and "object" also means "substitution that resolves to an object."
+
+Within an field value or array element, if only non-newline whitespace separates the end of a first array or object or substitution from the start of a second array or object or substitution, the two values are concatenated. Newlines may occur within the array or object, but not between them. Newlines between prevent concatenation.
+
+For objects, "concatenation" means "merging", so the second object overrides the first.
+
+Arrays and objects cannot be field keys, whether concatenation is involved or not.
+
+Here are several ways to define to the same object value:
+
+Here are several ways to define to the same array value:
+
+A common use of object concatenation is "inheritance":
+
+A common use of array concatenation is to add to paths:
+
+When concatenating substitutions such as , the substitutions may turn out to be strings (which makes the whitespace between them significant) or may turn out to be objects or lists (which makes it irrelevant). Unquoted whitespace must be ignored in between substitutions which resolve to objects or lists. Quoted whitespace should be an error.
+
+Arrays allow you to use newlines instead of commas, but not whitespace instead of commas. Non-newline whitespace will produce concatenation rather than separate elements.
+
+If this gets confusing, just use commas. The concatenation behavior is useful rather than surprising in cases like:
+
+Non-newline whitespace is never an element or field separator.
+
+Path expressions are used to write out a path through the object graph. They appear in two places; in substitutions, like , and as the keys in objects like .
+
+Path expressions are syntactically identical to a value concatenation, except that they may not contain substitutions. This means that you can't nest substitutions inside other substitutions, and you can't have substitutions in keys.
+
+When concatenating the path expression, any characters outside quoted strings are understood as path separators, while inside quoted strings has no special meaning. So would be a path with three elements, looking up key , key , then key .
+
+The main tricky point is that characters in numbers do count as a path separator. When dealing with a number as part of a path expression, it's essential to retain the original string representation of the number as it appeared in the file (rather than converting it back to a string with a generic number-to-string library function).
+
+Unlike value concatenations, path expressions are always converted to a string, even if they are just a single value.
+
+If you have an array or element value consisting of the single value , it's a value concatenation and retains its character as a boolean value.
+
+If you have a path expression (in a key or substitution) then it must always be converted to a string, so becomes the string that would be quoted as .
+
+If a path element is an empty string, it must always be quoted. That is, is a valid path with three elements, and the middle element is an empty string. But is invalid and should generate an error. Following the same rule, a path that starts or ends with a is invalid and should generate an error.
+
+If a key is a path expression with multiple elements, it is expanded to create an object for each path element other than the last. The last path element, combined with the value, becomes a field in the most-nested object.
+
+and so on. These values are merged in the usual way; which implies that:
+
+Because path expressions work like value concatenations, you can have whitespace in keys:
+
+Because path expressions are always converted to strings, even single values that would normally have another type become strings.
+
+As a special rule, the unquoted string may not begin a path expression in a key, because it has a special interpretation (see below).
+
+Substitutions are a way of referring to other parts of the configuration tree.
+
+The syntax is or where the is a path expression as described above. This path expression has the same syntax that you could use for an object key.
+
+The in must not have whitespace before it; the three characters must be exactly like that, grouped together.
+
+For substitutions which are not found in the configuration tree, implementations may try to resolve them by looking at system environment variables or other external sources of configuration. (More detail on environment variables in a later section.)
+
+Substitutions are not parsed inside quoted strings. To get a string containing a substitution, you must use value concatenation with the substitution in the unquoted portion:
+
+Or you could quote the non-substitution portion:
+
+Substitutions are resolved by looking up the path in the configuration. The path begins with the root configuration object, i.e. it is "absolute" rather than "relative."
+
+Substitution processing is performed as the last parsing step, so a substitution can look forward in the configuration. If a configuration consists of multiple files, it may even end up retrieving a value from another file.
+
+If a key has been specified more than once, the substitution will always evaluate to its latest-assigned value (that is, it will evaluate to the merged object, or the last non-object value that was set, in the entire document being parsed including all included files).
+
+If a configuration sets a value to then it should not be looked up in the external source. Unfortunately there is no way to "undo" this in a later configuration file; if you have in a root object, then will never look at the environment variable. There is no equivalent to JavaScript's operation in other words.
+
+If a substitution does not match any value present in the configuration and is not resolved by an external source, then it is undefined. An undefined substitution with the syntax is invalid and should generate an error.
+
+If a substitution with the syntax is undefined:
+
+Substitutions are only allowed in field values and array elements (value concatenations), they are not allowed in keys or nested inside other substitutions (path expressions).
+
+A substitution is replaced with any value type (number, object, string, array, true, false, null). If the substitution is the only part of a value, then the type is preserved. Otherwise, it is value-concatenated to form a string.
+
+The idea is to allow a new value for a field to be based on the older value:
+
+A self-referential field is one which:
+
+Note that an object or array with a substitution inside it is not considered self-referential for this purpose. The self-referential rules do not apply to:
+
+These cases are unbreakable cycles that generate an error. (If "looking backward" were allowed for these, something like would look backward for a nonexistent while resolving .)
+
+The simplest form of this implementation will report a circular reference as missing; in you would remove while resolving , leaving an empty document to look up in. You can give a more helpful error message if, rather than simply removing the field, you leave a marker value describing the cycle. Then generate an error if you return to that marker value during resolution.
+
+Cycles should be treated the same as a missing value when resolving an optional substitution (i.e. the syntax). If refers to itself then it's as if it referred to a nonexistent value.
+
+Fields may have as a separator rather than or . A field with transforms into a self-referential array concatenation, like this:
+
+appends an element to a previous array. If the previous value was not an array, an error will result just as it would in the long form . Note that the previous value is optional ( not ), which allows to be the first mention of in the file (it is not necessary to have first).
+
+Note: Akka 2.0 (and thus Play 2.0) contains an embedded implementation of the config lib which does not support .
+
+In isolation (with no merges involved), a self-referential field is an error because the substitution cannot be resolved:
+
+When is merged with an earlier value for , however, the substitution can be resolved to that earlier value. When merging two objects, the self-reference in the overriding field refers to the overridden field. Say you have:
+
+Then resolves to , the value of the overridden field.
+
+It would be an error if these two fields were reversed, so first:
+
+and then second:
+
+Here the self-reference comes before has a value, so it is undefined, exactly as if the substitution referenced a path not found in the document.
+
+Because conceptually looks to previous definitions of for a value, the error should be treated as "undefined" rather than "intractable cycle"; as a result, the optional substitution syntax does not create a cycle:
+
+If a substitution is hidden by a value that could not be merged with it (by a non-object value) then it is never evaluated and no error will be reported. So for example:
+
+In this case, no matter what resolves to, we know is , so is never evaluated and there is no error. The same is true for cycles like , where the initial self-reference must simply be ignored.
+
+A self-reference resolves to the value "below" even if it's part of a path expression. So for example:
+
+Here, would refer to rather than and so the final merge would be .
+
+Recall that for a field to be self-referential, it must have a substitution or value concatenation as its value. If a field has an object or array value, for example, then it is not self-referential even if there is a reference to the field itself inside that object or array.
+
+Implementations must be careful to allow objects to refer to paths within themselves, for example:
+
+Here, if an implementation resolved all substitutions in as part of resolving the substitution , there would be a cycle. The implementation must only resolve the field in , rather than recursing the entire object.
+
+Because there is no inherent cycle here, the substitution must "look forward" (including looking at the field currently being defined). To make this clearer, would be in:
+
+Mutually-referring objects should also work, and are not self-referential (so they look forward):
+
+Another tricky case is an optional self-reference in a value concatenation, in this example should be not because the self reference has to "look back" to an undefined :
+
+In general, in resolving a substitution the implementation must:
+
+For example, this is not possible to resolve:
+
+A multi-step loop like this should also be detected as invalid:
+
+Some cases have undefined behavior because the behavior depends on the order in which two fields are resolved, and that order is not defined. For example:
+
+Implementations are allowed to handle this by setting both and to 1, setting both to , or generating an error. Ideally this situation would generate an error, but that may be difficult to implement. Making the behavior defined would require always working with ordered maps rather than unordered maps, which is too constraining. Implementations only have to track order for duplicate instances of the same field (i.e. merges).
+
+Implementations must set both and to the same value in this case, however. In practice this means that all substitutions must be memoized (resolved once, with the result retained). Memoization should be keyed by the substitution "instance" (the specific occurrence of the expression) rather than by the path inside the expression, because substitutions may be resolved differently depending on their position in the file.
+
+An include statement consists of the unquoted string followed by whitespace and then either:
+
+An include statement can appear in place of an object field.
+
+If the unquoted string appears at the start of a path expression where an object key would be expected, then it is not interpreted as a path expression or a key.
+
+Instead, the next value must be a quoted string or a quoted string surrounded by , , or . This value is the resource name.
+
+Together, the unquoted and the resource name substitute for an object field syntactically, and are separated from the following object fields or includes by the usual comma (and as usual the comma may be omitted if there's a newline).
+
+If an unquoted at the start of a key is followed by anything other than a single quoted string or the / / syntax, it is invalid and an error should be generated.
+
+There can be any amount of whitespace, including newlines, between the unquoted and the resource name. For etc., whitespace is allowed inside the parentheses (outside of the quotes).
+
+Value concatenation is NOT performed on the "argument" to or etc. The argument must be a single quoted string. No substitutions are allowed, and the argument may not be an unquoted string or any other kind of value.
+
+Unquoted has no special meaning if it is not the start of a key's path expression.
+
+It may appear later in the key:
+
+It may appear as an object or array value:
+
+You can quote if you want a key that starts with the word , only unquoted is special:
+
+Note: Akka 2.0 (and thus Play 2.0) contains an embedded implementation of the config lib which does not support the / / syntax. Only the heuristic syntax is supported in that version.
+
+An including file contains the include statement and an included file is the one specified in the include statement. (They need not be regular files on a filesystem, but assume they are for the moment.)
+
+An included file must contain an object, not an array. This is significant because both JSON and HOCON allow arrays as root values in a document.
+
+If an included file contains an array as the root value, it is invalid and an error should be generated.
+
+The included file should be parsed, producing a root object. The keys from the root object are conceptually substituted for the include statement in the including file.
+
+Substitutions in included files are looked up at two different paths; first, relative to the root of the included file; second, relative to the root of the including configuration.
+
+Recall that substitution happens as a final step, after parsing. It should be done for the entire app's configuration, not for single files in isolation.
+
+Therefore, if an included file contains substitutions, they must be "fixed up" to be relative to the app's configuration root.
+
+Say for example that the root configuration is this:
+
+And "foo.conf" might look like this:
+
+If you parsed "foo.conf" in isolation, then would evaluate to 10, the value at the path . If you include "foo.conf" in an object at key , however, then it must be fixed up to be rather than .
+
+Say that the root configuration redefines , like this:
+
+Then the in "foo.conf", which has been fixed up to , would evaluate to rather than to . Substitution happens after parsing the whole configuration.
+
+However, there are plenty of cases where the included file might intend to refer to the application's root config. For example, to get a value from a system property or from the reference configuration. So it's not enough to only look up the "fixed up" path, it's necessary to look up the original path as well.
+
+By default, if an included file does not exist then the include statement should be silently ignored (as if the included file contained only an empty object).
+
+If however an included resource is mandatory then the name of the included resource may be wrapped with , in which case file parsing will fail with an error if the resource cannot be resolved.
+
+The syntax for this is
+
+Other IO errors probably should not be ignored but implementations will have to make a judgment which IO errors reflect an ignorable missing file, and which reflect a problem to bring to the user's attention.
+
+Implementations may support including files in other formats. Those formats must be compatible with the JSON type system, or have some documented mapping to JSON's type system.
+
+If an implementation supports multiple formats, then the extension may be omitted from the name of included files:
+
+If a filename has no extension, the implementation should treat it as a basename and try loading the file with all known extensions.
+
+If the file exists with multiple extensions, they should all be loaded and merged together.
+
+Files in HOCON format should be parsed last. Files in JSON format should be parsed next-to-last.
+
+In short, might be equivalent to:
+
+This same extension-based behavior is applied to classpath resources and files.
+
+For URLs, a basename without extension is not allowed; only the exact URL specified is used. The format will be chosen based on the Content-Type if available, or by the extension of the path component of the URL if no Content-Type is set. This is true even for file: URLs.
+
+A quoted string not surrounded by , , must be interpreted heuristically. The heuristic is to treat the quoted string as:
+
+Implementations may vary in the kinds of resources they can include.
+
+For resources located on the Java classpath:
+
+For plain files on the filesystem:
+
+Implementations need not support files, Java resources, or URLs; and they need not support particular URL protocols. However, if they do support them they should do so as described above.
+
+Note that at present, if / / are specified, the included items are NOT interpreted relative to the including items. Relative-to-including-file paths only work with the heuristic . This may change in the future.
+
+In some file formats and contexts, such as Java properties files, there isn't a good way to define arrays. To provide some mechanism for this, implementations should support converting objects with numeric keys into arrays. For example, this object:
+
+could be treated as:
+
+This allows creating an array in a properties file like this:
+
+Implementations of HOCON ideally follow certain conventions and work in a predictable way.
+
+If an application asks for a value with a particular type, the implementation should attempt to convert types as follows:
+
+The following type conversions should NOT be performed:
+
+Converting objects and arrays to and from strings is tempting, but in practical situations raises thorny issues of quoting and double-escaping.
+
+Implementations may wish to support interpreting a value with some family of units, such as time units or memory size units: or . HOCON does not have an extensible type system and there is no way to add a "duration" type. However, for example, if an application asks for milliseconds, the implementation can try to interpret a value as a milliseconds value.
+
+If an API supports this, for each family of units it should define a default unit in the family. For example, the family of duration units might default to milliseconds (see below for details on durations). The implementation should then interpret values as follows:
+
+Implementations may wish to support a (and similar for other time units).
+
+This can use the general "units format" described above; bare numbers are taken to be in milliseconds already, while strings are parsed as a number plus an optional unit string.
+
+The supported unit strings for duration are case sensitive and must be lowercase. Exactly these strings are supported:
+
+Implementations may wish to support a returning a size in bytes.
+
+This can use the general "units format" described above; bare numbers are taken to be in bytes already, while strings are parsed as a number plus an optional unit string.
+
+The one-letter unit strings may be uppercase (note: duration units are always lowercase, so this convention is specific to size units).
+
+There is an unfortunate nightmare with size-in-bytes units, that they may be in powers or two or powers of ten. The approach defined by standards bodies appears to differ from common usage, such that following the standard leads to people being confused. Worse, common usage varies based on whether people are talking about RAM or disk sizes, and various existing operating systems and apps do all kinds of different things. See http://en.wikipedia.org/wiki/Binary_prefix#Deviation_between_powers_of_1024_and_powers_of_1000 for examples. It appears impossible to sort this out without causing confusion for someone sometime.
+
+For single bytes, exactly these strings are supported:
+
+For powers of ten, exactly these strings are supported:
+
+For powers of two, exactly these strings are supported:
+
+It's very unclear which units the single-character abbreviations ("128K") should go with; some precedents such as and the GNU tools such as map these to powers of two, so this spec copies that. You can certainly find examples of mapping these to powers of ten, though. If you don't like ambiguity, don't use the single-letter abbreviations.
+
+Note: any value in zetta/zebi or yotta/yobi will overflow a 64-bit integer, and of course large-enough values in any of the units may overflow. Most real-world APIs and apps will not support byte counts that overflow a 64-bit integer. The huge units are provided just to be complete but probably aren't useful in practice. At least not in 2014.
+
+It may be useful to offer a method to merge two objects. If such a method is provided, it should work as if the two objects were duplicate values for the same key in the same file. (See the section earlier on duplicate key handling.)
+
+As with duplicate keys, an intermediate non-object value "hides" earlier object values. So say you merge three objects in this order:
+
+The result would be . The two objects are not merged because they are not "adjacent"; the merging is done in pairs, and when is paired with , simply wins and loses all information about what it overrode.
+
+But if you re-ordered like this:
+
+Now the result would be because the two objects are adjacent.
+
+This rule for merging objects loaded from different files is exactly the same behavior as for merging duplicate fields in the same file. All merging works the same way.
+
+Needless to say, normally it's well-defined whether a config setting is supposed to be a number or an object. This kind of weird pathology where the two are mixed should not be happening.
+
+The one place where it matters, though, is that it allows you to "clear" an object and start over by setting it to null and then setting it back to a new object. So this behavior gives people a way to get rid of default fallback values they don't want.
+
+It may be useful to merge Java properties data with data loaded from JSON or HOCON. See the Java properties spec here: http://download.oracle.com/javase/7/docs/api/java/util/Properties.html#load%28java.io.Reader%29
+
+Java properties parse as a one-level map from string keys to string values.
+
+To convert to HOCON, first split each key on the character, keeping any empty strings (including leading and trailing empty strings). Note that this is very different from parsing a path expression.
+
+The key split on is a series of path elements. So the properties key with just is a path with two elements, both of them an empty string. is a path with two elements, and empty string. (Java's does NOT do what you want for this.)
+
+It is impossible to represent a key with a in it in a properties file. If a JSON/HOCON key has a in it, which is possible if the key is quoted, then there is no way to refer to it as a Java property. It is not recommended to name HOCON keys with a in them, since it would be confusing at best in any case.
+
+Once you have a path for each value, construct a tree of JSON-style objects with the string value of each property located at that value's path.
+
+Values from properties files are always strings, even if they could be parsed as some other type. Implementations should do type conversion if an app asks for an integer, as described in an earlier section.
+
+When Java loads a properties file, unfortunately it does not preserve the order of the file. As a result, there is an intractable case where a single key needs to refer to both a parent object and a string value. For example, say the Java properties file has:
+
+In this case, needs to be both an object and a string value. The object must always win in this case... the "object wins" rule throws out at most one value (the string) while "string wins" would throw out all values in the object. Unfortunately, when properties files are mapped to the JSON structure, there is no way to access these strings that conflict with objects.
+
+The usual rule in HOCON would be that the later assignment in the file wins, rather than "object wins"; but implementing that for Java properties would require implementing a custom Java properties parser, which is surely not worth it and wouldn't help with system properties anyway.
+
+By convention, JVM apps have two parts to their configuration:
+
+The reference config for a given class loader should be merged and resolved first, and may be shared among all application configs in that class loader. Substitutions in the reference config are not affected by any application configs, because the reference config should be resolved by itself.
+
+The application config should then be loaded, have the reference config added as a fallback, and have substitutions resolved. This means the application config can refer to the reference config in its substitutions.
+
+For an application's config, Java system properties override settings found in the configuration file. This supports specifying config options on the command line.
+
+Recall that if a substitution is not present (not even set to ) within a configuration tree, implementations may search for it from external sources. One such source could be environment variables.
+
+It's recommended that HOCON keys always use lowercase, because environment variables generally are capitalized. This avoids naming collisions between environment variables and configuration properties. (While on Windows getenv() is generally not case-sensitive, the lookup will be case sensitive all the way until the env variable fallback lookup is reached).
+
+See also the notes below on Windows and case sensitivity.
+
+An application can explicitly block looking up a substitution in the environment by setting a value in the configuration, with the same name as the environment variable. You could set in your root object to avoid expanding from the environment, for example.
+
+Environment variables are interpreted as follows:
+
+Config keys are encouraged to be rather than .
+
+You can write a HOCON file that looks much like a Java properties file, and many valid Java properties files will also parse as HOCON.
+
+However, HOCON is not a Java properties superset and the corner cases work like JSON, not like properties.
+
+Differences include but are probably not limited to:
+
+HOCON's lookup of environment variable values is always case sensitive, but Linux and Windows differ in their handling of case.
+
+Linux allows one to define multiple environment variables with the same name but with different case; so both "PATH" and "Path" may be defined simultaneously. HOCON's access to these environment variables on Linux is straightforward; ie just make sure you define all your vars with the required case.
+
+Windows is more confusing. Windows environment variables names may contain a mix of upper and lowercase characters, eg "Path", however Windows does not allow one to define multiple instances of the same name but differing in case. Whilst accessing env vars in Windows is case insensitive, accessing env vars in HOCON is case sensitive. So if you know that you HOCON needs "PATH" then you must ensure that the variable is defined as "PATH" rather than some other name such as "Path" or "path". However, Windows does not allow us to change the case of an existing env var; we can't simply redefine the var with an upper case name. The only way to ensure that your environment variables have the desired case is to first undefine all the env vars that you will depend on then redefine them with the required case.
+
+For example, the the ambient environment might have this definition ...
+
+.. we just don't know. But if the HOCON needs "PATH", then the start script must take a precautionary approach and enforce the necessary case as follows ...
+
+You cannot know what ambient environment variables might exist in the ambient environment when your program is invoked, nor what case those definitions might have. Therefore the only safe thing to do is redefine all the vars you rely on as shown above.|||
+
+config - Configuration library for JVM languages
