@@ -1,0 +1,54 @@
+Many people think that monkey patching is something that is restricted to dynamic languages like Ruby and Python. That is not true however, as computers are just dumb machines and we can always make them do what we want! Let’s look at how Go functions work and how we can modify them at runtime. This article will use a lot of Intel assembly syntax, so I’m assuming you can read it already or are using a reference while reading.
+
+If you’re not interested in how it works and you just want to do monkey patching, then you can find the library here.
+
+Let’s look at what the following code produces when disassembled:
+
+Samples should be built with to disable inlining. For this article I assume your architecture is 64-bits and that you’re using a unix-based operating system like Mac OSX or a Linux variant.
+
+When compiled and looked at through Hopper, the above code will produce this assembly code:
+
+I will be referring to the addresses of the various instructions displayed on the left side of the screen.
+
+Our code starts in procedure , where instructions to set up the stack. You can read more about that here, I will be ignoring that code for the rest of the article.
+
+Line is the call to function at line which simply moves onto the stack and returns. Lines to then pass that value on to .
+
+Simple enough! Now let’s take a look at how function values are implemented in Go.
+
+Consider the following code:
+
+What I’m doing on line 11 is assigning to , which means that doing will now call . Then I use the unsafe Go package to directly read out the value stored in . If you come from a C background you might expect to simply be a function pointer to and thus this code to print out (the location of as we saw above). When I run this on my machine I get , which is an address not even close to our code! When disassembled, this is what happens on line 11 above:
+
+This references something called , and when we look at that location, we see this:
+
+Aha! is at and contains , which is the location of . It seems isn’t a pointer to a function, but a pointer to a pointer to a function. Let’s modify the code to compensate for that.
+
+This will now print , as expected. We can find a clue as to why this is implemented as it is here. Go function values can contain extra information, which is how closures and bound instance methods are implemented.
+
+Let’s look at how calling a function value works. I’ll change the code to call after assigning it.
+
+When we disassemble this we get the following:
+
+gets loaded into , then whatever points at gets loaded into , which then gets called. The address of the function value always gets loaded into , which the code being called can use to load any extra information it might need. This extra information is a pointer to the instance for a bound instance method and the closure for an anonymous function. I advise you to take out a disassembler and dive deeper if you want to know more!
+
+Let’s use our newly gained knowledge to implement monkeypatching in Go.
+
+What we want to achieve is to have the following code print out :
+
+Now how do we implement ? We need to modify function to jump to ’s code instead of executing its own body. Essentialy, we need to replace it with this, which loads the function value of into and then jumps to the location pointed to by .
+
+I’ve put the corresponding machine code that those lines generate when assembled next to it (you can easily play around with assembly using an online assembler like this). Writing a function that will generate this code is now straightforward, and looks like this:
+
+We now have everything we need to replace ’s function body with a jump to ! The following code attempts to copy the machine code directly to the location of the function body.
+
+Running this code does not work however, and will result in a segmentation fault. This is because the loaded binary is not writable by default. We can use the syscall to disable this protection, and this final version of the code does exactly that, resulting in function being replaced by function , and ‘2’ being printed.
+
+I took the above code and put it in an easy to use library. It supports 32 bit, reversing patches, and patching instance methods. I wrote a couple of examples and put those in the README.
+
+Where there’s a will there’s a way! It’s possible for a program to modify itself at runtime, which allows us to implement cool tricks like monkey patching.
+
+I hope you got something useful out of this blogpost, I know I had fun making it!
+
+You should follow me on Twitter!|||
+

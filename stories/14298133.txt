@@ -1,0 +1,87 @@
+The Realm Mobile Platform uses operational transformation to ensure that all mobile clients subscribed to a Realm file eventually agree on the contents, while still being able to make modifications while the network is down or unstable. Rather than confronting your users with dialog boxes to adjudicate each conflict, see how Realm conflicts automatically and seamlessly resolve.
+
+I’d like to cover conflict resolution in distributed systems. That is, what happens if different people change data independently, and how we resolve the occurring conflicts. My name is Martin Kleppmann, I’m a researcher at the University of Cambridge, and I was previously working in the industry at internet startups. I also worked at Linkedin for a couple of years.
+
+I’m working on a research product called Trve Data. Its goal is to bring end-to-end encryption to a larger range of applications, much like Google Docs, where several people can edit a document at the same time online, without having to trust Google’s servers.
+
+What we want to do is to be able to put data on various servers in the cloud, but not have to worry about what happens if they get compromised.
+
+Using Git as an example - you put the code in the repository, and push it somewhere remote where others can access it, such as GitHub.
+
+When another person also working on the codebase fetches additional changes, they will have to do a merge or rebase. If people change different files in the same repository, it will get merged without issue.
+
+But, if people change the same part of the same file, then you’re going to have to resolve the merge conflict yourself. This is the problem we’re trying to solve. It’s not only a problem in software development; it’s a very general purpose problem.
+
+Imagine you’re a lawyer working with another lawyer on a contract, sending different versions back and forth through email. What happens when someone manually copies the changes from one version of the contract to another?
+
+In this case, it’s best to have an informal lock where no additional changes are done until one person completes those. This is sequencing their updates through manual communication.
+
+Suppose I have a to-do list I share with my wife. I can add tasks like ‘Buy milk’ and ‘Water plants’. Each additional task will get sent to a server, and stored in a relational database. In this scenario, the updates are applied in sequential/serial order. There is no conflict resolution problem here, but in the case there is no internet, you will not be able to reach the centralized server.
+
+With a centralized server, there is no need to worry about concurrency and different edits happening at the same time. But, this requires a constant internet connection, which may not be reliable.
+
+Having a centralized server can make it vulnerable to Denial-of-Service attacks, or even censorship.
+
+So, suppose we’ve decided to have more than one server to address the issue of speed (because if a single server is on the other side of the world, it will take a long time to send and receive data back). Each person can get the response from their local datacenter, but these changes will be propagated asynchronously. Two people make these changes without knowing about each other, and you simply don’t know which one of these came first.
+
+Even if we take this to the extreme, and have the local device be treated as the data center, then do network calls to synchronize the changes later, the issue will still resolve to version conflicts, which was seen with GitHub or with Word documents.
+
+Eventual Consistency is a database term that’s used to describe systems that allow concurrency. The problem with the term eventual consistency is that it’s vague. The following are three issues related to eventual consistency:
+
+We send messages over the network, and we assume that the network is not interrupted. This assumption has to be made because if you assume that a device can be offline forever, then it can never come in-sync with the other devices again. We should assume that eventually, some messages will go through, but not make any assumptions about how quick that will be.
+
+If we assume that eventually, everybody gets all the messages, then they should be in the same state. This is even if they received the messages in a different order.
+
+A few database users use a mode called ‘Last writer wins,’ where if two people change the data at the same time, one is picked arbitrarily - based on the time-stamp - as being the winner. This type of system is not friendly to people because changes get lost.
+
+I will define the to-do list as a JSON document, each with a title and a flag ‘Done’ to indicate its state. Once we have these data structures, we can make various changes. The edit operation is assigning a value to a particular field in the JSON document. Users may edit a string of an item on a to-do list, or insert a new item between other items.
+
+We can model this document as a tree, and we can have data annotations on it. Suppose the top level document is a map, and inside it, there is a list under the key ‘To-do,’ for example.
+
+I have two instances of the basic text editor that we implemented using our data structure running. I can type something on one side, and it appears on the other side, and these two editors are communicating via a network connection.
+
+When I kill the server, I simulate a network interruption between the two and take the editors offline. I now make a change on the left, which will not appear on the right-hand side.
+
+When I restart the server, the editors in the background will try to reconnect to the server automatically. Now, what’s on the left is also on the right. We didn’t have any three-way merge user interface for this.
+
+Imagine a document consisting of the letters H, E, L and O, and each letter has an index of the position: 0, 1, 2, 3.
+
+Each editor makes an edit to this - the left-hand side inserts a second L character, to change it to ‘Hello,’ and the right-hand side inserts and exclamation mark at the end, making it ‘Hello!.
+
+When inserting ‘L’ at position three, it moves the O to position four. The clients send a diff to a server, and the server fowards theses to the clients. On the right side, an L is inserted at position 3.
+
+On the left, to insert the exclamation mark at position five, position four needs to be changed to position five, because there was concurrent insert at position three.
+
+The server has to keep track of all of these events simultaneously, and it has to transform the messages, rewriting the index three to four.
+
+The algorithm to accomplish the above is called Operational Transformation. It was first discussed in the academic literature back in the 1980s.
+
+Most modern Operational Transformation-based systems inherit from Jupiter, which is what Google Docs is based off of. The Jupiter design uses a central server for some of the transformations.
+
+Operational Transformation works for Google’s purposes, but for this to work with end-to-end encryption, we can’t have a single server transforming our messages. Instead, we need to forward the messages, which is where CRDT’s come in.
+
+CRDT stands for Conflict Free Replicated Datatypes. CRDT is defined as a family of data structures where several nodes can concurrently change the data, and automatically merge.
+
+To model a text document, the datatype will be an ordered list. The text editor here uses one that is based one called RGA - Replicated Growable Array, which came out of a Korean research group in 2011.
+
+Using the example document, instead of giving each letter just an index, 0, 1, 2, 3, it will have a unique identifier which might be just 0a, 1a, 2a, 3a.
+
+When a client edit occurs, we make up a new identifier for that letter. The identifiers have to be globally unique and should have a certain ordering property.
+
+We will construct the identifier with the following rules:
+
+In our case, the next number identifier will be 4. The left-hand will have the node A, and the right-hand, node B.
+
+Both sides will have the number 4, but because they are different nodes, they will have different identifiers. These changes can then be sent to a server or even a P2P network.
+
+The instruction is more descriptive. Instead of strictly inserting in a particular position, the dialog will be as such: ‘Insert L, which is 4a, after position 2a’. We can now forward these messages on a network, without having to perform any transformation work.
+
+There are scenarios which are unique to editing JSON documents concurrently.
+
+Suppose there is a map of colors, with a complete JSON structure. If one person decides to clear out an entire map, and someone else decides to add the color green to the map, how would we merge these concurrent changes?
+
+A solution can be to keep track of what setting the map to empty means. In particular, it’s important to remember what the state of the map was when it was set to empty. There is something known as a Causal Context - frameworks like React have this data types feature. The purpose is to keep track of the state through an HTTP header so that you can know what changes need to be applied.
+
+There is value in having different data structures that can automatically merge without having to write manual conflict resolution code. But, concurrency still is difficult - even if you abstract away concurrent communication, you still can still end up in a merge situation with no one right way of handling it.|||
+
+What do collaborative editors like Google Docs, the calendar app on your phone, and multi-datacenter database clusters have in common?

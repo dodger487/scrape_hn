@@ -1,0 +1,87 @@
+When you start using cloud hosting solutions like Amazon Web Services, Microsoft Azure or Rackspace Cloud, it doesn’t take long to feel overwhelmed by the choice and abundance of features of the platforms. Even worse, the initial setup of your applications or Web sites on a cloud platform can be very cumbersome; it involves a lot of clicking, configuring and discovering how the different parts fit together.
+
+With tools like Terraform, building your infrastructure becomes a whole lot easier and manageable. Terraform basically allows system administrators to sit down and script their whole infrastructure stack, and connect the different parts together, just like assigning a variable in a programming language. Instead, with Terraform, you’re assigning a load balancer’s backend hosts to a list of servers, for example.
+
+In this post I’ll walk you through a configuration example of how to set up a complete load balanced infrastructure with Terraform, and in the end you can download all the files and modify it to your own needs. I’ll also talk a little about where you can go from here if you want to go further with Terraform.
+
+To start using Terraform, you’ll need to install it. It’s available as a single binary for most platforms, so download the zip file and place it somewhere in your PATH, like /usr/local/bin. Terraform runs completely on the command-line, so you’ll need a little experience executing commands on the terminal.
+
+A core part of Terraform is the variables file, variables.tf, which is automatically included due to the file name. It’s a place where you can define the hard dependencies for your setup, and in this case we have two:
+
+Both of these variables have defaults, so Terraform won’t ask you to define them when running the planning step which we’ll get to in a minute.
+
+Create a folder somewhere on your harddrive, create a new file called variables.tf, and add the following:
+
+Terraform’s main entrypoint is a file called main.tf, which you’ll need to create. Add the following 3 lines:
+
+This clause defines the provider. Terraform comes bundled with functionality for some providers, like Amazon Web Services which we’re using in this example. One of the things you can configure it with is the default region, and we’re getting that from the variables file we just created. Terraform looks for a variables.tf file and includes it automatically. You can also configure AWS in other ways, like explicitly adding an AWS Access Key and Secret Key, but in this example we’ll add those as environment variables. We’ll also get to those later.
+
+Next we’ll start adding some actual infrastructure, in Terraform parlance that’s called a resource:
+
+To contain our setup, an AWS Virtual Private Cloud is created and configured with an internal IP range, as well as DNS support and a name. Next to the resource clause is aws_vpc, which is the resource we’re creating. After that is the identifier, vpc_main, which is how we’ll refer to it later.
+
+We’re also creating a gateway, a route and two subnets: one for public internet-facing services like the load balancers, and a private subnet that don’t need incoming network access.
+
+As you can see, different parts are neatly interlinked by referencing them like variables.
+
+At this point, we can start testing our setup. You’ll have two files in a folder, variables.tf and main.tf with the content that was just listed. Now it’s time to actually create it in AWS.
+
+To start, enter your AWS Access Keys as environment variables in the console, simply type the following two lines:
+
+Next, we’ll create the Terraform plan file. Terraform will, with your AWS credentials, check out the status of the different resources you’ve defined, like the VPC and the Gateway. Since it’s the first time you’re running it, Terraform will instill everything for creation in the resulting plan file. Just running the plan command won’t touch or create anything in AWS.
+
+You’ll see an overview of the resources to be created, and with the -o terraform.plan argument, the plan is saved to a file, ready for execution with apply.
+
+Executing this command will make Terraform start running commands on AWS to create the resources. As they run, you’ll see the results. If there’s any errors, for example you already created a VPC with the same name before, you’ll get an error, and Terraform will stop.
+
+After running apply, you’ll also see a new file in your project folder: terraform.tfstate – a cache file that maps your resources to the actual ones on Amazon. You should commit this file to git if you want to version control your Terraform project.
+
+So now Terraform knows that your resources were created on Amazon. They were created with the AWS API, and the IDs of the different resources are saved in the tfstate file – running terraform plan again will result in nothing – there’s nothing new to create.
+
+If you change your main.tf file, like changing the VPC subnet to 192.168.0.0/24 instead of 10.0.0.0/16, Terraform will figure out the necessary changes to carry out in order to to update the resources. That may result in your resources (and their dependents) being destroyed and re-created.
+
+Having learnt a little about how Terraform works, let’s go ahead and add some more things to our project.
+
+We’ll add 2 security groups, which we’ll use to limit network access to our servers, and open up for public load balancers using the AWS ELB service.
+
+Our elb security group is only reachable from port 80 and 443, HTTP and HTTPS, while the default one only has public access on port 22, SSH. It also allows access from the whole VPC (including public facing load balancers) on port 80, as well as full access from other servers. Both allow all outgoing traffic.
+
+After the ELBs, we need to define a public key which is placed on the instances we create later. Here, we use the pre-defined variable to specify the path on the local filesystem.
+
+You probably thought that there was a lot of duplicate code in those two security groups, and you’re right. To combat that, Terraform provides custom modules, which is basically like including files.
+
+Since we need to configure quite a few things in our EC2 instances, but the things we configure are almost always the same across them, we’ll create a module for our instances. Do do that, create a new folder called instance.
+
+In the instance folder, create 3 new files:
+
+In the variables file, we have a few things worth mentioning:
+
+The output file allows the module to export some properties – you have to explicitly define outputs for everything you want to reference later. The only thing I have to reference is the actual instance IDs (for use in the ELBs), so that’s the only output.
+
+Using the Tags array, we can add some info to our instances. I’m using one of Terraforms built-in functions, format, to generate a friendly hostname based on the group name and a 1-indexed number. Also, the provisioner clause is a little bare. Instead, one would typically reference an Chef or Ansible playbook, or just run some commands to set up your environment and bootstrap your application.
+
+Back in your main Terraform file, main.tf, you can now start referencing your AWS EC2 Instance module:
+
+Instead of resource, the modules are referenced using the module clause. All modules have to have a source reference, pertaining to the directory of where the module’s main.tf file is located.
+
+Again, since modules can’t automatically inherit or reference parent resources, we’ll have to explicitly pass the subnet, key pair and security groups to the module.
+
+To finish our terraform file, we add the remaining component: load balancers.
+
+The load balancers provide the entrypoints for our application. One thing to note here is how the instances are referenced[Footnote 1].
+
+To put a cherry on top, we’ll create an output file for our main project, output.tf. Again, due to the filename, Terraform will automatically pick it up.
+
+This will display the hostnames of our ELBs in a friendly format after running terraform apply, which is handy for copying into a configuration file or your browser.
+
+You can now run terraform plan again like before, but since you’re using modules, you’ll have to run terraform get first to include them.
+
+Then you can see that it will create the remaining infrastructure when you do terraform apply.
+
+You can clone, fork or download the full project over on Github.
+
+Where can you go from here? I have a couple ideas:
+
+This entry was posted on Sunday, May 7th, 2017 at 17:01 and is filed under Articles. . You can follow any responses to this entry through the RSS 2.0 feed. You can leave a response, or trackback from your own site.|||
+
+The personal Web site, CV and blog of Simon Fredsted. Posts about Web development, devops, and more.
