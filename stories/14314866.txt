@@ -1,0 +1,64 @@
+I came across a Haskell question which highlighted a common confusion. I'm going to explain how to get around that! The person who asked the question wants to create some sort of command-line interface in Haskell, and was wondering how to structure their code. In particular, they were curious about how to represent, in the code, the commands the interface should support.
+
+Let's get the obvious out of the way first. You could create a sum type along the lines of
+
+which makes it easy to write functions that parse and execute commands. A function would take two strings (command name and arguments) and return a value of this type, depending on which command name was written.
+
+The function works essentially in the reverse. For the sake of this toy example, commands are going to result in simple s; we could imagine that they instead return an which is a custom type that is allowed to have side effects. The function would then return a when given a command. Like so:
+
+This is a perfectly okay approach, but it has one drawback, which the person who asked the question also realised: when a programmer wants to extend your CLI by adding another command to it, they have to change the existing parsing and execution functions! It's a big effort and many places to remember to change just because you add a simple command.
+
+At this point, a beginner may faintly remember something about typeclasses being used when you have several different types which share some trait. So the beginner – and indeed the person who asked this question – will start writing the following skeleton code.
+
+A command is something you can execute and get back a .
+
+Then we have a few different commands:
+
+So far, this looks great! We have split up the function such that the user can define their own commands in separate modules. These user-defined functions will then automatically be called from our CLI main loop.
+
+But... what about the function? Trying to figure out its type signature is hard enough already. If we're used to object-oriented programming, we might want to say,
+
+We might think this means, "Given two strings, the function will maybe return something that is a command. We don't know what specific command type it will be, because that's determined by the strings passed into the function."
+
+In Haskell, you must know what type something has statically. You can't say "its type depends on some run-time value". (You can with various GHC extensions, but not in standard Haskell.)
+
+What that type signature actually means is, "If this function is given two strings and asked for any command type, it must obey!"
+
+In other words, the function does not get to decide what type its return value should have. The caller of the function decides that, and the function must work for all possible command types.
+
+Remember that typeclass constraints on functions mean "for all", not "there exists".
+
+Another way to phrase this is: typeclasses will not let you do dynamic dispatch. When the program is finally compiled, all types should be known. Typeclasses are an entirely static business.
+
+The good news is that we don't need any fancy advanced language features to get what we want in Haskell. In fact, we need to go back to basics. We need to start programming with values, functions and laziness.
+
+A is something that has a name and the odd property that when you supply arguments, you get an of the command. A can exist without arguments, though; exists as an abstract entity outside of a specific invocation of it. You can talk about "the command" without having to talk about a specific time you called the command with a specific set of arguments. However, once you have arguments, you are also able to talk about the specific invocation.)
+
+Phrased in Haskell, we say that a value has two properties, or fields:
+
+So what is an ? It is an invocation of a command, it has some arguments, and it results in a when executed (remember that the result type could be anything more powerful if you want, like ).
+
+Assuming commands are of these types, we can write a parser that takes a set of legal commands, and maybe returns an invocation of one of these commands. This function simply searches through the list of legal commands and looks for one where the name matches the input name. Then it runs that command with arguments to get an invocation.
+
+This is all well and good, but how are these commands defined? As regular Haskell values! Here's an example:
+
+The variable contains a with the name . Its field contains a function that, when given some arguments, returns an of the with the supplied arguments, and when you run on that invocation, you get the arguments sorted.
+
+It might look to you almost like we're "hard-coding" the result of the function at "invocation time", and not at execution time, because the function has become a plain field in the value. However, because of laziness and purity, that's not the case. We could put anything in that field (including an action!) and it would not be executed until we actually call the field on the value.
+
+Note also that the of the sorting command refers to the sorting command itself. Laziness. No problem. And if you think about it, why should that be a problem? Of course the invocation of a command should be able to refer to the command it's an invocation of!
+
+However, we still have one problem. We said the function takes a list of legal commands, which means that if we use the function in our main loop, we will have hard-coded a list of legal commands somewhere, and the user will have to modify our code to add a command anyway. Bummer.
+
+But of course, what do you do when you want to avoid hard-coding something? Change it to a function parameter! Throw out your main loop. Let your CLI processing function take a list of legal commands as a parameter, and let the user write the function, which calls out to your processing function with the commands the user wants. In other words, your CLI module could have a configuration type that looks something like
+
+and then you also write a "process user input" function that takes a configuration, an input string, and returns an output string:
+
+Given this (and other convenience functions you may export from your CLI module), the user can easily write their own main loop as
+
+As you see, the user barely has to do anything besides import some of your convenience functions for getting input and processing it, writing down the desired settings and putting it all together in an infinite loop.
+
+This was a bit of work to follow, so what did we learn from it? Five things:
+
+Sum types are troublesome when we want users of our code to be able to extend the type with more options. Why? Because most functions touching that type are hard-coded to deal with a fixed set of possibilities. When you define a sum type, you're essentially saying "these are the legal variants, and no others could exist." Type classes do not let us do dynamic dispatch, and are not a silver bullet for all kinds of extendability. In fact, typeclasses should be created only very sparingly, and it takes a pinch of experience to see when they are actually needed. Regular Haskell values go a surprisingly long way. When you write Haskell, the simplest solution is often the most flexible, the fastest, the easiest to understand and so on. Case in point: whenever you have several different things with common properties (and you want this set of things to be extendable), consider making a single datatype for that thing, and just defining constants for each of your variations. You may think a "bicycle" should be a different type from a "car", but maybe in the context of your application they're better thought of as different values of a single type for "mode of transport". Regular Haskell values also let you do dynamic dispatch. The idea is that you put a function field in the type, and when you create values of that type, you do that through a "smart constructor" that supplies the function with the necessary state for the computation to run. Laziness makes this more natural than you may think at first. If you want to know more, this Stack Overflow answer is way more exhaustive than I ever could be. Whenever we see something hard-coded that we don't want hard-coded, turn it into a function argument! Don't be scared of having too many function arguments. There are ways to deal with that. In object-oriented theory, applications tend to be extended "downward from the bottom". Imagine a tree of modules where the root is the main class, and the leaves are the lowest-level classes. The users of your code are expected to modify and add classes with specific interfaces on a lower level, and then your upper-level main classes automatically glue everything together through dynamic dispatch. If we drew the module tree, it would be well-defined at the root and have a bunch of question marks at the leaves. In functional programming, we often extend applications "at the top". Your application is written as a library that consists of a set of "lower-level" modules, and then the user creates the main functions that glue your lower-level functions together. If we drew a module tree, it would be well-defined at the leaves and have a bunch of question marks at the top. With the functional approach, think of the user more as a curator of components, and less as an implementer of contracts.|||
+
