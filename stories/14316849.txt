@@ -1,0 +1,39 @@
+For many years, the HAL's heap in Windows has always been located at the same static kernel address. On 32-bit versions of Windows it was located at the address 0xffd00000 while on 64-bit versions of Windows it could be found at the address 0xffffffff'ffd00000.
+
+Since Windows 8, a table of function pointers called HalpInterruptController (exported by HAL.DLL) was placed in the first or second memory page of the HAL’s heap (0xffd00000 or 0xffd01000 depending on if kernel debugging is enabled or not). All the stored function pointers would point to various functions inside HAL.DLL.
+
+One interesting thing to note here is that this table was always located at the same kernel address, except in some special cases. This made the table an ideal target to be abused for local and remote kernel exploits.
+
+The technique of abusing the HalpInterruptController table was first publicly mentioned in the presentation "Bypassing kernel ASLR - Target: Windows 10 (remote bypass)” by Stéfan Le Berre1. Afterwards, Enrique Nissim and I found a way to abuse the HAL's heap by abusing the Windows Paging System which we presented in our talk "Getting Physical - Extreme abuse of Intel based Paging Systems"2. Recently, Alex Ionescu abused this technique to implement his DMA attack over USB Type-C which he published in his RECon presentation "Getting Physical With USB Type-C"3
+
+The fact that the HalpInterruptController table is located at a known location and is composed of function pointers, makes it an ideal target for kernel bugs which provide you with an arbitrary write primitives. Assuming that we are targeting the 64-bit versions of Windows,  we know that pointer sizes are 8 bytes. So in order to corrupt one of the function pointers in a controlled way, we will need a fully controlled write of either 4 or 8 bytes.
+
+However, the use of an arbitrary 4-byte write should be enough, because we could use it to overwrite the lower part of a 64-bit pointer to redirect the program flow into other kernel modules such as ntoskrnl.exe, win32k.sys, or hal.dll. Of course assuming that we know where they are located in memory ;-).
+
+Another option would be to overwrite the complete 64-bit pointer with a user mode address to jump directly into your shellcode placed in user space. However, nowadays it’s quite uncommon to find a computer without SMEP (Supervisor Mode Execution Prevention) enabled, which makes this option a less useful alternative.
+
+The technique of abusing the HalpInterruptController table could easily be used in situations where the exploit was running at Medium Integrity Level. This is because the exploit could just obtain the kernel base address by calling the NtQuerySystemInformation function. Having the kernel base address, we can easily build a ROP chain to bypass SMEP by turning off the 20th bit of the CR4 register and finally jump into our shellcode located in user space.
+
+In the case of Low Integrity Level, the technique is only useful if you are able to leak some kernel pointer address by combining it with another info leak vulnerability. The same applies for remote kernel vulnerabilities which can be turned into the ability to leak kernel memory addresses remotely.
+
+The HalpInterruptController table stores several function pointers which could be corrupted. However the ideal function pointer to target in our experience is the HAL!HalpApicRequestInterrupt pointer which is located at index 0xf (offset 0x78). On Windows 10 this function pointer can usually (not always) be found at the address 0xffffffff'ffd00538 (if kernel debugging is enabled).
+
+This pointer is called quite frequently by the operating system. So we have to be careful when corrupting it, because if the corrupted function pointer would be invoked at a wrong context, i.e. inside a different process, it would lead to a BSoD.
+
+In order to make sure that no context switch is happening after we overwrote the function pointer, immediately after overwriting it, we can consume all the CPU time to avoid that the Idle process be present when this pointer is used. This makes sure that our process context stays active for the time of the exploitation.
+
+Once the function pointer was overwritten, we simply wait until it is being called by the kernel which then redirects the kernel’s control flow to our desired location :-).
+
+In April 2017, Microsoft released the “Creators Update” of Windows 10, identified by version number 1703. With the release of this new version, the HAL's heap has finally been randomized. Consequently the HalpInterruptController table is now located at a random address in memory. The HalpInterruptController table still remains inside the first memory page of the HAL's heap and its offset is almost identical, with only a difference of 8 bytes.
+
+Starting with the Creators Update version of Windows 10 the HalpInterruptController table can no longer be easily be misused without first leaking its kernel address somehow. Additionally, the physical address corresponding to the HalpInterruptController table has been changed in the new version of Windows, however it has not been randomized.
+
+If we look at the following screenshot, we can see that the table is located at the virtual address 0xfffff7f8'400004c8, so, when we use the "!pte" command to get the physical address corresponding to its virtual address, we get the PTE (Page Table Entry) located at address 0xffff807b'fc200000. Finding the real PTE location (randomized since Windows 10 Anniversary Update), we were able to find it at address 0xffff807b'fc200000 minus (512GB x 0xed). So, we can see that the physical address used by the PTE to map the first page of the HAL's heap still remains in the address 0x1000 (PFN 0x1).
+
+Looking at the following table taken from2, we can see that this address has been used since Windows 8.1 :
+
+Although the use of the HalpInterruptController table was never very popular among public privilege escalation exploits, there have been many cases in which an arbitrary write was used to modify a PTE to directly map this table or otherwise to create a PDE (Page Directory Entry) by turning on the Page Size (PS bit) bit to map a large page (2MB) to include this one. After that, the content of the table was read to build a ROP chain inside HAL.DLL, followed by overwriting a function pointer which then executed ring-0 code in user space.
+
+The randomization of the HAL’s heap base address introduced in the Creators Update version of Windows 10 killed another useful technique used by some kernel exploits, increasing the effort and costs to build modern Windows kernel exploits. However, it should be noted that the latest version of Windows 2016 is still using the Anniversary Update version of the kernel. This means that the HalpInterruptController table is not yet randomized, making the described technique still applicable to the latest version of Windows 2016.|||
+
+Windows 10 HAL’s Heap – Extinction of the "HalpInterruptController" Table Exploitation Technique. Another kernel exploitation technique killed in Windows 10 Creators Update| Bluefrostsecurity.
