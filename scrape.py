@@ -36,11 +36,11 @@ with open(fname, 'w') as file:
 
             if num_responses % 10 == 0:
                 print("num_responses:", num_responses, "Current ID:", current_id,
-                      "num_articles:", articles)
+                      "num_articles:", num_articles)
             
             current_id = current_id - 3
             num_responses += 1
-            if content[0] == "article":
+            if content[0] == "story":
                 num_articles += 1
         except Exception as e:
             print(e)
