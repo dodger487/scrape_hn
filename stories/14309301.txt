@@ -1,0 +1,103 @@
+You’ve assembled your superhero stack. Your React front-end is communicating with an Elixir/Phoenix back-end through an Apollo/Absinthe GraphQL data layer.
+
+But that feeling of invincibility quickly turns to panic as your first real development task comes down the pipe. You need to add user authentication to your system.
+
+How do we even do authentication in this stack?
+
+Our application will need to handle both publicly accessible and private queries and mutations through its GraphQL API. How do we set up these queries on the server, and how do we manage users’ sessions on the client?
+
+Great questions! Let the panic pass over you and let’s dive in.
+
+Every request made against our Absinthe-based GraphQL server is done through an HTTP request. This request layer provides a fantastic opportunity to lay the groundwork for our authentication system.
+
+Every GraphQL request that’s made against our system will come with an optional . A valid will map to a single user in our system. This is assigned to a user when they sign in.
+
+On each request we’ll look up the user associated with the given and attach them to the context of our GraphQL resolvers.
+
+If we can’t find a user associated with a given , we’ll return an authorization error ( ) at the HTTP level. Otherwise, if no was provided, we simply won’t set the in our GraphQL context and we’ll move onto processing our query and mutation resolvers.
+
+The key to our authentication (and authorization) system is that the currently signed in user can be pulled from the GraphQL context. This context can be accessed by all of our resolvers and can be used to make decisions about what data to return, which mutations to allow, etc…
+
+The first step of building our authentication solution is to write a piece of Plug middleware that populates our GraphQL context with the currently signed in user.
+
+To make things more real, let’s consider the context middleware I’m using for the security-focused SaaS application I’m building (Inject Detect). The middleware is based on the middleware provided by the Absinthe guide.
+
+With that in mind, let’s build out our Plug in a module called :
+
+To start, we’ll want our plug to implement the behavior, and to import . Implementing the behavior means that we’ll need to define an function, and a function.
+
+The function is the entry point into our Plug middleware. Let’s flesh it out a bit:
+
+Here’s the meat of our context middleware. We call out to a function called which builds our GraphQL context, as the name suggests.
+
+If returns an tuple, we stuff the resulting context into our as is expected by Absinthe.
+
+Otherwise, we return either a error or a error in the case of either a bad authentication token, or any other unexpected error.
+
+Now we need to flesh out the function:
+
+pulls the our of the header of the request and passes it into an function. either returns an tuple with the current , or an .
+
+If returns an error, we’ll pass that back up to our function, which returns a for us.
+
+Otherwise, if the header on the request is empty, we’ll return an empty map in the place of our GraphQL context. This empty context will allow our resolvers to let unauthenticated users access public queries and mutations.
+
+Lastly, let’s take a look at :
+
+It takes in an , looks up the user associated with that token, and either returns that user’s , or an tuple if no associated user was found.
+
+Armed with our new Plug, we can build a new pipeline in our router:
+
+And pipe our endpoint through it:
+
+Now all GraphQL requests made against our server will run through our authentication middleware, and the currently signed in user will be available to all of our GraphQL resolvers.
+
+Now that the currently signed in user can be accessed through our GraphQL context, we can start to perform authentication and authorization checks in our resolvers.
+
+But first, let’s take a look at how we would set up a public query as a point of comparison.
+
+In our application the query must be public. It will either return the currently signed in user (if a user is signed in), or if the current user is unauthenticated.
+
+The query takes no parameters, and it directly calls a function called :
+
+We use pattern matching the pull the current out of our GraphQL context, and then return the user with that back to our client. If our context is empty, the current user is unauthenticated, so we’ll return back to our client.
+
+Great, that makes sense. The query is returning data to both authenticated and unauthenticated users. It’s completely public and accessible by anyone with access to the GraphQL API.
+
+But what about a private queries?
+
+Similarly, our application has an query that returns an object representing a user’s application registered with Inject Detect. This query should only return a specified application if it belongs to the currently signed in user.
+
+Once again, our query calls out to a resolver function called :
+
+In this case, we’re once again pattern matching on our GraphQL context to grab the current . Next, we look up the specified application. If the set on the application matches the current user’s , we return the application.
+
+Otherwise, we return a error. We’ll also return a error if no is found in our GraphQL context.
+
+By making these checks, an authenticated user can only access their own applications. Anyone else trying to query against their application will receive a authorization error.
+
+Let’s take a look at another way of enforcing authentication at the query level.
+
+We have a mutation that should only be callable by a signed in user:
+
+You’ll notice that we’ve added a call to an Absinthe module before the call to our resolver. As you might have guessed, the module is where we’re enforcing an authentication check.
+
+The function is our entry-point into our middleware module. It takes an struct as an argument, which contains the current GraphQL context.
+
+If the context contains a , we know that the user making the request is authorized. We can return the unmodified from our middleware function, which lets it continue on to the resolver function.
+
+Otherwise, if no is found in the context, we use to modify the struct before returning it from our middleware. Giving the a result, in this case a tuple, will short circuit the query or mutation’s resolution and immediately return that result to the client.
+
+This piece of middleware effectively prevents unauthenticated users from accessing the mutation.
+
+This middleware pattern is extremely powerful. It can easily be extended to check for specific user roles or other criteria, and can be easily added to an existing query or mutation.
+
+Additionally, multiple middleware modules or functions can be chained together to create a very readable, declarative authentication and authorization scheme around your GraphQL API.
+
+At first, all of the moving parts related to handling authentication and authorization in a GraphQL application can be overwhelming.
+
+Thankfully, once you wrap your head around the basic strategies and building blocks involved, the end solution easily falls into place. Authorization and authentication in a GraphQL-based system isn’t much different than in any other system.
+
+Next week, we’ll move on to answering the second set of question raised in the beginning of this article. How do we manage user sessions on the front-end of our application?|||
+
+East5th provides consulting services and educational resources for building secure, robust, maintainable web applications. We’re constantly striving to deliver the highest quality articles, tools, services, and resources related to software development, software security, and consulting.

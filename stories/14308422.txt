@@ -1,0 +1,224 @@
+In this tutorial, we will take a look at how Kafka can help us with handling distributed messaging in a Go application, by using the Event Sourcing pattern.
+
+In this tutorial, we will take a look at how Kafka can help us with handling distributed messaging, by using the Event Sourcing pattern that is inherently atomic. Then, by using a pattern called Command-Query Responsibility Segregation (CQRS), we can have a materialized view acting as the gate for data retrieval. Finally, we'll learn how to make our consumer redundant by using consumer group. The whole application is delivered in Go.
+
+The most common argument that calls for microservices is scalability first and foremost. As an application grows, it can be hard to maintain all the code and make changes to it easily.
+
+This is why people turn to microservices. By decomposing a big system and creating various microservices for handling specific functions (e.g. a microservice to handle user management, a microservice to handle purchase, etc.), we can easily add new features to our application.
+
+However, building a microservice can be challenging. One of the challenges is atomicity — a way of dealing with distributed data, inherent to microservice architecture.
+
+Querying is also a challenge. It can be quite difficult to do a query like this when a customer and an order are two different services:
+
+The two architectural patterns are that are key for creating a microservice-based solution are Command-Query Responsibility Segregation, and Event Sourcing, when it makes sense.
+
+Not all systems require event sourcing. Event sourcing is good for a system that needs audit trail and time travel. If the system in question needs only basic decoupling from a larger system, event-driven design is probably a better option.
+
+If we compare Kafka to a database, a table in a database is a topic in Kafka. Each table can have data expressed as a row, while in Kafka, data is simply expressed as a commit log, which is a string. Each of the commit logs has an index, aka an offset. In Kafka, the order of commit logs is important, so each one of them has an ever-increasing index number used as an offset.
+
+However, unlike a table in a SQL database, a topic should normally have more than one partition. As Kafka performance is guaranteed to be constant at O(1), each partition can hold thousands, millions, or even more commit logs, and still do a fine job. Each partition then holds different logs.
+
+Partitioning is the the process through which Kafka allows us to do parallel processing. Thanks to partitioning, each consumer in a consumer group can be assigned to a process in an entirely different partition. In other words, this is how Kafka handles load balancing.
+
+Each message is produced somewhere outside of Kafka. The system responsible for sending a commit log to a Kafka broker is called a producer. The commit log is then received by a unique Kafka broker, acting as the leader of the partition to which the message is sent. Upon writing the data, each leader then replicates the same message to a different Kafka broker, either synchronously or asynchronously, as desired by the producer. This Producer-Broker orchestration is handled by an instance of Apache ZooKeeper, outside of Kafka.
+
+Kafka is usually compared to a queuing system such as RabbitMQ. What makes the difference is that after consuming the log, Kafka doesn't delete it. In that way, messages stay in Kafka longer, and they can be replayed.
+
+In this section, we will see how to create a topic in Kafka.
+
+Kafka can be downloaded from either Confluent's or Apache's website. The version that you need to download is in the 0.10 family. We’ll be using 0.10.1.0 in this tutorial.
+
+We will run a single Kafka broker for the time being:
+
+Then, we will create our first topic:
+
+Running multiple Kafka instances is very easy, just the file and make the necessary changes:
+
+To start the brokers, we must specify the file properly, as follows:
+
+That way, we have two running Kafka brokers inside our machine.
+
+Our Banku Corp, a top banking corporation had an increase in clients and transactions. The systems were interconnected, and massive. We want to separate them somehow.
+
+First, we want the balance calculation logic to stay out of the gigantic, monolithic application running on a mainframe developed in 1987. We decided that Kafka is good match for the job.
+
+We analyzed some contracts, and agreed that the events that need to be handled by microservices are the following:
+
+An event does not contain all of the data for an account, e.g. the account holder's name, balance, registration date, and so on. An event contains only the name of the event, and the necessary fields such as the ID and the changing attribute.
+
+The whole snapshot exists only as a mere reflection of past events. That way, by using events, we can recreate the data up to the point we desire.
+
+Let's start with creating a new folder, , and then use govendor to initiate the directory and serve for the project's dependency management (yes, Go has a lot of them, and no de facto standard yet).
+
+We will be using instead of go get to add a vendor or dependency for Banku. However, we need to go get` ginkgo and gomega for a BDD-style testing.
+
+Let's begin coding. First, let’s define our collection of Events in an . We want to do it the TDD-way this time, therefore, let's define our test file :
+
+To run that, type in , and we should see this error:
+
+This is because our app is packaged with — it expects an executable function. Let's create a simple file:
+
+Let's re-run the , and we should see the following errors:
+
+By following TDD guidelines, we can go from red to green with as little code as possible.
+
+To make it green, we first define an struct at our :
+
+Each corresponding Event should "inherit" the struct:
+
+After that, we define a function which will help us create a new :
+
+If we run again, we will see our test passing:
+
+Note that we need to install and import the go.uuid library since we are using in the , which is an imported package. We may also use another package/technique for generating the ID.
+
+We need to define 3 other structs and functions for the deposit, withdrawal, and transfer events. You may write them yourself, or look up the implementation here.
+
+In this file, we will also define the following functions:
+
+To materialize the state, we will be using Redis using go-redis library. It will materialize the view in this example to keep things downright simple.
+
+Next, we define a to deal with our Kafka things through Sarama, one of the principal libraries which helps us to communicate with Kafka.
+
+Let's define a function to create the Kafka configuration needed to instantiate both Sarama's and :
+
+The producer itself is as follows:
+
+Then, let's create a , which our function will call when the application performs as a producer. We will basically define a function:
+
+So far, our producer can only handle the command.
+
+To run the producer, just call:
+
+Don't forget to change our function to invoke :
+
+At our producer console, we can try sending a new command:
+
+Nothing will happen, since we haven't created the consumer that will process all those messages.
+
+Whenever there is an event coming, a consumer must set a clear contract, whether the event is for event sourcing or command sourcing. While both can be replayed, only event sourcing is side-effect free.
+
+Carefully designing the contract allows us to avoid executing unnecessary commands. For instance, upon receiving a event, the user should receive a welcome email. Then, replaying the same event must never send the email again by contract. In our case, all three events are purely event sourcing.
+
+Since event sourcing stores the current state as a result of various events, it would be time consuming to look up the current state by always replaying the event. In such cases, CQRS comes in handy, as it allows us to maintain a materialized view as a result of the events we are receiving.
+
+First, we need to create a function for each in a file named :
+
+Then, redefine each of the functions:
+
+These process methods will be invoked later by our consumer. The file itself starts out with a simple function:
+
+Note that we are using , which means that Kafka will be sending a log all the way from the first message ever created. This may be good for development mode since we don't need to write message after message to test out features. In production, we definitely would want to change it with , which will only ask for the newest messages that haven't been sent to us.
+
+The new function is then defined at as follows:
+
+The message processing itself is happening inside a goroutine .
+
+We used the and the blocking channel operator to ensure that our code continues to wait for incoming messages to that channel forever, or until the program terminates.
+
+Inside the case for , let's add the processing code:
+
+Since we have three more events, you can look at the complete implementation, but basically it is just repeated for each event.
+
+Ideally, the consumer and the producer are residing in altogether different source code repositories. However, to make it really short and convenient for us, we combine them into a single source code repository.
+
+Therefore, our function must be able to tell if the user intended to start the program as a producer, or as a consumer. We will be using to help us with that.
+
+To start the application as a consumer, invoke the application and pass the "act" flag with the consumer:
+
+As soon as it runs, it will fetch messages out of Kafka, and process them one by one by invoking the method on each event we have previously defined.
+
+Answer the following question: what if a Banku consumer died? The program may have suddenly crashed, or the network is gone. That's why we need to cluster the consumer, in other words, group the consumer.
+
+What happens is that we have all consumer instances running, but labeled the same. When there's a new log to send, Kafka will send it to just one instance. When that instance is unable to receive the log, Kafka will deliver the log to another subscriber within the same tag label.
+
+This mechanism has been available since Kafka 0.9. However, the Sarama library we are using doesn't support it. That's why we will use Sarama Cluster library instead. It's really simple to make a grouped consumer.
+
+First, govendor needs to fetch it:
+
+We need to change our methods so that the is instantiated from the cluster library:
+
+The itself is defined as follows:
+
+Our signature should now accept instead of .
+
+Case for consumer errors is changed to:
+
+Inside the we the as soon as possible:
+
+Now, let's try running our cluster in different terminal shells for each line:
+
+All of our past events will be consumed soon.
+
+Now, run our producer instance, and type in the following:
+
+Soon, one of our consumer in the same group will process that. The other consumer in the same group will be smart enough to ignore the incoming message to avoid double-processing it.
+
+Now, let's terminate two of the three consumers, and then send 3 messages at once:
+
+The message is processed just fine.
+
+So far, we have written some of our tests the TDD way. We also strictly adhered to the four-phase test technique, to best split a test spec into 4 distinct phases:
+
+In this section, we will add continuous integration to our Banku project to ensure that our code has passed all the tests before it is merged into the main branch.
+
+We'll use Semaphore as our continuous integration service. Let's first integrate Semaphore CI to our GitHub repository for the source code of this article.
+
+We will also be using Docker, which will help us with preparing our testing environment regardless of what is installed in the target environment.
+
+Now, let's dockerize our Golang application. Our Docker container needs to have the following:
+
+We will achieve this by utilizing a Dockerfile to specify the host our Banku application will be running on, as well as docker-compose to link together our Dockerfile with other dependencies, which is Redis in our case.
+
+Create a at the root folder on Banku, specifying the and indicating the base image, and the maintainer info respectively:
+
+After that, let's run the commands to install our dependencies: , and :
+
+Next, we need to copy our Banku folder at the host machine to the container:
+
+Then, let’s make sure the working directory is set at our folder:
+
+Lastly, we need to install any other dependencies needed by our Banku application:
+
+To test our Dockerfile locally, we can run the following commands at shell:
+
+You will then get connected to the container's bash shell, and if you run our tests will fail since there is no Redis instance running locally.
+
+Why don't we just include Redis as an image in the Dockerfile, so we can any command we want?
+
+Well, Docker views things layer by layer. Our application is just another layer, and Redis is a completely different layer. The and its command is where we "connect" those layers to work together.
+
+Let's create a in the same folder with our , specifying the file version:
+
+We want to have two services running when docker-compose is running this file, namely:
+
+To do that, we specify the as follows:
+
+Each service can either use , or . Specifying will make the composer pull the image from Docker repository. On the other hand, when is specified, a Dockerfile will be executed instead.
+
+By specifying under , we make sure that it will be started when the composer is running the service.
+
+Since and are running on different layers, we need to specify the environment variable, so that our can connect to a Redis server.
+
+We can now try running locally.
+
+Our local build is successful. A great thing about Docker is that, by using just these two files, Semaphore is able to pick up and do the things necessary for running our tests. In short, this is what we hear about when people refer to infrastructure as a code.
+
+Now, let's create a Semaphore account if you haven't got one. Connect Semaphore with your git so that you can choose your repo to integrate with.
+
+Then, choose the branch so that Semaphore analyzes the code when a pull request is made on this branch.
+
+When it finds out that the repository contains a and also, it will allow us to choose between platforms. Let's just choose the recommended platform — Docker.
+
+We can then set the setup script to:
+
+And the test script to :
+
+Those settings can later be found in Project Settings > Build Settings. Semaphore will run our test with the specified commands, and all of our tests should pass.
+
+If you want to continuously deliver your applications made with Docker, check out Semaphore’s Docker platform with full layer caching for tagged Docker images.
+
+In this tutorial, we have learned how to create and dockerize an event sourcing microservice in Go, by using Kafka as a message broker. We used Semaphore to perform continuous testing in the cloud.
+
+If you have any questions or comments, feel free to leave them in the section below.|||
+

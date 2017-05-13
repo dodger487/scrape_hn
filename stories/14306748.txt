@@ -1,0 +1,64 @@
+While working on Whereami I got interested on how Apple location services actually work. I know it is handled by since Little Snitch keeps blocking it. Usual way of inspecting traffic with proxychains did not work since macOS now has something called System Integrity Protection (SIP).
+
+Alternative way was to setup Charles as MITM proxy for an iOS device. After looking at the traffic which was mostly the device phoning home I got what I needed - a location services request.
+
+The request itself is just with some binary data.
+
+Since data does not have gzip header my second guess was protocol buffers. After all it is all the rage now and all the cool guys are using it. Let's try to decode.
+
+That did not work. Maybe there is something extra in the request. Logic says the mac addresses should be part of the data. Let's try to decode them. They are the blue part of the hex dump.
+
+Nope. Top part looks like a header. Let's try to remove the header instead.
+
+Still no go.
+
+After trial and erroring for a while I decided to brute force it by removing bytes one by one from the beginning to see if it decodes. Here is a bit polished version of that script.
+
+Running it first three matches seemed like false positives. There was output but some data was garbled. Fourth one feels legit.
+
+Seems like my original idea was quite close. Yellow part is the removed bytes. Blue part is the successfully decoded protocol buffers message.
+
+This means request message has four different type of data. In protocol buffers lingo each data type is called a tag. This message has four tags.
+
+To prove the hypothesis let try to make a request with different mac addresses. I used a hex editor to edit the binary request file and did a POST request with curl.
+
+No go. What went wrong?
+
+Looking at the dump you can see message is now one byte longer. So there must be a checksum somewhere. This one is pretty obvious. is 45 in decimal and the original message was 45 bytes long. New message is 46 bytes long which would be in hex. I would also bet the variable is a 16 bit integer ie. .
+
+Success. Now we know the format of request.
+
+Header itself can be dissected furthrer. I originally though these were just magical ASCII control code. However reader in reddit guided me to correct direction. These seem to be length-prefix framed byte strings. I still think indicates start of header though. It also looks like header is null terminated .
+
+I am not sure what the last four bytes mean. Maybe it is a placeholder for second header which is just currently empty.
+
+The response itself is quite large.
+
+Lets try our poor mans brute forcing again. It works again. Decoded output is approximately 1400 lines long.
+
+First one is bit confusing. is ie maximum unsigned 64 bit value. This probably means mac address was not found. I have no idea what to think about ie.
+
+Rest of the results are more clear.
+
+What puzzled me first is why I get 101 results. Then it occurred me that it is 100 successful results. First two are the mac addresses I sent. Rest of them are mac addresses which are in close vicinity to the ones I submitted.
+
+My guess is Apple offloads the trilateration calculations to client. Instead of doing expensive calculations for everyone just return bunch of access points and their coordinates.
+
+If at least three of those are actually visible to the client core location can use the signal level as distance. When you have three coordinates and their distance to target location you can calculate target location with reasonable accuracy.
+
+Below are the access points location services returned while requesting location in Changi.
+
+Having information of hundred access points around you also reduces the need of contacting the location services server again. As long as core location has coordinates of three visible access points it can calculate the location accurately. This can be done even when offline as long as wifi is turned on.
+
+You could write userland core location support for programming language which does not do it natively. Although there are easier ways to achieve the same thing.
+
+More interesting would be to write your own location services server to help with some creative debugging of your location enabled apps.
+
+Application à l’analyse des données de géolocalisation envoyées par un smartphone by François-Xavier Aguessy and Côme Demoustier. I do not read french but this paper has some file examples and Python code which helped me to get started. Protocol seems to have changed since the paper was published though.
+
+Vulnerability Analysis and Countermeasures for WiFi-based Location Services and Application by Jun Liang (Roy) Feng and Guang Gong is good reading in general to understand how WiFi based positioning works.
+
+Gaussian Processes for Signal Strength-Based Location Estimation by Brian Ferris, Dirk Hahnel and Dieter Fox. I do not understand half of the mathematics. However this paper gives good insight of the problems indoor WiFi positioning has.
+
+Posted in Protocol Buffers  Geolocation  on 10 May 2017.|||
+

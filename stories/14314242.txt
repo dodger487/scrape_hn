@@ -1,0 +1,52 @@
+I was excited about the Hello Sense, a popular Kickstarter project whose mantra is "Know More. Sleep Better." It's a beautifully-designed globe packed with sensors to tell you about your sleep environment, and a movement-tracking clip for your pillow. This device was especially interesting to me because of the work that me and my students have been doing on automatically-generated personalized sleep recommendations; so we wanted to know how the Hello Sense measured up.
+
+We immediately ordered two Hello Sense devices from their website to use for a few months, but alas it was disappointing that we could not access the data from the sensors. Instead, we could only view the charts that it generated, and were limited by what the Hello Sense app allowed us to see. To tease us, the Kickstarter page still says, "We are building tools to allow you to export, use or delete your data. Press a button and your data will be exported or deleted. It is entirely up to you. These tools will be available on our website. [..] You will be able to download a complete archive of your data."
+
+This article is about the procedure I went through to download my own data on to my computer. Skip to the section about Sending POST Requests if you are not interested in all the steps I went through. If you want to know what we did with the data, my student Jina Yoon wrote an article comparing 10 different sleep tracking devices and apps.
+
+Anyways, the Hello Sense syncs to its own smartphone app called Sense, but it was clear that there wasn't a way to export this data. In fact, after searching for solutions, all I could find were other users lamenting the lack of data exportability. So you can't run your own analysis or make it interoperable with other applications.
+
+I took this as a challenge, and wanted to try a similar procedure I had done before to extract data from the Microsoft Band, a wrist-worn device. Many apps will use a REST call to request a certain slice of the data, so knowing how to do that lets you talk to the server holding your data. Basically, I would intercept the messages between the Sense app and its servers to watch how they authenticated and transmitted my data to the app to make the charts. Then I could learn the "language" and mimic the app to ask for my own data from the servers.
+
+First I enabled the proxy on my Android phone (left screenshot below) to that my Macbook was set as the gateway.
+
+Next I checked that the browser was still working on my phone, and it was so that was a good sign. Then the tricky part; I set up a packet filter to forward the incoming packets to a different port on my computer. In a new file named love.conf,
+
+And then running the following pfctl (a packet filtering utility):
+
+Then I ran an open source tool called mitmproxy in transparent proxy mode.
+
+So this basically simulates a man-in-the-middle attack to intercept the data. Note that this is only capturing the data sent and received by my phone, so it's not really an attack in the usual sense but just a way for me to view the data my phone is already dealing with. Finally, I installed an SSL certificate on my phone from http://mitm.it, so that it could intercept the messages sent over https (port 443).
+
+I was delighted to see traffic being routed through my mitmproxy console when I visited websites (see the screenshot above on the right, where I eavesdrop on the phone's Chrome browser navigation). However, when I started up my Hello Sense app, it didn't connect to the server properly, "There was a problem securely connecting to the server."
+
+I wanted to get a better sense of what was going on in the app that caused the error to come up. I extracted the apk file from my phone using the Android Debug Bridge. The main code for the app is inside the apk in a file called classes.dex which is a Dalvik Executable file, basically a compiled Java binary. The file format is well defined so I was lucky to find an open source tool called jadx to decompile the source code into readable Java.
+
+After poking around the code, it was clear that the app used a library called OkHttp that did some sort of certificate pinning. Basically, there was code in there that checked whether the SSL certificate was the right one, and threw an exception if it wasn't. At this point, there were a couple of options: I could disassemble the app (note that the decompiled Java can't simply be recompiled into an app, so instead it needs to be disassembled into smali and edited) and remove the certificate pinning checks.
+
+But while I was looking into the source code, I came across a file called ApiService.java that showed the REST API queries that the app was making to retrieve data from the server. So theoretically, all we had to do was issue the same queries as if we were the app, and the server would send us the raw data back!
+
+Notice that to request the data, the phone uses links like /v2/timeline/{date}/events/{type}/{timestamp}. The timeline is in fact exactly what we want to get all the events that happened during a night of sleep for a particular date.
+
+But before we can send our own REST queries, the server asks for authentication using the OAuth protocol. OAuth authentication is done with a client ID and secret. So I searched the source tree for this, and luckily found it in a simple configuration file.
+
+I highlighted the two lines that specify the client ID and secret. This file also tells us the base URL for the REST server, which is https://api.hello.is so we now have all the pieces we need: the hostname of the REST service, the format of the requests, and the client ID and secret.
+
+Sending a GET request is easy with any web browser by just typing in the right URL. But crafting a POST request which is what we needed to do requires using a command line tool like curl or finding an application to take care of the annoying bits. I used Postman which is free and simply designed (and I love application names that are puns).
+
+So I entered the appropriate fields into the POST request, using a pretty standard OAuth format. The URL is https://api.hello.is/v1/oauth2/token based on what we found in the source code.
+
+One thing that tripped me up for a bit was the Content-Type header in the request needs to be set to "application/x-www-form-urlencoded" or the request will be rejected. Once that is set, the result of the POST request is the access_token which provides us access to the rest of the data that we can get using other queries. In the screenshot below, I covered part of my access token to prevent people from snooping on my sleep data.
+
+Now the fun part. I use the access token in the header as the Authorization field (the word "Bearer" needs to be prepended to it to indicate that it's a Bearer token type). And now I can change the URL to what I want, in this case to http://api.hello.is/v1/room/current to see my current room conditions from anywhere.
+
+If you really wanted to do something with your data, you could write your own script to automatically authenticate and then grab several days of data, maybe to create an online dashboard or send yourself sleep recommendations.
+
+Probably the most detailed data the Hello Sense stores is how it classifies my time during the night, as awake, medium sleep, sound sleep, etc. This is the timeline that is shown as bar charts in the app, but now we have access to the actual data to generate our own visualizations, or do comparisons and analyses. There's quite a few events during one night, but here's what it looks like.
+
+So the good news is that the Hello Sense does have sort of an API already. It took a bit of sleuthing to figure out how to get access to the data, but I imagine they haven't released this publicly yet because they want to provide a nicer interface to the API. But if you really want control over your own data, you can get it.
+
+Anyways, thanks for reading. Happy sleep tracking!
+
+If you liked my writeup here, you may also be interested in reading about how I extracted my data from the Microsoft Band|||
+
