@@ -10,7 +10,7 @@ import pandas as pd
 
 print("DID YOU CHECK YOUR OFFSET?")
 print("Nathan: 0, Dave: 1, Chris: 2")
-OFFSET = 2
+OFFSET = 1
 print("Current offset:", OFFSET)
 
 
@@ -34,8 +34,9 @@ with open(fname, 'w') as file:
             content = [str(content.get(k, '')) for k in fields]
             csvFile.writerow(content)
 
-            if num_responses % 100 == 0:
-                print("num_responses:", num_responses, "Current ID:", current_id)
+            if num_responses % 10 == 0:
+                print("num_responses:", num_responses, "Current ID:", current_id,
+                      "num_articles:", articles)
             
             current_id = current_id - 3
             num_responses += 1
