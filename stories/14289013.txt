@@ -1,0 +1,50 @@
+net80211 has reasonably good 802.11n support, but no 802.11ac support. I decided a while ago to start adding basic 802.11ac support. It was a good exercise in figuring out what the minimum set of required features are and another excuse to go find some of the broken corner cases in net80211 that needed addressing. I'll talk about a few here.
+
+802.11ac introduces a few new concepts that the stack needs to understand. I decided to use the QCA 802.11ac parts because (a) I know the firmware and general chip stuff from the first generation 11ac parts well, and (b) I know that it does a bunch of stuff (like rate control, packet scheduling, etc) so I don't have to do it. If I chose, say, the Intel 11ac parts then I'd have to implement a lot more of the fiddly stuff to get good behaviour.
+
+So, the first step was to survey what I needed to at bring up a very small subset of functionality. The typical first target is "monitor" mode, since that requires channel configuration to work, but doesn't require the rest of the stack to know about anything (ie, no 11ac aware IE negotiation.)
+
+Step one - adding VHT channels. I decided in the shorter term to cheat and just add VHT channels to the already very large ieee80211_channel map. The linux way of there being a channel context rather than hundreds of static channels to choose from is better in the long run, but I wanted to get things up and running. So, that's what I did first - I added VHT flags for 20, 40, 80, 80+80 and 160MHz operating modes and I did the bare work required to populate the channel lists with VHT channels as well.
+
+This required adding support to lib80211 and ifconfig to support loading VHT channels from the regulatory domain (regdomain.xml.) And yes, this let me get VHT channels statically configured.
+
+Then I needed to add VHT capabilities to the driver structure (ieee80211com) and the virtual interface structure (ieee80211vap.) This is so that drivers can be told that yes, we can do VHT things.
+
+Then I needed to glue it into an 11ac driver. My ath10k port was far enough along to attempt this, so I added enough glue to say "I support VHT" to the ic_caps field and propagated it to the driver for monitor mode configuration. And yes, after a bit of dancing, I managed to get a VHT channel to show up in ath10k in monitor mode and could capture 80MHz wide packets. Success!
+
+So at this point I took a big of a segue and decided to ensure that the receive packet flags made sense for VHT operation. I did a bunch of work to tidy this up so I could mark frames as 20/40/80/etc and had all of that mostly done in a few days.
+
+Next up was station operation. So this required a few things to get right:
+
+Sorry, I went off on a bit of a tangent. So one of the things net80211 does is it looks at the list of desired channels for each VAP and determines what the "NIC" channel should be in order to support it. So yes, ic_curchan is being used and it's what gets updated. the vap->iv_des_chan is the "I'd like to be this channel" but the active channel is actually vap->iv_bss->ni_chan (yes, the BSS node current channel.) That's what gets promoted. I need to uhm, "fix" the per-VAP state to have a "current channel" that gets updated with the BSS channel - so that's high on the list of things to fix.
+
+
+
+Then the next part for channel promotion is how it's done. IT's not done via a call to "promote channel" - it instead was done by a call to net80211's 802.11n routines which just parse HT (11n) IEs. Yes, parsing an 11n IE also upgraded the channel. So I spent a bunch of time refactoring that, and now the bits that parse IEs are separate from channel promotion. Fun times.
+
+
+
+So, once channel promotion worked, I associated fine as an open mode 11ac station. All of the negotiated pieces were wrong, so I spent a few days looking at packet captures to ensure I negotiated VHT capabilities correctly, but it seems to work fine.
+
+Next was adding in support for things that stopped me doing encrypted data. The TL;DR here is - net80211's crypto key handling model needed overhauling.
+
+Firstly the key management code assumes everything is synchronous and can't sleep. For firmware based devices this really isn't true. So, a lot of drivers defer key management into taskqueues to run things. This sounds fine, but then you realise that once the key addition succeeds, net80211 then will transmit frames expecting them to be encrypted. Userland too has this problem - it will do an ioctl() to set a key, then when it returns OK, it will queue further key negotiation frames. So, I had to do some uhm, clever things to try and work around this, and I'll cover how I need to fix it properly later.
+
+
+
+Next up - the QCA chips/firmware do 802.11 crypto offload. They actually pretend that there's no key - you don't include the IV, you don't include padding, or anything. You send commands to set the crypto keys and then you send unencrypted 802.11 frames (or 802.3 frames if you want to do ethernet only.) This means that I had to teach net80211 a few things:
+
+Now comes the hard bit of fixing the shortcomings before I can commit the driver. There are .. lots.
+
+
+
+The first one is the global state. The ath10k firmware allows what they call 'vdevs' (virtual devices) - for example, multiple SSID/BSSID support is implemented with multiple vdevs. STA+WDS is implemented with vdevs. STA+P2P is implemented with vdevs. So, technically speaking I should go and find all of the global state that should really be per-vdev and make it per-vdev. This is tricky though, because a lot of the state isn't kept per-VAP even though it should be.
+
+
+
+So, I need to fix the following to be per-vdev rather than global:
+
+Another thing as mentioned is channel width, as well as other 802.11n things that need extending for 802.11ac. A bit one that I'd like to get right is SMPS (spatial multiplexing power save.) If the chip supports it in firmware then we just need to allow it to be configured and controlled, but that isn't even an option right now. I'd like to implement SMPS for Atheros 11n parts in ath(4), but that's a lot more work.
+
+Anyway, so far so good. I need to do some of the above and land it in FreeBSD-HEAD so I can finish off the ath10k port and commit what I have to FreeBSD. There's a lot of stuff coming - including all of the wave-2 stuff (like multiuser MIMO / MU-MIMO) which I just plainly haven't talked about yet.|||
+
