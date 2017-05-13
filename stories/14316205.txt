@@ -1,0 +1,53 @@
+is a better hash table for the ELF used by GNU systems in GNU-compatible software, i.e. in almost every program compiled with gcc or clang for almost any Linux distribution.
+
+The problem with it is that is not documented anywhere other than in GNU binutils and glibc source code. You can either read source code to get some intel, or read emails with patches in mail list archives (Re: GNU_HASH section format is a pretty good one). Those are the only places you can try to find the truth on the matter.
+
+Of course, there’re some articles on the web where people try to break it down. Like this one.
+
+This article does not aspire to be the ultimate truth either. But I’ll try to cover everything about GNU Hash Table and explain all aspects of its work.
+
+Before reading any further please ensure that you understand what Symbol Table and String Table are in the ELF. Also you may want to read my previous article ELF: symbol lookup via DT_HASH to know the standard (90s-ish) way of doing symbol lookup.
+
+has nothing in common with standard , apart from serving the same purpose. It has its own hashing function, its own layout, it adds restrictions for the symbol table and contains an additional bloom filter to stop lookup for missing symbols early.
+
+Let’s start with the hashing function. It can be found in bfd_elf_gnu_hash or in dl_new_hash.
+
+Not a valid C code, but gives an idea:
+
+Bloom filter is used to stop the lookup for missing symbols early. , , and are parts of the structure, as their names suggest.
+
+Bloom filter behaves slightly differently for various binaries (defined by field in ELF Identification). Let’s define to be for 64-bit binaries ( ) and for 32-bit binaries ( ).
+
+Before doing symbol lookup, take . If bits and are set then a symbol may or may not be in the hash table, and you should proceed with a regular lookup through buckets and chains. But if at least one bit is not set then a symbol is certainly absent from the hash table.
+
+contains an element per symbol table’s element. This leads to a waste of space because and some other symbols are in the hash table but are never looked up. GNU hash table allows to skip first symbols at the beginning of the symbol table.
+
+Same as in , symbols are put in one of buckets depending on their hashes. To be specific, each symbol should be placed into bucket.
+
+Chains in the GNU hash table are nothing like strange linked lists in , they are contiguous sequences of hashes for symbols with the same index (remember that chains’ indexes are shifted by relatively to the symbol table). The last bit in chains’ element is discarded and instead used for indicating the chain’s end. If it is set then the element is the last one in the chain.
+
+array holds indexes of the first symbols in the chains. Note that those are not indexes for the array. Indexes for it will be .
+
+Chains being contiguous sequences imply that symbols within the same bucket must be stored contiguously. Order of buckets in the symbol table does not really matter but usually they’re stored in an ascending order.
+
+While looking extraneous, creating such restriction over the symbol table gives great advantage: a hash table now can store almost full hash (without the lowest bit) of a symbol within the same 32 bits. This allows linkers to compare hashes before comparing strings. Also, because requires symbol table ordering and doesn’t, you can fit both into a single binary. This way both standard and GNU linkers can look up symbols in it.
+
+Nothing is better than a visual representation of the rules. So, let’s create one.
+
+I took the same symbols as in ELF: symbol lookup via DT_HASH and created table from them. The example is for 64-bit ELF binaries, for 32-bit you’ll need to recalculate bloom word and bits.
+
+Knowing the rules and having a built table, let’s try to find some symbols by hand.
+
+Note that when comparing hashes the lowest bit is set on both left and right hand sides.
+
+Original algorithm is implemented in do_lookup_x in source code.
+
+Implementation is a little trickier than ‘s one, but with the example above it should be self-explanatory.
+
+Total number of symbols is missing from for reasons I do not know. To get a total number of symbols you’ll have to find a chain element with the highest index. To do so find a chain that starts at the highest index ( ) first and then walk the chain to its end ( ).
+
+This may be useful if you only have access to dynamic program information, e.g. if your program is a dynamic linker or an ELF loader. However, if you have access to section headers, you can simply calculate the total number of symbols from section’s header: just divide the section size by an entry size.
+
+is a way better structure that . It is a shame it is not standardized, because every system that uses ELF uses to its advantage. As noted in the original GNU binutils patch, it improves linking time by up to 50%. This is twice as fast loading time! Considering how much symbols are exported and imported by an average C++ shared library and size of those symbols’ names (mangling fits all namespaces, types, and template arguments into the final symbol name), obscure is the thing that makes your applications start as fast as they can.|||
+
+DT_GNU_HASH is a better hash table for the ELF used by GNU systems in GNU-compatible software, i.e. in almost every program compiled with gcc or clang for almost any Linux distribution.

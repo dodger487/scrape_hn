@@ -1,0 +1,131 @@
+Never configure nginx with the resolver directive pointing to a resolver on the Internet like Google Public DNS, OpenDNS, or your ISP’s resolver. Many nginx users make this exact mistake. Even pointing to a resolver on your internal local network may be a bad idea. Using a resolver on localhost ( ) is the only safe option, and mitigates against all vulnerabilities documented in this post.
+
+[Edit 11 May 2017: Eight months after reporting these vulnerabilities to the nginx developers, they still refuse to fix issues 2, 3, and 6. They did fix issues 1, 4, and 5, but did so without publishing a security advisory.]
+
+I discovered that not only nginx’s stub resolver generates non-random or predictable DNS txids, but also each nginx worker process reuses the same UDP source port for every DNS query.
+
+Nginx on Windows fails to seed its PRNG, causing txids to always follow the same sequence: 41, 18467, 6334, 26500, 19169, 15724…
+
+Nginx on Linux (GNU C library) generates txids that can be predicted with a short script.
+
+These flaws allow someone to send spoofed DNS replies to poison the resolver cache, causing nginx to proxy HTTP requests to an arbitrary upstream server chosen by the attacker, potentially serving malicious content to browsers.
+
+Strangely the nginx developers do not consider any of these problems a security issue. Following my report to security-alert@nginx.org, they patched some issues, refused to patch others, and did not publish a security advisory. So I feel compelled to disclose my findings publicly to inform nginx users of potential risks they expose themselves to.
+
+Nginx generates DNS txids using which is a macro for on Linux/Unix, and on Windows.
+
+Issue 1. On Windows, nginx never seeds the PRNG via , so the C library defaults to a seed of 1, causing the txids to be non-random and to always follow the same sequence: 41, 18467, 6334, 26500, 19169, 15724…
+
+Issue 2. On Linux, relying on makes txids predictable because, under certain configurations, nginx leaks values to remote users: through SMTP/POP3/IMAP CRAM-MD5 salts and through POP3 APOP timestamps (when is enabled), or through the variable sometimes exposed to clients via headers (when nginx is not built with ). And as explained in scenario 2, with the GNU C library implementation, knowing 31 consecutive random() values allows predicting 2 possible values for the next call. This information can be obtained, for example, by sending 31 commands to nginx’s SMTP endpoint.
+
+Issue 3. On all platforms, each worker process in nginx lets the OS pick a random UDP source port to send DNS queries. The worker processes will then reuse this same port over and over for all queries, until nginx is restarted. Since guessing the txid is possible, an attacker only needs to brute force the source port in order to poison nginx’s resolver cache. The OS TCP/IP stack typically picks ports from a range of 28232 ports on Linux, and 16384 ports on Windows. Identifying this port is a one-time effort for the attacker. Subsequently, he can conduct cache poisoning attacks with a single spoofed DNS reply because the port is known and the txid predictable.
+
+Other issues—which are more minor—affect nginx:
+
+Issue 4. On Linux/Unix with (not the default because this is a development setting normally not set) the PRNG is seeded with however the time in seconds when nginx is started can typically be guessed from the host’s uptime (if nginx is started at boot time) which is known through TCP timestamps.
+
+Issue 5. On Linux/Unix, with (default), the process ID is XOR’d into the seed but the PID typically has low entropy if nginx is started during boot (~10 bits.)
+
+Issue 6. On Windows, limits the entropy of DNS txids to 15 bits, not 16 bits ( is ).
+
+First, the requirements for successfully poisoning nginx’s DNS cache are that the attacker needs to:
+
+Some additional information or configuration may help, as described in the scenarios below, but is not necessary.
+
+This scenario demonstrates how to exploit issue 1.
+
+Nginx running on Windows with the following :
+
+If the Nginx instance is relatively busy (eg. handles one request per second or more, to keep nginx constantly resolving the backend name every time the cached entry expires), then:
+
+As of 24 August 2016, this attack works on all nginx versions released so far. After my report, it was patched on 04 August 2016 in the development branch, therefore future release 1.11.4 should include the fix. However the nginx developers do not consider it a security vulnerability, despite the obvious risk.
+
+This scenario demonstrates how to exploit issue 2 on Linux.
+
+It requires nginx to be configured as an SMTP or POP3 or IMAP endpoint with CRAM-MD5 authentication enabled (not the default), or to be configured with the POP3 APOP authentication (not the default), or to be configured to disclose to clients while not being compiled with . These are three mechanisms by which values leak to a remote attacker, allowing him to predict future txids.
+
+In the case of APOP, the value is disclosed in the APOP timestamp in the POP3 greeting banner. But I choose here instead to demonstrate Nginx running with an SMTP endpoint and CRAM-MD5 authentication:
+
+With this configuration, nginx leaks values through CRAM-MD5 salts used in SMTP/POP3/IMAP authentication:
+
+The integer 169379775 in is the value returned by . The GNU C library implementation of this function allows predicting future return values when knowing 31 consecutive ones. I wrote a demonstration Python script cram-md5-predict-random.py which connects to nginx’s SMTP endpoint, fetches 31 CRAM-MD5 salts, and calculates 2 possible values for the next number. One of the values has 75% chances of being correct, the other 25%. It also prints 2 possible DNS txids which are the same values but masked to 16 bits:
+
+Next we can verify this txid prediction by requesting in a browser while running a packet capture of nginx attempting to resolve .
+
+The txid is 21747 as predicted!
+
+The steps an attacker would take to poison nginx’s DNS cache are:
+
+I should point out that this attack works well if nginx is configured with only 1 worker process. If there are 2 or more, things become a little more complicated as each process uses their own UDP source port and have their own PRNG state.
+
+As of 24 August 2016, this attack works on all nginx versions, including the current development branch. The nginx developers do not plan to fix it.
+
+I reported these vulnerabilities to the developers, proposing 2 fixes:
+
+On one hand they fixed the lack of seeding on Windows (issue 1), and made the seeding less predictable on all platforms by XOR’ing in milliseconds (issues 4 and 5).
+
+But on the other hand they refused to consider any of these issues a security problem, they did not publish a security advisory, they will not address the rest of the vulnerabilities (issues 2, 3, and 6): they continue to use / , and they still fail to randomize source ports for each query. Therefore txids are still predictable and nginx’s cache can still be poisoned as per scenario 2.
+
+Their argument is that none of these issues matter because they assume the resolver is trusted. I was told “the suggested use case is to operate a name server on localhost, or on the (trusted) local network. We’ll make sure to make it clear in documentation.”
+
+I pointed out in the past they did patch DNS vulnerabilities that can only be exploited by an untrusted resolver or untrusted network: CVE-2016-0742, CVE-2016-0746, and CVE-2016-0747. Therefore this is a complete flip-flop from their previous stance that DNS is untrusted.
+
+As of 24 August 2016, all nginx versions that ever shipped with the resolver are affected by issues 1 through 6:
+
+Future releases such as 1.11.4 should contain the fix for issues 1, 4, and 5 but will still be vulnerable to issues 2, 3, and 6.
+
+This is the report I initially sent to the nginx developers on 27 July 2016:
+
+I discovered that the built-in stub resolver in nginx fails to securely randomize the DNS txid (transaction ID). See the three lines like this one in :
+
+is a macro for on Linux/Unix, and on Windows. However these PRNGs are weak, predictable, and not at all or poorly seeded by nginx:
+
+Also, nginx fails to randomize the UDP source port for each DNS query. It relies on the OS to pick a random port, but then uses it for all subsequent queries indefinitely. Reloading the config ( ) does not change the port. An nginx instance will continue to use the same port until nginx is stopped and restarted.
+
+Combined together, the predictable txids and invariable UDP source ports make DNS cache poisoning attacks possible. All nginx versions released in the last 9 years are affected (since 0.6.18 implemented the “resolver” directive).
+
+The sections below provide more details.
+
+Let me start with demonstrating the behavior of nginx on Windows. I created a simple nginx config:
+
+Note that using variables ( ) is necessary to demonstrate the vulnerability because this leads to hostname resolution at runtime using . If a plain URL is specified ( ) the hostname will be resolved during nginx configuration initialization using gethostbyname() or getaddrinfo().
+
+Here is a tcpdump capture of the DNS queries sent by nginx right after starting it up and after requesting /1/, /2/, and /3/ (.10 is nginx and .9 is the recursive resolver):
+
+On Windows, nginx generates the txids using and the values seen above (41, 18467, 6334, 26500, 19169, 15724…) correspond to the values generated by the Microsoft C library implementation of with the default seed value of 1. In other words: nginx fails to seed the PRNG, therefore all txids are trivially predictable.
+
+Also, nginx relies on Windows picking a random UDP source port (56524 in my example), but this port will be reused indefinitely for all subsequent queries (for name-1.lan, name-2.lan…) The only way the port will change is if nginx is stopped and restarted.
+
+These two flaws are a textbook example of a bad DNS implementation vulnerable to cache poisoning. Whenever an HTTP client requests a URL proxied to a host whose record cached by nginx has expired, will send a query to the recursive resolver which may take tens or hundreds of milliseconds to reply. This creates a window of opportunity for the attacker to send hundreds or thousands of spoofed DNS replies with different UDP source ports and txids. During this time nginx will log one error per response with a mismatched txid:
+
+But if guessed correctly, the cache would be poisoned and would cause nginx to pass the proxied HTTP requests to an IP chosen by the attacker, potentially serving malicious content to HTTP clients.
+
+On Linux/Unix, nginx generates the txids using and the PRNG is seeded in :
+
+However this too is insecure. For starters and are not cryptographically secure PRNGs therefore future txids can be predicted based on previous ones. For example, with the GNU C library implementation, knowing 31 consecutively generated random values lets you calculate the next few ones with high confidence.
+
+And in nginx’s particular case, the seed itself is not very random. is the process ID which is likely a small integer in the 0–2000 range if nginx is started at boot time (~10 bits of entropy). As to it is the time in seconds since Epoch when nginx was started, or approximately the host’s uptime if nginx is started at boot time. But the uptime can be guessed pretty accurately, for example the majority of Linux hosts indirectly disclose their uptime through TCP timestamps (“nmap -v -O x.x.x.x” and look for “Uptime guess” which is often accurate within minutes).
+
+Oh, another bad thing on Linux: if nginx is configured with (not the default) the PRNG is instead initialized with only the time (not XOR’d with the PID) in :
+
+I demonstrated an exploitable scenario when using , but of course other ones are possible, for example when proxying to hostnames using , , , or .
+
+The standard or , even well seeded, are not cryptographically secure PRNGs and should not be used to generate DNS txids. PowerDNS had the same vulnerability. Microsoft too. Pretty much all DNS implementations have switched to cryptographically secure PRNGs since July 2008 when Dan Kaminsky disclosed the DNS flaw, and so should nginx.
+
+Even though exploitability may be reduced in the context of nginx (because the window of opportunity to spoof DNS replies only exists when a cached record expires), nginx should use a cryptographically secure PRNG to generate the txid.
+
+On Linux kernels >= 3.17, I suggest using the syscall. On older Linux kernels and other Unix platforms, nginx should read from /dev/urandom. On Windows, nginx should use the CryptGenRandom() API.
+
+nginx should explicitely bind the resolver socket to a random UDP source port also chosen using a cryptographically secure PRNG. And it should use a different port for every DNS query if possible. If not possible the port should at least be rotated periodically, eg. after every N DNS queries with a small value of N (10?)
+
+I was enticed to do a security review of nginx because the Internet Bug Bounty program provides bounties through the HackerOne plattform. So, FYI, I plan to submit my reports to them after you resolve the issues.
+
+Let me know if you need more information. I am happy to help!
+
+Maxim and I exchanged 4 more emais (not listed here) to clarify the exact risk. Maxim was mostly defensive, but said one of his resolver devs will look into it.
+
+On 03 Aug 2016, the developer in charge of the resolver replied:
+
+I had not received a reply after a few weeks, so I published this blog post and sent another email:|||
+
+Never configure nginx with the resolver directive pointing toa resolver on the Internet like Google Public DNS, OpenDNS, or your ISP’sresolver. Many nginx us...
