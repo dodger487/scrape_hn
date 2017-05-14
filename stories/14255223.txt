@@ -1,0 +1,219 @@
+Being able to have your users authenticate using Google, Facebook, Twitter, etc is a great way to remove the annoyance of having to create a local account and go through the email validation process.
+
+We usually refer to the services we delegate the task of authenticating our users as external login providers. The most popular protocols for this are OAuth2.0 and OpenId Connect.
+
+The documentation on using External Login providers in ASP.NET is scarce. To make matters worse the templates that you get when you do “File -> New Project” are not very easy to follow, and without the knowledge of how the authentication middleware in ASP.NET works, they are nearly impossible to comprehend.
+
+To really understand how to use external login providers with ASP.NET it is necessary to understand how the middleware pipeline and in particular the authentication middleware work, and also a little bit about the OAuth protocol.
+
+This blog post explains how all these pieces fit together and provides examples on how to leverage the authentication middleware for external login providers on their own and with ASP.NET Core Identity.
+
+When an ASP.NET Core application receives a request it goes through a pipeline composed of middleware “components”. Each middleware will have an opportunity to inspect the request, do something with it, pass it along the rest of the pipeline, and then do something extra with it after the rest of the pipeline has executed.
+
+The pipeline is defined in the class, specifically in the method. Here’s an example of a middleware being added to the pipeline:
+
+One important thing to be aware of is that all the middleware will have access to an instance of . It is through this instance that they can “send” messages to each other. For example, if a middleware at the end of the pipeline changes by doing something like , all the middleware that precedes it will be able to access that value.
+
+Another important thing to have in mind is that any middleware can stop the pipeline, i.e., it can just choose not to invoke the next middleware. This is particularly important for external login providers.
+
+For example, if you use Google as your external login provider the user will be redirected to after a successful authentication. If you’ve tried the default visual studio templates with external login providers, in this case Google, you might have noticed that there’s no controller action, or seemingly anything else that responds to that URL.
+
+What happens is that the middleware looks for that URL, and when it finds it will “take over” the request by not invoking any other middleware down the pipeline, namely the MVC middleware.
+
+As a consequence of this type of behavior, the order in which the middlewares run is important.
+
+Imagine the scenario where you support multiple external login providers (e.g. Facebook and Google). When they run there needs to be a middleware before, namely the middleware, that is able to transform the information they put in into a cookie that represents a signed in user (an example of this is given later in this article).
+
+What makes a middleware an authentication middleware is that it inherits from a class named AuthenticationMiddleware. That class does little more than create an AuthenticationHandler. It is in the that most of the functionality is.
+
+Even though we’re not going to describe how you can create your own authentication middleware, we’re going to describe how the authentication middlewares can be interacted with, and also how they interact with each other, when you have several in the pipeline.
+
+When adding an the minimum you have to specify is its , a flag named and another named .
+
+You can think of the as being the name of the authentication middleware. In previous versions of ASP.NET this was called authentication type.
+
+The flag specifies that the middleware should “authenticate” the user as soon as it reaches its turn in the pipeline. For example, if the cookie middleware is added to the pipeline with it will look for the authentication cookie in the request and use it to create a and add it to . By the way, this is what makes a user be “logged in”.
+
+If you would setup a cookie middleware with and there was a cookie in the request for that cookie middleware the user would not be automatically “logged in”.
+
+In previous versions of ASP.NET an authentication middleware with was called an active authentication middleware, and with was called passive authentication middleware.
+
+You can “challenge” an authentication middleware. This is a new term that did not exist prior to ASP.NET Core. I don’t know the reasoning behind calling it a challenge so I won’t try to describe why it’s called that way. Instead I’ll give you some examples of what happens when a middleware is “challenged”.
+
+For example, the cookie middleware when challenged will redirect the user to a login page. The Google authentication middleware returns a 302 response that redirects the user to Google’s OAuth sign in page.
+
+Usually to challenge an authentication middleware you need to name it (by its ). For example, to challenge an authentication middleware with you could do this in a controller action:
+
+However, you can issue a “naked” challenge (i.e. not naming any authentication middleware, e.g. ) and the authentication middleware that has will be the one to respond to that challenge.
+
+A challenge is just one of the actions that can be “performed” on an authentication middleware. The others are Authenticate, SignIn and SignOut.
+
+For example, if you “issue” an Authenticate action to an authentication middleware (imagine this example is in a controller action):
+
+This will cause the middleware to try to authenticate and return a . For example, the cookie middleware will look at the request for a cookie and build a and with the information contained in the cookie.
+
+Usually you’d issue a “manual” Authenticate in an authentication middleware that was configured with .
+
+It is also possible to issue a SignIn:
+
+If “ApplicationCookie” were a cookie middleware it would modify the response so that a cookie would be created in the client. That cookie would contain all the information required to recreate the passed as a parameter.
+
+And finally SignOut, which, for example in a cookie middleware would remove the cookie that identifies the user. Here’s an example of how to call sign out on an authentication middleware named “ApplicationCookie”:
+
+It is hard to imagine how all this fits together without an example, so here’s a simple example using the cookie authentication middleware.
+
+Here’s the setup for a cookie authentication and MVC middlewares:
+
+What happens when a request hits an ASP.NET Core application configured with this pipeline is that the cookie authentication middleware will inspect the request looking for a cookie. This is because the authentication middleware is configured with .
+
+If the cookie is in the request, it is decrypted and converted into a and set in . After this the cookie middleware will invoke the next middleware in the pipeline, in this case MVC.
+
+If the cookie is not in the request, the cookie middleware will just invoke the MVC middleware.
+
+If the user performs a request for a controller action annotated with the attribute and the user is not signed in (i.e. was not set), for example:
+
+A challenge is issued and since the cookie authentication middleware is configured with it will handle it. The cookie middleware responds to a challenge by redirecting the user to the (by creating a response with status code 302 and a Location header for /account/login).
+
+Alternatively, if your authentication middleware is not set with and you want to “challenge” it you can specify the :
+
+And just to cover all possible ways to issue a challenge you can also do it using the Challenge method in the controller:
+
+One important thing to be aware when manually issuing a challenge this way. If you issue a challenge for an authentication middleware (e.g. “MyCookie”) and that authentication middleware “signed the user in” (in this case there was an cookie in the request for that middleware), then the middleware will respond to the challenge as an unauthorized access and will redirect the user to . You can change that path by setting the in .
+
+The reasoning behind this is that if the user is already signed in, and a challenge is issued to the middleware that signed the user in, it must mean that the user does not have sufficient permissions (e.g. does not have a required role).
+
+The behavior in previous versions of ASP.NET was to redirect the user back to the login page. However, this caused problems if external login providers were used.
+
+An external login provider “remembers” that you’ve already signed in. That’s why if you already signed in to, for example Facebook, and you use a web app that allows you to sign in with Facebook, you’ll be redirected to Facebook and then immediately back to the web app (assuming you’ve already authorized the web app in Facebook). If you don’t have enough permissions this can cause a redirect loop. So instead of a causing a redirect loop in these cases, the authentication middleware in ASP.NET Core will redirect the user to an access denied page.
+
+The simplest setup when relying on an external login provider is to configure a cookie authentication middleware that will be responsible for signing the user in, and then a middleware for the particular external login provider that we want to use.
+
+If we wanted to use Google we could configure our pipeline like this:
+
+Whenever a request comes in with this configuration it will “go through” the cookie middleware that will inspect it looking for a cookie. What determines if a cookie “belongs” to a particular middleware is its name. The default is to prefix with , so for the name of the cookie would be . Here’s how it would look in the Chrome Dev tools:
+
+If no cookie is in the request, the cookie authentication middleware simply invokes the next middleware in the pipeline. In this case that will be the Google authentication middleware.
+
+We’ve “named” the Google authentication middleware in this example as “Google”. When we use an external login provider that provider must know about our web app. There’s always a step where you register your app and you are given an ID and a Secret (we’ll go into more detail about why these are needed later). That’s the and properties in the example.
+
+Next we’ve defined a . When a user successfully logins using an external login provider, the external login provider issues a redirect so that the user is sent back to the web application that originated the login process. The must match that the location to where the external login provider redirects the user to (this will become clear later on).
+
+Finally, the specifies to which authentication scheme the Google authentication middleware will issue a SignIn after a successful authentication.
+
+The only situations where the external login provider middleware will “intervene” is when it is “challenged” or when the request matches the .
+
+Let’s look at the challenge first. Imagine you have a controller action like this one:
+
+When you issue a challenge you can specify an instance of . The class allows you to specify, among other options, where the user should be redirect to in the event of a successful authentication.
+
+When this challenge is issued, the middleware will respond by changing the response status code to 302 redirect to Google’s OAuth2 login url. It will looks something like this:
+
+The user then has to login/authorize the web application and will then be redirected back to the web application. For example, if you were to define a redirect uri as http://www.yourdomain.com/signin-goole when you registered your web app with Google, then after a successful authentication with Google, that’s where your user will be redirected to.
+
+When that request comes, if the configuration is correct it will match the ( ) and the middleware will take over that request.
+
+Here’s how one of those requests looks like:
+
+The value in the query string is then used to make a request to Google and get information about the user (this is part of the OAuth2 protocol and will be explained in more detail in the next section). Note that this is a request sent by the web application to Google. This is transparent to the user.
+
+With the response to that request (the one that uses the code) the GoogleAuthentication middleware creates a and “signs in” to the provided when configuring the middleware. Finally, the response is changed to a 302 redirect to the redirect url specified in the in the Challenge (in this example that will be the Index aciton in the Home controller).
+
+If you’ve ever tried to use the default Visual Studio templates with external login providers you’ve probably noticed that if you authenticate using the external login provider you are taken to a page where you are asked to create a local user account.
+
+The user has to go through this intermediate step before effectively being logged in.
+
+This is achieved by using two cookie authentication middlewares. One that actively looks for a cookie in the request and signs the user in if it is present ( ). This one is frequently called the , or in our example the .
+
+And another one that is passive ( , i.e. it won’t automatically set with the user that is in the respective cookie). This one is frequently called the because it’s the one to which the extrenal login providers will issue a “sign in”.
+
+The external login provider’s is set to the external cookie middleware (the one that is configured with ) and the challenge is issued with a RedirectUri set to a controller action that “manually” invokes an “Authentication” in that .
+
+Here’s an example of how a configuration for this setup would look like:
+
+The only difference between this and the previous scenario is that now there’s an additional authentication middleware (ExternalCookie) and the in the external login provider is set to that middleware.
+
+When we do the challenge in this scenario we have to redirect the user to a controller action that “manually” triggers an in the ExternalCookie. Here’s how that would look:
+
+And the method in the controller:
+
+What we are doing in this controller action is “manually” triggering an Authenticate action in the middleware. That is going to return a that is reconstructed from the cookie in the request.
+
+That cookie was set by the middleware after a successful authentication because we’ve set the . Internally, the middleware will perform an action similar to this:
+
+And that is what causes the middleware to create the cookie.
+
+Next we can do some extra operations using the information contained in the , for example check if the user (through the email contained in ) already has a local account, and if not redirect the user to a page where the option to create a local account is presented (this is what the default visual studio templates do).
+
+In this example we simply issue a action to the middleware. This is will cause that cookie middleware to change the response sent to the user so that a cookie is created that encodes the (i.e. the response will have Set-Cookie header for a cookie named with the encoded ).
+
+Remember that this middleware is the one that has and that means that on every request it will inspect it looking for a cookie (named ) and if it’s present, it will be decoded into a and set on , effectively making the user be signed in.
+
+Finally we just issue a to the middleware. This causes the middleware to remove its corresponding cookie.
+
+Here’s a recap of what happens from the point of view of the user:
+
+In the examples above we’ve used a client Id, a client secret, a callback URL and we briefly mentioned that the response from Google contained a “code”, but we didn’t really motivated the need for all of this.
+
+These are all terms form the OAuth2 protocol, specifically from something that is called the “Authorization Code Workflow” (you can find a more comprehensive description of OAuth2 here).
+
+The first step when using OAuth is to register the client. The client in this case is your web application, and you have to register it so that the external login provider has information about it.
+
+That information is required so that when presenting the authorization form to your user it can display the name of your application, and so that it knows where to redirect your user after the user accepts or rejects your application’s “requirements”.
+
+In OAuth these “requirements” are known as the “scopes”. An example of two scope “items” for Google are “profile” and “email”. When your application redirects the user to Google and includes those scopes the user will be asked if it is ok that the web application is able to access profile and email information.
+
+In sum, when you register your application with an external login provider you’ll have to provide (at least) a name for your application and a callback url (e.g. www.mydomain.com/signin-google).
+
+What you get in return is a client id and a client secret.
+
+The client id and client secret is all you need to enable your web application to start using the external login provider. Here’s a diagram of the interactions between the user’s browser, your web application and the external login provider. I’m being very lax with the terminology here, the actual term should be authorization server, and the server that actually contains the user’s accounts is named resource server. They might be the same. You should read the digitial ocean article about OAuth if you need a more strict description of these terms.
+
+This is the authorization code grant. There are other workflows, but for a web application this is the one you’d use. Important things to note here is that the can only be used one time and the client secret never goes to the user’s browser. This is so that it’s difficult for someone to impersonate your web application. They would need to know your client secret, and for that they’d need to have access to your server.
+
+When you use create a new project using Visual Studio and select Web Application with Membership and Authorization and you add an authentication middleware for an external login provider you’ll end up with a Startup configuration similar to this:
+
+If you look at the source code for the extension method you’ll find something similar to this:
+
+This is a similar setup to the one we described earlier. The difference is that there are two new external authentication middlewares (TwoFactorRememberMeCookie and TwoFactorUserIdCookie which are out of the scope of this post) and the order between the “main” authentication middleware (the one that has ) and the one we use as to store the external login provider authentication result ( ) are swapped (they will work the same way in either order).
+
+Also, the GoogleAuthentication middleware is configured with all the default options. The default for is , and this is something that is specific for the particular external login provider middleware that you are using.
+
+The challenge to the external login provider is performed in an action named in the :
+
+If you were to look at the source code for the in you would find that it simply creates an instance of the same way we did in our previous example:
+
+The “item” with key “LoginProvider” is used later on. I’ll highlight it when appropriate.
+
+As you can see from the ‘s action, the is set to the action also on the . Lets look at that action (I’ve removed parts that are not relevant):
+
+The first line, triggers an in the external cookie middleware. But instead of an instance of it will return an instance of the class that contains the following properties:
+
+This will check if there’s a record in the table. This table “links” an external login provider and a “provider key” (which is the user id for the external login provider) to a user in the table (the primary key for this table is a composite key of LoginProvider and ProviderKey).
+
+Here’s an example of how a record in that table looks like:
+
+So, if you sign in with Google, and your Google “user id” is , and you’ve previously associated your local user (more on this shortly) to this external login, then will issue a SignIn to the main cookie middleware and issue a SignOut to the external cookie middleware.
+
+The first time you do this though, there won’t be any local user or record on the table, and the method will simply return .
+
+And that will take us to the page:
+
+In this page you are asked to confirm the email you want to use to create your local account (i.e. a record in the table).
+
+When you click the button you’ll be taken to the action in the . Here’s a simplified version of it:
+
+This line will get the information that is stored in the external cookie and returns an instance of . This is exactly the same as what was done in the .
+
+This line creates a new instance of an ASP.NET Identity user using the email that was entered in the page where the user clicked Register.
+
+The third line creates a new user in the table:
+
+This line associates the newly created user with the external login provider we’ve just used. What this means is that a new record is created in the . A record in this table has four columns, ( , for example “Google”), ( , for example 123123123123 which you can think as of Google’s user id for the user that just signed in), which isn’t used (at least in this version of ASP.NET Identity as of 2017/04/29), and finally which is the user id of the newly created user in the third line.
+
+Creates a for the user and issues a to the application cookie. This is the cookie that has set to which means that on the next request, that middleware will will set with the user that was encoded in the cookie, effectivly making the user be “signed in”. Notice that the external cookie was never deleted in this flow. This isn’t a big problem since when the user eventually signs out, is called and that internally issues a sign out to all authentication middlewares.
+
+And this concludes the description of how using a external login provider works in ASP.NET Core, both using only authentication middleware and using ASP.NET Core Identity.
+
+There’s more to using ASP.NET Core Identity with external login providers. You can associate several of them to a local user account. And it is also possible to remove them while being sure that you won’t shoot yourself on the foot, for example by removing all ways a user has to log in. But that can be a topic for another blog post.|||
+
+The blog post explains how authentication using external login providers such as Facebook, Google or Twitter works in ASP.NET Core

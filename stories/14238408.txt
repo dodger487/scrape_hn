@@ -1,0 +1,47 @@
+I want exceptional debugging support for programs compiled to JavaScript (or wasm) on the web. I want first class developer tools support for these programs. Unfortunately, this isn't the case right now because source maps are currently insufficient.
+
+When boiled down to their essence, stepping debuggers enable users to do two things:
+
+A debugging format encodes information about a program that is lost at compile time, enabling source-level debugging of the compiled program. Source maps — the sole debugging format for compilers targeting JavaScript — can reconstruct source-level location information (filename, line, and column) which enables (1). However, that is the only data source maps encode, and the source map format does not attempt to solve (2). The result is that debugging programs compiled to JavaScript is positively maddening.
+
+The good news is that we can overcome this limitation and extend the source map format to support reconstructing source-level scopes, bindings, and values. Before we do that, we should understand how mature debugging formats encode this information and how it is in turn consumed by debuggers. The prevailing debugging data format for *nix-based systems today is DWARF. It supersedes earlier ad-hoc formats, such as stabs. DWARF's designers worked with earlier formats for years, and used that experience as the foundation upon which DWARF was built. What follows is an exploration of how DWARF encodes scope and binding debugging information while keeping an eye out for lessons we can learn and apply when extending source maps.
+
+DWARF uses a compact binary record format to store structured information, conceptually similar to Cap'n Proto or Message Pack serialization formats. These Debugging Information Entries, or DIEs, are made up of a type tag, a set of attribute type and attribute value pairs, and an optional set of child DIEs. With these children, DIEs form a tree structure.
+
+Furthermore, the metadata describing common attribute shapes can be factored out and de-duplicated with abbreviations. By using abbreviations, that previous series of DIEs can be compressed into this:
+
+With abbreviations, none of the attribute name and type metadata is repeated. This helps keep the debugging data compact. Debugging data can be huge in practice. Source maps can already be many megabytes in size, and the format already strives for as much de-duplication of data it can and only encodes limited debugging information as it is. This issue is exacerbated for source maps, because they are sent over the network and downloaded by debuggers. We must go to great lengths to keep debugging formats compact.
+
+Additionally, because the set of attributes a DIE contains is not fixed, the format is future extensible. New attributes can be added to provide new debugging information that wasn't previously encoded. If a debugger does not know how to interpret a given attribute, it can skip and ignore it. This is a huge deal for the web, where we tend to take many baby steps rather than a few giant leaps at a time. Any extension to the source map format must strive to remain future extensible.
+
+DWARF encodes data about the program's source-level scopes, bindings, and values in a DIE tree.
+
+Consider this example program, :
+
+Within this source, there are three scopes we are interested in: the top level, the main function, and the block within the while loop. These scopes nest to form a tree (it would be a more interesting tree with a more complicated example program). DWARF encodes this tree directly with DIEs: scopes have their variables as child DIEs, and nested scopes are also child DIEs of their parent scope's DIE. Different kinds of bindings, such as formal parameters vs. local variables vs. constants, are declared with separate DIE type tags.
+
+Below is a trimmed down subset of the information provides to debuggers via DWARF. It depicts the outline of the scope tree and the various bindings within those scopes. You can use the command line tool to view the text representation of the binary DIEs.
+
+Additionally, the start and end target location bounds of these scopes are embedded as well. These bounds are denoted with the and DIE attributes. When the debuggee pauses at a given target location, the debugger finds the innermost scope containing the current target location, and can walk up the DIE tree to find every binding that is in scope.
+
+Here is the DWARF data describing the bounds for the function, and the while loop's block:
+
+It is not enough to list the names of bindings that are in scope when paused during the program's execution. A debugger must also provide the current values of those bindings so that the user may inspect them for irregularities.
+
+Often, a binding's value is simply at some constant offset from the frame pointer. Other times it is in a specific register. Other times, the situation is a more complicated combination of these cases: for the first n instructions of this function, the parameter's value is located in this register, for the rest it is at that constant offset from the frame pointer. Even other times, a value is not located in one contiguous location! An optimizing compiler is free to explode a struct's members and store one member in a register, another member at this offset from the stack pointer, and to avoid even instantiating a value for the last member because that member is never used by the program.
+
+To handle all of these cases, DWARF employs "location descriptions". These descriptions are expressed in stack-based operations that form a Turing-complete language.
+
+JavaScript does not have frame pointers or registers. It has local, global, lexical, and dynamic (via ) bindings. It has objects and arrays with properties and indices. Because of that mismatch, it doesn't make sense for the source map format to adopt DWARF's location descriptions. Luckily, JavaScript engines already implement a sandboxed language for accessing and manipulating JavaScript values: JavaScript. We can embed snippets of JavaScript within the debugging data to locate a binding's value.
+
+We can extend the source map format to encode the source-level lexical environment, its scopes and bindings, and a way to locate those binding's values. This enables users compiling their programs to JavaScript to do the other half of their debugging: inspecting variables and values as they step through their programs instead of stepping blindly.
+
+However, we must ensure that source maps remain compact for quick downloads and parse times. The format should also be future extensible so we can add additional features down the line and don't need to reach consensus on everything all at once.
+
+Finally, we should follow DWARF's lead and encode the scopes as a tree and embed within each scope its set of bindings, their symbol names, the scope's location boundaries, types, etc. We can reuse JavaScript as our language for describing the location of a binding's value.
+
+If you are interested in being a part of these discussions, please join in at the Source Map RFC Repository.
+
+Thanks to Tom Tromey and Dave Herman for reading drafts.|||
+
+I want exceptional debugging support for programs compiled to JavaScript (orwasm) on the web. I want first class developer tools support for theseprograms. U...

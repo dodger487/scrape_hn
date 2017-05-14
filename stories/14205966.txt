@@ -1,0 +1,49 @@
+Fast feature development is critical to a company’s success. We all strive to increase developer productivity by decreasing the time to test, deploy, and monitor changes. To enable developers to push code safely, we run more than 20 million tests every day using our in-house distributed system called Seagull.
+
+Seagull is a fault tolerant and resilient distributed system which we use to parallelize our test suite execution. Seagull is built using the following:
+
+Before deploying any new code to production for our monolithic web application, yelp-main, Yelp developers run the entire test suite against a specific version of yelp-main. To run the tests, the developer triggers a job, which schedules the tests on our cluster. There are two important things to consider:
+
+The challenge is to execute each in minutes rather than days, while still being cost-effective, at our scale.
+
+First, the developer triggers a from the console. This starts a Jenkins job to build code artifact and generate a test list. Tests are then grouped together and passed to a scheduler to execute the tests on the Seagull cluster. Finally, test results are stored in Elasticsearch and S3.
+
+(1) A developer triggers a for a specific version of code (based on the git SHAs from their branch). Let’s say the git branch name is .
+
+(2) A code artifact and a test list is generated for and uploaded to S3.
+
+(3) Bin Packer fetches the test list along with test’s historic timing metadata to create multiple bundles containing tests. Efficient bundling is a bin packing problem and we use the following two algorithms to solve this problem, depending on the parameters passed to Seagull by the developer:
+
+We use Pulp LP solver to solve this equation
+
+Where, bundle and test_bundle are LpVariable, max_bundles and bundle_max_duration are integers.
+
+Normally we consider the testcases’ setup teardown durations in our LP constraints but for simplicity’s sake we ignore them here.
+
+(4) A scheduler process is started on a Jenkins host which fetches the bundles and then starts a mesos framework. We create a new scheduler for each .
+
+Each run generates more than 300 bundles, grouping each bundle to be around 10 minutes worth of tests. For each bundle the scheduler creates one mesos executor and schedules it on the Seagull cluster whenever sufficient resources are offered by the Mesos master.
+
+(5) Once an executor is scheduled on the cluster the following steps occur inside the executor:
+
+Each executor starts a sandbox and downloads the build artifact from S3 (uploaded in step 2). Docker images corresponding to test service dependencies are then downloaded to start the docker containers(services). When all the containers are up and running, the tests start executing. Finally, test results and metadata are stored in Elasticsearch (ES) and S3. To write to ES we use our in-house proxy service Apollo.
+
+If you are living in a distributed systems world one thing you cannot avoid is host failure. Seagull is fault tolerant towards any instance failure.
+
+For example, suppose a scheduler has two bundles to run. Mesos will offer the resources of an agent ( ) to the scheduler. Assuming the scheduler deems the resources sufficient, the two bundles will be scheduled on . Suppose for some reason goes down, then Mesos will let the scheduler know that is gone. The scheduler’s task manager makes a decision to retry those bundles or abort. If the bundles are retried, they will be re-scheduled when Mesos provides the next sufficient resource offer (in this case, from agent ). In case bundles are aborted, scheduler will mark those bundle’s tests as not executed.
+
+(6) Seagull UI fetches the results from ES using Apollo and loads it into a UI for developers to see their results. If they all pass, they’re ready to deploy!
+
+There are around 300 seagull-runs every day with 30-40 per hour at peak time. They launch more than 2 million Docker containers in a day. To handle this, we need to have around 10,000 CPU cores in our seagull cluster during peak hours.
+
+To maintain the timeliness of our test suite, especially at peak hours, we need to have hundreds of instances always available in Seagull Cluster. For a while we were using AWS ASGs with AWS On-Demand Instances but fulfilling this capacity was very expensive for us.
+
+To reduce costs, we started using an internal tool, called FleetMiser, to maintain the Seagull Cluster. FleetMiser is an auto-scaling engine which we built to scale a cluster based on different signals such as current cluster utilization, number of runs in pipeline, etc. It has 2 main components:
+
+FleerMiser saved us ~80% in cluster cost. Before FleetMiser, the cluster was completely on AWS On-Demand Instances with no auto scaling.
+
+Seagull has achieved a test result response time improvement from 2 days to 30 minutes and has also delivered a large reduction in execution costs. Our developers are able to confidently push their code without needing to wait hours or days to verify their changes haven’t broken anything.
+
+If you are interested in learning more, check out the AWS re:invent talks on Seagull and FleetMiser.|||
+
+How Yelp Runs Millions of Tests Every Day Chunky G., Software Engineer Apr 26, 2017 Fast feature development is critical to a company’s success. We all strive to increase developer...

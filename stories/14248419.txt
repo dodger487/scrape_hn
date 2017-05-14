@@ -1,0 +1,144 @@
+Linear logic has been proposed as one solution to the problem of garbage collection and providing efficient "update-in-place" capabilities within a more functional language. Linear logic conserves accessibility, and hence provides a mechanical metaphor which is more appropriate for a distributed-memory parallel processor in which copying is explicit. However, linear logic's lack of sharing may introduce significant inefficiencies of its own.
+
+We show an efficient implementation of linear logic called Linear Lisp that runs within a constant factor of non-linear logic. This Linear Lisp allows RPLACX operations, and manages storage as safely as a non-linear Lisp, but does not need a garbage collector. Since it offers assignments but no sharing, it occupies a twilight zone between functional languages and imperative languages. Our Linear Lisp Machine offers many of the same capabilities as combinator/graph reduction machines, but without their copying and garbage collection problems.
+
+The sharing of data structures can be efficient, because sharing can substitute for copying, but it creates ambiguity as to who is responsible for their management. This ambiguity is difficult to statically remove [Barth77] [Bloss89] [Chase87] [Hederman88] [Inoue88] [Jones89] [Ruggieri88], and we have shown [Baker90] that static sharing analysis--even for pure functional languages--may be as hard as ML type inference, which is known to be exponential [Mairson90]. [footnote 2] We show here that a system which takes advantage of incidental, rather than necessary, sharing can provide efficiency without the ambiguity normally associated with sharing.
+
+Linear logic was invented by Girard [Girard87] as a way to deal with objects which should not be blithely shared or copied. Wadler [Wadler91] has proposed the use of data structures with unity reference counts in order to avoid the problems of garbage collection and provide for O(1) array update. Wakeling [Wakeling91] has implemented linear logic and found that it is extremely slow, due to its requirement for laborious copying. Our Linear Lisp Machine implements unity reference count data structures more efficiently than Wakeling's machine, and should be "competitive" with traditional implementations of combinator/graph reduction machines.
+
+In this section we introduce an automata-theoretic model of a Lisp Machine in which all cons cells have reference counts of exactly 1, which implies that all data structures are trees--i.e., they have no sharing or cycles. For example, in our Linear Lisp, is isomorphic to .
+
+Our machine consists of a finite state control and n pointer registers which can hold either atoms or pointers to cons cells. An atom is either or a symbol. One of the registers-- --is distinguished as the "free list" register, and is initialized to point to an infinite list of 's. Another register-- --is designated as the "stack pointer" register.
+
+The machine can execute any of the following atomic operations:
+
+Proposition 1. List cell reference counts are conserved and are always identically 1.
+
+Proof by induction [Suzuki82,s.4]. All cons cells start out with unity reference counts, and are only manipulated by exchanges which preserve reference counts. QED
+
+Proposition 2. All list cells are always accessible--i.e. live, and no garbage is created.
+
+Proof by induction [Suzuki82,s.5]. Storage could "leak" only if we performed , but we do not allow the swapping of a register with a portion of its own contents. QED
+
+Programming Note: The only way to "clear" a register which points to a list is to decompose the list stored there and put it back onto the free list. [footnote 3]
+
+We can copy, but only by destroying the original list and creating two new lists.
+
+Finally, we can program recursive by destroying and recreating both lists. (We switch to Lisp notation in order to utilize the capabilities of .)
+
+Using these definitions, it should be clear that we can program a traditional Lisp interpreter (see Appendix). However, this interpreter will be inefficient, due to the extra expense of copying. The one minor problem to be faced is how to handle recursive functions, since we cannot create cycles. We suggest the following trick based on the lambda calculus Y combinator [Gabriel88]:
+
+In the previous section, we described a Linear Lisp Machine in which , and had to be programmed. Now that we have seen how to implement these three functions, we will describe a new machine in which they are primitive operations--e.g., they are implemented in microcode. This revision will not provide much additional efficiency, but it will provide a more traditional set of primitive operations.
+
+Using this new set of operations, we can now program our Lisp interpreter in the traditional way, although this interpreter will now be slower unless we have taken precautions to avoid extraneous copying. This interpreter is still linear logic, in which there is no sharing, however, so operations like cannot create loops.
+
+Before showing how to make , and more efficient, it is instructive to show a natural programming metaphor for Linear Lisp. The natural metaphor for Linear Lisp is quantum mechanics, in which objects interact, and every interaction with an object--including reading--affects the object.
+
+Linear Lisp calls for the mechanical interpretation of a function as a "black box" which consumes its arguments and produces its result, while returning the black box to its quiescent state. Since an argument to a function is consumed, the function can reference it only once, after which the formal parameter binding becomes unbound! In fact, the requirement to return the box to its quiescent state means that every parameter and local variable must be referenced exactly once, since it is a run-time error to return from the function so long as any parameters or local variables still have bindings. [footnote 5] In order to utilize a value more than once, it must be explicitly copied. We relax the "reference-once" requirement in the case of multiple-arm conditionals. Since the execution of one arm implies the non-execution of the other arms, the single use of the variable within each arm is sufficient to guarantee that single use is dynamically satisfied. [footnote 6] In fact, the best policy is to reference exactly the same set of variables in all of the arms of the conditional. The exactly-one-reference policy can be checked syntactically at compile-time in a manner analogous to the "occurs free" predicate of the lambda calculus.
+
+The following technique should make the programming of certain predicates more efficient. A value passed to a predicate is often subsequently used in the arm of a conditional, yet in many of these cases, the predicate does not depend upon any deep property of the value. The cost of copying and then consuming the entire value is therefore wasted. For such a "shallow" predicate, one might rather program it to return (a list of) two values--the value of the predicate and its reconstituted arguments, which is then bound to new parameters and (re)used in the subsequent computation.
+
+Since the argument to or is completely consumed, how can one gain access to both components? The natural model for binding in Linear Lisp is that of a destructuring bind, which binds a number of variables "simultaneously", while recycling the backbone of the value-containing list structure. This destructuring bind eliminates the need for separate and functions.
+
+Nested functional composition has the obvious mechanical interpretation, since the intermediate results are utilized by exactly one consumer. The mechanical metaphor also shows that parallel execution of subexpressions is possible and correct (so long as the primitive itself--the creator of argument lists--evaluates its arguments in parallel), since there is no mechanism whereby the subexpressions can communicate. Thus, collateral argument evaluation [Baker77] can be considered the norm, and on this machine there are no garbage collection problems because every callee is required to "clean up" after itself. Unfortunately, the hash consing technique described later requires that be (transitively) strict in both of its arguments. As a result, only variable binding itself can be lazy, which isn't nearly lazy enough for most interesting applications of laziness; lazy "futures" [Baker77] cannot be supported.
+
+The analogy with a dataflow machine [Arvind87] is quite close. Values are tokens which are consumed by a function to produce a new token/value. The implementation of the token metaphor on our Swapping Lisp Machine is straightforward. In addition to programmer-visible values, we also have "holes", which are the bindings of variables when they are "unbound". Argument passing is accomplished by "swap-in, swap-out" (reminiscent of [Harms91]), and "holes" flow backwards relative to values. When implemented in this way (see Appendix), avoids most copying, and should be reasonably efficient even without the hash consing scheme discussed in the next section.
+
+We will now show how to implement a linear machine with the instructions , , , , , , , , and in such a way that all of these instructions operate in O(1) average time. In other words, our machine will be as fast as a machine based on "hash consing" [Goto74], except that our machine can also execute .
+
+Our machine will operate on a "virtual heap", and the real heap will be separated from the CPU by a "read barrier" [Moon84]. More precisely, the cons cells pointed at directly by the machine registers will operate in the fashion described above, but any cons cells which are not directly pointed at by machine registers may be represented differently. In particular, any cons cells which are not directly pointed at by machine registers are represented in a hidden hash table which is built in such a way that list structures which are will be represented by exactly the same cell in this hash table. This "hash cons" table is built inductively from cells having atomic 's and 's by hashing the addresses of non-atomic 's and 's; this scheme is called "hash consing" and under the appropriate circumstances the cost of a "hash cons" operation averages O(1). Furthermore, these cells can be dereferenced for or in O(1) time. These cells cannot be side-effected, however, so that cannot be used directly on these hash-consed cells. We will manage this hash table using reference counts, since we intend that cells stored in this table are capable of being shared.
+
+We now analyze the operation of the read barrier. If the CPU attempts to read the or of a cell referenced directly by a machine register, then the read barrier causes the cell in the hash table to be copied ("unshared") into a normal cell, and the reference count of the cell in the hash table is decremented. Similarly, if the CPU attempts to write the or of a cell referenced directly by a machine register, then the cell is copied into the hash table by "hash consing" (including incrementing the reference counter) and the copied pointer is stored into the instead.
+
+Since there are never more than n "normal" cells which can be seen by the CPU, because there are only n registers, and because none of these normal cells can be shared, we can eliminate the expense of allocating and deallocating these cells, and associate one of these normal cells with each machine register. Thus, all storage management effort is concentrated in the hash cons table.
+
+Another optimization is that of keeping a "hidden" pointer in each normal cell to the entry in the hash table from which it was copied; if it is newly consed, then this pointer is empty. This pointer is used as a "hint" when hash consing, so that no searching will be necessary to share the cell in the hash consed heap. Of course, any side-effects to this normal cell will cause its "hint" pointer to be cleared, since we will now require a hash lookup in order to share the cell in the hash consed heap.
+
+Since the free list seen by the CPU is an infinite list of 's, we can represent it as a special circular list of one cell in the hash table whose reference count is not modified. In this case, the free list register is identical in nature to the other registers in the CPU; the only difference is in the hash table pointer stored in the of the first cell on the list.
+
+Of course, there is a real "free list" which is hidden from the CPU which is used to provide cells for the hash table when a never-before-hashed < > configuration is seen. This "free list" is refreshed whenever the reference count of a table entry drops to zero. Depending upon our time/space tradeoff, we can either recycle hash table cells aggressively or lazily. If we recycle aggressively, then we may have to recycle an unbounded number of nodes at one time, which can create an unbounded delay. Alternatively, we can recycle lazily, in which case the and of a recycled cell are only marked as deleted, but not actually reclaimed, at the time that the reference count for the cell drops to zero. Notice, though, that any sublists of this "garbage" list are still hashable by the hash table and can become non-garbage at any time. Thus, the garbage is not really garbage, although it can only be used for a very special purpose until recycled for general use.
+
+We can now describe the operation of our "fast" machine. All primitive operations, with the exception of , and , operate exactly as if the CPU were operating on a "real heap" rather than a "virtual heap". copies only the top-level cons cell, and "copies" the sublists by simply incrementing the reference counts of the and cells in the hash table. compares only the top-level cons cell, and simply compares the addresses of the 's and 's for their locations in the hash table. Thus, and are both O(1) operations. If we utilize lazy recycling for hash table entries, then is also an O(1) operation.
+
+It is interesting to analyze the operation of a traditional Lisp interpreter written for this Linear Lisp Machine (see Appendix). Since traditional Lisp utilizes "applicative order" evaluation, an argument used multiple times is only evaluated once. The traditional problem in "call-by-need" evaluation has been the shared flag variable which indicates that the argument has already been computed; Linear Lisp utilizes its arguments exactly once, with an explicit copy required for additional uses, so the applicative-order/normal-order issue is moot and the shared flag variable is not necessary. Our use of hash consing requires transitive strictness on both of its arguments; otherwise 'ity could be decided prior to the determination of a lazy value, since and are equivalent for hash conses. Thus, parallel evaluation of arguments can be supported, but not laziness. On the other hand, the implicit synchronization required to strictly resolve a "future" [Baker77] can be efficiently performed with a swapping operation [Herlihy91].
+
+Since the association list of variable bindings must be destroyed in order to search it anyway, the "shallow binding" technique utilizing "rerooting" [Baker78] is essentially optimal.
+
+We can destroy the Lisp program during evaluation in the manner of combinator/graph reduction [Turner79] [Kieburtz85] [Kieburtz87] [Johnsson85] [Johnsson91]; indeed, we must destroy it, since we cannot reference it otherwise, as all of its reference counts are one!
+
+Linear Lisp can be used in a "shared-heap-memory" multiprocessing configuration, in which the memory to be shared is actually the hash consed heap. Each CPU operates independently, with its "normal nodes" acting like a local cache into the heap. The read barrier logic is the "cache consistency protocol" for this hashed memory, which is simple because there is no visible sharing among CPU's. This parallel configuration can be used, e.g., for the collateral evaluation of arguments.
+
+Hardware swapping has been advocated as a synchronization mechanism [Herlihy91]. However, even without hardware swaps, modern RISC compilers can optimize register-register swaps, while write-back caches reduce the cost of register-memory swaps; swaps should thus be relatively cheap even on a traditional load/store architecture.
+
+Some have suggested that garbage collection not be done at all [White80] or after the program has finished [Moon84] (comment on the Boyer benchmark). Linear Lisp provides a hyper-clean environment in which garbage is never produced, and therefore garbage collection is not necessary.
+
+Hash consing was invented by Ershov for the detection of common subexpressions in a compiler [Ershov58] and popularized by Goto for use in a Lisp-based symbolic algebra systems [Goto74] [Goto76] [Goto80]. While a hash-consing system with reference count management can be used to implement a functional (applicative) subset of Lisp with the same efficiency shown here, we believe that our Linear Lisp Machine is the first efficient implementation which allows for (linear) side-effects such as . See [Baker92] for a "warp speed" implementation of the Gabriel "Boyer" benchmark using hash consing.
+
+Linear Lisp is an ideal environment for symbolic algebra, since it provides the efficiencies of sharing, including fast copying and fast equality checking [Goto76], without the problems. For example, the Macsyma symbolic algebra system can represent the symbolic determinant of an nxn matrix with O(n^3) cons cells, even though this expression prints out with O(n!) terms. Furthermore, Linear Lisp allows for destructive operations on expressions, which can sometimes be more efficient [Gabriel85] [Fateman91], yet these destructive operations are completely safe.
+
+While our Linear Lisp cannot support laziness, because is transitively strict in both arguments, it does support a mild form of side-effects. Linear Lisp cannot be used to produce (visible) sharing, and hence requirements for "object identity" expressed in [Baker93ER] are vacuously met for cons cells. These cells live in a twilight zone between functional and non-functional data; any "side-effects" to the data are not really "side"-effects because they are not visible through any other pointer alias. [Myers84] describes a scheme for implementing certain imperative data structures efficiently using applicative data structures. We believe that the implementation of side-effects in Linear Lisp automatically produces the efficiency claimed by his scheme, without translating the program into applicative form.
+
+[Harms91] discusses the advantages of unity reference count data structures and swapping for efficient programming of abstract data types, although he utilizes notions as "unshared" or "non-aliased" instead of unity reference counts. [Kieburtz76] also advocates the use of hidden (unity reference count) pointers. Pointer swapping can be used to minimize reference count overflows in systems with limited counts [Wise77], and to avoid appearing multiply referenced [Deutsch76]. Memory-to-memory swapping is a superior form of synchronization [Herlihy91], so we expect to see efficient swapping operations implemented on future shared-memory multiprocessors.
+
+Our Linear Lisp Machine consumes the programs it interprets, therefore requiring a private copy of the code in the manner of a combinator reduction machine. The Linear Lisp is more efficient, however, than the real copying utilized in combinator reduction machines. A machine which consumes its programs provides new insight into the mechanisms of instruction caches (see also [Kieburtz87]) and "index registers". Since index registers were invented in order to avoid side-effecting code, and since all modern CPU's utilize instruction caches, the index register is obsolete! Linear logic provides a firm semantics for an unshared instruction stream, which could be destructively modified without causing havoc.
+
+Other approaches to "linear-like" logic include connection graphs [Bawden86], chemical abstract machines [Berry90], linear abstract machines [Lafont88] and interaction nets [Lafont90].
+
+We have not yet integrated arrays into our Linear Lisp, so we cannot perform imperative array updates. However, [Baker91SB] shows an efficient O(1) implementation of array updates for "single-threaded" programs. Another approach would be to incorporate I-Structures [Arvind89] into Linear Lisp.
+
+We appreciate the helpful discussions with Peter Deutsch, Richard Fateman, Robert Keller, Nori Suzuki and David Wise about these concepts.
+
+Abadi, M., and Plotkin, G.D. "A Logical View of Composition and Refinement". (Jan. 1991), 323-332.
+
+Arvind, and Nikhil, R.S. "Executing a program on the MIT tagged-token dataflow architecture". v. II, Springer LNCS 259, 1987, 1-29.
+
+Arvind, and Nikhil, R.S., and Pingali K.K. "I-Structures: Data Structures for Parallel Computing". 4 (Oct. 1989), 598-632.
+
+[Baker77] Baker, H.G., and Hewitt, C. "The Incremental Garbage Collection of Processes". 8 (Aug. 1977), 55-59.
+
+Bloss, A. "Update Analysis and the Efficient Implementation of Functional Aggregates". London, Sept. 1989, 26-38.
+
+Collins, G.E. "A method for overlapping and erasure of lists". 12 (Dec. 1960), 655-657.
+
+Gabriel, R.P. "The Why of Y". 2 (Oct.-Dec. 1988), 15-25.
+
+Goto, Eiichi. "Monocopy and Associative Algorithms in an Extended Lisp". Tech. Rep. 74-03, Info. Sci. Lab., U. Tokyo, April 1974.
+
+Goto, Eiichi, and Kanada, Yasumasa. "Hashing Lemmas on Time Complexities with Applications to Formula Manipulation". Yorktown Hgts., NY, 1976.
+
+Harms, D.E., and Weide, B.W. "Copying and Swapping: Influences on the Design of Reusable Software Components". 5 (May 1991), 424-435.
+
+Inoue, K., et al. "Analysis of functional programs to detect run-time garbage cells". 4 (Oct. 1988), 555-578.
+
+Kieburtz, Richard B. "Programming without pointer variables". Proc. Conf. on Data: Abstraction, Definition and Structure, Sigplan Not. 11 (special issue 1976), 95-107.
+
+Knight, Tom. "An Architecture for Mostly Functional Languages". MIT, Aug. 1986, 105-112.
+
+Lieberman, H., and Hewitt, C. "A Real-Time Garbage Collector Based on the Lifetimes of Objects". 6 (June 1983), 419-429.
+
+Mason, Ian A. Ctr. for the Study of Lang. & Info., Stanford, CA, 1986.
+
+Morris, J.M. "A proof of the Schorr-Waite algorithm". In Broy, M., and Schmidt, G., Eds. NATA Advanced Study Inst., D. Reidel, 1982, 43-51.
+
+Rees, J. and Clinger, W., et al. "Revised Report on the Algorithmic Language Scheme". 12 (Dec. 1986), 37-79.
+
+Schorr, H., and Waite, W.M. "An efficient machine-independent procedure for garbage collection in various list structures". 8 (Aug. 1967), 501-506.
+
+Wadler, Philip. "Is there a use for linear logic?". New Haven, June, 1991, 255-273.
+
+Wakeling, D., and Runciman, C. "Linearity and Laziness". LNCS 523, Springer-Verlag, Aug. 1991, 215-240.
+
+Wilson, Paul R. "Some Issues and Strategies in Heap Management and Memory Hierarchies". 3 (March 1991), 45-52.
+
+Obscure reference to old Proctor & Gamble television advertisement for Crest toothpaste.
+
+We have conjectured that sharing analysis [Baker90] utilizing ML type inference will elicit its exponential behavior.
+
+One could use the Weizenbaum lazy recycling trick [Weizenbaum63] and put garbage onto the free list; this trick has also been advocated by [Wise85]. Putting garbage onto the free list moves work from the point of freeing to the point of allocation; this may smooth out the work, but does not decrease its amount, unless the program terminates with a dirty free list.
+
+There are implicit "old-PC" stack operations involved with recursive calls, but we leave those details to the reader.
+
+I.e., no values can be "left on base at the end of an inning", to provide a baseball analogy. This error can usually be checked at compile-time.
+
+Copying is still required if speculative execution of an arm is performed.|||
+

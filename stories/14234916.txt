@@ -1,0 +1,166 @@
+Swift has rich value types, which is a new experience for many software developers. This has opened the door for the functionalists to ride in.
+
+What I call "functionalism" is really the philosophy of functional programming, which is in fact a very old idea. The idea is that a lot of bugs in programming today are due to having the wrong state. For example, the Heartbleed bug happened because someone re-used the same array for a different purpose. So the solution, clearly, is to get rid of mutable arrays, and mutable variables, and the assignment operator, and you can't have the heartbleed bug now. (Why they did not also get rid of the programmer is an exercise left to the reader.)
+
+As you can tell by the tone of this essay I am not a functionalist, although in the interests of fairness I will defend them on two points before I tear into them. The first is that there are, legitimately, moments where state does more harm than good. There are even moments like that on most software projects. If you have a problem that feels very mathematical, then it can often be represented in a functional paradigm very well.
+
+The second point of defense is that this whole scheme works a lot better than you might expect. The way they write functional programs for decidedly non-functional problems is through a trick called a monad, which I will not explain and nobody understands anyway, but the point is, in the hands of a very clever programmer, functional programming "can" be used in many more places than you would naively expect.
+
+And that is really the problem. It works at first and then it keeps working until suddenly it doesn't. And this functionalism spreads ideologically until your codebase is saddled with debt and nobody can bail you out because you have a lot of monads and nobody can understand them.
+
+But this is not a rant about functional programming; this is a rant about Swift.
+
+Swift has rich value types, which operates like a light that draws the functionalists and functionalist-sympathizers towards it. Who are all wondering if, perhaps, this turn of events means their weekends poking around in Haskell are now at last commercially relevant.
+
+The problem, like all problems in programming, is figuring out which tool is right for which job. Programming is a discipline prone to cargo-cult thinking, which is why your company religiously performs the Agile Scrum magic spell and yet somehow the project is still late. So it turns out there's no magic trick that makes all programs better.
+
+The trouble is that Swift is a young language and we don't have a good intuition about if tool X is a good fit for the problem or not because Tool X was announced 1 year ago and most people are doing Swift part-time right now.
+
+This leads to vaguely positive statements like Andy Matuschak's in which he is "emphatically not suggesting that we build everything out of inert values" and yet we should "Think of objects as a thin, imperative layer" which presumably leaves a thick layer of values for everything else, and "As you make more code inert, your system will become easier to test and change over time" which is vaguely true but when taken to its logical conclusion seems to contradict his earlier statement that "not everything" should be a struct.
+
+Meanwhile some other, less-pessimistic people actually have run this out to its logical conclusion. And that produces results like the top SO answer
+
+I'm not saying these people are on crack, but they have been swindled by the funtionalist lobby. A lobby that wants you to believe that one weird trick will make your codebase better, replacing the cargo-cult Agile practices with equivalently useless cargo-cult functionalist practices.
+
+Meanwhile, I have been working in Swift practically full-time since it was released, and have built entire projects in several different Swift programming paradigms. I will first develop what is wrong with the Structs Philosophy™ and then I will present a totally different paradigm that leverages structs where they work in real life and not where they don't.
+
+First, we will consider as our object of study a project that has no legacy dependencies. That is, it's Swift "all the way down". This excludes a whole category of problems of the form "You wanted to use structs but you needed to implement so you can't."
+
+Second, I want to consider a project that is arbitrarily large. Obviously, because arbitrarily small programs are boring. But really, because arbitrarily large projects are guaranteed to have all the problems that it is possible to have within the language features that we allow ourselves.
+
+Since our program is arbitrarily large, it follows that it can send mail. (The proof is straightforward: if it doesn't, then there exists some larger program that sends mail, and then our program is not arbitrarily large.)
+
+Of course, our program can not only send mail, but it can send HTTP requests, and send birthday presents, and any number of other things. Naturally, we encode this behavior with a protocol.
+
+Now we can implement this protocol with our NetworkSender, our BirthdayPresentSender, and so on. And these are all implemented with Structs because we follow the Struct Philosophy™
+
+Now our program, naturally, has unit tests, (because it is arbitrarily large). And so we have a MockSender somewhere that we use as a mock for our tests.
+
+We can of course implement our CanSend protocol for our MockSender:
+
+Well obviously. We just have to make a mutating function.
+
+Now if you are not intimately familiar with Swift semantics I should probably explain what mutating functions are. They are perhaps poorly named.
+
+What they really do logically is they generate a completely new version of the struct and assign the caller's reference to this new version. This becomes clear if you read the Swift book:
+
+is really semantic sugar for
+
+so there is not really a mutation here so much as the illusion of one. But anyway
+
+With mutating funcs, we get
+
+Right, so the problem is our protocol says the function is non-mutating, but in reality it needs to be mutating.
+
+So we go change the protocol, right? I mean after all, by definition this program has no legacy code, so we can structure the protocol however we want.
+
+First off, 90%+ of the types that implement can be side-effect-free, at least at their own level of abstraction. When you call posix for example, you don't need to record that fact anywhere. When you call you don't update any state. Deep down in your kernel, sure, there is some mutable state. But if your implementation of consists of passing the message onto somebody else to deal with, you can implement that fine as a non-mutating . In fact the Struct Philosophy says you should. It wants you to prefer immutable state.
+
+It's that last 10% of the time that's a problem though. Here we have a mock that needs to track what messages it's been sent, and that requires mutating state.
+
+We can solve this problem with a device called an "inner class", which you probably have already seen, but if you haven't just imagine that there is some god-awful way to create a mutating implementation of a non-mutating func, and we will cover the details later.
+
+Now we can do more than simply send messages. We have arbitrarily large protocols in our arbitrarily large program.
+
+As we've established, most types (say, 90%) can implement funcs in a non-mutating way. But to quote another Zawinski law, "Everybody uses a different 10%".
+
+Similarly, for every type that is sufficiently large, it conforms to some non-mutating protocol with a mutating implementation.
+
+Or, to put this in code
+
+Now. How are we going to solve this problem? Well, the mutating inner class. And fun fact: we've used one already while you weren't paying attention. I've just kept it out of view.
+
+Recall that when we send a message via posix , "way down in the kernel" somewhere, there is mutable state. In other words, we have wrapped a mutating type in an immutable one.
+
+If you're anything like me, the above listing has a "code smell". But the problem is, this isn't any different from the way we've done it earlier. There's always been a kernel out there somewhere, that has a mutable buffer to store the messages. The only difference is now instead of being "out there somewhere" it has a code listing that we see in front of us.
+
+If there is a problem with this, then there must be the same problem in all the earlier examples. If there is no problem with them, there can't be one here. In any case we must be consistent.
+
+Anyways, There is mutable state "out there somewhere" and we're just wrapping it in an 'immutable' container. Is this really a struct though? Because the move semantics are weird.
+
+I claim that when we depart from the land of "pass-by-value" and even "pass-by-reference" into "pass-by-WTF", we have departed the land of the reasonable. So something is very very wrong here.
+
+Even the Swift engineers are with me on this one. WWDC 2015 414 "Building better apps with value types in Swift"
+
+Let me talk about what is not wrong. It is not wrong to wrap a class in a struct. This is how Swift.Array works under the hood.
+
+Here's a WWDC slide verifying that they do, in fact, use classes-inside-structs "throughout" the standard library:
+
+The difference is, A) they have been really clever about hiding the inner class, which involves a lot of code and neat tricks that you can learn more about in the WWDC session (e.g., this is an advanced topic, that you should not sprinkle liberally throughout your codebase where the muggles will see it) and B) there is nothing fundamentally classful about arrays. Arrays are, from a certain point of view, a kind of value. So it makes sense for them to be a value type.
+
+Our isn't like that though. In reality our KernelSender wraps an underlying singleton--the kernel. You don't have two kernels. You can't copy a kernel. A kernel isn't a value. It's a machine.
+
+The conclusion here is that anything that wraps (read: calls) the kernel really shouldn't be a struct. The implication being that you should not write structs that do:
+
+But if you consider what we're really saying, we're really saying you shouldn't wrap not just the kernel, but any singleton. Any singleton that you try and mess with from a struct will have this issue, becuase the references to those singletons don't get copied. So we can add to the list of things you shouldn't do with structs:
+
+So what's left? What's left is the classic value type stuff. "Bag of ints" . Stuff that is pure data. The "leaf nodes" of your object graph. The "dumb models" in your MVC.
+
+But when it comes time to actually save any of those models to disk, or push them over a network, or draw them to the screen, or whatever, you need a class. Classes everywhere. Not "immutable valuable types everywhere" like in the Struct Philosophy™
+
+Value types are often championed as applicable for "purely functional" problems (and they are certainly more applicable there than to the real-world problems we have studied so far).
+
+One commonly-proffered example of an applicable problem is the Sieve of Erosthenes, which can be elegantly expressed with immutable value types:
+
+Unfortunately this algorithm is not the Sieve of Erosthenes, not the least because the real Sieve is O(n*ln(ln(n))) and this algorithm is O(n^2) because we had to copy our array instead of mutating it, a result derived in this paper. The author concludes:
+
+It turns out you actually can implement the Sieve of Erosthenes in a purely functional style, but it is a lot longer than the ordinary mutating one and it is so nonintuitive that apparently nobody in practice ever does it.
+
+The moral of this story is that immutable, pure functional programming does not always work even in the literal textbook examples. A mutating implementation of the Sieve is both simpler and faster, and far from helping, functional programming has actually hindered the exercise of writing fast, maintainable code.
+
+By now you should be on your guard against anyone who promises one weird trick to a better codebase.
+
+I now present an alternative to the Structs Everywhere™ philosophy that I think is practical and resolves difficult cases, including all of the ones above, quickly and easily.
+
+Imagine your coworker Jeff comes to you with the following question:
+
+If your answer to this hypothetical question is "Of course", or "I thought that was already implemented", use a struct. Note that CGRect et al, as well as your "dumb models" fit easily into these answers.
+
+If your answer is anything else, use a class. But especially these:
+
+All of those responses are hints that you don't want a value type after all, but a reference type. Use a class.
+
+I call this trick the "Jeff trick", since conversations with Jeff neatly resolve nearly every quandry I have about structs and classes.
+
+Meanwhile, in the Swift Book, Chris Lattner has already ruled on when you should use classes and when you should use structs. (As the most experienced Swift developer, he would know.) I will now reproduce his guidance here, which I intersperse with commentary. Notably, it's basically the Jeff Trick, but harder to read because he writes compilers for a living and is way smarter than any of us.
+
+Note that this is trivially a case where you would tell Jeff to override
+
+Here he is setting up those requirements that make equality-by-comparing-values sensible. If your struct wraps a class instance (say, it wraps an ) then checking is not sensible, because .
+
+This raises complicated questions about what it means for to be equal to , which is yet another case where you would question Jeff's sanity.
+
+The guidance then continues with 3 specific examples of good structs, all of which you would be happy to let Jeff define equality for:
+
+Finally, the official Apple guidance concludes with this dire warning:
+
+First off, if you can imagine a kernel that forward-thinking you live in a cooler world than mine. But in fairness, I did say "no legacy code".
+
+But the problem is actually deeper than simply marking methods as mutating and non-mutating. If we consider an arbitrary stack of types
+
+Suppose we want to introduce a new implementation with side-by-side with .
+
+To achieve this, must be , and so must , and so must . Now that does work, but when you run that out arbitrarily, all functions are mutating, and when everything is mutating, you're no longer following the Struct Philosophy™, which has the tenet "immutable types everywhere".
+
+The insight here is that doing anything of value involves calling at least one mutating function and as soon as you do that, your function must be mutating, and everything that calls you must be mutating, and it's mutating all the way up, except for the silly leaf nodes like or your bag of s.
+
+The second insight is "surprise mutation", as in, "I am surprised to realize I need to call a mutating function". And now you have to wander all over your codebase and sprinkle mutating everywhere so you're allowed to do that.
+
+Maybe. The thing is, I have a lot of experience in pure Swift projects at this point and I consistently underestimate the number of mutating functions that be will uncovered later.
+
+So I'm reporting to you that when you estimate 10%, it's really more like 50% a month from now.
+
+Fun fact: I actually have a struct in my codebase where I explicitly wrote code to make it thread-unsafe because the cost of doing thread safety on its inner class was too annoying and there's only ever one of them anyway.
+
+The thing is, when you weigh your codebase by types, most of your types don't need to be threadsafe. You have a lot of things that are only going to have "one" instance. e.g., I hope you only have one MainViewController in your application. You should not be investing in the work to make that threadsafe.
+
+When people think about threadsafety they think about things they have a lot of instances of (e.g., ). Sure, make that a struct. That will solve a lot of problems for you. But now you have one struct type. Make your models a struct. Now you have 10 struct types. Maybe at runtime you have thousands or millions of structs of those 10 types. When you weigh your program "by instances" you have a lot of structs. Good for you. You've solved a large class of race conditions.
+
+But no part of that implies "for every type, it should probably be a struct". It doesn't mean "Type whenever you create a new type." . Most of your types do not need to be threadsafe. You do not have enough instances of them for threadsafety bugs to be a real issue. And the overhead to figure out the vs non- stuff on those things you don't really care about is nontrivial.
+
+Yeah, I'll let you write that essay, and then I'll try to read it and probably not understand any of it.
+
+Well, that is actually a valid objection. I wrote this playground to try to explain to myself what I didn't like about my current codebase and to try to develop a better rule of thumb than "everything is born a struct" which is what the Struct Philosophy™ advocates. And to develop an actual alternative rather than a generic "down with this sort of thing" criticism.
+
+Now that I've developed it, I will get better about using it.|||
+

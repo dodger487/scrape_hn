@@ -1,0 +1,63 @@
+A timing attack is usually an overlooked threat. Is it just a fluke or can it really be pulled off on a real web server?
+
+JSON Web Token (JWT) is a secure way to represent claims between the server and the client. Its stateless nature allows better scalability on the server side as it doesn’t require stateful sessions or database querying on the server. The decoded JWT consists of three parts:
+
+The encoded token is the concatenation of these three parts:
+
+After Alice authenticates herself on the server, it creates a JWT with her claims. As the token contains enough information to identify Alice, the server only needs to validate the signature. Because of this, anyone who could forge a valid signature could impersonate any user.
+
+JWT is a sophisticated, secure method with numerous options. For more details check RFC 7519.
+
+A timing attack is a side channel attack in which the attacker can compromise the crypto system by measuring how long it takes the system to respond to different inputs.
+
+Imagine that the server protected by JWT would reply with a message:
+
+It would be trivial to find the first byte and then the second byte of the valid signature. We could forge a valid signature for anything. We can get the same behavior if a weak JWT library is used.
+
+To verify a signature using symmetric-key cryptography, the server typically calculates the valid signature for the given payload and compares it with the one provided. A potential vulnerability of this method is the use of a lazy algorithm for the signature comparison.
+
+If the first byte of the provided signature matches the valid one, we check the second byte and so on. However, if a byte doesn’t match, we stop comparing other bytes. Obviously the more bytes we compare, the more time the process takes.
+
+As the payload is not encoded anyone can easily construct an invalid JWT in an attempt to impersonate Alice.
+
+Imagine that the server responds measurably slower if the first byte of a provided signature matches the first byte of the valid signature:
+
+It would take 256 attempts to find out the first byte of the 256 bit signature; another 256 attempts to find the second byte and so on. It would take 8192 attempts to find the complete valid 256 bit signature. The strength of a 256 bit signature would degrade to 13 bits.
+
+Even if it takes a few operations more to compare one byte than to compare two bytes; the time difference is expected in nanoseconds. We need more advanced tools to reliably measure this over a noisy network.
+
+We need to take a big sample of response times for various signatures. Then we filter the sample to reduce the noise and analyze the response time distribution.
+
+For the attacked web application, I’ve created a simple Scala application with Akka HTTP (the project is available on GitHub). For simplicity, it only expects the plain signature in an HTTP header. To validate the signature, the server uses a lazy algorithm, so it’s vulnerable. If the signature is invalid, the server sends it back in the response so it’s easier to analyze later.
+
+I’ve deployed this application to Google Container Engine with Kubernetes, it uses four pods and a global load balancer to simulate an actual web server.
+
+To generate test traffic, I’ve used a simple Akka reactive stream Scala program to send the signature guesses. It randomly sends two guesses and some noise.
+
+I ran this program on my local machine so the requests and responses went through the internet. I sent requests with different signature guesses; guesses with zero and one byte matches. I generated 200k request/response pairs for each guess.
+
+Precise measurement of the response times is key in this test; to get precise times we will use low level TCP timestamps instead of HTTP-level logic. I used Wireshark to capture and extract the TCP timestamps from the HTTP traffic I generated.
+
+As this data is very noisy, it’s useful to apply a smoothing filter on it. I used a simple, moving mean filter, but for better results we could apply the Kalman filter.
+
+To compare response times of different signature guesses, I fitted normal distribution on the response time histogram. We can see that the mean value of the zero byte match is lower than the one byte match.
+
+Even if the difference is only 0.0011 nanoseconds, the test is reproducible and each gives similar results.
+
+For signature equality you can use MessageDigest.isEqual from Java (this method used to be vulnerable) or a similar, robust library.
+
+JWT is a secure and convenient method for authenticating users, make sure that the your chosen library is safe against timing attacks.
+
+Also make sure the library checks the token validity and total lifetime; in this way you can reduce the attacker’s time to forge valid signature.
+
+Check out my JWT library on GitHub.
+
+Even if a time difference is small, it’s measurable and it is exploitable.
+
+One difficulty is the number of requests a potential attacker needs to find the bytes. Using the earlier example — to find the first byte, let’s try all possible bytes 500k times. So after 128 million requests, we could identify the first character; after another 128 million, the next, and so on. To find the complete 256 bit signature, we would need 4096 million requests in total. The strength of a 256 bit signature would degrade to 32 bits.
+
+At first, 4096 million requests sounds like a huge number, however they come from distributed attackers. The nature of a DDoS attack supposes that attackers could send 50k requests/second. If this rate were sustained, the attack would take 22 hours to find the valid signature.
+
+It is not easy to pull off, but very achievable.|||
+
+A timing attack is usually an overlooked threat. Is it just a fluke or can it really be pulled off on a real web server? JSON Web Token (JWT) is a secure way to represent claims between the server…

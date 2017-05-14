@@ -1,0 +1,29 @@
+This is public postmortem for an a complete shutdown of our internal Kubernetes cluster. It’s shared with you all so everyone may learn.
+
+Saltside has multiple Kubernetes clusters for different use cases. This postmortem covers an outage on . This is our nonproduction cluster used for general developer experiments and as a target for CI builds. I lead the SRE team at Saltside. We’re responsible for provisioning and maintaining these clusters.
+
+I had completed a round of work on our application’s Helm chart and needed to test the CI process on my machine before making some commits. The CI process builds charts for all our markets (Efritin.com, Tonaton.com, Ikman.lk, and Bikroy.com), installs them on a cluster ( ), and runs against each release. I fired off the command and monitored pods with . All pods came to the phase after sometime. I continued watching the pods incase of failed probes triggering extra restarts. I noticed some pods entered the phase after being . I shrugged this off as a transient issue that would resolve itself. Nothing was broken or critical at this point, plus I had a meeting to attend. I expected things to resolve during the meeting.
+
+I checked on things two hours later. The issue had not resolved itself. It became larger. I noticed pods in an state. This was new to me and really piqued my interest and made me thing something had definitely gone wrong internally.
+
+I used to find more information. The pod event logs were full of image pulling errors from the container runtime (Docker in our case). Again, I largely wrote this problem off because:
+
+My estimation at his point was things has gotten overwhelmed pulling all the images. I decided it would be easier to start deleting things given the uncertainty around the root cause and low business impact of the current conditions.
+
+I attempted to start with deleting Helm releases. This would delete everything ( , , , , ) without needing to delete individual resources. Unfortunately the pods in had started trashing. They were in a crash loop for an unknown reason. Now the only option was to delete things outside of and worry about afterwards.
+
+Initial commands seemed to work successfully but nothing actually was removed. I started to assume there was some strange internal inconsistency that was being exacerbated by CPU/Memory/Disk consumption. A quick google search (naturally leading to Stack overflow) revealed a way to forcibly delete resources. I added and attempted to delete pods. The pods where removed from Kubernetes (not known in ). However I did not verify at Docker level (which should have been done). Now I needed turned my attention to restoring the service.
+
+I ran to see the internal state there. Pods were in a variety of undesired states. Notably some where in . This was another I had not seen before — another indicator of something going seriously wrong. This prompted me to inspect the nodes with . Some nodes reported the container runtime was done and others reported the kubelet was done for various failed checks. I attempted to SSH into the instances but my connections repeatedly timeout. I decided it would be easier to simply terminate these instances and let the ASG sort it out. I terminated the three worker nodes and waited for new instances to join the cluster. Sure enough everything was back to normal after about 10 minutes.
+
+This sequence of events was quite concerning. The normal activity of deploying our application could collapse the cluster and leave things in disarray. Terminating worker nodes is undesirable solution because pods are not drained to other nodes which would like create unavailability for our customers. It works, but it cannot be standard procedure for these kind of outages. Beyond that there were other important observations about out current setup:
+
+There were some short term actions to take based on the observations. First, I wanted to repeat the process with more telemetry to better diagnose the system bottleneck. I fixed the issue with the DataDog integration and our nonproduction AWS account so there was some data. I suspected bottleneck was either the disk or the Docker daemon itself. I repeated the process and watched the EBS metrics. The results were conclusive:
+
+The graphs show the EBS queue length hockey sicking. It turns out that Kops used 20GB EBS volumes by default. IOPs are tied to disk size. We needed more IOPs and more disk space ( reported 90% usage). This also revealed does not support EBS optimization. Hopefully this if fixed (GitHub issue) in future release. This was may not solve the problem, but it will increase overall performance. This is also a problem for large instance types that require EBS optimization. I scaled up the root EBS volume to 120GB and repeated the exercise. I also deployed that ran a sleep loop inside common base images (e.g. or ). This hack work around “pre-pulled” images on nodes until Kops supports user supported hooks. This time charts installed successfully without killing the Kubelet. However other things broke so the cluster still cannot support this amount of parallel container operations.
+
+I also spend time investigating the other observations.
+
+There are two things that keep me up at night right now.|||
+
+This is public postmortem for an a complete shutdown of our internal Kubernetes cluster. It’s shared with you all so everyone may learn. Saltside has multiple Kubernetes clusters for different use…

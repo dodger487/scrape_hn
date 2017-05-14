@@ -1,0 +1,71 @@
+While other languages such as C# offer type-safe callbacks/delegates out-of-the-box, C++ unfortunately does not offer such features. But delegates and events provide a nice way of “coupling” completely unrelated classes without having to write a lot of boilerplate code.
+
+This blog post describes a generic, type-safe implementation of such delegates and events using advanced C++ features such as non-type template arguments and partial template specialization, supporting both free functions and member functions alike, without any restrictions or dynamic memory allocation.
+
+Again, let’s start with a simple example of how we want to use delegates. Imagine that MyDelegate is a delegate accepting an integer, returning nothing (how such a delegate can be declared will be shown later):
+
+As can be seen in the example, we want to be able to bind arbitrary free functions as well as member functions to the delegate, as long as they match the delegate’s signature – void (int) in this case. The only difference between those two is that member functions can only be called on an instance of the corresponding class, hence we need to pass a Class object to the delegate.
+
+But how do we store pointers to either free functions and member functions internally?
+
+Pointers to functions in C++
+
+In case you have never used pointers to functions in C++ before, the typedef defines a type FreeFunction, which is a pointer to any free function accepting an integer, returning void. Such a free function can be any global function, a function inside a namespace, or a class-static function – but not a member function.
+
+Pointers to member functions in C++ are an entirely different beast altogether.
+
+First, their type differs from ordinary pointers to functions:
+
+As can be seen, a pointer to a member function also “carries” the type of the class, hence pointers to member functions cannot be interchanged between different classes!
+
+Secondly, while pointers to free functions have the same size as void*, pointers to member functions do not. That means that pointers to different member functions can have different sizes:
+
+On my machine using Visual Studio 2010, I get the following output:
+
+That may come as a surprise, but the standard does not dictate strict sizes for pointers to member functions. Generally, in Visual Studio pointers to member functions will occupy either 4, 8 or 12 bytes (for single inheritance, multiple inheritance, and virtual inheritance, respectively). A more thorough discussion can be read here.
+
+The above is also a very strong argument against casting pointers to member functions into void*, ever – they do not fit, and your program is broken (even though it might work on your machine).
+
+Back to our delegates, how can we turn any pointer to a member function into the same type? One possibility is to use type erasure in conjunction with an abstract base class:
+
+Using type erasure, concrete implementations of the class AbstractBase still know about the type of class they’re dealing with (template <class C>), and can call member functions without any nasty casting or other illegal statements. And instances of AbstractBase just use C++’s virtual function mechanism for dispatching the function call to the underlying implementation. This means that we could store pointers to member functions by storing instances of AbstractBase:
+
+This is certainly a valid and legal approach, but it has the drawbacks of using dynamic memory allocations, and adding another level of indirection via the virtual function.
+
+Let us go back to the original delegate, and see whether there’s an alternative solution. If we somehow could turn pointers to member functions into ordinary pointers to functions, we only need to store the latter, and not care about member functions at all.
+
+We could try to write such a wrapper function the following way:
+
+The above works, but we cannot store it inside our Delegate class, because WrapMemberFunction has a different signature than an ordinary free function:
+
+Still, the type of the class C is lurking around in the typedefs, and we need an additional C* argument which is the instance the pointer to member function is to be called upon.
+
+Introducing an additional, unused argument to the free function, and using plain, old void* pointers halfway gets us there:
+
+Note that we are not sacrificing type-safety by using a void* here – the function template always knows the original type, and correctly casts it back again (casting from any pointer to void* and back is safe according to the standard).
+
+But the second argument still does not match. We need to get rid of it altogether, and we can do that by using one of C++’s advanced template features – passing pointers to free functions and pointers to member functions as template arguments, using non-type template parameters.
+
+That means we can turn our delegate into the following:
+
+Both free function and member function “wrappers” now share exactly the same signature, and can thus be stored inside the Delegate class. The delegate can now be used for both free functions and member functions:
+
+All that is left to do is turn the delegate into a class template, so it can be used for arbitrary return types and arguments.
+
+This can easily be done by using partial template specialization:
+
+Personally, I did not write all the implementations by hand, but rather used a macro-based approach, in conjunction with a pre-build step inside Visual Studio. That way, you only have to write the implementation once, but keep all the benefits (readability, debuggability) as if you had actually written all implementations by hand.
+
+Regarding performance, the delegate implementation offers exactly the same performance as simple free function pointers, because the pointers are passed as template arguments, and the stub functions are marked ME_INLINE (__forceinline), forcing the compiler to inline the call (profiled using Visual Studio 2010) at the calling site.
+
+Using the same approach, we can easily extend the above delegate implementation into a full-blown event system by storing an array of Stubs rather than just a single one.
+
+In Molecule, the event system is split into an Event and a corresponding Event::Sink. The Event::Sink takes care of storing all the listeners to a certain event, and such a sink can be bound to an Event using Event::Bind(). Using Event::Signal(), all listeners inside a bound sink will be notified of the event.
+
+Splitting the event system into those two parts allows me to store an Event somewhere as member in a class, allowing different sinks/listeners to be notified while never exposing the Signal() functionality to the user of the class.
+
+As an example, Molecule already offers a completely generic hot-reload system, which makes heavy use of the event system. Just define a DirectoryWatcher somewhere, and hook up some event listeners:
+
+Another example of coupling unrelated classes using the delegate and/or event system is binding low-level input from physical devices to high-level logical devices, but that will be discussed in a separate post.|||
+
+While other languages such as C# offer type-safe callbacks/delegates out-of-the-box, C++ unfortunately does not offer such features. But delegates and events provide a nice way of "coupling" completely unrelated classes without having to write a lot of boilerplate code. This blog post describes a generic, type-safe implementation of such delegates and events using advanced C++…

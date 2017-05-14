@@ -1,0 +1,67 @@
+In the previous article, we covered how to monitor a Docker Swarm. As a follow up, in this article, we will go through setting up a dynamic solution for log management in a docker swarm. We will be collecting logs from all the containers in all the nodes of the swarm. With all this data, we would also be able to do querying and analysis.
+
+We will use the very popular ELK stack from elastic for log management. This includes Elasticsearch, Logstash and Kibana. is the database to store the log data and query for it. is a log collection pipeline that ingests logs from multiple sources and feeds it to Elasticsearch. is the web UI to display Elasticsearch data. We will also deploy logspout to all nodes in the swarm, which will connect to docker daemon in the host to collect all logs and feed it to logstash. All these tools are open-source and can be deployed as a container.
+
+We will use the Docker Swarm Mode to build the cluster and deploy these services as a stack. This allows for us to collect logs from any container without making any changes. Any logs that can be seen with command will be automatically collected. Also, logs will collected from any new nodes joining the swarm. All the files used for this project can be found here.
+
+The tools that we use for log management stack are all open-source. These tools are all container-friendly and easily scalable. Our stack comprises of the following tools.
+
+Elasticsearch is essentially a database that store JSON documents, based on Apache Lucene. It is a very powerful and efficent full-text search engine with a REST API. In this article, we will deploy only a single instance of Elasticsearch. However, for any sort of production setup, you would need to setup a cluster of Elasticsearch. To setup an Elasticsearch cluster, check here and here.
+
+Logstash ingests data from many source, do some processing and then feed it to Elasticsearch. In this demo, we are pushing the logs to a single instance for logstash. We can have multiple instances of logstash and even have a layer of Beats shippers that push logs to logstash.
+
+Kibana is a web UI for elastic stack. It lets you see and query the log data. You can create graphs and dashboards with the data. Kibana stores all the information including the graphs in elasticsearch. So, Kibana in itself is stateless and can be scaled independently.
+
+Logspout from Gliderlabs is log router that connects to the docker daemon and collects logs from all its container. Here, we use the logstash plugin to push it to logstash. We use the bekt/logspout-logstash image for this. We deploy it to all nodes in the cluster to get all the logs.
+
+The first thing to do is to create a Docker Swarm with the docker-machine. We will be creating a swarm with one manager named and two workers named and . To follow along with the demonstration, you need to have the following prerequisites:
+
+I have explained how to do this in my previous article, Monitoring Docker Swarm with cAdvisor, InfluxDB and Grafana. Follow the steps in the section of that article to create and setup the Swarm. Once the swarm is setup, you can see the hosts with command. The output of this command must look something like this.
+
+For elasticsearch to not give errors, we need set of the kernel of VMs to atleast . To do this, run the following commands.
+
+We will define the entire stack for logging in the file. This will contain the information about different services including the deploy stratergies. This file will be in the docker-compose v3 format. We can then deploy it with one command. The file is given below.
+
+We will start by saying that we are using the version 3 of file. We have following 4 services in the stack.
+
+For the Elasticsearch service, we use the offical image. With the environment variable, we will set the heap space, 256MB as the minimum and maximum here. Also, the official image comes with X-Pack installed, which will take care of security, monitoring, alerting etc. of the elastic stack. For this demo, we will disable the X-Pack. We set , , and as to do this. We will setup a docker volume named mounted at to store all Elasticsearch data. In the deploy key, we are saying that we need one copy of it. We are placing this service in node. This is done to make sure that the volume is always in that host.
+
+We will use the official image for logstash. We also need to setup a custom configuration file for logstash to define its pipeline. The configuration file is given below.
+
+The config file contains three sections. The section defines where logstash is listening for log data. In this case, logstash will listen at port where log will be coming in format and using protocol. The section can do some processing with the log data. Here, we will drop all the logs coming from image, as those are duplicates. The section defines where logstash is feeding the data to. Here, we will send it to service at port . We will use the codec as it will use Ruby Awesome Print library to pretty-print the data.
+
+Put this file, in a folder named . We are creating a volume to share this file at the location of the container. This will then be read automatically when logstash starts up. Also, this service depends on Elasticsearch as it feed data to it. As before, we only need one copy of this service.
+
+For , we use bekt/logspout-logstash image. This image contains logspout with logstash plugin. We need to provide the environment variable with the location of logstash. In this case, it is with protocol. We also need to create a volume for the Docker socket, . This lets the container to attach to the docker daemon in the host and collect all the logs. This service depends on Logstash as it feed data to it. We need to deploy this service to all the nodes. So we use the mode for . Also, there is a chance for this service to fail bacause logstash is not ready. So, we setup a restart policy that restarts the service if it fails with a delay of 30 seconds.
+
+We use the official image and expose the port of the container to port of the host. The feature will then let us access kibana from port 80 of any host in the swarm. This service get data from Elasticsearch, so depended on it. We need to set the to the elasticsearch service, in this case. We also set the and environment variables as , to disable . Here also, we only need one instance of this service.
+
+Finally, at the end of the file, we have the key with the volumes. We are using the driver for this so the data will be stored in the host containing the service. As Elasticsearch service is placed in , the volume is always present there.
+
+To deploy this stack, save the above file as and run the following command.
+
+This will start the services in the stack named . The first time takes more time as the nodes have to download the images. To see the services in the stack, you can use the command , the output of the command will look like this.
+
+You can see the running containers in the stack with the command . Its output will look like this.
+
+Once the services have started, you can open kibana with the following command:
+
+It might take some time for kibana to load up. So, if the page doesn’t load up, wait for a few minutes and try again. The first time kibana is opened, it will ask to specify a default index pattern. Logstash will create index starting with , so the default index pattern is . Also the Time-field name is . This is the field that stores the time when the log entry is made. Click on the button to set it up. Now go to the tab to see all the log entries. To the left, you can see all the fields indentified from the logs. If you click on any field, you can see the top values and its percentages. The field will give the docker image used, the field gives the container name, etc.
+
+To test this setup, we will deploy another stack and see its logs from here. For this we will use a simple stack containing a single service. It will be nginx webserver serving a static webpage. The image used for this is and we expose port of the container as port in the host. Also, we deploy 5 instances of this service, just to see logs from different instances. The stack file for this stack is given below.
+
+We will deploy this stack using the command,
+
+You can see the services in the stack with the command . The output of the command will look something like this.
+
+You can open up the nginx webserver with the following command
+
+Refresh the page a few times to generate some log entries. Now you can see the logs in Kibana. Use the query in Kibana. This filter will fetch the log entries where the docker image name contains and the log message contains or . If you look at the field on the left, you can see that we are reading logs from multiple containers across different hosts.
+
+In this article, we have deployed a dynamic log management solution for our docker swarm. Once the stack is setup, logs are automatically collected from all the containers across all the hosts in the swarm. To do this, we have used popular open-source tools like Elasticsearch, Logstash, Kibana and Logspout.
+
+Once you are done with the demonstration, you can remove the stack with command,
+
+If you are done with the VMs created for the demo, you can stop and remove then with the following commands,|||
+
+In the previous article, we covered how to monitor a Docker Swarm. As a follow up, in this article, we will go through setting up a dynamic solution for log ...

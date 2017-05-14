@@ -1,0 +1,106 @@
+You already know the fundamentals of , so come with me on an odyssey into the strange and exciting world outside of the day-to-day uses, about real things I've had to do. Some of the ideas we're going to visit included rewriting history in projects half a decade old, cloning as fast as possible for Continuous Delivery, and needing to download hundreds of gigabytes worth of git repos and turning them into features for machine learning. At the end I'll share a trick that makes code challenge interviews a cakewalk!
+
+Not long ago I was working with my friend Chris (@perrupa) on a project where we needed to migrate a repo well over 20 gigabytes from a network share onto GitHub. At a high level that sounds like a cake walk, simply add a second remote as github to the repo, push it, and be done.
+
+You can run the upload before you go home and check on it tomorrow. Easy. But wait... you come in the next day and discover github rejected the upload. What?!
+
+Okay, if we remove the file from the project we should be good to go, right?
+
+If you try to delete the file, commit, and upload again, you'll get the same error. The common trap here is when users of git think of it as an "undo" mechanism. Git is actually stringing together changes and whatever you have "checked out" (a branch, master, a tag, whatever!) is the result of those patches. This also means that your massive 200mb file is still in your history somewhere, just not at the latest part of master.
+
+Lucky for us, there's an answer. git offers a feature called which can be used to walk through the history of your project and change it based on some rules. Here's what that looks like for our case:
+
+This tells git to iterate over the entire history and run the removal command, and re-write that commit as if it never existed in the first place. There are other interesting possibilities here however:
+
+Unsurprisingly, for repos that are many years old and worked on daily by about 50 developers you're going to have to wait a while for this to work.
+
+Ah, but we can do it faster. There's a great utility called the BFG Repo cleaner. It will do the same job between 10x - 720x faster.
+
+Okay, so now what if we upload? Well... sorry, it may technically work, but what about the 50 developers using this repository? The ones who are under pressure to ship their feature? The ones who don't feel comfortable doing this sort of thing in git? The ones who don't read emails past the subject line? You just re-wrote master, every commit hash is different from theirs. Their histories still include the 200mb files.
+
+Why not just merge? A merge will resolve the difference between code at the most recent commit for both branches, however, it will also add the legacy repo's branch to the entire history of your project, meaning the 200mb file is back, but even worse, your repo has now doubled in size as it includes both the cleaned history and legacy history.
+
+There's a few technical options that can in theory help resolve this:
+
+To be clear about , you can have two branches that don't share any history:
+
+You can also have a feature that contains legacy-master in the history:
+
+If you run a replace such as: your branch will now appear as:
+
+However, you may be stuck technically if rolling this out to your entire team is too tricky from a "everyone needs to do this" standpoint (for reasons mentioned above) and if that happens, the only recourse is a hard-handed policy like "everyone needs to push their branch before 3PM on Friday or their work will not ship". Not awesome, but really the only option left.
+
+An interesting artifact of this discussion by the way is having two histories with no common ancestor. You can create these at any time in your repo by creating an orphan branch: . You may run into situations where this makes sense to do. It is also interesting to think about, as it also means you can actually "merge" two repos into one and preserve the history, if you find a reason to.
+
+Eventually you'll need to deploy your software to a continuious deployment or delivery server. If you're unlucky, your repo will be huge and take an hour to download. And if it really is that big, even simple tasks like changing branches or walking through history can take some time. The good news is there's a way out.
+
+We first looked at cloning our repo only to find the bottleneck was our spinning rust HDD moving magnetic heads around trying to write bytes as fast as it can. We made the call to opt for an SSD (which are so common now that anything else is just nostalgia). Unfortunately we didn't get the speed we wanted. We eventually discovered a way to write the files directly to memory through , which is a ramdisk device on your system that writes directly to your memory, not a drive (and also destroys everything when the computer shuts off). The catch is that you need to have the free memory! There is also an implementation of a memory-based file system called , but there may be some issues related to read performance. I never tested it but feel free to give it a spin! Once the repo was loaded into memory, operations were significantly faster, especially when we needed to run tools like on it!
+
+There was one more barrier to overcome: Every time we cloned the repository we downloaded a few gigabytes for the sake of testing the state of the code that was written in the last few weeks. There's a feature in git that lets to determine how much history you would like to have in your project when you clone it (and you can also truncate some history afterwards if you'd like).
+
+Just providing a depth of 10 tells git it only needs to represent the repo at the state it was in 10 commits ago, so instead of storing all the details forever, it stores information that proxies the delta, is aware other commits exist, but it doesn't know what they are, only what come after it. This can be a bit confusing at first if you ever find yourself in one of these "shallow" repos as it looks like your history has been removed. You can tell git to update all your references with which will download all the remaining data. The benefit is you can quickly download a massive code base in a fraction of the time.
+
+But wait, there's one more improvement!
+
+The last step I'd advise here is creating a mirrored repository on the host that runs your CI or CD.
+
+A mirror repository will copy over every commit and reference available on the remote branch, which is better than a clone (which is an outdated way of doing this task). If you run a git fetch command periodically or on-demand on this repo you'll always have an up-to-date local copy. That means your deploy speeds are no longer restrained by the time it takes to download those commits, and instead the time it takes to drop files into memory. There's one big reason to do this last step that has nothing to do with performance: Github goes down some times! At least you can always deploy. Once you've done this, you'll quickly find diminishing returns in improving the speed of git, and find that something else like your test suite needs far more attention.
+
+I started a new project where I wanted to run machine learning over a few hundred large git repos. I tried a few methods and eventually discovered the simplest answer was really the best.
+
+Initially I thought I would write a quick node script that would use and to download my repos. Something like this:
+
+I ran into two annoying problems here:
+
+So I changed the plan. What I really needed were commits, and git is great at downloading commits. So I created a bare repo and added thousands of remote addresses, and I'll just let git figure out how to download them all. Easy!
+
+It worked! ... Well, kind of. Git wants to ensure references don't interfere with each-other and are always valid. So this means it worked through all the remotes in sequential order. A full download would have taken far longer than I was willing to wait for. Never the less, it is interesting that a git repo can actually be used to reference multiple remote repositories, and perhaps even merge together work. I will explore this idea a bit later in this post.
+
+I was just looking to download pull requests instead of everything, so I ultimately accepted the best and fastest way was to simply create one bare repo per remote (a mirror would have contained everything). This can be done, but it isn't common to see it. If you ever wanted to explore pull requests on your local machine, it may be fun to try (but don't mess with the local repo you do your work out of in case you don't know how to fix it).
+
+In each bare repo I ran a script to update the config to something like this:
+
+I would then run git fetch --all in each repo at the same time (background jobs in bash). I found I could run about 200 at the same time, and downloading would only take a few hours for everything.
+
+Because each repo is only aware of commits in pull requests, running a command like will reveal all the commit hashes that are in the history of pull requests up to the initial commit of the repo. In this case, not using a mirror is actually an advantage.
+
+The last step in my machine learning adventure was to do something useful with all those commits. I need to turn all this data into east to work with features.
+
+I decided working with a command line interface was the wrong choice for this, and I just wanted to throw information about commits into MongoDB. Commits are actually complex objects when you get into the nitty gritty, especially when using something like the API to work with them. A commit will have all the obvious features like author and message, but also you should know it breaks down details about patches, and the diffs within them, meaning if you want to know the line of code detail for a commit by using libgit (in my case, nodegit) you'll have to map over all the patches to compute this. The good news is that you can easily come up with at-least a 50 features from a one commit, and that's before you look at actual lines-of-code in the diff.
+
+Initially I just used nodegit to walk through each repository, pull all references, then pull all commits in that history. If you're using streams (for performance, because you're going to have a lot of data here) the nodegit api for working with history might look something like this:
+
+This ends up being a terrible idea! Don't do it! Most of your pull requests will share a substantial amount of history, so most of your commits pushed into the pipe will end up have being pushed by some other PR's history walk. You could put in checks and markers to avoid pushing duplicates through, but after playing with this idea for a bit I ultimately decided the better way was to use some of the command line tools for this.
+
+Over each repo I ran a bash script that would do this:
+
+It would dump a file with one hash per commit for the entire history. This means my node program just needs to pipe individual lines through:
+
+In practice I would load repos well over 10x faster, which was great, because most PRs only had 2 or 3 commits in them anyway. As a word of caution to anyone who's going after this implementation, just be careful about memory consumption in nodejs. I found with this implementation the heap size would remain consistently under 200mb, but the would grow quickly to gigabytes and eventually consume all resources. is the "resident set size", which is how much your entire node process uses. For some odd reason I found manually invoking the garbage collector and deallocating local variables ( ) a the end of functions improved this a bit, but not fully. I didn't investigate further.
+
+An interesting technique I've found really useful is occasionally remixing and split up git repos. I've often found great software grows out of large repos, and ends up being useful in situations beyond the repo. A typical way to solve this is to simply cut the files, paste them into a new repo and write a commit like git commit -m "Idk, it was like that when I got here" .
+
+While it "works", it's not awesome because you've just lost the entire history, and along with that, all the design opinions and context for why changes ended up how they did. Wouldn't it be nice if we could move all those files into a new repo and keep the relevant history, while discarding everything else? Let me introduce you to a little dance called the subtree split.
+
+And you're done. You've just created a branch that has a history that looks as if the only thing that ever happened was that library. You'll want to move it into a proper repo however, because right now it is in the same one it broke off from. To make this easy, init a repo in your home directory, and from your original repo, push thatLibrary into your new repo.
+
+Now you can introduce any changes and additional work to make your library into a npm package, have tests, or even a new readme. However, you get to keep all the history, and authors of the repo get their hard-earned credit for their work. Lastly, in your original repo, you can now remove the library from your code base and import it as a package. I'd advise not removing it from history, but simply adding a commit that deletes it. This just ends up being the most reasonable way to work in large teams and keep facts straight about changes.
+
+You can also do the inverse of this. We've already seen how a repo can contain multiple histories that are un-related. If you're working on a sensitive code base and need to hire a contractor to perhaps do some web design work, why not let them work out of their own repo, that doesn't have any of your code in it? When you need to merge, you can simply add their repository as an additional remote, and merge into your code base.
+
+What's interesting about this is your repo will now have two initial commits. You have a history that in theory looks like this, where one commit was written in a repo, and the other is from :
+
+And if you want to put the new commit tree into a specific directory (you probably will in real life), check out the documentation for and which let you do all of this with that sort of work flow in mind.
+
+It's fairly common to see the interview process require the completion of some sort of code challenge. Sometimes they ask for many trivial single function problems, but other times they want you to build something more complex. What often happens is a candidate will either submit a massive zip file (I've seen 800MB zip files from candidates, they don't get opened). The other option is seeing a patch file, which can have a number of problems that frustrate the reviewer and also obscure the development process of the candidate from you.
+
+I advise asking candidates to submit a "git bundle". It is a single file which contains the entire git repository. You can easily generate one if inside a repository:
+
+The file name can be anything, including "flimflam", bundle just makes it obvious what the file is. but there is no real standard.
+
+Ask the candidate to send you the file (I haven't had spam filter issues with gmail, but test it for yourself please). On your side simply download this file and can run:
+
+This creates the entire repo for you in a directory named after the file with all the commit history the candidate had. If you want to see something really cool, go into that repo and look at your list of remotes, .
+
+I hope you enjoyed this and can see some more ways that git can be used to solve real problems in interesting ways. If you'd like to learn more I highly recommend "Pro Git" whis is available Online and in Paperback.|||
+
