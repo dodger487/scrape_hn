@@ -1,0 +1,90 @@
+I was asked to debug another weird issue on our network. Apparently every now and then a connection going through CloudFlare would time out with 522 HTTP error.
+
+522 error on CloudFlare indicates a connection issue between our edge server and the origin server. Most often the blame is on the origin server side - the origin server is slow, offline or encountering high packet loss. Less often the problem is on our side.
+
+In the case I was debugging it was neither. The internet connectivity between CloudFlare and origin was perfect. No packet loss, flat latency. So why did we see a 522 error?
+
+The root cause of this issue was pretty complex. After a lot of debugging we identified an important symptom: sometimes, once in thousands of runs, our test program failed to establish a connection between two daemons on the same machine. To be precise, an NGINX instance was trying to establish a TCP connection to our internal acceleration service on localhost. This failed with a timeout error.
+
+Once we knew what to look for we were able to reproduce this with good old . After a couple of dozen of runs this is what we saw:
+
+calls to establish a connection to localhost. This takes a long time and eventually fails with error. Tcpdump confirms that did send SYN packets over loopback but never received any SYN+ACKs:
+
+Hold on. What just happened here?
+
+Well, we called to localhost and it timed out. The SYN packets went off over loopback to localhost but were never answered.
+
+The first thought is about Internet stability. Maybe the SYN packets were lost? A little known fact is that it's not possible to have any packet loss or congestion on the loopback interface. The loopback works magically: when an application sends packets to it, it immediately, still within the syscall handling, gets delivered to the appropriate target. There is no buffering over loopback. Calling over loopback triggers iptables, network stack delivery mechanisms and delivers the packet to the appropriate queue of the target application. Assuming the target application has some space in its buffers, packet loss over loopback is not possible.
+
+Under normal circumstances connections to localhost are not supposed to time out. There is one corner case when this may happen though - when the listening application does not call fast enough.
+
+When that happens, the default behavior is to drop the new SYN packets. If the listening socket has a full accept queue, then new SYN packets will be dropped. The intention is to cause push-back, to slow down the rate of incoming connections. The peers should eventually re-send SYN packets, and hopefully by that time the accept queue will be freed. This behavior is controlled by the sysctl.
+
+But this accept queue overflow did not happen in our case. Our listening application had an empty accept queue. We checked this with the command:
+
+The column shows the backlog / accept queue size given to syscall - 128 in our case. The reports on the number of outstanding connections in the accept queue - zero.
+
+To recap: we are establishing connections to localhost. Most of them work fine but sometimes the syscall times out. The SYN packets are being sent over loopback. Because it's loopback they are being delivered to the listening socket. The listening socket accept queue is empty, but we see no SYN+ACKs.
+
+Further investigation revealed something peculiar. We noticed hundreds of CLOSE_WAIT sockets:
+
+CLOSE_WAIT - Indicates that the server has received the first FIN signal from the client and the connection is in the process of being closed. This means the socket is waiting for the application to execute . A socket can be in CLOSE_WAIT state indefinitely until the application closes it. Faulty scenarios would be like a file descriptor leak: server not executing on sockets leading to pile up of CLOSE_WAIT sockets.
+
+This makes sense. Indeed, we were able to confirm the listening application leaks sockets. Hurray, good progress!
+
+The leaking sockets don't explain everything though.
+
+Usually a Linux process can open up to 1,024 file descriptors. If our application did run out of file descriptors the syscall would return the EMFILE error. If the application further mishandled this error case, this could result in losing incoming SYN packets. Failed calls will not dequeue a socket from accept queue, causing the accept queue to grow. The accept queue will not be drained and will eventually overflow. An overflowing accept queue could result in dropped SYN packets and failing connection attempts.
+
+But this is not what happened here. Our application hasn't run out of file descriptors yet. This can be verified by counting file descriptors in directory:
+
+517 file descriptors are comfortably far from the 1,024 file descriptor limit. Also, we earlier showed with that the accept queue is empty. So why did our connections time out?
+
+The root cause of the problem is definitely our application leaking sockets. The symptoms though, the connection timing out, are still unexplained.
+
+Time to raise the curtain of doubt. Here is what happens.
+
+The listening application leaks sockets, they are stuck in CLOSE_WAIT TCP state forever. These sockets look like (127.0.0.1:5000, 127.0.0.1:some-port). The client socket at the other end of the connection is (127.0.0.1:some-port, 127.0.0.1:5000), and is properly closed and cleaned up.
+
+When the client application quits, the (127.0.0.1:some-port, 127.0.0.1:5000) socket enters the FIN_WAIT_1 state and then quickly transitions to FIN_WAIT_2. The FIN_WAIT_2 state should move on to TIME_WAIT if the client received FIN packet, but this never happens. The FIN_WAIT_2 eventually times out. On Linux this is 60 seconds, controlled by sysctl.
+
+This is where the problem starts. The (127.0.0.1:5000, 127.0.0.1:some-port) socket is still in CLOSE_WAIT state, while (127.0.0.1:some-port, 127.0.0.1:5000) has been cleaned up and is ready to be reused. When this happens the result is a total mess. One part of the socket won't be able to advance from the SYN_SENT state, while the other part is stuck in CLOSE_WAIT. The SYN_SENT socket will eventually give up failing with ETIMEDOUT.
+
+It all starts with a listening application that leaks sockets and forgets to call . This kind of bug does happen in complex applications. An example buggy code is available here. When you run it nothing will happen initially. will show a usual listening socket:
+
+Then we have a client application. The client behaves correctly - it establishes a connection and after a while it closes it. We can demonstrate this with :
+
+As you see above shows two TCP sockets, representing the two ends of the TCP connection. The client one is (127.0.0.1:36613, 127.0.0.1:5000), the server one (127.0.0.1:5000, 127.0.0.1:36613).
+
+The next step is to gracefully close the client connection:
+
+Now the connections enter TCP cleanup stages: FIN_WAIT_2 for the client connection, and CLOSE_WAIT for the server one (if you want to read more about these TCP states here's a recommended read):
+
+After a while FIN_WAIT_2 will expire:
+
+But the CLOSE_WAIT socket stays in! Since we have a leaked file descriptor in the program, the kernel is not allowed to move it to FIN_WAIT state. It is stuck in CLOSE_WAIT indefinitely. This stray CLOSE_WAIT would not be a problem if only the same port pair was never reused. Unfortunately, it happens and causes the problem.
+
+To see this we need to launch hundreds of instances and hope the kernel will assign the colliding port number to one of them. The affected will be stuck in for a while:
+
+We can use the to confirm that the ports indeed collide:
+
+In our example the kernel allocated source address (127.0.0.1:36613) to the process. This TCP flow is okay to be used for a connection going to the listener application. But the listener will not be able to allocate a flow in reverse direction since (127.0.0.1:5000, 127.0.0.1:36613) from previous connections is still being used and remains with CLOSE_WAIT state.
+
+The kernel gets confused. It retries the SYN packets, but will never respond since the other TCP socket is stick in the CLOSE_WAIT state. Eventually our affected will die with unhappy ETIMEDOUT error message:
+
+If you want to reproduce this weird scenario consider running this script. It will greatly increase the probability of netcat hitting the conflicted socket:
+
+A little known fact is that the source port automatically assigned by the kernel is incremental, unless you select the source IP manually. In such case the source port is random. This bash script will create a minefield of CLOSE_WAIT sockets randomly distributed across the ephemeral port range.
+
+If there's a moral from the story it's to watch out for CLOSE_WAIT sockets. Their presence indicate leaking sockets, and with leaking sockets some incoming connections may time out. Presence of many TIME_WAIT_2 sockets says the problem is not on current machine but on the remote end of the connection.
+
+Furthermore, this bug shows that it is possible for the states of the two ends of a TCP connection to be at odds, even if the connection is over the loopback interface.
+
+It seems that the design decisions made by the BSD Socket API have unexpected long lasting consequences. If you think about it - why exactly the socket can automatically expire the FIN_WAIT state, but can't move off from CLOSE_WAIT after some grace time. This is very confusing... And it should be! The original TCP specification does not allow automatic state transition after FIN_WAIT_2 state! According to the spec FIN_WAIT_2 is supposed to stay running until the application on the other side cleans up.
+
+Let me leave you with the manpage describing the setting:
+
+I think now we understand why automatically closing FIN_WAIT_2 is strictly speaking a violation of the TCP specification.
+
+Do you enjoy playing with low level networking bits? Are you interested in dealing with some of the largest DDoS attacks ever seen? If so you should definitely have a look at the open positions in our London, San Francisco, Singapore, Champaign (IL) and Austin (TX) offices!|||
+

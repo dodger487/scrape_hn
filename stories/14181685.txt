@@ -1,0 +1,56 @@
+TensorFlow raises the level of abstraction in distributed programs from message-passing to data structures and operations directly on those data structures. The difference is analogous to the difference between programming in assembly and programming in a high-level language. TensorFlow may not have every possible high-performance feature for cluster computing, but what it offers is compelling.
+
+Leaving aside shared filesystems or directly accessed shared memory, systems that run across multiple computers have to communicate by sending messages to one another. A low-level approach might use TCP sockets directly. Some convenience could be obtained by using Remote Procedure Calls (RPC).
+
+The Message-Passing Interface (MPI) was created in the early 1990s to make distributed programming easier within the High Performance Computing (HPC) community. It standardized interfaces like and to facilitate exchanging data between processes of a distributed system.
+
+The actor model also focuses on message-passing, as for example in Erlang or with Akka in Java or Scala.
+
+Message-passing gives you fine-grained control over how nodes communicate. You can use message-passing to build up a variety of algorithms and new systems. For example, Spark was built in part with Akka agents for some time, before switching to an RPC-based implementation. TensorFlow also builds its own abstractions using message-passing.
+
+TensorFlow uses message-passing, but it's largely invisible to TensorFlow users. The TensorFlow API lets you say where data and operations should live, and TensorFlow automatically handles any necessary messaging.
+
+Programming with explicit messages is like the low-level memory shifting necessary when programming in assembly. For example, here is some assembly pseudo-code:
+
+In a high-level language, this could be:
+
+Similarly, with TensorFlow, you focus on the computation you want performed, and don't worry about how values may need to be moved around to make it happen. A distributed analog to the assembly above might look like this:
+
+At least, that's the ideal. TensorFlow may still need explicit direction on where things should be placed (with tf.device) especially when multiple machines are involved. But that direction is more succinct and declarative than the full imperative detail of message-passing.
+
+TensorFlow's user API is essentially message-less, but TensorFlow still uses messages under the hood. The contents of the messages are serialized protocol buffers sent via gRPC, which uses HTTP/2.
+
+A message-based approach can be made faster by using a faster transport, and by using faster algorithms. TensorFlow has some early support for both, but other frameworks may offer more. You may or may not care, as the simplicity of TensorFlow's approach may or may not outweigh possible performance boosts.
+
+One easy transport speedup could come in hardware with NVIDIA's NVLink interconnect, which is faster than PCIe. As far as I can tell NVLink won't require code changes, but it looks like it will be pretty rare: it may be that only some supercomputers (Summit, Sierra) will use NVLink, with IBM's POWER processors.
+
+Some clusters connect machines with InfiniBand rather than ethernet. InfiniBand Remote Direct Memory Access (RDMA) is supposed to be pretty fast.
+
+Jun Shi at Yahoo contributed an implementation, merged four days ago, that begins to let TensorFlow use RDMA for transport via IB verbs, in addition to gRPC.
+
+MPI implementations often support InfiniBand, and an advantage of using MPI is that you can let that implementation worry about InfiniBand support without writing your own RDMA code. There's an open pull request to give TensorFlow this kind of MPI integration.
+
+On the algorithm side, there are collective communication operations that can be optimized, and MPI implementations tend to be good at these. For example, ring allreduce is more efficient for syncing up model parameters than sending them all to a central parameter server and then sending them all back out. Baidu has a fork of TensorFlow that adds their implementation of ring allreduce using MPI at .
+
+Outside the MPI world, the NVIDIA Collective Communications Library (NCCL) works with multiple GPUs on the same machine. TensorFlow has some support for this via .
+
+Quite distinct from TensorFlow, the Facebook Incubator project Gloo focuses on collective communication algorithms and supports transport via TCP/IP and InfiniBand without MPI. Gloo is used by Caffe2; the Caffe2 example resnet50 trainer uses Gloo's ring allreduce.
+
+The HPC community has an approach called "MPI everywhere" which means running one single-threaded MPI processes per CPU core. The simplicity of writing single-threaded programs with all parallelism via MPI is attractive, but it's not necessarily the best way to use a machine with a lot of cores and possibly GPUs.
+
+The hybrid approach is to have parallelism both across multiple machines and within each individual machine, usually via threads. HPC folks seem to like to use OpenMP for multithreading.
+
+TensorFlow supports this kind of within-process parallelism. TensorFlow uses threads pretty freely internally, and you can add your own additional parallelism with Python's threading or multiprocessing libraries, among many possible options. Just as with MPI though, when programs are run by a cluster manager, resources may be restricted.
+
+It isn't strictly required for either, but it seems most common to write MPI programs and distributed TensorFlow programs with one entry point that quickly specializes based on the particular role in the cluster for that node. As this implies, every invocation of the program has to know something about the cluster and its place in it.
+
+MPI implementations provide a mechanism in starting a group of processes by which every process knows how many there are in its group and its position or rank in the group. The rank 0 process, called the root, is generally special.
+
+TensorFlow leaves the starting of distributed processes to a cluster manager like Kubernetes. It's common to have several task groups like and , with a given process having a task type and a number within that group.
+
+Gloo is interestingly different in that individual processes may not start with knowledge of the cluster topology, but only with a reference to a central broker which could be a file on a shared filesystem or a Redis server. Each process checks in with and gets information about other members of the cluster via the central broker. Gloo calls this process rendezvous. As with MPI, processes find out about just one group of processes, and in fact Gloo can use MPI for its initial rendezvous setup.
+
+Thanks to Dan Fujita for suggesting more connections between TensorFlow and MPI, and sharing some MPI code that was helpful. Thanks also to Jonathan Dursi, whose blog I read with interest. And thanks to Cliff Woolley of NVIDIA for clarifying the meaning of NCCL.
+
+I'm working on Building TensorFlow systems from components, a workshop at OSCON 2017.|||
+
