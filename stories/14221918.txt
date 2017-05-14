@@ -1,0 +1,52 @@
+In this project, I create a parallel version of R-tree on GPU. My parallel R-tree is able to support parallel R-tree construction and parallel query execution of R-tree on GPU.
+
+R-trees are well known spatial indexing techniques and have been widely adopted in many applications for indexing 2D or higher dimensional data. While processing a single spatial query on an R-Tree is typically sub-linear, there are many applications that involve bulk-loading for R-tree construction and batched queries on R-Trees. Morever, as the dataset grows increasingly larger, single-thread spatial query sometines cannot meet the performance requirement. Therefore, parallelization is obviously beneficial to be used on both R-tree constrcution and R-tree query.
+
+Quite some parallel R-Tree construction and query processing algorithms have been proposed for different parallel architectures. But most of them are based on CPU parallelization techniques such as OpenMP. Unlike CPU, GPU devices usually have larger numbers of processing cores and higher computing power, which has attracted considerable interests of implementing both R-tree bulk loading construction and R-tree based spatial window query on GPU.
+
+The original data of R-tree is typically a bunch of multi-dimensional points. The first step of constructing R-tree is to generate minimum bounding boxes for these points. The next iteration is to group nearby rectangles and represent them with another minimum bounding rectangle in the next higher level of the tree. This process will continue until we get the root of R-tree. This process is also called bulk-loading.
+
+Constructing R-tree on GPU is different. One of the main goals is to maximize the usage of cuda threads while still ensure correctness of construction. There are two approaches to bulk loading on GPU, the bottom-up approach and the top-down approach. Both approaches are composed of the same basic steps, sorting and packing. In this project, I use bottom-up approach to construct my R-tree.
+
+The idea is of sorting the data on the x coordinate of the rectangles. The purpose of sorting is to prepare data for the packing phase.
+
+The packing phase is to scan the sorted list of rectangles. Successive rectangles are assigned to the same Rtree leaf node until this node reaches its fanout; then, a new leaf node is created and the scanning of the sorted list continues. The same process is applied to the MBRs to build another level of the R-tree. This process is applied iteratively until the root node is obtained.
+
+This process is illustrated in the following graph:
+
+Here is a simple code of how to do packing in parallel:
+
+Before performing queries on GPU, we should first copy relavent data structures to the GPU global memory. Here I use three arrays: A node_array to store all the node of R-tree and a rect_array to store the MBR of each node.
+
+Another edge_array is used to store the starting index of all the children of a R-tree node in the edge_array. Each node has a starting attribute which is the starting index of the its first child and a num_edges attribute. If a node is a leaf-node, then the starting attribute is -1.
+
+All the above data structures are constructed in CPU and copy to GPU for further uses.
+
+After we successfully copy all the data structures to GPU. We begin to perform the searching. We start with the root node and push it into a frontier queue. Then we examine all the MBRs of the node in frontier; if they intersect with the query rectangle, I put the children into new frontier array. The search continues with the new frontier array until we find all the overlap rectangles. The following steps how I implement parallel searching for R-tree:
+
+Take the following figure for example; the search begins from the root; then we pop out root from frontier and found Node B and Node C overlap the query rectangle thus they become the new frontier; when we reach the leaf level, we put all the MBRs that overlaps the query rectanglr into the result array.
+
+This process explores node-based parallelism, meaning that each thread is dedicated to one node. The following code shows how the searching is performed in parallel:
+
+Another kernel function is used to copy the search_nextfront to search_front. Note that there is d_over in the second kernel function. This variable is intialized to be true. The second kernel function will set this variable to be false. Becasue executing the second kernel function means that there is at least one node in the frontier array so the searching needs to be continued.
+
+Currently my project only supports searching for overlap. There are many other types of queries of R-tree but most of them are the varients of overlap searching.
+
+The result also contains two parts: the performance of R-tree construction and the performance of R-tree query. I conducted experiments on a host machine with six 2.4 GHz Intel Xeon processor and 15 MB cache. A single NVIDIA GeForce GTX 480 processor with 1.5 GB global memory was used to run CUDA applications. We downloaded the R-tree sequential implementation from here as the baseline implementation.
+
+The first benchmark for construction is to test the speedup with randomly generated rectangles. I found the following construction times:
+
+The GPU time includes the time to copy the query results back from the GPU memory to the CPU memory. From the graph, we can see that CPU outperforms GPU as for small datasets. The reason is that copying original data from CPU to GPU takes lots of time thus the speedup is limited by bandwidth. However, more speedup is achieved as the problem size grows. For the even biggest benchmark, I can achieve almost 30 times speedup.
+
+Another test is to construct r-tree using real-world 2-D spatial data. The test cases include roads of Germany, railways of France and hypsography data. I downloaded these test cases from here. Each test case is a list of rectangles. The following graph shows the construction time of these three real-world dataset:
+
+The above graph shows that GPUs are capable of achieving better performance when bulk-load real-world datasets since most of those datasets are quite large.
+
+Next benchmark is to test the performance of spatial window query processing on GPUs. As mentioned in the above section, the data transfer between CPU and GPU is expensive, soCPU can outperforms GPU for querying only a small amount of rectanlges. Thus one assumption of this benchmark is that the number of query rectanlges is large enough to eliminate the overhead of transferring data and result between CPU and GPU. From my experiments, the number of query rectangles should at least be larger than 100. Another issue is that the R-tree constructed in parallel on GPU may have a different structure from R-tree constructed on CPU since the construction algorithm is very different. Thus I compare three types of queries: serial query on R-tree constructed on CPU, serial query on R-tree constructed on GPU and parallel query. Here is the result I observed:
+
+The result shows that parallel query can outperform serial query to some extent but the result is not very promising. First, the speedup is not very obvious. From my experiments, the speedup can reach at maximum 25 percent comparing with serial query. Second, another observation is that if the number of rectanlges is smaller than 8 million or larger than 16 million, the perofrmance of parallel query is even worse than serial query on CPU. I think there are three reasons:
+
+The results show parallel r-tree is more suitable dense graph which has lots of overlapping. To verify this speculation, I manually make the test graph dense and increase the amount of overlapping of query rectangles by manually enlarge the r-tree rectangles and query rectangles by a factor of 150 percent and did the above benchmark again. Here is result I observed:
+
+The result show that now parallel query does have significant speedup. Therefore for dense graphs or queries with lots of overlapping, parallel r-tree is a better choice. But if the graph is sparse or most of the workload consist of small query rectangles, serial query on CPU is enough to do the work.|||
+

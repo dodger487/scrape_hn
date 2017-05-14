@@ -1,0 +1,138 @@
+Want to program your microcontroller in Rust but your microcontroller vendor doesn’t provide a Rust HAL / SDK? No wonder. AFAIK, no vendor is betting for Rust … yet. How about binding to a C HAL? No? Don’t feel like wrestling with and the HAL build system and then having a bunch of FFI calls in your application? OK, how’s this alternative: A method to easily build 100% Rust applications that can use all the device hardware through a memory safe API? Sounds good? Excellent because that’s today menu.
+
+In this post, I’ll cover how to build an application for a Cortex-M microcontroller from scratch. However, I’m going to take a practical approach here and omit explaining low level details like linker scripts and the boot sequence. There are crates published on crates.io that deal with those low level details so we’ll leverage those instead of reinventing the wheel.
+
+For this demo, I’m going to use the STM32F3DISCOVERY development board but the steps here can be adapted to any other development board. Here are the specifications of the DISCOVERY board:
+
+We’ll need these tools on the host system:
+
+You can find installation instructions for Windows and macOS here.
+
+We’ll use the crate as a template ; it contains all the pieces needed to build a microcontroller application. This template should work for any microcontroller that lets you override the boot sequence . I have tested this template with 6 different microcontrollers / development boards from 3 different vendors without a hitch.
+
+Each microcontroller has different amounts of RAM and Flash memory, and the location of these memory regions in the address space can vary from vendor to vendor. We have to specify this information in the file to produce a binary that’s valid for the target device. For this demo, I’ll use this file :
+
+The memory layout of the program will look like this:
+
+The region is where variables are stored. The size of this region is known at compile time and doesn’t change at runtime. The call stack region can grow or shrink at runtime due to function calls. There’s no heap .
+
+Finally, for convenience we set a default target in . With this we can omit the flag on every Xargo invocation.
+
+The target chosen here must match the ARM core inside the target device. There are four options:
+
+We are done setting up the template. Let’s build as our first program. This program will print on the host console. This program is written in a device agnostic manner and will work on any microcontroller. The only requirement to be able to see the message on the host side is a GDB connection between host and device.
+
+For convenience, here’s the full source of the program:
+
+At first glance, it looks kind of normal – it has a function like the programs that link to . Let’s inspect it in parts.
+
+We don’t link to as doesn’t support microcontrollers.
+
+The crate is a very small runtime that boots the device, initializes RAM and then calls . It does all this implicitly; you only need to link to it with to opt into this runtime. The crate provides an API to use functionality common to all Cortex-M microcontrollers.
+
+In , we use the macro from the crate to print the message to the OpenOCD console . The syntax is the same as in .
+
+There’s also this variable. This variable is used to register interrupt handlers. As we are not using any interrupt we just register a catch all handler for all the possible interrupt sources.
+
+And then run it on the microcontroller.
+
+Thanks to the in the root of the Cargo project, the debugger will drop you at the entry point of the program, which is where the program starts its execution. In the source view, you can see that the runtime does what I said it does.
+
+From that point you can step through the program all the way to but the fastest way to get there is to set a breakpoint and let the program run:
+
+You should see:
+
+After you step over the line, you should see this on the OpenOCD terminal:
+
+There you go: An embedded “Hello, world” in Rust.
+
+Some of you may be wondering whats happens when returns since embedded programs are supposed to never end. What the runtime does is put the device in “reactive” mode ( ), where it services interrupts and then sleeps when there’s nothing to do.
+
+The ships with a few extra optional features that result in a more pleasant development experience. I think they are just too good to miss the opportunity of showing them to you so let me show two use cases where they come in handy:
+
+Consider this program: (See for the full source).
+
+It tries to read an invalid memory address. Although this is kinda obvious from the source code (if you know what typical RAM addresses look like), let’s see how the runtime would have helped us debug this problem.
+
+If you debug this program and just leave it run freely, you’ll end with a debug session like the one shown below.
+
+Fatal errors like this invalid memory access are handled by the hardware through an exception mechanism. When such an error occurs, the processor stops doing whatever it was doing and immediately calls the corresponding exception handler, which is just a function from the POV of the programmer.
+
+The crate injects a catch all exception handler tailored for debugging. This handler will trigger a breakpoint during an exception and give you access to plenty of information about the cause of the exception.
+
+Continuing the debug session: A will give us a general idea of where we came from:
+
+is the hardware calling the exception handler, so is where the exception occurred.
+
+Within the exception handler context, there’s this value which indicates what kind of exception was raised.
+
+There are different kinds of exceptions and each one has its own handler. The hard fault exception is the exception that’s called when a invalid memory access occurs or when the processor tries to execute an invalid instruction, among other fatal errors.
+
+There’s also this value, this is a snapshot of the CPU registers at the time the exception occurred.
+
+Perhaps the most important of these registers is the (Program Counter) register; it points to the instruction that triggered the exception. We can disassemble the program around that instruction to investigate further:
+
+is pointed out as the culprit. This instruction tries to load the value stored at the address indicated by the register. From the value, we know that was . This must mean that the address is invalid as in it must not be in the RAM or Flash memory region. Which is exactly the case here.
+
+Another nifty thing that the crate can do is print messages on the OpenOCD console just like the macro does.
+
+Consider this program (See for the full source).
+
+If we enable the feature of the crate, we’ll see the message appear on the OpenOCD console when the program is executed under the debugger.
+
+Line and source file information will show up just like they do when a regular Rust program panics. This is pretty useful to catch bugs like arithmetic overflow and out of bounds accesses. Oh, and s trigger breakpoints just like exceptions so you can use within the GDB session to get a backtrace.
+
+Now that we have verified that both the tooling and the template work, we can go ahead and build a program that makes use of the device hardware.
+
+As you may know, using the hardware requires reading and writing to special memory regions referred to as registers. The reference manual of the microcontroller contains all there is to know about a microcontroller’s registers: their locations in memory and what their contents mean. You could translate that information into an API but that’s a lot of work and error prone.
+
+A better way is to auto-generate that API from the microcontroller’s System View Description (SVD) file using a tool like . A SVD file is basically a machine readable version of the reference manual. Most vendors provide these for their devices. Here’s a database of such files – it contains more than 500 SVD files. If you don’t find a SVD file for your device there, check your microcontroller vendor website or ask them directly.
+
+Let’s use on the SVD file of the STM32F303VCT6 microcontroller .
+
+That wasn’t too hard and 200K+ lines of Rust just materialized from thin air.
+
+The output of is a crate that provides an API to access every one of the microcontroller’s peripherals. The API is relatively low level as it operates at the register level but it’s type safe: It won’t let you
+
+Apart from avoiding those footguns, the API uses enums / methods instead of magic bit patterns like for clarity. The generated API is documented here.
+
+Armed with an API to access the hardware, we now can write the real “Hello, world!” of the embedded world: A program to blink an LED.
+
+There’s no example for this in as the implementation is device and board specific but here’s the code for the STM32F3DISCOVERY:
+
+It’s not necessary to understand every single line of the previous program as it contains low level device specific code. But here are some things to note:
+
+But the best part is the disassembly of the program when compiled in release mode.
+
+The generated API makes heavy use of closures and enums for type safety, and of method chains for ergonomics but LLVM optimizes all that away and produces very lean code. Also notice how there are no branches; LLVM proved that the failure branches of the methods were unreachable and optimized them away. This shows that the type safety provided by the generated API is zero cost.
+
+Although you could go ahead and build applications just using the register level API that generates, it’s nicer if you can code in something higher level and that abstracts away the registers. That’s where Board Support Crates come in.
+
+A board support crate provides a high level API to program a specific development board. I have developed one such crate for the STM32F3DISCOVERY: the crate. Let’s use that crate to simplify the blinky program.
+
+All the register names are gone. The abstraction encodes the idea of a timer that generates periodic update events. Even the LEDs have their own abstraction in the form of the type. And is a collection of all the user LEDs on the board.
+
+Behavior is unchanged after moving to the crate so I’m not going to show another video of the same thing. Let’s see how the new program does in terms of performance.
+
+The generated code is about the same as the version that directly used the crate. So the higher level API provided by the crate is also a zero cost abstraction.
+
+OK. That’s all the code I’m going to show you in this post.
+
+I’d like to step back for a bit to look at all the abstraction layers (crates) we are using:
+
+In the above diagram, you can see that the layers are split in two halves. The layers on the left are what I like to call device agnostic layers. The crates on that side rely on hardware features available on all Cortex-M cores so they work for any microcontroller. The crates on the right side are device specific and will only work on a limited set of microcontrollers.
+
+Here’s a recap of what each crate does:
+
+That’s it for this post. We have seen:
+
+In the next one, we’ll fix this inefficiency:
+
+This is blocking code that forces the processor to uselessly busy wait for a whole second when it could have been doing something more useful. Also, although critical sections give the synchronization needed to achieve memory safety, they should be used sparingly. Here we executed everything inside a critical section. We’ll fix that too. So in the next post, with just one more device agnostic crate, we’ll leverage interrupts in a memory safe manner and build an efficient multitasking application. I’ll leave you with this figure.
+
+Enjoyed this post? Like my work on embedded stuff? Consider supporting my work on Patreon!
+
+Follow me on twitter for even more embedded stuff.
+
+The embedded Rust community gathers on the #rust-embedded IRC channel (irc.mozilla.org). Join us!|||
+

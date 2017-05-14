@@ -1,0 +1,147 @@
+Haskell is a pure language. Every Haskell expression is referentially transparent, meaning that you can substitute that expression with its evaluated result without changing the program. Or, put into code:
+
+And this is true for all expressions , and all functions . These could be complex expressions which describe ways of manipulating network channels or window buffers, or something trivial like a numeric literal. You can always substitute the expression with its value.
+
+This is not true in Scala, simply because Scala allows unrestricted side-effects. Unlike Haskell, Scala puts no limitations on where and when we can use things like mutable state ( s) or evaluated external effects like or . Since there are no restrictions on where and when we can do evil, the Scala equivalent to the above just doesn’t work:
+
+The reason it isn’t equivalent comes from the different sorts of expressions that we could find in . For example, what if is . If we make that substitution, our snippet looks like the following:
+
+Clearly these are not the same two programs. The first prints twice, while the second only prints it once. This is a violation of referential transparency, and it’s why we sometimes say that Scala is an impure language. Any expression which is not referentially transparent must contain side-effects, by definition.
+
+Now of course, we found this problem by using a side-effecting function: namely, . Haskell clearly has the ability to print to standard output, so how does it avoid this issue? If we build the same program in Haskell, can we violate referential transparency?
+
+As it turns out, this is still referentially transparent! These two programs still have the same meaning. This is possible only because neither program actually prints anything!
+
+In Haskell, effects are treated as first-class values. The function doesn’t print to standard out, it returns a value (of type ) which describes how to print to standard out, but stops short of actually doing it. These sorts of values can be composed using the monadic operators (in Scala, and ), allowing Haskell programmers to build up expressions composed of sequences of dependent effects, all of which are merely descriptions of the side-effects which will eventually be performed by the runtime. Ultimately, the description which comprises your whole program is the return result from the function. The Haskell runtime runs the function to get this description of all your effects, and then runs the effects per your instructions.
+
+This is kind of a clever trick. It allows Haskell to simultaneously be pure and still have excellent support for manipulating effects and interacting with the “real world”. But why is it relevant to Scala? After all, Scala is an impure language. We don’t need to go through this complex rigmarole of describing our effects and composing those descriptions; the language lets us just do it! So why wouldn’t we just, you know, evaluate the effects that we need evaluated?
+
+The answer is that we want to reason about where and when our effects are evaluated. And of course, we want to be able to leverage laws and abstractions which assume equational semantics for expressions (i.e. referential transparency). Cats is full of these sorts of abstractions, and cats-laws provides a vast set of laws which describe them. But all of these abstractions and all of these laws break down the moment you introduce some sort of side-effecting expression. Because, much like our referential transparency example from earlier, these abstractions assume that you can substitute expressions with their evaluated results, and that’s just not true in the presence of side-effects.
+
+What we need is a data type which allows us to encapsulate Scala-style side-effects in the form of a pure value, on which referential transparency holds and which we can compose using other well-defined abstractions, such as . Scalaz defines two such data types which meet these criteria: and . But in practice, nearly everyone uses instead of because of its support for asynchronous effects.
+
+Cats does not define any such abstraction, and what’s worse is the cats ecosystem also doesn’t really provide any such abstraction. There are two implementations that are relatively commonly used with cats – namely, and – but these are not part of cats per se, nor are they deeply integrated into its abstraction hierarchy. Additionally, the proliferation of broadly equivalent options has led to confusion in the ecosystem, with middleware authors often forced to choose a solution for their end-users, and end-users uncertain as to which choice is “right”.
+
+The cats-effect project aims to change all of that. The goal of cats-effect is to provide an “easy default” type for the cats ecosystem, deeply integrated with cats-core, with all of the features and performance that are required for real world production use. Additionally, cats-effect defines a set of abstractions in the form of several typeclasses which describe what it means to be a pure effect type. These abstractions are extremely useful both in enabling MTL-style program composition and to ensure that other pre-existing implementations remain first-class citizens of the ecosystem. does not overshadow or ; it complements them by providing a set of abstractions and laws which allow users to write safe, parametric code which supports each of them equally.
+
+One important sidebar here: cats-effect does not provide any concurrency primitives. and are both notable for providing functions such as , which takes two s and runs them in parallel, returning a of a tuple of the results. The type does not provide any such function, and while it would be possible to define such a function (and others like it!), we strongly encourage users to instead consider full-on streaming frameworks such as fs2 or Monix for their concurrency needs, as these frameworks are able to provide a much sounder foundation for such functions. See here for a rough outline of why this is. Also note that some implementations, such as Monix’s, can and do provide parallelism on a sound foundation by enriching their internal algebraic structures. Thus, is actually quite different from , despite having a similar core set of operations.
+
+What does this look like in practice? Well, ideally, as convenient as possible! Let’s look at our println example:
+
+Great! We can write Haskell fanfic in Scala. 😛
+
+The notable element here is the use of the constructor to wrap the effect in a pure value. This pattern can be applied to any side-effect. You can think of this sort of like an FFI that converts impure code (like ) into pure code (like ). The goal of this API was to be as simple and straightforward as possible. If you have a curly brace block of impure side-effecting code, you can wrap it in a composable and pure abstraction by just adding two characters: . You can wrap arbitrarily large or small blocks of code, potentially involving complex allocations, JNI calls, resource semantics, etc; but it is generally considered a best practice to wrap side-effects into the smallest composable units that make sense and do all of your sequentialization using and -comprehensions.
+
+For example, here’s a program that performs some simple user interaction in the shell:
+
+We could have just as easily written this program in the following way:
+
+But this gives us less flexibility for composition. Remember that even though is a pure and referentially transparent value, its definition is not, which is to say that is not the same as . Anything inside the … block is not referentially transparent, and so should be treated with extreme care and suspicion. The less of our program we have inside these blocks, the better!
+
+As a sidebar that is actually kinda cool, we can implement a action that wraps as a !
+
+This is totally valid! We don’t need to worry about the difference between and anymore, because is referentially transparent. So you use when you need parameters, and you use when you don’t, and you don’t have to think about evaluation semantics. No more subtle bugs caused by accidentally memoizing your effects!
+
+Of course, if is referentially transparent, then clearly repeated values of cannot possibly run the effects it represents multiple times. For example:
+
+If this weren’t the case, then we would be in trouble when trying to construct examples like the Haskell one from earlier. But there is an implication here that is quite profound: cannot eagerly evaluate its effects, and similarly cannot memoize its results! If were to eagerly evaluate or to memoize, then we could no longer replace references to the expression with the expression itself, since that would result in a different instance to be evaluated separately.
+
+This is precisely why is not a suitable type for encapsulating effects in this way: constructing a that will eventually side-effect is itself a side-effect! evaluates eagerly (sort of, see below) and memoizes its results, meaning that a inside of a given will only evaluate once, even if the is sequenced multiple times. This in turn means that is not the same program as , which is the very definition of a violation of referential transparency.
+
+Coming back to … If does not evaluate eagerly, then clearly there must be some mechanism for asking it to evaluate. After all, Scala is not like Haskell: we don’t return a value of type from our function. provides an FFI of sorts for wrapping side-effecting code into pure values, so it must also provide an FFI for going in the opposite direction: taking a pure value and evaluating its constituent actions as side-effects.
+
+This function is called . Given an , the function will give you a value of type . You should only call this function once, ideally at the very end of your program! (i.e. in your function) Just as with , any expression involving is not referentially transparent. For example:
+
+The above will run twice. So clearly, referential transparency is out the window whenever we do this, and we cannot expect the normal laws and abstractions to remain sound in the presence of this function.
+
+As Viktor Klang is fond of pointing out, doesn’t need to evaluate eagerly. It is possible to define an in which defers its evaluation until some indefinitely later point. However, this is not the default mode of operation for 99% of all s ever constructed; most people just use and leave it at that. Additionally, if someone hands me an arbitrary , perhaps as a return value from a function, I really have no idea whether or not that is secretly running without my consent. In other words, the referential transparency (or lack thereof) of functions that I write using is dependent on the runtime configuration of some other function which is hidden from me. That’s not referential transparency anymore. Because we cannot be certain that is deferring its evaluation, we must defensively assume that it is not.
+
+This, in a nutshell, is precisely why is not appropriate for functional programming. provides a pair of functions ( and ) for interacting with -using APIs, but in general, you should try to stick with as much as possible when manipulating effects.
+
+Scala runs on three platforms: the JVM, JavaScript and LLVM. For the moment, we’ll just focus on the first two. The JVM has support for multiple threads, but those threads are native (i.e. kernel) threads, meaning that they are relatively expensive to create and maintain in the runtime. They are a very limited resource, sort of like file handles or heap space, and you can’t just write programs which require an unbounded number of them. The exact upper bound on the JVM varies from platform to platform, and varies considerably depending on your GC configuration, but a general rule of thumb is “a few thousand”, where “few” is a small number. In practice, you’re going to want far less threads than that if you want to avoid thrashing your GC, and most applications will divide themselves into a bounded “main” thread pool (usually bounded to exactly the number of CPUs) on which all CPU-bound tasks are performed and most of the program runs, as well as a set of unbounded “blocking” thread pools on which blocking IO actions (such as anything in ) are run. When you add NIO worker pools into the mix, the final number of threads in a practical production service is usually around 30-40 on an 8 CPU machine, growing roughly linearly as you add CPUs. Clearly, this is not a very large number.
+
+On JavaScript runtimes (such as or in the browser), the situation is even worse: you have exactly one thread! JavaScript simply doesn’t have multi-threading in any (real) form, and so it’s like the JVM situation, but 30-40x more constraining.
+
+For this reason, we need to be very careful when writing Scala to treat threads as an extremely scarce resource. Blocking threads (using mechanisms such as , or ) should be considered absolutely anathema, since it selfishly wastes a very finite and very critical resource, leading to thread starvation and deadlocks.
+
+This is very different from how things are in Haskell though! The Haskell runtime is implemented around the concept of green threads, which is to say, emulated concurrency by means of a runtime dispatch lock. Haskell basically creates a global bounded thread pool in the runtime with the same number of threads as your machine has CPUs. On top of that pool, it runs dispatch trampolines that schedule and evict expression evaluation, effectively emulating an arbitrarily large number of “fake” threads atop a small fixed set of “real” threads. So when you write code in Haskell, you generally just assume that threads are extremely cheap and you can have as many of them as you want. Under these circumstances, blocking a thread is not really a big deal (as long as you don’t do it in FFI native code), so there’s no reason to go out of your way to avoid it in abstractions like .
+
+This presents a bit of a dilemma for cats-effect: we want to provide a practical pure abstraction for encapsulating effects, but we need to run on the JVM and on JavaScript which means we need to provide a way to avoid thread blocking. So, the implementation in cats-effect is going to necessarily end up looking very, very different from the one in Haskell, providing a very different set of operations.
+
+Specifically, provides an additional constructor, , which allows the construction of instances from callback-driven APIs. This is generally referred to as “asynchronous” control flow, as opposed to “synchronous” control flow (represented by the constructor). To see how this works, we’re going to need a bit of setup.
+
+Consider the following somewhat-realistic NIO API (translated to Scala):
+
+This is an asynchronous API. Neither of the functions or attempt to block on completion. Instead, they schedule their operations via some underlying mechanism. This interface could be implemented on top of (which is a synchronous API) through the use of an internal thread pool, but most NIO implementations are actually going to delegate their scheduling all the way down to the kernel layer, avoiding the consumption of a precious thread while waiting for the underlying IO – which, in the case of network sockets, may be a very long wait indeed!
+
+Wrapping this sort of API in a referentially transparent and uniform fashion is a very important feature of , precisely because of Scala’s underlying platform constraints. Clearly, and both represent side-effects, but they’re different than and in that they don’t produce their results in a sequentially returned value. Instead, they take a callback, , which will eventually be notified (likely on some other thread!) when the result is available. The constructor is designed for precisely these situations:
+
+Obviously, this is a little more daunting than the examples from earlier, but that’s mostly the fault of the anonymous inner class syntactic ceremony. The interaction is actually quite simple!
+
+The constructor takes a function which is handed a callback (represented above by in both cases). This callback is itself a function of type , where is the type produced by the . So when our comes back as in the example, we invoke the callback with a since we’re trying to produce an . When the comes back as in the example, we invoke the callback with , since the produces an .
+
+Now remember, is still a monad, and values constructed with are perfectly capable of all of the things that “normal”, synchronous values are, which means that you can use these values inside -comprehensions and other conventional composition! This is incredibly, unbelievably nice in practice, because it takes your complex, nested, callback-driven code and flattens it into simple, easy-to-read sequential composition. For example:
+
+This is kind of amazing. There’s no thread blocking at all in the above (other than the blocking on standard output). The could take quite a long time to come back to us, and our thread is free to do other things in the interim. Everything is driven by callbacks under the surface, and asynchronous actions can be manipulated just as easily as synchronous ones.
+
+Of course, this is an even bigger win on JavaScript, where nearly everything is callback-based, and gigantic, deeply nested chunks of code are not unusual. allows you to flatten those deeply nested chunks of code into a nice, clean, linear and sequential formulation.
+
+Now there is a caveat here. When our handler is invoked by , it is very likely that the callback will be run on a thread which is part of a different thread pool than our main program. Remember from earlier where I described how most well-designed Java services are organized:
+
+We definitely want to run nearly everything on that first pool (which is probably ), but we’re probably going to receive the callback on one of the third pools. So how can we force the rest of our program (including those s) back onto the main pool?
+
+The answer is the function.
+
+’s functionality is a little complicated, but generally speaking, you should think of it as a “force this onto this other thread pool” function. Of course, when executes, most of its work isn’t done on any thread at all (since it is simply registering a hook with the kernel), and so that work isn’t thread shifted to any pool, main or otherwise. But when gets back to us with the network response, the callback will be handled and then immediately thread-shifted back onto the main pool, which is passed implicitly as a parameter to (you can also pass this explicitly if you like). This thread-shifting means that all of the subsequent actions within the -comprehension – which is to say, the continuation of – will be run on the thread pool, rather than whatever worker pool is used internally by . This is an extremely common use-case in practice, and attempts to make it as straightforward as possible.
+
+Another possible application of thread shifting is ensuring that a blocking action is relocated from the main, CPU-bound thread pool onto one of the pools designated for blocking IO. An example of this would be any interaction with :
+
+Clearly, is blocking the underlying thread while it waits for the disk to return the file contents to us, and for a large file, we might be blocking the thread for quite a long time! Now if we’re treating our thread pools with respect (as described above), then we probably have a pair of (s) sitting around in our code somewhere:
+
+We want to ensure that runs on the pool, while everything else in the -comprehension runs on . How can we achieve this?
+
+Now we’re definitely in bizarro land. Two calls to , one after the other? Let’s break this apart:
+
+One of the functions of is to take the action it is given and relocate that action onto the given thread pool. In the case of , this component of was meaningless since didn’t use a thread under the surface (it was asynchronous!). However, does use a thread under the surface (hint: it was constructed with rather than ), and so that work will be relocated onto the pool by the above expression.
+
+Additionally, the continuation of this work will also be relocated onto the pool, and that’s definitely not what we want. The evaluation of the function is definitely CPU-bound, and should be run on the pool. So we need to a second time, but only the continuation of the action, not itself. As it turns out, we can achieve this just by adding the second call:
+
+Now, will be run on the pool, but the continuation of (namely, everything that follows it in the -comprehension) will be run on . This works because creates an asynchronous that schedules the target action on the given thread pool and invokes its continuation from a callback. The ExecutionContext#execute function should give you an idea of how this works. This means that the result of the first is an constructed with , and cannot itself be thread-shifted (unlike an constructed with ), but its continuation can be thread-shifted, which is exactly what happens.
+
+This sort of double- idiom is very common in production service code that makes use of legacy blocking IO libraries such as .
+
+Speaking of asynchrony, readers who have been looking ahead in the class syllabus probably realized that the type signature of is more than a little suspicious. Specifically, it promises to give us an immediately given an ; but if that is an asynchronous action invoked with a callback, how can it achieve this promise?
+
+The answer is that it blocks a thread. (gasp!!!) Under the surface, a is used to block the calling thread whenever an is encountered that was constructed with . Functionally, this is very similar to the function in , and it is just as dangerous. Additionally, it clearly cannot possibly work on JavaScript, since you only have one thread to block! If you try to call on JavaScript with an underlying , it will just throw an exception rather than deadlock your application.
+
+This is not such a great state of affairs. I mean, it works if is being run in test code, or as the last line of your function, but sometimes we need to interact with legacy code or with Java APIs that weren’t designed for purity. Sometimes, we just have to evaluate our actions before “the end of the world”, and when we do that, we don’t want to block any of our precious threads.
+
+So provides an additional function: . This function takes a callback (of type ) which it will run when (and if) the completes its execution. As the name implies, this function is also not referentially transparent, but unlike , it will not block a thread.
+
+As a sidebar that will be important in a few paragraphs, also defines a safe function called which has a very similar signature to , except it returns an . The which is returned from this function will not block if you call . In other words, it is always safe to call on the results of , even on JavaScript.
+
+Another way to look at this is in terms of . You can define in terms of and :
+
+This isn’t the actual definition, but it would be a valid one, and it would run correctly on every platform.
+
+As mentioned earlier (about 10000 words ago…), the cats-effect project not only provides a concrete type with a lot of nice features, it also provides a set of abstractions characterized by typeclasses and associated laws. These abstractions collectively define what it means to be a type which encapsulates side-effects in a pure fashion, and they are implemented by as well as several other types (including and ). The hierarchy looks like this:
+
+and are of course a part of cats-core, while everything else is in cats-effect. is functionally equivalent to the familiar typeclass, which was commonly used in conjunction with . It literally means “a monad with error-handling capabilities”. certainly fits that description, as any exceptions thrown within its method (or within ) will be caught and may be handled in pure code by means of the function. , , and are the new typeclasses.
+
+simply describes the function (in the typeclasses, this function is called ). Which is to say, any type constructor which has a has the capability to suspend synchronous side-effecting code. is very similar to this in that it describes the function. So any type constructor which has an can suspend asynchronous side-effecting code. should be familiar to Haskell veterans, and is broadly useful for defining parametric signatures and composing monad transformer stacks.
+
+is where everything is brought together. In addition to being able to suspend synchronous and asynchronous side-effecting code, anything that has an instance may also be asynchronously interpreted into an . The way this is specified is using the function:
+
+What this is saying is that any must define the ability to evaluate as a side-effect, but of course, we don’t want to have side-effects in our pure and reasonable code. So how are side-effects purely represented? With !
+
+From a parametric reasoning standpoint, means “here be effects”, and so any type signature which involves thus also involves side-effects (well, effects anyway), and any type signature which requires side-effects must also involve . This bit of trickery allows us to reason about in a way that would have been much harder if we had defined as a member, and it ensures that downstream projects which write code abstracting over types can do so without using any functions if they so choose (especially when taken together with the function).
+
+The lack of a production-ready -like type fully integrated into the cats ecosystem has been a sticking point for a lot of people considering adopting cats. With the introduction of cats-effect, this should no longer be a problem! As of right now, the only releases are snapshots with hash-based versions, the latest of which can be found in the maven badge at the top of the readme. These snapshots are stable versions (in the repeatable-build sense), but they should not be considered stable, production-ready, future-proof software. We are quickly moving towards a final 0.1 release, which will depend on cats-core and will represent the stable, finalized API.
+
+Once cats releases a final 1.0 version, cats-effect will also release version 1.0 which will depend on the corresponding version of cats-core. Changes to cats-effect are expected to be extremely rare, and thus the dependency should be considered quite stable for the purposes of upstream compatibility. Nevertheless, the release and versioning cycle is decoupled from cats-core to account for the possibility that breaking changes may need to be made independent of the cats-core release cycle.
+
+Check out the sources! Check out the documentation. Play around with the snapshots, and let us know what you think! Now is the time to make your opinion heard. If in its current form doesn’t meet your needs, we want to hear about it!
+
+Unless otherwise noted, all content is licensed under a Creative Commons Attribution 3.0 Unported License.|||
+
+Let the Scala compiler work for you. We provide type classes, instances, conversions, testing, supplements to the standard library, and much more.
