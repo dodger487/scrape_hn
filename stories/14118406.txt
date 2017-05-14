@@ -1,0 +1,115 @@
+This post was co-written with Arham Ahmed, and shout-outs to Sean Corcoran of MacStadium and Tim Lucas of Buildkite.
+
+The mobile space has changed quickly, even within the past few years. At Shopify, the world’s largest Rails application, we have seen the growth and potential of the mobile market and set a goal of becoming a mobile-first company. Today, over 130,000 merchants are using Shopify Mobile to set up and run their stores from their smartphones. Through the inherent simplicity and flexibility of the mobile platform, many mobile-focused products have found success.
+
+Our production engineering team recently revamped our old continuous integration setup to be more dynamic and built to scale from the ground up. Previously, the environments were shared between projects, with capacity statically assigned to either Android or iOS. This made evolving the configuration difficult because it required updating all projects at the same time.
+
+We needed a system to replace our preconfigured Mac Minis that was faster, more reliable and could scale to a larger number of builds. We set out to build something that, in terms of performance, took less than 10 minutes per build and was scalable across our entire engineering team. In this blog post we’ll share how we built the new system, how it works, and what we learned in the process.
+
+Shopify has dozens of developers working on mobile apps. We publish to the Google Play Store and Apple’s App Store, in addition to releasing internal builds for testing. We expect mobile to grow a lot in the future, and, to accommodate this growth, we invested in our continuous integration cluster.
+
+Our mobile CI pipeline builds, tests, and publishes apps, which includes signing the apps with the right certificates. We try to eliminate manual steps as much as possible in favor of reproducible automated steps. We also put a lot of effort into modern testing strategies for mobile apps.
+
+We considered third-party party services such as CircleCI and Travis CI for ease of use; however, we found severe limitations in terms of performance and scalability for our purposes. Furthermore, the ability to track the latest OS and toolchain versions was a big factor as well. In the end, we needed to build something custom.
+
+Buildkite forms the backbone of our CI systems. We chose it in part for its great flexibility and the ability to use our own infrastructure.
+
+Buildkite runs lightweight Buildkite agents that can be run in many different environments and support all of the major operating systems. The agents connect to Buildkite’s backend, coordinating the scheduling of jobs on agents. We can customize the agent’s behavior on a host by overriding the ‘hooks’ (essentially just shell scripts invoked by the agent). We use hooks to check out code, initialize the build environment, and expose pipeline secrets.
+
+We aimed for a virtualized infrastructure for its many advantages in deploying changes, reproducibility, and scalability. Our goal was to run every build in its own virtual machine and to dispose of it afterwards. This way each build is isolated from changes made by others in previous builds, since no state persists between builds. After experimenting with multiple possible solutions such as AWS and Docker, we decided to run both our Android and iOS CI on VMware virtual machines, on top of the VMware ESXi hypervisor.
+
+As you probably already know, iOS applications must be built and tested on macOS. Due to Apple’s EULA, macOS is only allowed to run on Mac hardware. Furthermore, macOS cannot be run on Docker. Setting up the iOS build environment to work from the command line requires more steps than for Android’s Ubuntu setup.
+
+iOS apps require the macOS environment to be provisioned correctly with certificates and provisioning profiles. Fortunately, fastlane match makes this a breeze. As part of initializing the VM, we run match with access to an encrypted repo that contains all the provisioning profiles and certificates. Fastlane’s documentation nicely explains how to use match.
+
+Rather than using match in full automatic mode, we opted for a more manual approach. This involves using match in read-only mode so we can manage the certificates and provisioning profiles ourselves in Apple’s Developer Portal. We implemented our own management scripts using fastlane spaceship, another great open-source tool from fastlane. This allowed us to provision our existing profiles with match.
+
+We allow developers to use the Xcode’s automatic signing configuration locally. This is a new feature in Xcode 8 that makes it easier for developers to build apps locally. However, this doesn’t work on CI, so we decided to convert the Xcode project config to manual as part of the CI pipeline. The xcodeproj gem is great for these kind of tasks. Fastlane’s code signing guide is useful as well.
+
+We found for Android that Docker in the cloud (AWS, Google Cloud) does not support Linux KVM. However, Linux KVM optimizes nested virtualization, a requirement for accelerated Android x86/x86-64 emulators. One alternative was running Docker instances for Android CI in our own data center, but it was simpler to reuse the mobile CI setup we already needed for iOS in MacStadium.
+
+We use VMware vCenter for managing VMs, rather than managing VMs on top of ESXi directly. VMware provides a Ruby interface (rbvmomi) to the VMware vSphere API, which is well-documented.
+
+Xcode upgrades are still a bit of work, even with the level of automation we have in place. When upgrading from Xcode 7 to Xcode 8, we encountered several breaking changes, most of which were related to changes in the code signing process of Xcode 8.
+
+Upgrading macOS to newer point-release versions is usually pretty smooth, but major upgrades such as from Yosemite to Sierra caused some issues because of the more strict keychain permissions that Apple implemented in Sierra.
+
+Configuring a Packer template for Ubuntu 16.04 was relatively straightforward, and overall a much smoother process than for macOS. Updates to the Android SDK are modular and barely ever require breaking changes.
+
+Overall, it’s difficult to predict the level of impact of new macOS and Xcode releases. To avoid unexpected upgrade issues, we first beta test new versions before switching our projects. We also use serverspec to test our iOS and Android environments as the final step of our Packer build process. However, even serverspec and manual testing of an environment does not guarantee that the new version works perfectly with all projects that use the CI system.
+
+We discovered that the ability to run different OS and toolchain versions side-by-side makes for a much smoother rollout of new versions and is a must have feature in larger CI systems.
+
+Deploying changes to the old setup became increasingly slow as we added more Mac Minis and a critical reason why we switched to a better system. We started with six Mac Minis, but once we reached 24 Mac Minis deploying new virtual machines to all of them took roughly two hours, even with optimizations such as compressing the VM disk images and parallelizing the upload process.
+
+The incredibly slow VM image deploy times, exceeding two hours, meant uploading VMs to each host was simply not feasible. Fortunately, Macstadium has a Private Cloud solution with a typical private cloud node consisting of a 12 core, 64 or 128GB RAM Apple Mac Pro with 2x 10Gb Ethernet (Intel X520 NIC), and 2x Fibre Channel (QLogic 2562 2x 8Gbps Ports), offering the following advantages over the Mac Minis:
+
+We realized that using a shared SAN to store VM templates could reduce our deploy times from O(N) to O(1). This opened the door to horizontal scalability since adding a host only increased the CI system’s capacity without any other side-effects, as long as the storage platform is able to keep up with the concurrent read/write workload. The big lesson learned here was to invest in the right hardware.
+
+We wanted greater flexibility through an abstraction layer between new jobs and the environment they were run in. Inspired by Kubernetes, we came up with the idea of having a ‘scheduler’ VMs that delegate jobs to freshly created ‘worker’ VMs which were destroyed upon the job’s completion. Scheduler VMs are the entry point for CI jobs, and the same scheduler VMs are used by Android and iOS CI jobs.
+
+Since the new Mac Pros are much more powerful than the Mac Minis, we provisioned scheduler VMs (each a relatively lightweight Ubuntu server instance) to run six Buildkite agents each. This means up to six jobs run in parallel per Mac Pro.
+
+We now have eight Mac Pros in our MacStadium cluster, which gives us a capacity of 48 concurrently running jobs--and we’re planning to scale up in the future.
+
+The separation between scheduler and worker VMs allows us to remove all of the Buildkite logic from VM templates and move it into the scheduler, which makes creating templates simpler. Instead of having only one VM type, our development teams can create their own customized VM templates to run their builds.
+
+We created a few base templates, such as:
+
+The templates are stored on the SAN and are accessible by each scheduler, so that builds can select which template to run on through an environment variable on Buildkite.
+
+Once the agent receives a job, it is delegated to a freshly created worker VM. Below is an overview of the final setup.
+
+Each build is required to specify an environment variable that selects a matching template on the SAN. From this template, a linked clone of the template is created using VMware APIs. A linked clone is essentially a delta disk (read/write) on top of the VM template itself (read only). While we could have made full clones, linked clones use significantly less disk space on the SAN and are much faster to create.
+
+Each Buildkite agent runs exactly one job at the time and uses one linked clone to run the assigned job. Workers are created using a naming convention which ensures that no more than one VM can be running per Buildkite agent. In some cases, ‘zombie’ workers can be left behind, which are essentially worker VMs that are not destroyed at the end due to a job being cancelled by users of the system, or an unexpected infrastructure failure. We implemented a simple zombie removal step that guarantees there are always six or fewer workers per scheduler (since there are six agents) running concurrently so the space and memory constraints of the hardware are maintained.
+
+Each project has its own pipeline in the Shopify organization on Buildkite where builds are run. To do so, each project requires a pipeline file, which may look like the following.
+
+A pipeline can contain multiple of these steps. By default, steps in the pipeline are executed in parallel; steps can be configured to run only after the preceding steps have passed. In this example, Buildkite will run this step as 5 parallel steps. Each step is executed on a separate linked clone worker VM.
+
+The scheduler VMs are provisioned with clones of our git repositories during their build process so that the project’s checkout step after schedulers are deployed is much faster than otherwise would be possible.
+
+The total time for a VM to be ready is roughly 40 seconds. However, creating a linked clone on the SAN takes less than 3s: the slow part is waiting for the operating system to be fully booted.
+
+We assign static IPs to the virtual machines based on the host and Buildkite agent index. Virtual machines are also named using this naming convention in vSphere, which makes garbage collection of ‘zombie workers’ easy as names can easily be inferred by the job that was delegated to an agent.
+
+As mentioned before, builds are run on disposable worker VMs that are destroyed once the build completes. Mobile projects use cache files to speed up successive builds, so this benefit would be lost when using fresh workers each time. For example, Android stores its build dependencies in the directory ~/.gradle. In the new setup, we wanted to make sure we still benefit from the speed gains even though every build starts with a blank slate.
+
+To ensure consecutive builds run fast, there would need to be a caching layer that made all the cache files Android Studio and Xcode used internally available to each job. Projects can specify the directories they want to cache between runs.
+
+In the project pipeline file, we allow a list of cached directories to be specified. Then, as part of preparing a worker VM, the cached directory or file is loaded into the VM at the same path. To save an entity, a hash is generated based off the project name, revision of the project, and the name of the entity to be cached itself. The entity is then compressed and streamed over SSH to its destination on the SAN. We use Redis to maintain a list of all revisions for each project name and directory where the latest revision is appended to the start of the list.
+
+Once the list reaches a certain maximum size, the last entry is removed and the corresponding tarball is deleted to recollect the disk space. We ran into an issue, however, with concurrent writes to the same folder as multiple steps run in parallel. We solved this by using Redis to atomically acquire a lock. Whichever worker receives the lock writes to the cache normally whereas other workers would simply skip the “updating cache” step. As for loading, after looking up the latest cache revision in Redis, the hash is generated to infer the filename, and the decompressed entity is streamed over SSH to the correct path.
+
+To further optimize the caching process, we added RAM disks to the worker VMs. The RAM disk is mounted like any other folder in the filesystem but resides in memory. By default, cache files are written and read from the RAM disk in the VM, which reduces the load on the SAN and generally improves I/O performance.
+
+Our goal to make configuration management as smooth as possible meant we wanted to ship changes to VMs in a fully automated way.
+
+We created a Buildkite pipeline that runs on a bare metal Mac Pro in MacStadium, dedicated to building and deploying VMs to Mac Pros in the private cloud. This Mac Pro contains large-sized packages such as the macOS and Xcode installers on its local SSD.
+
+This build machine is connected to a Buildkite pipeline that triggers Packer builds of VMs when changes are committed to our VM template repositories. Each VM template has its own GitHub repository that contains its Packer configuration files.
+
+Packer allows us to provision a VM with a number of scripts and some configuration parameters such as the resources for a VM. Once a template is built using Packer, we upload it to the shared SAN with a command line tool called ovftool. The VMs we build tend to be rather large: roughly 50 GB for most variants.
+
+Provisioning VMs with Packer can be a slow process, with build times of more than an hour for macOS excluding the upload time to actually deploy it. To improve build times, we implemented ‘layered’ VM builds with Packer, taking advantage of how Packer allows you to build VMs in multiple steps, with each step taking the resulting VM of the previous step as its input.
+
+We split up the build process for our macOS and Ubuntu VMs into three separate layers:
+
+A VM layer is rebuilt if the template file corresponding to that layer changed, or if any of the scripts referenced by that template file has changed, causing the following layers to rebuild as well. In many cases only the outer layer (strapped) needs to be changed, which allows quickly rebuilding the VM in a matter of minutes.
+
+Due to the SAN being shared across all hosts in the clusters, a VM image only needs to be uploaded once to the SAN for it to be available on all Mac Pros. Once the VM image is uploaded to the SAN, all hosts can access it through vCenter over the high-bandwidth connection.
+
+This fundamental improvement dramatically reduced the worst deploy time from approximately 150 minutes (2 ½ hours) to 20 minutes.
+
+Uploading to only one destination rather than to each machine separately also increased the reliability of our deploys. We deploy changes to our VM templates atomically, which never interrupts running builds (VM templates on the SAN are never overwritten.) We tag each template with its unique git revision, and, to deploy a change to an existing template, we upload an image tagged with the new revision (which is stored in addition to the old revisions). New Buildkite jobs will seamlessly switch to the new revision. We keep track of VM revisions using a Redis database. Over time, old revisions of templates are garbage collected, without affecting active pipelines.
+
+Our upgrade to the MacStadium Private Cloud allows the new CI system to horizontally scale as adding additional hosts increases capacity without increasing VM image deploy times. Our Ubuntu deploy times went from roughly 40 minutes to 5 minutes, and the macOS deploys went from 120 minutes (2 hours) to 15 minutes. Although there is overhead in setting up worker VMs on the fly, it lets us achieve build-wide isolation of environments with the benefits of deterministic builds run on disposable, dynamically created workers.
+
+In summary, the benefits of our new system include:
+
+Screenshot of our deploy pipeline on Buildkite for Mobile Shopify Android
+
+We hope this blog post has helped anyone in the same situation. Leave us any comments or questions below. We look forward to sharing more about our mobile CI setup in the future.|||
+
+We share how we built a new system that took less than 10 minutes per build and was scalable across our org, how it works, and lessons learned.
