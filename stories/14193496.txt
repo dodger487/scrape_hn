@@ -1,0 +1,73 @@
+Now that you know what we expected S1Search to achieve, we move on to describing how we got there.
+
+We start with a high level overview of S1Search internals and processing flows, passing through its architecture, data model and distribution, and finally covering the most important flows: data insertion and querying. By the end of this post we will also cover a little bit on some optimizations we implemented on S1Search in order to fulfill our “light, cheap and fast” goal.
+
+At the end of this post there is a list of many references we used to learn about databases and consequently implement things on S1Search.
+
+That being said, let’s rock.
+
+S1Search implements a client-server architecture: an application instantiates a client which submits queries to be processed by the S1Search cluster — the machines that actually store data. On the server side, nodes are as independent from each other as possible following the principles of a shared nothing architecture. As for the client, it is a Python class that handles communication to the cluster and coordinates requests.
+
+To further explain how the client coordinates things, we need to understand what it coordinates in the first place. Hence we now present the data model supported by S1Search and the scheme used to partition data among cluster nodes.
+
+Databases are usually classified according to the abstraction they provide to the system using it. Many traditional databases follow a so called relational model which is backed by sound mathematical theory. Although broadly adopted, alternatives to this model have been growing consistently from the 2000’s on as a multitude of databases were created with new models that allow cheaper management of big data.
+
+The so called non-relational databases span a list of categories that include: key-value store, document store, graph database, wide-column store and others. With so many competing models on the database ecosystem, it should be clear that a definitive solution has not yet been found and that there is still space for innovation. This is the case of S1Search: although similarities can be traced, none of the known models are exactly a description to what S1Search implements.
+
+S1Search was not developed with any model in mind and, as a result, it has its own representation of data. However, you may follow the model explained in this section to organize your data when using S1Search as your data warehouse solution.
+
+First things first, S1Search stores data of entities, so every data must be associated with an entity. An entity is an instance of whatever the application wants to store data about in S1Search and it is identified by a numerical value. You may think of it as the primary key of a record, although this equivalence is not exact. But what is data?
+
+S1Search natively supports two types of data: time-series and non-time-series data.
+
+A time-series data entry is a triplet (Field Name, Field Value, Timestamp) and a non-time-series data entry is a tuple (Field Name, Field Value), where:
+
+Note that these tuples/triples are added independently: if you ever think you are adding many rows of data to S1Search at once, this is simply syntax sugar. Internally these data is split into distinct tuples or triplets. Therefore, a complete data record in S1Search associates either a tuple or a triplet to one entity and many tuples/triplets can be associated with a single entity.
+
+With all that in mind, a good picture of S1Search’s data model is a table whose sorting key is the Entity Identifier (Entity ID) and whose content is a list of tuples and triplets. This data visualization is called a materialized view.
+
+Additionally to the materialized view S1Search keeps data in a format called inverted index view. Hence S1Search always provide two views of these tuples and triplets: a materialized view and an inverted index view. By using a materialized view, one can query the value of an entity on a field and the inverted index view allows one to query for all entities with a value on a field.
+
+The problem with any big table is that it eventually gets too big for a single machine to manage it. By “too big” we mean that it gets too slow to query for entries in the table.
+
+A common solution is to partition a big table into smaller ones and give each partition to an independent machine. The usual way of splitting the table is by cutting it horizontally: for instance, call rows 0 to 1,000,000 the first partition of the table and set a machine to handle it. This technique is called sharding and is broadly used by S1Search.
+
+The way data is distributed among S1Search nodes is by following a mapping rule from the Entity ID (a numerical value) to a set of partition IDs (called a shard) to a node responsible for storing this shard.
+
+A simple sharding scheme consists of keeping in the same shard a quantity of sequential Entity IDs, such as having IDs from 0 to 999,999 in the first shard, IDs from 1,000,000 to 1,999,999 in the second shard and so on. A shard is then identified by its index in this sequence — the first shard has ID 1, the second has ID 2 and so on — and they are distributed evenly among nodes.
+
+For redundancy reasons, there might be more than one node responsible for a shard, in which case all responsible nodes must independently store to its system the same set of stored data. The advantage of this design is that shards might be added as the system grows and might be moved between nodes if a node is to be shut down. As a result, sharding is a technique applied for the sake of horizontal scalability of the system.
+
+Summing up, every data inserted on S1Search must belong to some Entity ID, and as Entity IDs are divided among existing shards. All data belonging to an Entity ID will end up being stored in the same shard, instead of being distributed among all the shards.
+
+If you haven’t heard of Kafka so far, here is a quick overview:
+
+For more information on Apache Kafka, this book could be a good start.
+
+Apache Kafka has two main roles in S1Search’s pipeline:
+
+1. It servers as a buffer of messages to be processed.
+
+2. It also works as a tool for failure recovery.
+
+Buffering messages is important in case the system is under heavy load and cannot process all messages immediately. In this scenario messages are held on Kafka until the cluster is available to process them.
+
+As for failure recovery, consumed Kafka messages are not immediately removed from its logs: they can be reprocessed in case a node fails or needs to reboot.
+
+One important note regarding the use of Kafka is that when an application sends a message using the S1Search client, the client returns as soon as the message is added to the in-memory message buffer of the Kafka’s client, so that it will be asynchronously sent to a Kafka topic packed other messages in batch. Therefore, a query executed immediately after indexing this data won’t see the effect of the data entry, since the entry probably has not yet been processed by a node. It eventually gets processed for sure, but in the meanwhile that data entry will not be returned on queries.
+
+Relating S1Search shards to Kafka: for every S1Search shard there is a Kafka topic from which nodes read messages. This, however, does not get rid of all communication between client and server during data addition. In order to build a complete data entry message, the client must first have contacted servers to fetch available Entity IDs. This is one of the topics covered in the next section.
+
+Given that in S1Search every data entry is associated with an Entity ID, every data entry message must contain one Entity ID. This Entity ID must come from somewhere, and in order to get a new Entity ID, the client must first connect directly to a cluster node.
+
+The node which the client connects to is responsible for managing a set of shards and keeping information of used Entity IDs that are allocated to these shards. This node answers the request with a pool of IDs that the client might use in the future when the need for new Entity ID arrives.
+
+The decision of which node to connect is made by the client and it does it in a round-robin fashion as a way to achieve load balancing and fair data distribution among nodes. This is, as in many other scenarios, a case in which the client performs important management logic.
+
+Besides the Entity ID to whom the data in the message belongs, there is one more piece of data that must be added to a message regarding S1Search’s consistency protocol: a Record Identifier (Record ID) generated by the client. This record is later going to be used when verifying which messages were effectively processed and added on S1Search and which were not.
+
+For the sake of understanding the need for the Record ID, recall that a node might fail. When the node reboots, it reads Kafka topics to reload any message it could not completely process before crashing. In this process the node might end up reading again a message that has in fact been processed before the failure.
+
+S1Search operations are not idempotent and reapplying a command might produce wrong results on future queries. Record IDs are thus used to verify if a given message was already processed. A S1Search node keeps track of processed Record IDs and skips a message in case the Record ID has already been processed. As for the Record ID itself, it is a string containing a unique identifier from the client that generated the record and a sequential number generated by the client itself.|||
+
+S1Search is an data warehouse and analytics database, that is a special type of database optimized to store data such that analytical queries can be executed really fast, even when data size is huge.

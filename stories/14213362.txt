@@ -1,0 +1,61 @@
+In TensorFlow for Poets, I showed how you could train a neural network to recognize objects using your own custom images. The next step is getting that model into users’ hands, so in this tutorial I’ll show you what you need to do to run it in your own iOS application.
+
+I’m assuming you’ve already completed TensorFlow for Poets, and so you should have Docker installed and a tf_files folder in your home directory that contains a retrained_graph.pb file containing your model. If you don’t, you’ll need to work through that example to build your own network.
+
+You’ll find the screencast to accompany this tutorial above, or at https://www.youtube.com/watch?v=_bkZPpniYdo, which should help clarify the steps I’ll be walking you through.
+
+As a first step, open the Docker QuickStart Terminal and start a new docker container using the latest Docker image. This tutorial relies on some newer features of TensorFlow, so the v0.8 image used for the original TF for Poets won’t work.
+
+You should find yourself in a new shell where the prompt begins with root@ and ends with a ‘#’, indicating you’re running inside the Docker image. To make sure things are setup correctly, run this `ls -lah /tf_files/` and make sure that the retrained_graph.pb file appears.
+
+Next, we’re going to make sure that the model is producing sane results at the start. Here I’m using the default flower images to test, but if you have trained on custom categories substitute the image file with one of your own. The compilation process may take a few minutes too, so make sure that you have updated the VirtualBox settings to take advantage of your machine’s memory and processors if things are running too slowly.
+
+This should hopefully produce a sensible top label for your example, in the case of flowers with daisy at the top. We’ll be using this command to make sure we’re still getting sensible results as we do further processing on the model file to prepare it for use in a mobile app.
+
+Mobile devices have limited amounts of memory, and apps need to be downloaded, so by default the iOS version of TensorFlow only includes support for operations that are common in inference and don’t have large external dependencies. You can see the list of supported ops in the tensorflow/contrib/makefile/tf_op_files.txt file. One of the operations that isn’t supported is DecodeJpeg, because the current implementation relies on libjpeg which is painful to support on iOS and would increase the binary footprint. While we could write a new implementation that uses iOS’s native image libraries, for most mobile applications we don’t need to decode JPEGs because we’re dealing directly with camera image buffers.
+
+Unfortunately the Inception model we based our retraining on includes a DecodeJpeg operation. We normally bypass this by directly feeding the Mul node that occurs after the decode, but on platforms that don’t support the operation you’ll see an error when the graph is loaded, even if the op is never called. To avoid this, the optimize_for_inference script removes all nodes that aren’t needed for a given set of input and output nodes.
+
+The script also does a few other optimizations that help speed, such as merging explicit batch normalization ops into the convolutional weights to reduce the number of calculations. Here’s how you run it:
+
+This creates a new file at /tf_files/optimized_graph.pb. To check that it hasn’t altered the output of the network, run label_image again on the updated model:
+
+You should see very similar results to the first time you ran label_image, since the underlying mathematical results should be preserved through the changes made to streamline it.
+
+The retrained model is still 87MB in size at this point, and that guarantees a large download size for any app that includes it. There are lots of ways to reduce download sizes, and I’ll cover those in more detail in other documentation, but there’s one very simple approach that’s a big help without adding much complexity. Because Apple distributes apps in .ipa packages, all of the assets are compressed using zip. Usually models don’t compress well because the weights are all slightly different floating point values. You can achieve much better compression just by rounding all the weights within a particular constant to 256 levels though, while still leaving them in floating-point format. This gives a lot more repetition for the compression algorithm to take advantage of, but doesn’t require any new operators and only reduces the precision by a small amount (typically less than a 1% drop in precision). Here’s how you call the quantize_graph script to apply these changes:
+
+If you look on disk, the raw size of the rounded_graph.pb file is the same at 87MB, but if you right-click on it in the finder and choose “Compress”, you should see it results in a file that’s only about 24MB or so. That reflects what size increase you’d actually see in a compressed .ipa on iOS, or an .apk on Android.
+
+To verify that the model is still working, run label_image again:
+
+This time, I would expect that the results may have slightly more noticeable changes thanks to the effects of the quantization, but the overall size and order of the labels should still be the same.
+
+The final processing step we need to run is memory mapping. Because the buffers holding the model weight values are 87MB in size, the memory needed to load these into the app can put a lot of pressure on RAM in iOS even before the model is run. This can lead to stability problems as the OS can unpredictably kill apps that use too much memory. Fortunately these buffers are read-only, so it’s possible to map them into memory in a way that the OS can easily discard them behind the scenes when there’s memory pressure, avoiding the possibility of those crashes.
+
+To support this, we need to rearrange the model so that the weights are held in sections that can be easily loaded separately from the main GraphDef, though they’re all still in one file. Here is the command to do that:
+
+One thing to watch out for is that the file on disk is no longer a plain GraphDef protobuf, so if you try loading it into a program like label_image that expects one, you’ll see errors. You need to load the model file slightly differently, which we’ll show in the iOS example below.
+
+So far we’ve been running all these scripts in Docker, since for demonstration purposes it’s a lot easier to run scripts there, because installing the Python dependencies is a lot more straightforward on Ubuntu than OS X. Now we’re going to switch to a native terminal so that we can compile an iOS app that uses the model you’ve trained.
+
+You’ll need Xcode 7.3 or later with the command line tools installed to build the app, which you can download from Apple. You’ll also need brew, and automake to run the build script. To install it using brew, run this command:
+
+Once you have those, open up a new terminal window, download the TensorFlow source (using `git clone https://github.com/tensorflow/tensorflow`) to a folder on your machine (replacing `~/projects/tensorflow` below with that location) and run the following commands to build the framework and copy your model files over:
+
+Check the terminal to make sure that your compilation succeeded without errors, and then you should find the camera example project opened in Xcode. This app shows a live feed of your camera, together with the labels for any objects it has recognized, so it’s a good demo project for testing out a new model.
+
+The terminal commands above should have copied the model files you need into the apps data folder, but you still need to let Xcode know that it should include them in the app. To remove the default model files, go to the left-hand project navigator pane in Xcode, select imagenet_comp_graph_label_strings.txt and tensorflow_inception_graph.pb in the data folder, and delete them, choosing “Move to Trash” when prompted.
+
+Next, open a Finder window containing the new model files, for example from the terminal like this:
+
+Drag `mmapped_graph.pb` and `retrained_labels.txt` from that Finder window, into the data folder in the project navigator. Make sure the “Add to Targets” is enabled for CameraExample in the dialog’s checkbox. This should let Xcode know that it should include the files when you build the app, so if you see later errors about missing files, double-check these steps.
+
+We’ve got the files in the app, but we also need to update some other information. We need to update the name of the files to load, but also some other metadata about the size of the input images, the node names, and how to scale the pixel values numerically before feeding them in. To make those changes open CameraExampleViewController.mm in Xcode, and look for the model settings near the top of the file. Replace them with the following block:
+
+Finally, plug in and select your iOS device (this won’t run on the simulator because it needs a camera) and hit Command+R to build and run the modified example. If everything has worked, you should see the app start, display the live camera feed, and begin showing labels from your training categories.
+
+To test it out, find an example of the kind of objects you’re trying to recognize, point the camera at it and see if it is able to give it the right label. If you don’t have any physical objects handy, try doing an image search on the web, and then point it at your computer display. Congratulations, you’ve managed to train your own model and run it on a phone!
+
+As next steps, a lot of the same transformations can be used on Android or for the Raspberry Pi, and for all sorts of other models available in TensorFlow for everything from natural language processing to speech synthesis. I’m excited to see new apps emerge using the incredible capabilities of deep learning on device, so I can’t wait to see what you come up with!|||
+
+https://www.youtube.com/watch?v=_bkZPpniYdo In TensorFlow for Poets, I showed how you could train a neural network to recognize objects using your own custom images. The next step is getting that model into users' hands, so in this tutorial I'll show you what you need to do to run it in your own iOS application. I'm assuming you've…

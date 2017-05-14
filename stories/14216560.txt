@@ -1,0 +1,72 @@
+When using OpenGL (or WebGL), you have to do everything yourself, including font rendering and layouting. I thought: “Wouldn’t it be great if you could just reuse the browser’s layouting and font-rendering engine instead of heaving to reinvent the wheel?”. Yes, but there’s no API for that. Or is there?
+
+When you want to render strings to screen in OpenGL, it’s not uncommon to use a bitmap font and distance field to place each individual symbol on a quad. You have to do everything yourself: Font sizing and smoothing, calculating the coordinates of each of these quads, when to line wrap and how to handle the baseline. If you want them, you will also need to implement support for ligatures yourself. Most of the time, being able to render text is only a precursor to having a 2D UI within your 3D OpenGL world, so you start implementing layout algorithms too. That seems not only unfun to me, but highly redunant. You could implement the UI in vanilla DOM and place the elements on top of the WebGL canvas, but that would start failing once you wanted to expand your 3D experience to WebVR. So I got creative!
+
+As you can tell by the demo (and the presence of a TL;DR), there is a way to render DOM elements to a canvas – if you don’t mind bending over backwards. And once we have something on canvas, we can use it as a texture in WebGL and it would allow us to make use of all the things the browser has already implemented: Loading different fonts, rendering them, coloring them, text shadows, text decorations, weights, RTL, word-wrapping, etc etc etc. But be warned: The TL;DR might make you think that this blog is short. It’s not. Brace yourself.
+
+Let’s start with Arcane API #1: As far as I am aware, Foreign Objects are seldomly used. They allow you to include a different XML namespace into an SVG and the SVG renderer will hand of the rendering to the renderer responsible for that namespace. (Danger: This is probably a gross oversimplification.) So by using we can mix SVG graphics with, let’s say, a and it will not only render, it will function and be interactive. Amazing!
+
+Foreign objects, just like all other SVG elements, need a size. Think of it as a canvas within a canvas. The dimensions you specify will be used similarly to what the viewport is for an HTML document. Since I am trying to generate textures consisting of DOM elements, I made both the SVG and Foreign Object have the same dimensions. If you open the markup above as an HTML file and open it in your browser, you’ll see an SVG circle with a button:
+
+WebGL doesn’t accept SVG objects as textures. It only takes canvases and image elements of raster images. But SVGs are kiiinda images, so there must be a way to do a conversion here, right? Yes, but it’s not as simple as you might expect. Here’s what we have to do:
+
+Let’s take these steps one by one.
+
+When turning the DOM into a string, most people go and grab on the parent element:
+
+For most use-cases, that is good enough, but when trying to serialize SVGs with multiple XML namespaces, it’s not. Try it: The button won’t appear if you load the above markup as an SVG image. Enter Arcane API #2: :
+
+As you can see, this serializer took care of adding the XHTML namespace of the children inside the , and turns it into valid XML by turning into a self-closing tag (i.e. ). And now, the button shows up.
+
+We have our SVG as a string. But for our data URL we need it in base64. Enter Arcane API #3: and . I think these are some of the weirdest (and probably oldest) functions the platform has to offer. They are cryptically named and even after deciphering the names they don’t make a lot of sense. Additionally their accepted input data isn’t really sufficient nowadays: stands for “binary to ascii” and encodes any binary strings (because back in the day, there were no s and strings didn’t have to worry about Unicode) into safe ASCII by using base64. I don’t know why they didn’t call the function or anything more descriptive, but now it’s burnt into the platform. Forever. But apart from that naming: The second you have any code points in your string above the 255 mark, this happens:
+
+Aaaah, yes, my old friend Latin1 (actually, technically it’s Windows-1252). It’s been a while. For our undertaking that means: As long as our document is purely ASCII, we’ll be fine. The second we leave the ASCII range, things will probably stop working. And let’s be honest: We want emoji in our WebGL UIs!
+
+Since the introduction of UTF-8 and s, the platform also offers and . We only need the as we want to encode a string into a using UTF-8:
+
+Sadly, doesn’t handle , so we need to find another way of base64 encoding an array of bytes. Honestly, I was shocked to find that there’s nothing on the platform – for now I’ll resort to Jameson Little’s base64js, which polyfills that functionality.
+
+We are almost done. Don’t be alarmed, the last two steps are actually rather short!
+
+Note the function we are registering. Images are decoded asynchronously, so if we didn’t put our code in the handler, it would probably try to use an image that has not have been decoded yet.
+
+Drawing an image to canvas is surprisingly easy and works the same with any image, even our weird base64-encoded SVG:
+
+Take a look for yourself.
+
+We got ourselves a way to render DOM elements to canvas. Hooray! This technique works in Chrome, Edge, Firefox and Safari! In contrast to Chrome and Firefox, however, Safari taints the canvas if you draw an SVG containing a to it. That means that – at the time of writing – it is not usable as a WebGL texture in Safari.
+
+We are done here. Off you go. … except, not quite:
+
+Thinking I was done, I went ahead and tried using this technique to render some styled text as a texture for a WebGL experiment:
+
+Turns out I didn’t grasp the isolated nature of our SVG in its entirety. Take a look:
+
+Not only is all styling gone, but the image is a no-show. What’s going on here?
+
+Once you think about it, it makes sense that there’s no styling. We are basically creating a separate SVG document (in form of a data URL) and our styling is well outside that document. So let’s make it available by cloning all our styles and moving them into the SVG element.
+
+A thing to keep in mind is that some UAs apply different default stylesheets for SVGs than they do for HTML. So if you leave any properties unspecified, these differences in the UA stylesheet can show. Case in point: in Safari:
+
+Safari’s default font size in an SVG context seems to be much smaller than for HTML. This is easily fixed by explicitly specifying in our stylesheet, but it’s yet another bump in the road that is interop.
+
+But let’s talk about the elephant in the room: The image is still missing. What’s up with that?
+
+It turns out that for security reasons, the SVG renderer the uses has no access to the network. So while the element is actually there, it’s just empty as the URL could not be resolved to a resource. But we can do something about this and it involves, you might have guess it, data URLs! As long as the image is either from the same origin or from another origin with CORS headers set, we can take the image and draw it to a canvas to convert it to a brand new data URL.
+
+This is probably the biggest chunk of code in this blog post, and yet it doesn’t really introduce any new concepts. We grab all the in our SVG and pass them to , which replace the current of the with a data URL. The function returns a promise that resolves when all the work is done.
+
+Now that we know that we don’t have any network access when rendering our SVG, we should also take a look at tags that reference stylesheets. In contrast to tags we can’t just clone them. The obvious solution is to just the stylesheet and to inline it. But there is another way – time for arcane API #4: The property. Admittedly, it’s not really arcane, but it’s probably a lesser known feature: Both tags and tags have a property with which you can iterate over parsed versions of all the rules in the stylesheet. So we can just grab all our and tags and put them into one big element without doing another network request:
+
+Keep in mind that this approach won’t work if you link to cross-origin stylesheets (like web fonts!).
+
+This is left as an exercise for the reader :P
+
+We are looking pretty good! We have all we need to solve my original WebGL problem. But here’s an additional tripwire: All internal state of the DOM elements that is not reflected to DOM will be lost. So if you have input elements like sliders or text fields you have to do some extra work to make them render in the same state they were in. In the context of input fields you could do something like the following.
+
+This is quite fun to play with.
+
+This approach is not cheap. At all. For the last demo, going from SVG to rendered canvas takes 10ms on the new 2017 MacBook Pro, and 62ms on a Pixel. Considering the frame budget for 60fps is 16ms, you need to be extremely careful. If you want to use it right now, I’d suggest breaking it up into smaller chunks of work using to make sure the main thread is not blocked for too long. Luckily, there is a spec to expose in workers called , that’d allow you to do all that expensive work in a different thread, keeping your main thread nice and responsive. is available in Firefox and being worked on in Chrome.
+
+So there you have it. Quite a ride, isn’t it? It’s nothing that should be use lightheartedly and the number of hoops you have to jump through to render some of your own DOM to a canvas is somewhat shocking. It’s cool that it works, but the platform could definitely do better here. If you have any ideas, let me know!|||
+

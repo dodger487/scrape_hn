@@ -1,0 +1,55 @@
+One of the things Flexport aims to do is to give clarity on where a user’s cargo is at any given point. Our main way of displaying this for each individual shipment is our Shipment Timeline. This displays all of the messages between the client and their Flexport team, and all of the events that have happened to the shipment.
+
+It’s pretty important that this timeline is accurate and easy to read. In the past this has been easy — we just want to display events in the order in which they occurred — but a while ago, we added the concept of times being “date-only.” We know that a date-only event happened on, say, January 2nd, but we don’t know the exact time. We wanted to add this both so that we don’t accidentally claim that one event definitely happened before another one (because one was recorded at being at 10am and one at 2pm) even though as far as we know they could actually have occurred in either order, and so that we keep track of only the information we are actually sure of (analogous to using the sensible amount of significant figures when reporting experiment results).
+
+A side effect of adding this “date only” concept is that we now have cases where the ordering of two events is ambiguous in terms of time (time zones also make this confusing, but we’re going to totally ignore them for now), but not at all ambiguous to humans who know facts like, “If a plane travels from Sydney to Oakland, events in Sydney must happen before events in Oakland,” or, “A shipment must arrive at a location before it can be undergoing a customs exam at that location.” This meant that if we ordered things purely on the date, we could have timelines which looked very odd:
+
+We also wanted to make sure that the dates and events on a shipment were kept consistent and accurate, so it would be great if we could find a way to both: 1) present a sensible ordering of events, and 2) give helpful errors if a newly added event is in some way unreasonable or inconsistent with the ones we already have.
+
+The problem we had was that there are many properties of events which can be used to tell which one needed to happen first, not all of which would be present on both events being compared.
+
+Event A must happen before event B if any of the following are true:
+
+We wanted to find some way to take these sets of directed connections between events to a linear chain of events, where any item in the chain must plausibly happen before any later item in the chain.
+
+This sounds very much like we would like to do a topological sort on a directed graph!
+
+A nice way of doing that is Kahn’s algorithm. An extra-exciting thing about this is that Kahn’s algorithm will always end with us having an ordered list of events and an empty graph if the original graph is acyclic, which happens if the shipment has no contradictory events. If there are contradictory events, we will be left with a graph of only the events which form a cycle, so we’re able to not only get a sensible ordering for displaying the events but also able to find which if any of the events on a shipment contradict each other.
+
+The first step was to move information like “a shipment needs to have a quote request accepted before it can leave a port” and “a ship must arrive at a location before it departs” out of human brains and into a file of directed graphs. This step basically consisted of messaging various people on our Operations team, and having them give me lists of facts they knew about the correct ordering of events.
+
+Some events have a meaningful ordering across the whole shipment, and some only matter within a location, so we kept those in separate graphs.
+
+At this point we needed to make a decision about whether the event type orderings would be transitive. The main advantage of intransitivity is that in theory we could have events set up like:
+
+A > B
+
+B > C
+
+A < C
+
+Only 2 of [A, B, C] ever appear on the same shipment
+
+No one I talked to was able to think of a set of our events where this happens. The main disadvantage is that we would need to store something on the order of n² connections between n events in a file which a human may occasionally want to read through when adding a new event.
+
+We decided we would assume transitivity until we were able to find some example of the above situation (we haven’t found such an example in the year or so since we first implemented this system), and would add a spec which ensures that the template ordering graphs remain acyclic as new relationships between events are added.
+
+This means that all we need to keep track of for each event type is a list of the event types that must happen after it, but that do not already appear in the list of any of its children. We’ll be making queries of the form “which event_slugs must happen after [some event slug],” so the easiest way to store it is a hash from events to a list of events which must happen after them.
+
+We start with an unordered array of events, and some graphs of event orderings over the whole shipment, event orderings per location, and order of locations:
+
+For each event on a shipment, we traverse each of the ordering graphs to find which types of events must happen after this one (based on the event type), and then we find and add other events which must be after this one. To do this, we traverse the ordering graph starting at the node which matches the type of our current event, terminating at a node if we are able to find an event with that type and add a connection between it and the original event.
+
+In the above example, we don’t add a vertex between the event with type A and the event with type C because we know that an event of type B exists and that our ordering is transitive, so any children of the B node will end up being connected to A via B.
+
+We also add relationships between all events where one of them has a date which is definitely earlier than the other one, or where one of them happens at a location earlier in the shipment route than the other one.
+
+We can then use Kahn’s algorithm on the final graph to produce either an ordered array of all of the events, or an ordered array and a graph containing the events which are in a cycle, which we then use to produce an error message.
+
+We know all of the leftover events form at least one cycle. Rather than just presenting the tangle of contradictory events, we can annotate each edge between two nodes with the reason(s) the edge exists, and can then list those reasons in any error messages we present.
+
+Follow the discussion or upvote on Hacker News! https://news.ycombinator.com/item?id=14205361
+
+Interested in solving these types of problems? Follow us here or on Twitter to learn more about interesting problems in the world of freight, or if you’re ready to take the next step, we’re hiring! Check out our current openings!|||
+
+We use topological sorts, timestamps, and locations to determine the proper sequencing of events on a shipment.
