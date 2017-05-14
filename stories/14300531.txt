@@ -1,0 +1,242 @@
+I want to start by thanking all the people that has sent improvements and comments to all the crates and tools I presented in the last blog post. The Rust community rocks!
+
+Last time I showed you how to easily develop Rust programs for pretty much any ARM Cortex-M microcontroller. In this post I’ll show you one way of doing memory safe concurrency. It’s important to note that the Rust language doesn’t impose a single concurrency model. Instead it gives you building blocks in the form of the and traits, and the borrow checker. Concurrency models can then be implemented as crates (libraries) that leverage those core features.
+
+In the last post I left you with this figure:
+
+Today I reveal the missing piece: the crate, a realization of the Real Time For the Masses (RTFM) framework for the Cortex-M architecture. This framework’s main goal is facilitating development of embedded real time software, but it can be used for general concurrent programming as well. These are its main features:
+
+This framework is actually a port of the core ideas of the RTFM language to Rust. The RTFM language was created by LTU’s Embedded Systems group, led by prof. Per Lindgren, to develop real time systems for which FreeRTOS didn’t fit the bill. Prof. Lindgren and I have been working on this port for a while, and we believe it’s now in good shape enough for a v0.1.0 release.
+
+In the rest of this post I’ll illustrate the core concepts of the RTFM framework by building an application that runs two tasks concurrently.
+
+Will be a LED roulette (for lack of a better word) controlled via serial interface. This is what it will look like:
+
+This roulette never actually stops spinning, but its spin direction can be reversed at any time (see 00:00:03) by sending the command over the serial interface. The roulette can operate in two modes: continuous mode (00:00:00 - 00:00:06) where the roulette keeps spinning in the same direction, and bounce mode (00:00:06-00:00:11) where the roulette reverses its direction every time it completes one turn. The mode can be selected by sending one of these two strings through the serial interface: and .
+
+In the video I’m emulating a serial interface on top of Bluetooth , and I’m sending the commands by typing them on a program called (shown below).
+
+We’ll build this application incrementally, but before that let’s first port the two programs that I presented in the previous post.
+
+This is what “Hello, world” looks like when ported to the RTFM framework. You can see the previous version here.
+
+First thing to note is the macro. I mentioned above that the unit of concurrency of the RTFM framework is the task. The macro is used to declare all the tasks that made up a program. This particular program has zero tasks, and that’s why the second argument of the macro is just empty braces.
+
+The first argument of the macro must be a device crate generated using the svd2rust tool. In this case our program doesn’t directly depend on a device crate; instead it depends on the board support crate . But the crate builds upon the device crate and re-exports it as part of its API so we can still pass the crate to the macro.
+
+Next thing to note is that the function is missing. Instead we have two functions: and . is not required because expands to a function that will call first and then .
+
+Finally, note that the variable, where interrupt handlers are normally registered, is missing as well: the macro will create that variable for us.
+
+Now, let’s look at both and in detail.
+
+The signature of must be , and the signature of must be ; both signatures are enforced by the macro. Both and have two similarly looking arguments available to them: and . These are zero sized tokens that grant them some privileges. We won’t use them in this program though.
+
+The RTFM scheduler uses priorities as part of its scheduling algorithm: Tasks with a higher priority level are more urgent so the scheduler prioritizes their execution. Although they are not tasks, both and also have a priority: 0, the lowest priority. The RTFM framework keeps track of priorities in the type system, in the form of tokens like and . The number of priority levels is device dependent; the STM32F303VCT6 microcontroller, for instance, supports priorities from 0 ( ) to 16 ( ).
+
+I’ll say more about the token later on.
+
+Next, note that is a diverging function, as evidenced by its signature: ; this means that it can’t return or terminate. To avoid returning from after printing “World” to console, the CPU is put to sleep (to conserve energy) by calling the WFI (Wait For Interrupt) instruction in a loop. The “Hello, world” program from the previous post also did this, but implicitly.
+
+To run this program we can continue from the demo crate from the previous post and run the following commands:
+
+Then you should see this on the OpenOCD console:
+
+Next, let’s port the blinky program from previous post to the RTFM framework. Here’s the full program:
+
+First we have the macro:
+
+When using the RTFM framework you have to declare all the peripherals you are going to use in this macro. Both the name of the peripheral (for example: ) and its type (for example: ) must match the device crate, in this case, definitions. What’s new here is that each peripheral must be assigned a ceiling. For now suffices to say that ceilings are just (type level) numbers in the same range as priorities. In this case ceilings can range from to .
+
+Next we have the function:
+
+Here we configure the LED pin and the timer. The timer will be configured to generate a periodic update event every one second. The code here is actually the same as the one from the previous blog post version. In that old version we created a critical section by disabling all the interrupts ( ). That gave us the necessary synchronization to access the peripherals. The same happens here: runs under the same kind of global critical section; this is reflected in its token which has type , the maximum preemption threshold.
+
+The token indicates the preemption threshold of the current context. This threshold indicates the priority that a task must have to preempt the current context. A threshold of 0, , indicates that only tasks with priority of 1 or higher can preempt the current context. This is the case of the loop: it can be preempted by any task since tasks are enforced to always have a priority of 1 or higher. On the other hand, the maximum threshold, , (as used in ) indicates that the current context can’t be preempted by any task.
+
+To actually be able to use the peripherals we must first call the method. This method requires you to present both the and the tokens. There are some conditions that must be met between the priority level, the threshold level and the peripheral ceiling for this method to work. If the conditions are not met the program won’t compile as it would not be free of data races. The exact conditions are not important at this point because you’ll always be able to access any peripheral within the function.
+
+In this program the processor is sent to sleep in the function.
+
+We could have written something like this:
+
+and we would have ended with the same inefficient busy waiting behavior as the program from the previous post.
+
+But we are not going to do that. Instead we are going to use …
+
+In the RTFM framework tasks are implemented on top of interrupt handlers; in fact, each task is an interrupt handler. This means that each task is triggered by the events that would trigger the corresponding interrupt, and also that each task has a priority.
+
+From the POV of the programmer a task is just a function with the peculiarity that it will be called by the hardware when some event happens: 10 ms have elapsed, user pressed a button, data arrived, etc.
+
+In this program, we’ll use a single task named :
+
+This declaration says that the task is the interrupt (TIM7 is the timer we are using to generate periodic update events), and has a priority of 1 ( ), the lowest priority a task can have. means that the interrupt, and thus this task, will be enabled after finishes but before starts.
+
+This is how scheduling will look like for this program:
+
+Something important: tasks have run to completion semantics. The scheduler will run every task to completion and only temporarily switch to another task if it has higher priority. For this reason tasks must not contain endless loops; otherwise lower priority tasks will never get a chance to run (this is known as starvation).
+
+We have a task (function) that will be executed (called) every second. We want to toggle the state of an LED on every invocation of the task but the task is effectively a function and has no state. How do we add state? The obvious answer would be to use a variable, an unsynchronized global variable, but that’s . Instead we’ll use the safe task local data abstraction: .
+
+The signature of the task must match its declaration; it must contain three arguments: a token whose type must match the field of the declaration, a token whose type must match the field of the declaration, and a token whose type must match the level of the token.
+
+The and tokens we have already seen. The new token here is the token. Each task has a unique token type. The main use of this token is accessing task local data. When you create task local data you pin it to a certain task by assigning a token type to it (for example, the in ). Afterwards, you can only access the data if you present an instance of the token, which only a single task has access to. This arrangement disables sharing of this kind of data across tasks eliminating the possibility of data races.
+
+As for the logic of the task, we simply toggle the boolean variable and turn the LED on / off depending on its value. The interesting bit here is that we branch depending on the result of . That expression clears the update event flag and returns an error ( variant) if the flag was not set. We have to clear that flag or the task will get invoked again right after it finishes. In this program we should never hit the branch because the task is always triggered by the update event. But that may not be the case in general as it’s possible to manually trigger a task using the function.
+
+Something I omitted is that the was ed without extra synchronization. The reason why this was possible is the ceiling value that was assigned to ( ) matches the task priority ( ) and preemption threshold ( ).
+
+If you run this program, you’ll see one LED blink. I already showed a video of this in the last post so I’m not going to post it again.
+
+With some small changes we can turn the LED blinking application into the LED roulette shown in the intro video. The full code for the roulette is here. These are the relevant changes:
+
+Note that the roulette is spinning in clockwise direction. And yes, this roulette is spinning faster than the one shown in the intro video.
+
+Now we are going to write a totally different program to test out the serial interface: a loopback. A software loopback is when you send back the data you just received without processing it. This is a great way to sanity check that your serial code is working (and that you got the wiring right).
+
+By default doesnt print back the characters you type, which are the characters you send through the terminal interface. However, if the other side of the serial connection is doing a loopback then you should see what you type printed on the console because that’s what the serial device sends back to you.
+
+The full source of the loopback program is here. These are the relevant bits:
+
+Let’s go through the program in parts:
+
+We have to pick a transmission speed for the interface. Any number will do as long as both sides are configured to run at the same speed. is a standard and pretty common baud rate.
+
+In we configure the Serial interface to run at bits per second. It should be noted that the method also configures the USART1 peripheral to generate interrupt events when a new byte is received.
+
+Here we bind the task to the interrupt handler. As already mentioned the interrupt, and thus the task, will be triggered every time a new byte is received.
+
+The task will send back the byte that was just received. It’s important to note that both the and methods used here are non blocking. Two error conditions needs to be dealt with:
+
+Let’s draw a possible timeline of events for this program:
+
+There’s only one task running and is non periodic. The task will run only when a new byte arrives. We’ll call this new byte arrived event .
+
+Now let’s merge these two last programs into a single one. The merged program will run the and tasks concurrently. This is actually trivial to implement beacuse the two tasks are independent: they don’t share state or have a run task A after task B” kind of relationship.
+
+The full source of the merged program is here. The relevant parts are shown below:
+
+If you run this program you should see the LED roulette in action and the serial console should echo what you type. Yay, multitasking!
+
+Lets see how the scheduler would handle these two task running concurrently:
+
+Let’s continue building the final application. We’ll have to parse the strings received through the serial interface. This will require storing the characters into a buffer. We’ll use the crate to avoid depending on a dynamic memory allocator; this crate provides common data structures backed by statically allocated memory.
+
+These are the relevant changes:
+
+Now we are parsing user commands but we are not obeying them. To do that, we’ll need some form of communication between the task and the task.
+
+The RTFM framework provides a abstraction that can be used to share memory between two or more tasks in a data race free manner.
+
+We’ll use the following resource to share state between the and tasks:
+
+where is defined like this:
+
+When you declare a resource you must assign a ceiling to it in its type signature. I’ll assign a ceiling of 1 ( ) to this resource; this value matches the priority of both the and tasks.
+
+Because both tasks run at the same priority no preemption can occur: if both tasks needs to run at around the same time one task will be postponed until after the other finishes. Because of this no data race can occur if and directly the resource.
+
+With that in mind, let’s see the new task code.
+
+This method has the exact same signature as the peripheral’s one. Both methods require you to present a and a token. This is no coincidence: when we declare peripherals in the macro we are actually converting the raw peripherals defined in the device crate into actual resources. That’s why you have to assign ceilings in the macro: all resources must have a ceiling assigned to them.
+
+If you run this program (here’s the full code) you’ll get the same behavior as the one shown in the intro video 🎉.
+
+So, are we done? Nope, not yet. Let’s now spice things up with some …
+
+The task can now take much longer because it does parsing. In the worst case scenario a new byte may arrive just before the (timer) update event causing the task to wait for several cycles until after the task is finished. This deviation from true periodicity is known as jitter. Although unlikely to be perceived in this particular application, jitter can cause problems in more critical applications like control systems so let’s see how to address it.
+
+To reduce jitter we can increase the priority of the task to 2. This way, if the previous scenario arises (update event right after the task starts) the processor will stop executing the task, run the task and once it’s done with that it will resume the execution of the task.
+
+So, let’s just change the priority of the task in the macro.
+
+We’ll have to update the signature of the task accordingly as well as fix some ceiling values:
+
+The program no longer compiles! And that’s great because the Rust compiler just caught a data race – although I admit that the error message is awful. Here’s a better view of the source of the error:
+
+What went wrong? When we increased the priority of the task we made preemption of the task possible – that was the goal. The problem with this is that both and may modify the resource, but this time unsynchronized mutation is possible: the task could be performing a read-modify-write operation on the resource and get preempted by the task, which can do the same! This is a potential data race so the compiler rejects the program.
+
+How do we fix this? We have to add synchronization. More precisely, we must ensure that no preemption occurs while the task is modifying the resource. How do we that? We temporarily raise the preemption threshold.
+
+Let’s refresh our memory: a preemption threshold of indicates that only a task with a priority of 2 or higher can preempt the current context. That’s the preemption threshold of the task. With that threshold the task, which has a priority of 2, can preempt the task. If we could raise that preemption level of the task to 2 ( ) then the wouldn’t be able to preempt it.
+
+tokens have a method that does exactly that. This method takes two arguments: the first one is a resource and second one is a closure. This method will temporarily raise the preemption threshold of the task to match the resource ceiling value and execute the closure under that raised threshold condition. This is effectively a critical section for the duration of the closure.
+
+Let’s put that in use. Here’s the updated task:
+
+We use the critical sections to perform updates of the resource atomically. During these critical sections can’t preempt the task so data races are impossible.
+
+How would this program look from a scheduling point of view? See below:
+
+That’s the final version of the application! (full code here) Let’s leave coding aside and learn more about the …
+
+I will now tell you all the rules of the ceiling system. Well, there’s only one rule actually:
+
+But let’s re-frame this rule into a practical guideline. It’s usually the case that you know what the priorities of your tasks are as these can be derived from the deadline constraints of your application. Preemption thresholds are dynamic due to the method, and their initial value is known once you know the tasks priorities so no problem there either. The problem is computing the ceiling of resources: if you get them wrong then you won’t be able to use the resources in the tasks that you want. So here’s the rule of thumb for picking ceilings:
+
+Example: If the resource R must be accessed by tasks A, B and C with priorities , and respectively then you should set the ceiling of the resource to .
+
+You can flip the rule of thumb to answer the question “who can access this resource?”:
+
+After you have computed the resource ceilings the next question is: How do you access the resource from the different tasks?
+
+Those are the guidelines for the general case.
+
+What about extreme values? Remember that the minimum task priority is . From this fact the following corollary arises:
+
+Due to how the hardware works you can’t use to raise the threshold all the way to . If you need a token to access a resource then you’ll have to use the function which is a global critical section that disables all interrupts / tasks.
+
+When people say critical section they usually mean turning off all the interrupts. In RTFM, this would the equivalent of blocking every other task from running. Although this approach ensures the atomicity of the routine that is executed within the critical section, it introduces more task blocking than necessary, which is bad from a scheduling perspective.
+
+does not do that. It only blocks tasks that would cause a data race. Other higher priority tasks can preempt the closure and continue to make progress. The ceiling system will ensure that the preemption of those tasks doesn’t lead to data races.
+
+Let me show you an example:
+
+doesn’t block all tasks. , which has greater priority than ’s ceiling can preempt that critical section.
+
+“But wouldn’t it be bad if accessed the resource after it has preempted ?“. Yes, that would be bad BUT such program wouldn’t compile.
+
+If we change to look like this:
+
+This follows from the ceiling rules: has priority so it can’t access a resource with ceiling ; only tasks with a priority or lower can access .
+
+Although s provide a form of mutual exclusion, they can’t deadlock like Mutexes do. This deadlock freedom is a consequence of the invariants that hold in the tasks and resources system:
+
+These invariants are guaranteed by the ceiling system: Once a task has entered a critical section to access a resource no other task can preempt the first one to access the same resource.
+
+Here’s an example of how using Mutexes and threads can result in a deadlock:
+
+Here we have a program with two threads and two mutexes where both threads have to access both mutexes. Let’s see how this program may deadlock:
+
+Now both threads are blocked, each one is waiting for the mutex that the other thread holds and none can make progress. You got yourself a deadlock.
+
+Now, let’s see the equivalent program using tasks and resources:
+
+Similar scenario: two tasks and two resources where both tasks must access both resources. Here I give task B a higher priority so context switching can occur midway A’s execution.
+
+Let’s see how events would unfold in this case:
+
+There you go: no deadlock. You can tweak the priorities, add more tasks, add more resources and perform the same analysis but the conclusion will be the same: no deadlock can occur.
+
+You could carefully design your use of es and threads to avoid deadlocks. In the above Mutex example locking X before Y in thread B would have prevented the deadlock. However, this may not always be so obvious, and the compiler will happily compile a program that deadlocks. On the other hand, with tasks and resources you never have to worry about deadlocks. As long as you use the ceiling system correctly – and the compiler enforces this – you simply can’t deadlock.
+
+Wow, that was a lot of stuff. We just did totally memory safe multitasking. No , no deadlocks, and the compiler detected data races at compile time. All this on a single core microcontroller without relying on a garbage collector, dynamic memory collector or operating system.
+
+The best part: this is just the beginning of the RTFM framework.
+
+There’s a bunch of stuff in the pipeline:
+
+If you have a Cortex-M microcontroller around please give the RTFM framework a try! We’d love to hear what you think of it.
+
+In the next post I’ll analyze the overhead of the RTFM framework. Both the runtime overhead of and switching tasks as well as the memory overhead of adding tasks and of using the abstraction. I’ll leave you with this:
+
+The size of the final version of this post’s application.
+
+I want to wholeheartedly thank Iban Eguia, Aaron Turon, Geoff Cant and 8 more people for supporting my work on Patreon.
+
+Enjoyed this post? Like my work on embedded stuff? Consider supporting my work on Patreon!
+
+Follow me on twitter for even more embedded stuff.
+
+The embedded Rust community gathers on the #rust-embedded IRC channel (irc.mozilla.org). Join us!|||
+

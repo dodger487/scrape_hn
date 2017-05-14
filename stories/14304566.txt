@@ -1,0 +1,34 @@
+When stumbling upon the great American Fuzzy Lop and trying its awesome deterministic fuzzing capabilities and instrumentation soon we find out that this fuzzer was built to fuzz programs that take input from the command line instead of standard input or a network socket. Because of that, I thought I would give it a try and make AFL fuzz against Apache's httpd server. First the AFL way by adding a new option to Apache's command line and the second way, by using the persistence fuzzing (afl-clang-fast) by shamelessly copying the way Robert Swiecky fuzzes Apache with honggfuzz
+
+If you are following the structure mentioned above, you can cd into your Compilers  folder and drop the tarball there, extract it and then add the binaries folder to your path by adding the following line to the end of your  ~/.basrc  file ( ~/.profile nor /etc/environment worked for me).
+
+Getting pre-built binaries for clang-4.0 and the llvm-tools is fairly easy if you have Debian or Ubuntu. You can get these from here http://releases.llvm.org/download.html . In my case the clang+llvm-4.0.0-x86_64-linux-gnu-debian8.tar.xz tarball.
+
+I will be using a Debian GNU/Linux 8 64bit with the kernel 4.9.0-0.bpo.2-rt-amd64. You don't really need that setup, this can be done on Ubuntu as well . All that you need is an operating system (under a virtual machine or not) that can compile and run AFL with the afl-clang feature.But, before getting into any compilations/installations/fuzzing, I encourage you to set an organised folder structure that suits you best but, in case you haven't got one already, I am sharing mine.
+
+Now issuing the which command on a new shell we should have the following output:
+
+That's it, the binaryshould be in your path now ready to be unleashed.First move to a folder where we are about to download all the dependencies needed by Apache and apache itself. In my case the folder is atBefore compiling Apache we are going to need the Apache Portable Runtime (APR), APR Utils and support for HTTP/2 through nghttp2.No lazyness this time, go download:Now we need to get the latest Apache build, which I recommend you do from theirrepository by doing so:Now if you downloaded and unpacked everything, you should have a similiar output fromcommand:As you might know by now, AFL in its basic usage feeds a file into the target program through its "" array in the following form:The problem with Apache is that it doesn't have such functionality so we will have to patch it our own way.
+
+I made the following file to compile and link it all since I found myself often changing flags for the compiler and it was too time consuming compiling each dependency one by one with its own flags. Get it with:wget https://gist.githubusercontent.com/n30m1nd/14418fd425a3b2d14b64650710fae301/raw/e1cff738eb1ffaa55cb8a1a66bb1a2b06ed7f97e/compile_httpd_with_flags.sh Before editing any files yet lets run the bash script and see that we can compile everything cleanly without any missing dependencies whatsoever:Please see the next asciinema for reference of a nice compilation run.
+
+Yes! We are ready now! Let's compile Apache:
+
+If you are familiar with AFL and how it works you probably have your own testcases to feed it with, in case you don't the following video shows how to launch AFL and create two very simple test cases - remember that we need to be root in order to use the  function AND MORE IMPORTANT TO LAUNCH APACHE WITH THE "-X" FLAG AND "-m none -t 5000" FOR AFL SO IT CAN BOOT APACHE:
+
+Well, that was not too fast, was it? 5 execs per second on my laptop... how can we speed things up a bit?
+
+ 
+
+
+
+Remember we downloaded clang-4.0 and the llvm-tools before and set it in our path? This is where it comes most handy. Inside your AFL folder, navigate to the llvm_mode and run make and sudo make install in the root folder of AFL. What we have just done is compiling an experimental feature of AFL that will run a certain number of fuzzed inputs against a program without having to run the whole program per fuzzing input.
+
+Let the video speak for itself but again remember the previously mentioned "-X" flag for Apache server and the "-m none -t 5000" flags for AFL
+
+ 
+
+
+
+Taking into account the aforementioned problem, we need to write some lines into Apache'sfile to make it able to read files from input.You can patch Apache with the following patch file here . Now apply it by'ing into theand issuing the following command:I am not going to cover all the patch in detail but some parts are worth mentioning.The first and only time that I have seen the following technique was by Robert Swiecky , an information security researcher at Google when fuzzing Apache with honggfuzz. It is pretty clever and pretty obvious once you see the way it is done. It basically consists of launching a new thread inside Apache that will create a connection to the web server itself and send our fuzzed input;  all happening within the same unique process so we can get all the instrumentation data into AFL. Clever! Right?To achieve this it uses thefunction that disassociates parts of this thread's context from the others without the need of creating a new process. Specifically,andare separated. This is done so we can have several processes with the same settings (listening on the same loopback interface and port with the help ofon line 44 of the patch file and writing logs toon line 75 ) running at the same time on each process we launch.We can see that the unshare function iscalled on line 188 previous to firing the new thread that will receive the fuzzed input at line 189 The process of reading a file through the "-F" switch starts on line 156 and when the file is read into a buffer, this buffer is passed onto the function responsible to launch the new thread ( 189 ) that will, in turn, send the fuzzed file inside the SENDFILE function on line 119|||
+

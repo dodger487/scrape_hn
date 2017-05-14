@@ -1,0 +1,125 @@
+If you have used Go (aka golang) for any amount of time, you have probably run into a situation where the language being both statically typed and not supporting generics has proven to be problematic.
+
+For example, when I created my videos introducing queues and stacks and demonstrating how to implement them, it quickly becomes clear that there isn't a great way to create a single queue implementation that can be used by any type.
+
+Sure, there are things like container/list, but at the end of the day you are left to do a lot of type assertions on your own to make it work. Eg you end up with code that looks like this:
+
+In a language with generics, you would instead have code that instead specifies the underlying type of our list upfront, and then all values added to the list would have to follow along with that type. Eg it might look something like below.
+
+NOTE: THIS IS NOT VALID CODE! It is here to demonstrate what generics might look like.
+
+Unfortunately, there aren't generics in Go.
+
+I don't want to get into an argument about whether or not they are worth the added complexity here, but what I would like to discuss are approaches that developers can take to avoid writing code like in the first example. I want to talk about how we write sane & maintainable code in a land without generics.
+
+I think this is an important topic because many people coming from other languages won't have any idea how to approach this, and without some guidance about the "Go way" they are likely to get a bad taste regarding Go in general and miss out on all the amazingness that golang has to offer. So let's jump right into this.
+
+The very first thing I would recommend to someone new to Go is to simply create a type specific wrapper for whatever their use case is. For example, if we needed to create an integer queue, you could easily wrap the package with your own type inside the package. This is shown below.
+
+While this seems like a lot at first, if you trim out the comments it is less than 40 lines of code. Not too bad for the value it adds.
+
+Before moving on, I do want to mention that in the queue example we are using a struct containing a container/list.List under the hood. This is an implementation of a doubly linked list that supports all of the methods necessary to create both a queue and a stack, but it works with the type, meaning that it has no type safety built in for us. It will literally accept any value that we provide and throw it into the queue.
+
+That clearly isn't what we want, but with a few typed methods on our type we can use the type to handle most of the heavy lifting for us and all we are left to do is expose appropriate methods and do some type checking.
+
+While it can be insanely useful at times to have an underlying implementation that works on an interface, it isn't necessary. For example, I could have written my own queue implementation here instead of using . It would have taken more code, but it isn't outside the realm of possibility.
+
+As a general guideline, if there is something like that does what I need, I will use it to back my type-specific implementations. This is especially common when using the sort package, and I find myself writing code like this all the time:
+
+Rather than writing a sort implementation, I rely on the package to handle the heavy lifting and I simply provide a function to simplify the rest of my code.
+
+Imagine for a minute that the package didn't exist and you wanted to create an integer stack implementation. How do you proceed?
+
+At this point you have two options:
+
+Which is the correct path? Well... it depends.
+
+If you only need a single implementation (eg you only need an integer stack), then option (1) makes the most sense.
+
+Putting it simply, the second option is harder to write, read, and maintain and will always result in more code if you are only using it once, so rather than wasting your time for no real benefit just don't do it. Stick with option (1) until a real need arises to move to option (2).
+
+Then **when you need multiple implementations (eg an integer stack, a string stack, and a Dog stack), refactor to create a type-agnostic version to back all three of those. The refactor to a type-agnostic version is almost always easier than the first version. And as an added bonus you have likely learned a lot about how the code is being used and ironed out some of the kinks by that point. I call that a win.
+
+Now you might be asking yourself, "doesn't this mean I have to write a lot of code?"
+
+Yes, yes it does. Well, if do it all manually it does. But there are ways to make that easier, such as creating a generator.
+
+Once you have a type-agnostic implementation, it is sometimes a good idea to consider creating a generator that leverages it. This will allow you to pump out type-specific implementations in no time while maintaining your sanity.
+
+You won't have to maintain 3+ versions of the same code, but instead you restrict yourself to one master version (the template we generate from), and when you make any changes to that file you can simply regenerate all of your code over again.
+
+Now this does have one glaring flaw - you can't modify the generated files if you want to be able to regenerate them anytime the master version changes. As a result, this isn't always an appropriate approach, but I often find that it works well enough.
+
+Let's look at an example of how this might work. We will do this using the queue example from earlier in the article, but rather than being integer specific we will look at how to make a generator for any type.
+
+The first step I like to take is to pull out the shared pieces. That is, any code that doesn't need to be generated individually for every wrapper needs pulled out so that it isn't duplicated.
+
+I'm going to assume we are starting with the code
+
+In the queue example, this is just the error messages that we will share across all of our queue implementations. The code is shown below (without comments for brevity).
+
+Once I know what code I plan to use as a shared code base, I move that to its own file. Lets call that .
+
+If you have already written two or more implementations you may have already done this step along the way, so oftentimes this doesn't require much work.
+
+This step is shown on Github here - https://github.com/joncalhoun/queue/tree/step1
+
+This step is definitely customizable, but at this point I find it useful to create a subdirectory that will contain all of my generation code. That is, it will contain all of our templates and the code used to process those and create our resulting go code.
+
+I name mine , but whatever you want is fine. Some people prefer something like to make it clear that this is a command.
+
+And then we get to work writing a generator.
+
+The first version I do typically create writes the executed code template out to stdout and uses a quick inline template file. The template file is the unshared code that we used to create our , but I replaced all occurrences of with and I replaced the relevant types with .
+
+NOTE: Not all occurrences should be replaced. Eg still returns an int!
+
+The code for this step is shown below, minus the comments. Alternatively, you can get the larger version on Github here - https://github.com/joncalhoun/queue/tree/step2
+
+With this I can easily create new queue implementations by running the following FROM THE DIRECTORY!
+
+If you look closely there are a few flaws (like a newline at the top of our generated template) but there aren't any glaring flaws that make this unusable. That means we are ready to go to the final step - cleaning up those minor flaws!
+
+How you clean up your code is up to you, but I personally like to run and just to make sure things get cleaned up. This allows me to not worry about my template file being perfectly formatted (like the newline at the top), and running allows me to avoid having to provide import flags. I instead rely on to handle that for me.
+
+How you do this is up to you, but you are going to need to chain some commands so that each subsequent command reads the input from the previous command and writes its output in a way that the next command can consume it. The easiest way to do this is with the standard library is to use io.Pipe() and do something like is suggested in this stack overflow article.
+
+Or you can use a package I just published so that others don't have to rewrite all this code - https://github.com/joncalhoun/pipe - which is what I'll be using here. I'll also be ignoring pretty much all potential errors because I only run this when I'm sitting at the computer intentionally generating code and I can visually check for errors.
+
+Find the line in our code from Step 2 that reads and replace that with the following:
+
+takes in a set of commands and returns an , an , and a (which I ignore here). I write the output from executing my template to , the WriteCloser, and then I close it so that the next command knows that the input it is reading is finished. Finally, I copy the output from , the ReadCloser, to so it prints out on my screen.
+
+With this setup it would be trivial to add new commands to our pipeline, so add away as you see fit.
+
+The final code for this section is on Github here - https://github.com/joncalhoun/queue/tree/step3
+
+Putting all three steps together we can now generate code and create new queue implementations to use. Below are a few commands I ran to give you a few example output files in the final Github repo which can be found here - https://github.com/joncalhoun/queue
+
+If you want to see these queues being used, you can do so by going to the demo directory in master - https://github.com/joncalhoun/queue/blob/master/demo/demo.go
+
+What makes this really awesome is that we can now use all of our queue implementations and rest assured that we can't possibly pass the wrong data type in. The compiler now has our back!
+
+The only area of our code that isn't type-checked by the compiler is the generated code, and because we only allow access to the underlying types via type-safe methods we don't even have to worry much about that.
+
+Side note: If you want to, you could also generate tests for each file, but I didn't do that here.
+
+Alright, enough of code generation. Let's briefly talk about another option - interfaces.
+
+Another approach to take is to use interfaces instead of specific types. I am not going to go into too much detail here because it is covered elsewhere and because this article is already lengthy, but if you want an example of this I would strongly suggest checking out the sort package.
+
+Rather than requiring you to write your own sort functionality, the only thing you need to do to make something sortable is implement the sort.Interface. After that you can use nearly all of the functions inside the sort package regardless of your underlying type.
+
+This is a little harder to break down like I did for the type-specific wrappers, but generally speaking the best way to determine if an interface is right is to ask yourself "Do I actually care what the underlying type is, or are there a few methods I could instead use to achieve the same goal?"
+
+If the answer to that question is "yes", then you can write code like the package that only cares whether or not an interface is implemented.
+
+It isn't always obvious, but with a little practice you will find yourself opting for and leveraging interfaces more frequently, but the key here is practice. You can't get better or learn a skill without practicing, so be sure to actually give it a try from time to time.
+
+If you enjoyed this article, please consider joining my mailing list.
+
+I will send you roughly one email every week letting you know about new articles or screencasts (like this one) that I am working on or have published recently. No spam. No selling your emails. Nothing shady - I'll treat your inbox like it was my own.
+
+As a special thank you for joining, I'll also send you a both screencast and ebook samples from my upcoming course, Web Development with Go.|||
+
+Learn how to use code generation to create type-safe code (like a Queue or LinkedList) without having to rewrite the same thing over and over again.

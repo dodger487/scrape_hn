@@ -1,0 +1,124 @@
+Thoughts on what Redux requires, how Redux is intended to be used, and what is possible with Redux
+
+Redux is, at its core, an incredibly simple pattern. It saves a current value, runs a single function to update that value when needed, and notifies any subscribers that something has changed.
+
+Despite that simplicity, or perhaps because of it, there's a wide variety of approaches, opinions, and attitudes about how to use Redux. Many of these approaches diverge widely from the concepts and examples that are in the docs.
+
+At the same time, there's been ongoing complaints about how Redux "forces" you to do things certain ways. Many of the complaints actually involve concepts related to how Redux is typically used, rather than any actual limitation imposed by the Redux library itself. (For example, in one recent HN thread alone, I saw complaints about "too much boilerplate", "action constants and action creators aren't needed", "I have to edit too many files to add a feature", "why do I have to switch files to get to my write logic?", "the terms and names are too hard to learn or are confusing", and way too much more.)
+
+As I've researched, read, discussed, and examined the variety of ways that Redux is used and the ideas being shared in the community, I've concluded that it's important to distinguish between how Redux actually works, the ways that Redux is intended to be used conceptually, and the nearly infinite number of ways that it's possible to use Redux. I'd like to address several aspects of Redux usage, and discuss how they fit into these categories. Overall, I hope to explain why specific Redux usage patterns and practices exist, the philosophy and intent behind Redux, and what I consider to be "idiomatic" and "non-idiomatic" Redux usage.
+
+This post will be split into two parts. In Part 1 - Implementation and Intent, we'll look at the actual implementation of Redux, what specific limitations and constraints it requires, and why those limitations exist. Then, we'll review the original intent and design goals for Redux, based on the discussions and statements from the authors (especially during the early development process).
+
+In Part 2 - Practice and Philosophy, we'll investigate the common practices that are widely used in Redux apps, and describe why those practices exist in the first place . Finally, we'll examine a number of "alternative" approaches for using Redux, and discuss why many of them are possible but not necessarily "idiomatic".
+
+Let's start by taking a look at the now-famous Three Principles of Redux:
+
+In a very real sense, each one of those statements is a lie! (Or, to borrow the classic line from Return of the Jedi, "they're true... from a certain point of view.")
+
+So, if these statements aren't entirely true, why even have them? These principles aren't fixed rules or literal statements about the implementation of Redux. Rather, they form a statement of intent about how Redux should be used.
+
+That theme is going to continue throughout the rest of this discussion. Because Redux is such a minimal library implementation-wise, there's very little that it actually requires or enforces at the technical level. That brings up a valuable side discussion that's worth looking at.
+
+In Cheng Lou's ReactConf 2017 talk on "Taming the Meta Language", he described how only source code is "language", and everything else, like comments, tests, docs, tutorials, blog posts, and conferences, is "meta language". In other words, the source code itself can only convey a certain amount of information by itself. Many additional layers of human-level information passing are needed in order to help people understand the "language".
+
+Cheng Lou's talk then continues on to discuss how moving additional concepts into the actual programming language itself enable expressing more information through the medium of the source code, without having to resort to the use of "meta language" to pass on the ideas. From that perspective, Redux is a tiny "language", and almost all of the information about how it should be used is actually "meta language".
+
+The "language" (in this case, the core Redux library) has minimal expressivity, and therefore the concepts, norms, and ideas that surround Redux are all at the "meta language" level. (In fact, the post Understanding "Taming the Meta Language", which breaks down the ideas in Cheng Lou's talk, actually calls out Redux as a specific example of these ideas.) Ultimately, what this means is that understanding why certain practices exist around Redux, and decisions of what is and isn't "idiomatic", will involve opinions and discussions rather than just determination based on the source code.
+
+Before we really get much further into the philosophical side of things, it's important to understand what kind of technical expectations Redux does actually have. Taking a look at the internals and implementation is informative.
+
+The function is the core of Redux's functionality. If we strip out the comments, the error checking, and the code for a couple of advanced features like store enhancers and observables, here's what looks like (code sample borrowed from a "build-a-mini-Redux" tutorial called Hacking Redux ):
+
+That's approximately 25 lines of code, yet it includes the key functionality. It tracks the current state value and multiple subscribers, updates the value and notifies subscribers when an action is dispatched, and exposes the store API.
+
+Consider all the things this snippet doesn't include:
+
+In that vein, it's worth quoting Dan Abramov's pull request for the "counter-vanilla" example:
+
+The function inside of simply calls the reducer function and saves whatever value it returns. And yet, despite that, the items in this list of ideas are widely acknowledged to be concepts that a good Redux app should care about.
+
+Having listed all the things that does not care about, it's important to note what it does actually require. The real function enforces two specific limitations: actions that reach the store must be plain objects, and actions must have a field that is not undefined.
+
+Both of these constraints have their origins in the original "Flux Architecture" concept. To quote the Flux Actions and the Dispatcher section of the Flux docs:
+
+Redux did not originally require the field specifically, but the validation check was later added to help catch possible typos or wrong imports of action constants, and to avoid bikeshedding regarding the basic structure of action objects.
+
+This is where we start seeing some constraints that more people are familiar with. expects that each slice reducer it's been given will "correctly" respond to an unknown action by returning its default state, and never actually return . It also expects that the current state value is a plain JS object, and that there's an exact correspondence between the keys in the current state object and the reducer functions object. Finally, it does reference equality comparisons to see if all slice reducers returned their previous values. If all of the returned values appear to be the same, it assumes that nothing actually changed anywhere, and it returns the original root state object as a potential optimization.
+
+The Redux DevTools consists of two main pieces: the store enhancer that implements the time traveling behavior by tracking a list of dispatched actions, and the UI that allows you to view and manipulate the history. The store enhancer itself does not care about the contents of the actions or the state - it just stores the actions in memory. The original DevTools UI is a component you render inside of your application's component tree, and it also does not care about the contents of your actions or state. However, the Redux DevTools Extension operates in a separate process (at least under Chrome), and thus requires all actions and state to be serializable in order for all time-traveling features to behave properly and performantly. The ability to import and export state and actions also requires them to be serializable as well.
+
+The other semi-requirement for time travel debugging is immutability and pure functions. If a reducer function mutates state, then jumping between actions in the debugger will result in inconsistent values. If a reducer has side effects, then those side effects will be re-executed each time the action is replayed by the DevTools. In either case, time-travel debugging won't fully work as expected.
+
+React-Redux's function is where mutation really becomes an issue. The wrapper components generated by implement a lot of optimizations to ensure that the wrapped components only re-render when actually necessary. Those optimizations revolve around reference equality checks to determine if data has actually changed.
+
+Specifically, every time an action is dispatched and subscribers are notified, checks to see if the root state object has changed. If it hasn't, assumes that nothing else in the state changed, and skips any further rendering work. (This is why tries to return the same root state object if possible.) If the root state object did change, will call the supplied function, and do a shallow equality check on the current result versus the previous returned result, to see if any of the props from store data have changed. Again, if the contents of the data appears to be the same, will not actually re-render the wrapped component. These equality checks in are why accidental state mutations result in components not re-rendering, because assumes that data hasn't changed and re-rendering isn't needed.
+
+Immutability comes into play in other libraries that are commonly used with Redux as well. The Reselect library creates memoized "selector" functions that are typically used to extract data from the Redux state tree. Memoization normally relies on reference equality checks to determine if the input parameters are the same.
+
+Similarly, while a React component can implement using any logic it wants, the most common implementation relies on shallow equality checks of the current props and incoming props, such as .
+
+In either case, mutation of data would generally result in undesired behavior. Memoized selectors would likely not return the proper values, and optimized React components would not re-render when they actually should.
+
+The core Redux function itself puts only two limitations on how you must write your code: actions must be plain objects, and they must contain a defined field. It does not care about immutability, serializability, or side effects, or what the value of the field actually is.
+
+That said, the commonly used pieces around that core, including the Redux DevTools, React-Redux, React, and Reselect, do rely on proper use of immutability, serializable actions/state, and pure reducer functions. The main application logic may work okay if these expectations are ignored, but it's very likely that time-travel debugging and component re-rendering will break. These also will affect any other persistence-related use cases as well.
+
+It's also important to note that immutability, serializability, and pure functions are not enforced in any way by Redux. It's entirely possible for a reducer function to mutate its state or trigger an AJAX call. It's entirely possible for any other part of the application to call and modify the contents of the state tree directly. It's entirely possible to put promises, functions, Symbols, class instances, or other non-serializable values into actions or the state tree. You are not supposed to do any of those things, but it's possible.
+
+With those technical constraints in mind, we can turn our attention to how Redux is intended to be used. To better understand that intent, it's helpful to look back at the ideas and influences that drove the initial development of Redux.
+
+The "Introduction" section in the Redux docs lays out several major influences on Redux's development and concepts in the Motivation, Core Concepts, and Prior Art topics. As a quick summary:
+
+It's also worth taking a look at the stated design goals from an early version of the Redux README
+
+Reading through the Redux docs, the early Redux issue threads, and many other comments made by Dan Abramov and Andrew Clark elsewhere, we can see several specific themes regarding the intended design and use of Redux.
+
+Redux was originally intended to be "just" another library that implemented the Flux Architecture. As a result, it inherited many concepts from Flux: the idea of "dispatching actions", that actions are plain objects with a field, the use of "action creator functions" to create those action objects, that "update logic" should be decoupled from the rest of the application and centralized, and more.
+
+I frequently see questions asking "Why does Redux do $THING?", and for many of those questions the answer is "Because that's how the Flux Architecture and specific Flux libraries did things".
+
+Almost every aspect of Redux is meant to make it easier for a developer to understand when, why, and how a given piece of state changed. That includes both actual implementation as well as encouraged usage.
+
+That means that a developer should be able to look at a dispatched action, see what state changes occurred as a result, and trace back to the places in the codebase where that action is dispatched (especially based on the type of the action). If data is wrong in the Redux store, it should be possible to trace what dispatched action resulted in that wrong state, and work backwards from there.
+
+The emphasis on "hot reloading" and "time-travel debugging" is also aimed squarely at developer productivity and maintainability, since both of those allow a developer to iterate faster and better understand what's happening in the system.
+
+While Redux's core does not care what the actual value of your action's field is, the clear intent is that action types should have some kind of meaning and information. The Redux DevTools and other logging utilities display the field for each dispatched action, so having values that are understandable at a quick glance is important.
+
+This means that strings are more useful than Symbols or numbers in terms of conveying information. It also means that the wording of those action type strings should be clear and understandable. This generally means that having more distinct action types is going to be better for developer understanding than only having one or two action types. If only a single action type is used across the entire codebase (like ), it will be harder to track down where a particular action was dispatched from, and the history log will be less readable.
+
+Redux is explicitly intended to be built and used with functional programming concepts, and to help introduce those concepts to both new and experienced developers. This includes FP basics such as immutability and pure functions, but also ideas such as composing functions together to achieve a larger task.
+
+At the same time, Redux is intended to help provide real value to developers trying to solve problems and build applications, without overwhelming a user in too many abstract FP concepts or getting bogged down in arguments over deep FP terminology like "monads" or "endofunctors". (Admittedly, the number of terms and concepts around Redux has grown over time, and many of those are confusing to new learners, but the goals of leveraging the benefits of FP and introducing learners to FP were clearly part of the original design and philosophy.)
+
+Having reducers be pure functions enables time travel debugging, but it also means that a reducer function should be easily testable in isolation. Testing a reducer should only require calling it with specific arguments, and verifying the output - no need to mock things like AJAX calls.
+
+AJAX calls and other side effects still have to live somewhere in the application, and testing code that uses those can still take work. However, emphasizing pure functions for a meaningful part of the codebase reduces the overall complexity of testing.
+
+Redux takes the concept of individual "stores" from the Flux architecture, and merges them into a single combined store. The most straightforward mapping between Flux and Redux is to create a separate top-level key or "slice" in the state tree for each store. If a Flux app has a separate UsersStore, PostsStore, and CommentsStore, the Redux equivalent would probably have a root state tree that looks like .
+
+It's possible to have a single function that contains all the logic for updating all of those state slices together, but any meaningful application will want to break up that function into smaller functions for maintainability. The most obvious way to do that is to split up the logic based on which slice of state needs to be updated. This means that each "slice reducer" only needs to worry about its own slice of state, and as far as it knows, that slice may as well be all of the state. This pattern of "reducer composition" can be nested repeatedly to handle updates to nested state structure, and the utility is included with Redux specifically to make it easy to follow this pattern.
+
+If each slice reducer function can be called separately and given just its own slice of state as a parameter, that also implies that multiple slice reducers can be called with the same action, and each one can update its own slice of state independently from any others. Based on statements from Dan and Andrew, having a single action result in updates from multiple slice reducers is a core intended use case for Redux. This is often referred to as actions having a "1:many" relationship with reducer functions.
+
+Redux does not contain any "magic". A few aspects of its implementation are a bit tricky to grasp right away unless you're familiar with some more advanced FP principles (such as and store enhancers), but otherwise everything is intended to be explicit, clear, and traceable, with minimal abstraction.
+
+Redux really doesn't even implement the actual state update logic. It simply relies on whatever root reducer function you provide. It does provide the utility to help with the intended common use case of slice reducers managing state independently, but you are entirely encouraged to write your own reducer logic to handle your own needs. This also means that your reducer logic can be simple or complex, abstracted or verbose - it's all about how you want to write it.
+
+In the original Flux dispatcher, Stores needed a event that could be used to set up dependency chains. If a CommentsStore needed data from a PostsStore to properly update itself, it could call to ensure that it would run after the PostsStore updated. Unfortunately, that dependency chain was not easily visualized. However, with Redux, that sequencing can simply be accomplished by explicitly calling specific reducer functions in sequence.
+
+As an example, here's some (slightly modified) quotes and snippets from Dan's "Combining Stateless Stores" gist:
+
+This also applies to the idea of "higher order reducers". A given slice reducer can be wrapped up in other reducers to add abilities like undo/redo or pagination.
+
+This goal was stated repeatedly by both Dan and Andrew throughout Redux's development. It's easiest to just quote some of their comments:
+
+This ties in with the "minimal API" goal. Some Flux libraries, like Andrew's Flummox lib, had some form of async behavior built-in to the library itself (such as dispatching actions for promises). However, while having something built into the core meant it was always available, it also limited flexibility.
+
+Again, it's easiest to quote comments from the design discussions and the Hashnode AMA with Dan and Andrew :
+
+I spent a lot of time doing research for these two posts. It was fascinating to read back through the early issues and discussions, and watch Redux evolve into what we now know. As seen in that quoted README, the vision for Redux was clear from the beginning, and there were several specific insights and conceptual leaps that resulted in the final API and implementation. Hopefully this look at the internals and the history of Redux helps shed some light on how Redux actually works, and why it was built this way.
+
+Be sure to check out The Tao of Redux, Part 2 - Practice and Philosophy, where we'll look at why many common patterns of Redux usage exist, and I'll give my thoughts on the pros and cons of many "variations" in how it's possible to use Redux.|||
+
