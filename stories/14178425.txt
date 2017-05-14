@@ -1,0 +1,70 @@
+For programmers new to cryptography, there are plenty of “known unknowns” – unfamiliar terms like “elliptic curves” and “random oracles”, and unnecessarily long acronyms (“RSASSA-PKCS-v1_5”, like really?). But what really gives cryptography its reputation is the unknown unknowns. The things that catch even experienced developers by surprise.
+
+Quick: where’s the vulnerability in this code? (I used JavaScript here, but the same vulnerability would occur in Python, Ruby, and most other languages.)
+
+If you spotted it, nice work. I’m guessing you have at least a passing interest in cryptography.
+
+If you didn’t, here’s how the exploit works. The comparison operator, “!==”, is vulnerable to a timing attack. The string comparison compares the two keys one byte at a time, stopping as soon as it finds an offset where the two strings do not match. As a result, will take longer if the two keys start with the same bytes. It’s sort of like if the error message itself said “wrong key, but you got the first 2 bytes right!”.
+
+Now, it may not seem significant that an attacker can see how many bytes of their key were a match, but it can actually be fatal to security. The attacker can crack the first byte of the key by trying all 256 possibilities, and observing which one caused the comparison to take longer. Now, armed with the first byte, they can do the same with the second byte, and the third, and so on, until they have recovered the entire key.
+
+For a 16-byte key, a normal brute force attack would require about 1.7 x 10^38 guesses on average – impossible in most contexts. With a timing attack, however, full key recovery can be possible with only a few thousand guesses.
+
+Are attacks like this practical? Yes, especially if you are in a shared hosting environment like EC2 or DigitalOcean, allowing attackers to get a low latency connection to your server. See this paper for details of practical exploitation (pdf).
+
+A common suggestion in response to this vulnerability goes something like this:
+
+The program sleeps for a random amount of time, so now an attacker can’t get precise timing measurements. The attack is thwarted!
+
+Unfortunately, this doesn’t really work well. The first problem is that your attacker might possess Statistics™. We can add noise to the attacker’s measurements, but the attacker can respond by collecting more measurements and using statistical classifiers (pdf) to see through the noise. We can add more noise, which forces the attacker to collect even more samples, but now our code is slow.
+
+There’s another problem here too, but let’s look at another common suggestion first:
+
+Here, the program chooses a finish time before is called. If we assume that is a constant, then this code should always take the same amount of time.
+
+There are problems with this approach too. First, how do we choose a reliable value for ? Too high a value is a problem for performance, while too low a value risks not being long enough to hide the computation’s time. It’s not clear that it’s possible to have any reliable strategy other than “choose an absurdly high value”. There are too many situation- and hardware-dependent factors to account for here.
+
+The other problem, which I alluded to earlier, is much messier. Modern computers don’t perform computations one at a time. Even single-core computers execute multiple tasks concurrently using context switches. While your program is sleeping, the CPU is free to work on other tasks. In other words, the amount of time your code spends sleeping affects how quickly other tasks finish… which is something a skilled attacker can measure.
+
+OK, so why don’t we replace with a busy loop? Now the CPU will be busy from the time we start the function until . So an attacker can’t learn anything from measuring timing, right?
+
+… Not quite. Modern CPUs have multiple physical cores and features like simultaneous multithreading (Intel calls it “hyper-threading”). Even if one logical core is 100% occupied by a thread, other tasks might still be executed in parallel on other cores. Depending on what it’s doing exactly, your code will produce a subtle but measurable pattern of interference in the performance of other threads and processes on the same hardware.
+
+Suppose your code spends most of its time waiting for memory to load. The CPU will be free to schedule more execution units to another hardware thread, and the other processes’ CPU-heavy computations will be largely unaffected by your process. However, if another process needs to access memory as well, it will compete with your process for memory bandwidth and may run more slowly as a result.
+
+Conversely, if your code is CPU-bound (like, say, a busy loop), other processes will have the memory bus to themselves, but parts of the CPU core will be completely available.
+
+That’s a simple example of the kind of information your code leaks to other threads and processes running on the same hardware. Processes/threads will compete for space in the same CPU caches, evicting each others’ entries. This leaks information about what locations in memory are being accessed. Contention for particular execution units can reveal what kinds of computations are occurring (e.g. integer arithmetic/logic vs floating-point). The list goes on. In fact, there’s an entire subsection of academic literature devoted to researching how microarchitectural implementation details can be exploited in this way.
+
+Did I mention that this all happens at the hardware level? These interference patterns can show up in other containers and VMs running on the same machine. Researchers have shown (pdf) that these information leaks are not stopped by the per-tenant isolation used in cloud computing environments like EC2 and Azure. It’s hard to fix hardware.
+
+So what do we do about all of this? How do we prevent hardware from leaking out secret information through timing?
+
+The technique that has emerged as best practice over the last ten years is to write code that is “constant-time”. We can’t really hide what kinds of computations we’re doing, but we can write our code so that secret information has no influence on how we use hardware resources. In other words, even if an attacker can see exactly what hardware resources our program uses and when, they still won’t learn anything secret.
+
+You might notice that I use scare quotes around “constant-time”. I don’t really like the term as I find it quite misleading:
+
+“Secret-independent resource usage” might be a more accurate term. I digress.
+
+Here is the golden rule of writing code that is “constant-time”:
+
+In practice, this golden rule has a few implications:
+
+If you write all of your code in assembly, carefully keep track of what values are secret, and follow the golden rule, you should hopefully produce code that does not leak secret information via timing.
+
+Oh, and by the way, whether a particular instruction is “constant-time” can vary by architecture and by processor model, and there isn’t any official documentation for this behaviour… but I’ll save that story for another time.
+
+Some people enjoy working directly with assembly (you know who you are). For the rest of us, it’s not so great if we have to write any and all crypto code in assembly. So how can we write code in high-level languages that will still follow the golden rule when compiled?
+
+The answer is: it’s complicated. Today’s languages and compilers weren’t really built for this, so it’s a challenge.
+
+The usual approach is to write code that looks constant-time. Document which variables you want to keep secret. Avoid using those variables in the conditions of statements and loops. Avoid using those variables when calculating an array index (since the array index determines what memory address in the array to access). Avoid using those variables in operations that probably compile into variable-time instructions, like division or modulus.
+
+But this doesn’t always work. The compiler might decide that your code would be faster if it used variable-time instructions. There are even cases where an optimizing compiler will see that you are trying to, say, avoid using an if statement, and the compiler puts the if statement back in because it knows it will be faster.
+
+Given the lack of language and compiler support, the only reliable way to know if code in a high-level language is secure against timing attacks is to check the compiler’s output. One common approach looks something like this:
+
+Adam Langley has done some interesting work at Google to make this process easier by patching Valgrind. Efforts to automate this verification process are definitely helpful.
+
+My belief is that, ultimately, the best solutions are going to involve teaching compilers to understand how to produce code that is not vulnerable to timing attacks. In the meantime, the most practical solution for high-level timing-attack-resistant crypto code is careful coding paired with a manual or automated verification of compiler output.|||
+

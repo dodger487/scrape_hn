@@ -1,0 +1,121 @@
+After doing hundreds of security code reviews for companies ranging from small start-ups to large banks and telcos, and after reading hundreds of stack overflow posts on security, I have composed a list of the top 10 crypto problems I have seen.
+
+Bad crypto is everywhere, unfortunately. The frequency of finding crypto done correctly is much less than the number of times I find it done incorrectly.  Many of the problems are due to complex crypto APIs that are insecure by default and have have poor documentation. Java is the biggest offender here, but it does not stand alone. Perhaps Java should learn from its archenemy, .Net, on how to build a crypto API that is easier to use and less prone to security problems.
+
+Another reason for so many problems is that finding the issues seems to require manual code analysis by a trained expert. According to my experience, the popular static analysis tools do not do well in finding crypto problems. Also, black-box penetration testing will almost never find these problems. My hope in publishing this list is for it to be used by both code reviewers and programmers to improve the state of crypto in software.
+
+1. Hard-coded keys
+
+ 2. Improperly choosing an IV
+
+ 3. ECB mode of operation
+
+ 4. Wrong use or misuse of a cryptographic primitive for password storage
+
+ 5. MD5 just won’t die. And SHA1 needs to go too!
+
+ 6. Passwords are not cryptographic keys
+
+ 7. Assuming encryption provides message integrity
+
+ 8. Asymmetric key sizes too small
+
+ 9. Insecure randomness
+
+ 10. “Crypto soup”
+
+Now we break it down in detail:
+
+I have seen this very often. Hard-coding keys implies that whoever has access to the software knows the keys to decrypt the data (and for those developers who start talking about obfuscation, my 10th entry is for you). Ideally, we never want cryptographic keys accessible to human eyes (for example, see what happened to RSA about six years ago). But many companies fall far short of this ideal, and therefore the next best thing we can ask is to restrict access to the keys to a security operations team only. Developers should not have access to production keys, and especially those keys should not be checked into source code repositories.
+
+Hard-coded keys is also indicative of insufficient thought about key management. Key management is a complex topic that goes well beyond the scope of this blog.  But what I will say is if a key gets compromised, then rotation of a hard-coded key requires releasing new software that must be tested before going live.  Releasing new software takes time, which is not a luxury when incidents like this happen.
+
+It’s easy for security people to tell developers what not to do, but the unfortunate reality is that what we really want them to do is often not feasible for whatever reason. Therefore, developers need some middle-ground advice.
+
+A big caveat here that I am not a security operations person nor an expert on key management, but I can comment on what I have seen from a distance in some places.  Even though it is less than ideal, a configuration file is a better option for key storage than hard-coding it. Although some frameworks support encrypted configuration sections (see also this .Net guidance) what is really needed is for developers to have test keys for their test and development environments, and these keys are replaced by real keys by a security operations team upon deployment into the live environment.
+
+The above guidance I have seen this botched up in practice. In one case, the deployment team put in an RSA public key incorrectly, and was not able to decrypt because they didn’t have a private key corresponding to the erroneous public key. My advice is that the software needs a means to test itself to make sure it can encrypt/decrypt (or whatever operation it needs to do), or else there needs to be a procedure as part of the deployment to make sure things work as expected.
+
+IV means initialization vector.  This problem is usually with CBC mode of encryption. Very often it is a hard-coded IV, usually all 0s. In other cases, some magic is done with a secret (sometimes the key itself) and/or a salt, but the end result is that the same IV is used every time. The worst one I have seen, on three occurrences, is the key also used as the IV — See Section 7.6 of Crypto 101 on why this is dangerous.
+
+When you are using CBC mode of operation, the requirement is that the IV is chosen randomly and unpredictably.  In Java, use SecureRandom.  In .Net, simply use GenerateIV.  Also, you cannot just choose an IV this way once and then use the exact same IV again for another encryption.  For every encryption, a new IV needs to be generated. The IV is not secret and is typically included with the encrypted data at the beginning.
+
+If you do not choose your IV properly, then security properties are lost. An example of improper choice of IV where the implications were huge is in SSL/TLS.
+
+Unfortunately, APIs are often the problem here. Apple API is a perfect example of what not to do (note: I am using  this mirror of Apple’s code so I can link directly to the evidence) — tell developers it is optional and use all zero if it is not provided. Sure, it will still encrypt and decrypt, but it is not secure Apple!
+
+More information about requirements for IVs and nonces in various modes of operation is given here.
+
+When you encrypt with a block cipher such as the AES, you should choose a mode of operation.  The worst one you can choose or have chosen for you is ECB mode, which stands for Electronic Code Book.
+
+It doesn’t matter what block cipher is under the hood: if you are using ECB mode, it is not secure because it leaks information about the plaintext. In particular, duplicate plaintexts become duplicate ciphertexts. If you think that doesn’t matter so much, then you probably have not seen the encrypted penguin yet either (this image is Copyright Larry Ewing, lewing@isc.tamu.edu, and I am required to mention The GIMP):
+
+Bad APIs, like Java, leave it up to the provider to specify the default behaviour. Typically, ECB is used by default. Embarrassingly, OWASP gets this wrong in their “Good Practice: Use Strong Algorithms” example, though they get it right here, which is one of the few places on the internet that looks to be free of problems.
+
+Bottom line: Don’t use ECB mode.  See here for guidance on modes that are safe to use.
+
+When a crypto person sees PBKDF2 being used with 1000 iterations for password storage, they may complain that 1000 iterations is too few and a function like bcrypt is a better choice anyway. On the other hand, I have seen so much worse that I’m just excited that the developer is on the right track.
+
+Part of the problem here is terminology, which the cryptographic community has made no effort to fix. Hash functions are wonderful, magical functions. They are collision resistant, preimage resistant, 2nd preimage resistant, behave like random oracles, and they are both fast and slow at the same time. Maybe, just maybe, it is time to define separate cryptographic functions for separate purposes rather than relying too much upon a single source of magic.
+
+For password processing, the main properties we need are slow speed, preimage resistance, and 2nd preimage resistance. The slow speed requirement is explained wonderfully by Troy Hunt.
+
+There are specific functions designed to meet these goals: pbkdf2, bcrypt, scrypt and argon2. Thomas Pornin has played an excellent role in helping developers and security engineers understand this. Now if only we can get rid of the MD5, SHA1, SHA256, and SHA512 implementations for processing passwords!
+
+Also, I sometimes see APIs that make available PBKDF1, which really should not be used any more. Examples include Microsoft and Java.
+
+Additionally, another common problem I see is hard-coded salts when doing password processing. One of the main purposes of the salt is so that two identical passwords do not “hash” to the same value. If you hard-code the salt, then you lose this property. In this case, one who gets access to your database can readily identify the easy targets by doing a frequency analysis on the ‘hashed’ passwords. The attacker’s efforts suddenly become more focused and more successful.
+
+For developers, my recommendation is to do what Thomas Pornin says. He has commented on various aspects of password processing frequently on the security stack exchange.
+
+Personally, I would go with bcrypt if that is possible. Unfortunately, many libraries only give you PBKDF2. If you are stuck with that, then make sure you use at least 10,000 iterations and be happy that your password storage is better than most.
+
+MD5 has been broken in practice for more than 10 years, and there were warnings against using it for more than 20 years.  Yet I am still finding MD5 in many, many places. Often, it is being used in some crazy way where it is not clear what the security properties are that they need.
+
+SHA1 has been broken in theory almost as long as MD5, but the first real attack only came recently. Google has been doing well in deprecating from certificates years before the practical break, however SHA1 still exists in developer code in many places.
+
+Whenever I see developer code using a cryptographic hash function, I get worried. Often they do not know what they are doing. Hash functions are wonderful primitives for cryptographers to use in building useful cryptographic primitives such as message authentication codes, digital signature algorithms, and various prngs, but letting developers do what they please with them is like giving a machine gun to an 8 year old. Developers, are you sure these functions are what you need?
+
+I see this often: not understanding the difference between a password and a cryptographic key. Passwords are things people remember and can be arbitrary length. Keys on the other hand are not limited to printable characters and have fixed length.
+
+The security issue here is that keys should be full entropy, whereas passwords are low entropy by nature.  Sometimes you need to change a password into a key.  The proper way to do this is with a password based key derivation function (pbkdf2, bcrypt, scrypt or argon2), which compensates for the low entropy input by making the derivation of the key from the password a time consuming process.  Very seldom do I see this done.
+
+Libraries like Crypto-js blend the concepts of keys and passwords together, and inevitably people who use it wonder why they cannot encrypt in JavaScript and then decrypt in Java or .Net or whatever other language/framework. Worse, the library uses some awful algorithm based upon MD5 to convert the password to a key.
+
+My advice to developers is whenever you find an API that offers passwords or passphrases to encrypt, avoid it unless you specifically know how the password is converted to a key. Hopefully, the conversion is done with an algorithm such as PBKDF2, bcrypt, scrypt, or argon2.
+
+For APIs that take keys as input, generate the keys using a cryptographic prng such as SecureRandom.
+
+Encryption hides data, but an attacker might be able to modify the encrypted data, and the results can potentially be accepted by your software if you do not check message integrity. While the developer will say “but the modified data will come back as garbage after decryption”, a good security engineer will find the probability that the garbage causes adverse behaviour in the software, and then he will turn that analysis into a real attack. I have seen many cases where encryption was used but message integrity was really needed more than the encryption. Understand what you need.
+
+There are certain encryption modes of operation that provide both secrecy and message integrity, the best known one being GCM. But GCM is unforgiving if a developer reuses and IV. Given how frequent the IV reuse problem is, I cannot recommend GCM mode.  Alternative options are .Net’s Counter with CBC-MAC and Java BouncyCastle choices of CCMBlockCipher, EAXBlockCipher, OCBBlockCipher.
+
+For message integrity only, HMAC is an excellent choice. HMAC uses a hash function internally, and the specific one is not too important. I recommend that people use a hash function such as SHA256 under the hood, but the truth is that even HMAC-SHA1 is quite secure even though SHA1 lacks collision resistance.
+
+Note that encryption and HMAC can be combined for both secrecy and message integrity. But the catch here is that the HMAC should not be applied to the plaintext but instead to the ciphertext combined with the IV.  Acknowledgments to the good people at /r/crypto for correcting earlier versions of this section.
+
+Developers do really well in choosing their symmetric key sizes, often choosing much stronger than they need (128-bit is enough). But for asymmetric crypto, they often err on the other side.
+
+For RSA, DSA, DH, and similar algorithms, 1024-bit is within reaching distance of an organisation such as the NSA, and will soon become reachable by smaller organisations with Moore’s law. At the very least, using 2048-bits.
+
+For elliptic curve based systems, one can get away with much smaller key sizes. I have not seen these algorithms used by developers so often, so I have not seen problems with key sizes for them.
+
+General guidance on key sizes is provided here.
+
+I’m surprised that this does not occur more often, but I do find it from time to time. The general issue is that typical (pseudo) random number generators may look random to the untrained eye, but they fail to meet the unpredictable requirement to the trained expert.
+
+As an example, imagine you are using java.util.Random to generate a session token for a web application. When I as a legitimate user get my session token, I (using my crypto expertise) can then predict the next session token for the next user and the previous session token for the previous user. I can then hijack their sessions.
+
+This would not be possible if the session token is generated with SecureRandom. The general requirement is a pseudo random number generator with cryptographic security. In .Net, the good source is System.Security.Cryptography.RandomNumberGenerator.
+
+It is also worth mentioning that just because you are using a good source of randomness does not mean that you cannot screw up. For example, I saw one implementation that took a 32-bit integer from SecureRandom and hashed it to produce a session token. It never occurred to the developer that that implies at most 2^32 possible sessions, which would allow an attacker to hijack one just by enumerating these values.
+
+I use this term to mean a developer mixing a bunch of cryptographic primitives together without a clear goal. I don’t like to call it roll-your-own-crypto, because I think of that term attempting to build something where the goals are clear, such as a block cipher.
+
+Crypto soup often uses hash functions, and at this point you may want to have a second look at my final paragraph for point 5. When I see this, I want to scream to the developer “get your hands off that hash function, you don’t know what you’re doing!”
+
+I remember one case of crypto soup where the developer used a hard-coded key. I told him that it is unclear what you are trying to do, but you cannot use hard-coded keys. This caused him a lot of trouble because they didn’t have a clear path forward to getting the key out of the source. Eventually, he explained that he didn’t really need security for what he was doing, but instead he was just trying to obfuscate. Huh? This is exactly the type of conversation one tends to get into when you see crypto soup.
+
+To improve the state of crypto in developer code, I make the following recommendations:|||
+
+After doing hundreds of security code reviews for companies ranging from small start-ups to large banks and telcos, and after reading hundreds of stack overflow posts on security, I have composed a list of the top 10 crypto problems I have seen. Bad crypto is everywhere, unfortunately. The frequency of finding crypto done correctly is…

@@ -1,0 +1,83 @@
+Last August we introduced Winston, our event driven diagnostic and remediation platform. Winston helps orchestrate diagnostic and remediation actions from the outside. As part of that orchestration, there are multiple actions that need to be performed at an AWS instance(vm) level to collect data or take mitigation steps. We would like to discuss a supporting service called Bolt that helps with instance level action executions. By “action,” we refer to runbook, script or automation code.
+
+Netflix does not run its own data centers. We use AWS services for all our infrastructure needs. While we do utilize value added services from AWS (SQS, S3, etc.), much of our usage for AWS is on top of the core compute service provided by Amazon called EC2.
+
+As part of operationalizing our fleet of EC2 instances, we needed a simple way of automating common diagnostics and remediation tasks on these instances. This solution could integrate with our orchestration services like Winston to run these actions across multiple instances, making it easy to collect data and aggregate at scale as needed. This solution would became especially important for our instances hosting persistent services like Cassandra which are more long lived than our non-persistent services. For example, when a Cassandra node is running low on disk space, a Bolt action would be executed to analyze if any stale snapshots are laying around and if so, reclaim disk space without user intervention.
+
+Bolt is an instance level daemon that runs on every instance and exposes custom actions as REST commands for execution. Developers provide their own custom scripts as actions to Bolt which are version controlled and then seamlessly deployed across all relevant EC2 instance dynamically. Once deployed, these actions are available for execution via REST endpoints through Bolt.
+
+Some interesting design decisions when building Bolt were
+
+Below, we go over some of the more interesting features of Bolt.
+
+The main languages used for writing Bolt actions are Python and Bash/Shell. Actually, any scripting language that are installed on the instance can be used (Groovy, Perl, …), as long as a proper shebang is specified.
+
+The advantage of using Python is that we provide per-pack virtual environment support which give dependency isolation to the automation. We also provide, through Winston Studio, self-serve dependency management using the standard requirements.txt approach.
+
+We chose to extend Winston Studio to supports CRUD & Execute operations for both Winston and Bolt. By providing a simple and intuitive interface on where to upload your Bolt actions, look at execution history, experiment and execute on demand, we ensured that the Fault Detection Engineering team is not the bottleneck for operations associated with Bolt actions.
+
+Here is a screenshot of what a single Bolt action looks like. Users (Netflix engineers) can iterate, introspect and manage all aspects of their action via this studio. This studio also implements and exposes the paved path for action deployment to make it easy for engineers to do the right thing to mitigate risks.
+
+Users can also look at the previous executions and individual execution details through Winston Studio as shown in the following snapshots.
+
+Here is an example requirements.txt file which specifies the pack dependencies (for Python Bolt actions):
+
+Similar to Winston, we help ensure that these actions are version controlled correctly and we enforce staged deployment. Here are the 3 stages:
+
+Even though this is an internal administrative service, security was a big aspect of building software that installs on all EC2 instances we run. Here are some key security features and decisions we took to harden the service from bad actors
+
+The decision of choosing an Async API to execute actions allows the ability to run long running diagnostics or remediation actions without blocking the client. It also allows the clients to scale to managing thousands of instances in short interval of time through fire and check back later interface.
+
+Here is a simple sequence diagram to illustrate the flow of an action being executed on a single EC2 instance:
+
+The Bolt ecosystem consists of both a Python and Java client libraries for integrations..
+
+This client library also makes the task of TLS authenticated calls available out of the box as well as implements common client side patterns of orchestration.
+
+What do we mean by orchestration? Let say that you want to restart tomcat on 100 instances. You probably don’t want to do it on all instances at the same time, as your service would experience down-time. This is where the serial/parallel nature of an execution comes into play. We support running an action one instance at a time, one EC2 Availability Zone at a time, one EC2 Region at a time, or on all instances in parallel (if this is a read-only action for example). The user decides which strategy applies to his action (the default is one instance at a time, just to be safe).
+
+Other notables features include the support for action timeout and the support for killing running actions. Also, the user can see the output (stdout/stderr) while the action is running (doesn’t have to wait for the action to be complete).
+
+While Bolt is very flexible as to what action it can perform, the majority of use cases fall into these patterns:
+
+Bolt is used as a diagnostic tool to help engineers when their system is not behaving as expected. Also, some team uses it to gather metadata about their instance (disk usage, version of packages installed, JDK version, …). Others use Bolt to get detailed disk usage information when a low disk space alert gets triggered.
+
+Remediation is an approach to fix an underlying condition that is rendering a system non-optimal. For example, Bolt is used by our Data Pipeline team to restart the Kafka broker when needed. It is also used by our Cassandra team to free up disk space.
+
+In the case of our Cassandra instances, Bolt is used for proactive maintenance (repairs, compactions, Datastax & Priam binary upgrades, …). It is also used for binary upgrades on our Dynomite instances (for Florida and Redis).
+
+Here are some usage stats number:
+
+Below is a simplified diagram of how Bolt actions are deployed on the instances:
+
+It also explains how they are being triggered (either manually from Winston Studio or in response to an event from Winston).
+
+The diagram also summarizes how Bolt is stored on each instance:
+
+It also shows that we send metrics to Atlas to track usage as well as Pack upgrades failures. This is critical to ensure that we get notified of any issues.
+
+Here are some alternatives we looked at before building Bolt.
+
+Before Bolt, we were using plain and simple SSH to connect to instances and execute actions as needed. While inbuilt in every VM and very flexible, there were some critical issues with using this model:
+
+We discussed the idea of using separate sudo rules, a dedicated set of keys and some form of binary whitelisting to improve the security aspect. This would alleviate our security concerns, but would have limited our agility to add custom scripts (which could contains non whitelisted binaries).
+
+In the end, we decided to invest in building technology that allows us to support the instance level use case with the flexibility to add value added features while strengthening the security, reliability and performance challenges we had.
+
+AWS EC2 Run is a great option if you need to run remote script on AWS EC2 instances. But in October 2014 (when Bolt was created), EC2 Run was either not created yet, or not public (introduction post was published on October 2015). Since then, we sync quarterly with the EC2 Run team from AWS to see how we can leverage their agent to replace the Bolt agent. But, at the time of writing, given the Netflix specific features of Bolt and it’s integration with our Atlas Monitoring system, we decided not to migrate yet.
+
+These are great tools for configuration management/orchestration. Sadly, some of them (Ansible/RunDeck) had dependencies on SSH, which was an issue for the reasons listed above. For Chef and Puppet, we assessed that they were not quite the right tool for what we were trying to achieve (being mostly configuration management tools). As for Salt, adding a middle tier (Salt Master) meant increased risk of down time even with a Multi-Master approach. Bolt doesn’t have any middle tier or master, which significantly reduces the risk of down time and allows better scalability.
+
+Below is a glimpse of some future work we plan to do in this space.
+
+As an engineer, one of the biggest concern when running extra agent/process is: “Could it take over my system memory/cpu?”. In this regard, we plan to invest into memory/cpu capping as an optional configuration in Bolt. We already reduce processing priority of Bolt and the actions processes with ‘nice’, but memory is currently unconstrained. The current plan is to use cgroups.
+
+The Spinnaker team is planning on using Bolt to gather metadata information about running instances as well as other general use-cases that applies to all Netflix micro-services (Restart Tomcat, …). For this reason, we are planning to add Bolt to our BaseAMI, which will automatically make it available on all Netflix micro-services.
+
+Since its creation to solve specific needs for our Cloud Database Engineering group to its broader adoption, and soon to be included in all Netflix EC2 instances, Bolt has evolved into a reliable and effective tool.
+
+By: Jean-Sebastien Jeannotte and Vinay Shah
+
+on behalf of the Fault Detection Engineering team|||
+
+Bolt helps with instance level action executions. By action, we mean runbook, script, or automation code.

@@ -1,0 +1,58 @@
+In late 2010 I had the opportunity to research new rendering algorithms on the newly released DirectX 11 class video cards for a technical demo Epic was making in Unreal Engine 3.  At the time the next console generation was being decided and Epic wanted to show console manufacturers what next-gen games could look like if they invested in decent graphics hardware, instead of say a gimmicky input device that doesn’t benefit any of the core games.
+
+That tech demo became known as the Samaritan demo and was shown at GDC 2011.  It had an extremely ambitious visual bar for the time and Martin Mittring and I were the only graphics programmers working on it.  Martin ended up presenting some of the work we did in “The Technology Behind the DirectX 11 Unreal Engine “Samaritan” Demo” (along with the great tessellation work Nvidia had done in UE3 beforehand).
+
+The demo is set in a rainy city with lots of street lights and signs, so getting high quality reflections was always going to be critical to the look.  Every surface needs to receive reflections, and they need to parallax accurately and handle varying material roughness caused by varying wetness.  Most realtime methods can only handle two out of three of those requirements.
+
+Reflections off of arbitrary surfaces are divergent and require ray tracing.  I needed to create a simplified scene representation that would support ray tracing on the GPU.
+
+I went with textured quads as the primary scene representation, which covered the needs of the demo well – most of the bright reflections came from signs.  Artists imported a texture for the reflection quads of signs.
+
+I also made a scene capture quad which was used for everything else.  Artists placed these over building facades.
+
+The entire scene’s textured quads were packed into a 2d texture array, with quad positions and orientations in a buffer.  I didn’t have time to create a spatial data structure although clearly that would have been needed to scale up to larger scenes.  Each pixel’s reflection cone was intersected against all the textured quads in the scene, computing the incident lighting along the cone.  Every surface receives reflections, even the character’s back.
+
+In order to support varying material roughness efficiently you really need to trace a cone, instead of just a ray.  Textured quads can be prefiltered by different roughness values to approximate a cone intersection.  Then you just need to figure out the size of the cone at the intersection and sample from the right mip.  There are some gotchas here, like quads seen from the side remain sharp and need to be faded out, and quad extents actually increase as the cone gets larger which needs to be taken into account in the intersection.
+
+Normally you have to compute lighting in the correct order, since each textured quad both emits and blocks light.  Instead I used a depth visibility function with only a few steps.  Shadowing (described later) limits the number of quads you can see through at one time so this worked pretty well.
+
+If you look around on a rainy day you’ll notice reflections are actually streaked in the direction perpendicular to the reflecting surface.  We can achieve this with prefiltered roughness – just use anisotropic filtering, passing an explicitly computed ddx and ddy to SampleGrad.  The texture unit uses the length of the shorter vector to determine which mip to sample.  Then it will sample many times in the direction of the longer vector.  We can compute the blur direction by intersecting a second ray with the quad – the reflection half vector.
+
+The other major light source in the Samaritan demo were the street lights.  I applied these regardless of their distance, using the depth visibility function created by textured quads to get the sorting right.  Again culling against a spatial data structure would be critical here to scale up to larger scenes.
+
+I used the modified phong specular model which is energy conserving.  I achieved the streakiness by flattening the camera and reflection vectors toward the plane of the receiver surface somewhat before shading.
+
+Finally, I supported an environment map to represent background lighting, which was used for the starry sky and surrounding city lighting.
+
+How do you compute visibility for a set of incoherent reflection cones efficiently, and with enough accuracy to avoid incorrect self-shadowing?  Voxel methods have problems with the accuracy and the performance part.  Ray tracing against triangles has problems with the performance part, and becomes noisy quickly for rough surfaces.  Screen space ray tracing methods have blatant failure cases.
+
+I went with ray marching a Signed Distance Field of the scene.  This has three important characteristics: 1) you can skip empty space while ray marching (called Sphere Tracing), 2) you can approximate cone occlusion by tracking the closest the cone axis ever passed by a surface, and 3) you get effectively 4x higher resolution in each dimension (compared to voxels) because distance interpolates linearly.
+
+Of course, ray marching SDFs can only provide visibility (and the hit distance), but with separate reflection quads and analytical light sources, that’s all I needed!
+
+I generated the signed distance field in a single volume texture bounding the scene.  This is a visualization of the number of steps needed to find an intersection with the SDF in a simple scene.  Ray marching skips through empty space and terminates when entering the negative ‘inside’ region.
+
+The single volume texture did not scale up to larger scenes, but more recently in Unreal Engine 4 I have support for large scenes by instancing per-object distance fields and then compositing together with heightfields into a global distance field as the viewer traverses the scene – presented in “Dynamic Occlusion with Signed Distance Fields”.
+
+The distance field representation was fairly low resolution which manifested as rounded-off corners on architecture, causing black reflections where walls intersect with the ground.  I improved this by generating separate distance fields from mostly vertical triangles and everything else.  These got interpolated separately and the minimum value was used at each ray marching step, resulting in more accurate shadowing where walls intersected the ground.
+
+In order to combine SDF shadowing with reflection quad lighting and shadowing, and analytical lighting, I used a depth visibility function again.  Cones passing by surfaces are not fully occluded, so this is a transparency problem and the order matters.  Each ray marching step that produced a new closest DistanceToSurface was a candidate for a new opacity node.  Only the nodes with the furthest gaps from previous nodes were kept.  Reflection quads and analytical lights are then occluded based on their distance plugged into the depth visibility function.
+
+Ray marching required quite a few steps before surface intersection was achieved, so the cost was fairly high.  I did the ray marching at half resolution with a bilateral upsample to reduce the GPU cost.
+
+It’s interesting to compare this technique for occluding analytical specular with traditional shadowmaps.  When ray marching an SDF of the scene, we only need to trace one cone per pixel, which can then be used to shadow any number of lights at any distance, because we are gathering them onto the reflection cone.  With shadowmaps you’d have to render meshes into the shadowmaps of every light, which would end up being the whole scene since specular travels so far.  More realistically you’d just limit specular with an aggressive influence radius and miss out on the distant specular needed by highly reflective scenes.
+
+At this point I had a fairly accurate reflection method that supported varying roughness and worked on any surface.  The one big thing missing was shadowing from dynamic objects like characters.  Characters weren’t represented in the Signed Distance Field, so they did not occlude reflections.  They looked like they were floating when walking in front of a sign or headlight.  There were only a few weeks left until GDC and time was tight!
+
+I ended up implementing a character-only planar reflection.  This method still needed to support varying roughness and anisotropy to match the other methods, so I generated screen-facing quads from the triangles of the mesh using a Geometry Shader that blended in that triangle’s occlusion contribution.  Each quad was sized based on how large the reflection cone got at that distance.  This is nearly the same method commonly used for Bokeh Depth of Field, where a quad is rendered for each pixel, sized based on that pixel’s Circle of Confusion, to scatter the pixel’s contribution onto neighbors.
+
+Again merging with the other reflection features was achieved with the depth visibility function, so that for example a car would shadow the background reflections while not occluding its own headlights.
+
+Today I would solve character occlusion with capsules setup by artists attached to skeletal mesh bones, which would work on any receiver surface and be a lot cheaper.  Hindsight!
+
+Ultimately I think this collection of reflection techniques is promising, in particular I like how it decouples lighting from shadowing through the depth visibility function, allowing multiple methods to work together, complementing each others strengths.
+
+But it’s only viable for scenes where you can feasibly setup cards to represent light sources ahead of time.  This limits it to wet nighttime scenes and is one of the main reasons we went in a different direction in Unreal Engine 4, along with the need for better performance and scalability.
+
+I have great memories of working on the Samaritan demo.  It was one of those situations where you’re working with the best people with singular focus and it shows in the results.  The Epic art team absolutely killed it.  Jordan Walker did an amazing job lighting with the new features.  On the tech side it was like a whole new world of possibilities had opened up to us with the feature set of Shader Model 5 and the performance of the new DirectX 11 video cards.|||
+
