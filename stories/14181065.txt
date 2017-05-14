@@ -1,0 +1,61 @@
+The "threaded cadscene" sample allows comparing various rendering approaches using core OpenGL, extended OpenGL via bindless graphics and NV_command_list as well as Vulkan. It does make use of NVIDIA specific extensions to use Vulkan within an OpenGL context and display a Vulkan image.
+
+The content being rendered in the sample is a CAD model which is made of many parts that have few triangles. Having such low complexity per draw-call can very often result into being CPU bound.
+
+The sample is a fork of the public cadscene OpenGL sample and introduces the usage of multiple CPU threads.
+
+By default a performance graph is drawn that illustrates the relative costs of rendering. The top green bar represents GPU time, and the lower blue bar CPU time. The bar that extends the furthest is the primary bottle-neck. Be aware that the GPU costs may appear higher than actual, when very CPU bound as discussed below in the performance section. When cloning the model multiple times the scene complexity is increased, however the sample does not use instancing for this, but generates actual bindings/drawcalls for the new objects. An animation effect can also be activated to "explode" the model by modifying the matrices on the GPU.
+
+The sample loads a cadscene file (csf), which is a inspired by CAD applications' data organization, just that for simplicity everything is stored in a single RAW file.
+
+The Scene is organized in:
+
+When animation is activated, the matrices will be animated through a compute shader, resulting in a "explosion view" of the model. One buffer stores all matrices, another all materials. Geometry is stored in multiple buffers for OpenGL, and only one in the Vulkan case (can be changed via ).
+
+When the "min statechanges" option is enabled, we will draw first solid then edges, effectively reducing the number of shader changes dramatically.
+
+These influence the number of drawcalls we generate for the hardware and software. The strategy is applied on a per-object level. Imagine an object whose parts use two materials, red and blue:
+
+Typically we do all rendering with basic state redundancy filtering so we don't setup a matrix/material change if the same is still active. To keep things simple for state redundancy filtering, you should not go too fine-grained, otherwise all the tracking causes too much memory hopping. In our case we have 3 indices we track: geometry (handles vertex / index buffer setup), material and matrix.
+
+Global sorting of all items can be enabled with the "min statechanges" option. This will sort all items to reduce the amount of state changes.
+
+Upon renderer activation the scene is traversed and encoded into a list of "drawitems". Optionally this list can be globally sorted once with the "min statechanges" option. All renderers operate from the same "drawitems" list.
+
+By default all renderers also use the same principle state and binding sequences. VBO/IBO bind per geometry change, a uniform buffer range bind per material and a matrix change. Vulkan does allow alternative ways to pass the uniform data, which is discussed in a separate file.
+
+If the driver supports the new "VK_NVX_device_generated_commands" extension, you will see additional renderers
+
+There is more information about these renderers and the extension in this document.
+
+The sample allows to feed the material and matrix data in various ways to Vulkan by changing the define. Please find much more detailed information here.
+
+Preliminary Results: The Vulkan driver is still very new and the performance numbers are therefore not final. The benchmark was run on a Quadro M6000, with a first generation i7-860 CPU.
+
+To get more exact timings about the relative cost of each section, the application does measure the CPU time for the "flush" (Vulkan vkQueueSubmit, OpenGL glFlush) as well. The application does three flushes when animation is active, and two otherwise.
+
+In this scenario we generate around 44k drawcalls all using the same shader. The cost of uniform and geometry buffer binds as well as drawcalls (average ~50 triangles) dominates.
+
+Our CPU costs are nicely reduced with Vulkan and scale with more threads. By re-using command buffers we can remove the CPU costs almost entirely. We can also see that the re-use of many tiny command buffers is not recommended (in this scenario around 10k secondary buffers per-frame).
+
+The NV_command_list can be a tad faster than Vulkan on the CPU-side, as it benefits of having the API designed directly for the hardware in mind. There are no function calls and the data is formatted in a hardware friendly way. It is expected that Vulkan's performance will improve or that similar mechanisms will be exposed.
+
+Now we render edges on top of the surfaces. We still generate around 44k drawcalls but half are for triangles, the other for lines. Within every object we toggle between the two and change the shader (not optimal but serves as stress test). The cost of those shader changes now dominates.
+
+In this scenario we can see that the modern principles of Vulkan (and NV_command_list) are on a whole new level when it comes to CPU efficiency (and NVIDIA's Quadro OpenGL driver is well-optimized). The shader toggles are just way too costly for a classic graphics API approach.
+
+The NV_command_list doesn't scale with CPU threads as the shader state switching is handled on the main submission thread in a serial fashion. Vulkan, however, still can scale by using more threads.
+
+Overall Vulkan is a big improvement over unextended OpenGL, especially re-using CommandBuffers can result in greatly reduced CPU cost. In this particular sample NV_command_list is often similar to Vulkan, which does show that OpenGL with proprietary extensions can be very fast. In pure draw-call limited scenarios core OpenGL's MultiDrawIndirect can also be very efficient as seen in another sample.
+
+As this sample only uses two pipeline objects (or state-objects in OpenGL) and the rest of the scene's resources are static as well, Vulkan cannot make use of its greatest strength: generating and validating resources in parallel. Therefore, benchmarks in samples like this are very directed at a certain problem and only demonstrate a snapshot of an APIs capability.
+
+Make sure to have installed the Vulkan-SDK and a driver that supports Vulkan.
+
+Ideally clone this and other interesting nvpro-samples repositories into a common subdirectory. You will always need shared_sources and on Windows shared_external. The shared directories are searched either as subdirectory of the sample or one directory up. It is recommended to use the build_all cmake as entry point, it will also give you options to enable/disable individual samples when creating the solutions.
+
+gl cadscene render techniques is most similar to this sample and covers various OpenGL approaches. gl commandlist basic illustrates the core principle of the NV_command_list extension. gl occlusion cullling also uses the occlusion system of this sample, but in a simpler usage scenario.
+
+When using classic scenegraphs, there is typically a lot of overhead in traversing the scene, it is highly recommended to use simpler representations for actual rendering. Flattened hierarchy, arrays... memory friendly data structures, data-oriented design. If you are still working with a classic scenegraph then nvpro-pipeline may provide some acceleration strategies to avoid full scenegraph traversal, of which some are also described in this GTC 2013 presentation.|||
+
+gl_vk_threaded_cadscene - OpenGL and Vulkan comparison on rendering a CAD scene using various techniques

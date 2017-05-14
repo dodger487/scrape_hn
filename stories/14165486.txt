@@ -1,0 +1,205 @@
+Hey there,
+
+
+
+Today we're going to look at a little something that is a fairly hot-running-water issue on most of the Linux and Unix boards lately (actually, probably always has been, but our research staff quit on us ;) This post will be similar in focus to our previous post on the differences between sar and vmstat with regards to free memory/swap reporting.
+
+
+
+Today's post is similar in spirit, but not a replay of that previous memory/swap reporting issue. Today, we're going to take a look at two other commands that, seemingly, measure and display the same information, although with (sometimes) huge discrepancies in output. Those two commands are du and df.
+
+
+
+The question you'll most often see (or, perhaps, have :) is something to the effect of "Why do my outputs from du and df differ? One says I'm using more disk space than the other. Which of them is correct?" Generally you'll find that df shows more disk spaced used than du does, but the case can sometimes be the opposite. It's very rare (unless you don't use your computer, and it doesn't use itself, at all ;) that the output from the two commands match. It's actually rare that they ever come close to matching. Generally, the longer a machine is up, the greater the rift between figures becomes.
+
+
+
+The bad news: This is confusing and sometimes hard to communicate to others, even when you know why the situation exists :(
+
+
+
+The good news: This is normal and can be explained; perhaps even simply :)
+
+
+
+To set up the "typical" situation, we used a Solaris 10 box (although this issue is common on all proprietary Unix and Linux distro's). Below, the output from four commands executed in the /opt directory (NOTE: For du, the "-s" flag is used to print summary information for the entire object, rather than a listing of all of its parts (i.e. the whole directory rather than all the files and subdirectories)):
+
+
+
+host # cd /opt <-- For df, look at the "used" column and for du, look at the only output there is ;)
+
+ 
+
+
+
+Now, in two parts, the complicated reasons, explanation and summation of why this disparity exists, followed by the more customer/user-friendly version of the exact same thing :)
+
+
+
+1. The convoluted, complicated and hard to pass-along explanation:
+
+
+
+Reasons: While du and df report "approximately" the same information, they don't report "exactly" the same information. While they both report "about" the "same things" (some of the time), they don't measure those "things" using equal methods or metrics.
+
+
+
+Explanation: These differences can occur for a number of reasons, including (but not limited to):
+
+
+
+a) Overlay mounts, which can skew df output when it's run from a higher level directory (e.g. df -k /opt would not report the total space used on /opt if there were overlay mounts of /opt/something and /opt/anotherthing on the system - du will. If you actually need the total space used by /opt and everything underneath it, including the overlay mounts, df can do it, but it takes some plate-spinning ;).
+
+
+
+b) Sometimes (This actually should never happen on any "recent" OS) hidden files and subdirectories could skew du's output.
+
+
+
+c) Unlinked inodes can cause unexpected statistics with both df and du (For, instance, in the situation where your filesystem shows almost 100% free space but all the inodes are in use.)
+
+
+
+d) You're using the "-h" flag instead of the "-k" flag for one or the other commands (or both). The "-h" (human readable) flag can sometimes make things seem worse (or more divergent) than they are. Since it tries to make the output more easily digestible, it will round the numbers you see, so you can't "really" be sure whether "5.1 GB" is closer to 5 GB or 5.2 GB. "-k" is slightly more likely to produce relatively equal results, as it reports the size in kb. It still does do rounding so that you only get straight up integers and no floating point results, but it's generally better to check with if your output from "-h" is very close, or even the same (since it might not be). If your implementation of df and/or du supports the "-v" flag (or something similar), that's even better since it reports in multiples of your system blocksize and is even more exact.
+
+
+
+e) The fundamental way in which each of the commands work:
+
+
+
+i) df: 
+
+
+
+df reports only on the mount point, or filesystem, level. So a df on /opt would produce the same results as a df on /opt/csw (assuming, as noted above, that they're both on the same partition):
+
+
+
+ 
+
+
+
+df gets most of its information from a filesystem's primary superblock (except in the odd instance that an alternate superblock is being used - although this would only happen in an "fsck" situation. After that, the information from the alternate superblock would be copied back to the primary, and all other superblocks). It takes this information at face value, which is to say that it does not question the information provided to it by the primary superblock. In this respect, df is a very fast tool for getting disk usage information (at the cost of reliability).
+
+
+
+df will include open files (in memory, but not on disk), data/index files (used for data management - sometimes using approximately 2 to 5% of each filesystem) and unnamed files in its size calculation. This is one reason why, sometimes (although not very often), df can show a larger amount of disk used than du does.
+
+
+
+df, as per above, will explicitly trust any errors in space calculation that may have occurred over time, since it trusts the primary superblock entirely. This means that if you've fsck'ed a filesystem (and not resynced or rebooted since), and/or have experienced any hard or soft errors on the device/disk housing the filesystem, you're measuring (again, assuming you haven't rebooted since they happened) and/or experience any possible corruption or inconsistencies in any filesystem-state records (like /etc/mnttab), your output will be commensurately incorrect.
+
+
+
+df sometimes reports file sizes incorrectly, as it works on what we like to call the whole-enchilada-principle ;) Basically, if you take your filesystem's block size (for the /opt filesystem here - different filesystems may have different block sizes), which you can find by executing either of the following commands, both of them, or whatever works on your OS:
+
+
+
+ 
+
+
+
+...you'll be able to do this experiment on your own (we'll leave out the grisly details to save on space :). In our instance, we have a default block size of 8192 bits or 8 kb. Now, here's where it gets somewhat interesting ;) If you create a new file that's 1 kb in size and it writes to a new, or - depending - not fully used, block, df will report that file as being 8 kb in size, even though it's actually only 1 kb in size!
+
+
+
+ii) du:
+
+
+
+du reports at the "object" level rather than at the filesystem/mountpoint level, as df does. So, to repeat the example from above, if you run du on /opt and /opt/csw, you'll get different results. I find it easier to think of du as handling its measurement via a simple "object" model. The main partition would be the meta-object, while any subdirectory you may be running du against would be considered a sub-object of the filesystem meta-object (you'll note that the du size output for /opt/csw is, naturally, smaller than that for the entirety of /opt):
+
+
+
+ 
+
+
+
+du gets its information at the time you execute it (unless you run it repeatedly in succession, where you'll notice a slight performance improvement). To test this, run du on a partition, then wait 5 minutes and run it again. It should take just as long as the first time (unless you've added lots of files since then). In this respect, du can be a very slow tool for getting disk usage information (with the benefit that your information will be more accurate). It should be noted that, because of the way it takes measure of most (see below) filesystem objects, it takes much longer for it to report the size of a billion 1 kb files than it does to report the size of one file of 1 billion kb size.
+
+
+
+du does not count data/index files or open files (in memory, but not on disk).
+
+
+
+du does not take into account any information "supplied" by the system (meaning the information, like from the superblock, as listed under the df section) and gets its information independent of whatever the system thinks is correct.
+
+
+
+du does not rely on block size (see the whole-enchilada-principle in df's section above) to determine file size. So, if you have a default 8 kb block size on your filesystem, you create a new 1 kb file that writes to an empty 8 kb block, du will report that file as being 1 kb in size and "not" assume a minimum size of the filesystem block size. This is worth remembering, because it can cause a great deal of difference in the filesystem "usage" size between du and df (which would consider that 1 kb file an 8 kb file - 8 times larger than it actually is)!
+
+
+
+du is more reliable if you want to know the state of your filesystem "right now." It doesn't count any data/index blocks .
+
+
+
+Summation: If you are interested in knowing exactly how much of your filesystem is actually being used, du is a much more accurate tool for collecting and displaying this information. Note, however, that - since du does "on demand" filesystem size reporting, it is much slower than df. Also, du does not play as well with some system internal files and processes since it essentially ignores information reported by the primary superblock, system mount information tables, etc. Ultimately, the purpose for which you need to determine your filesystem's size (coupled with an understanding of the "Explanation" section for both utilities) is the best way to decide which utility to use in any given situation.
+
+
+
+2. (Did you forget this was coming, too? ;) The simple, and easy to convey, explanation:
+
+
+
+Reasons: df and du rely on different information to determine how much disk space is used on a filesystem.
+
+
+
+Explanation: df and du report filesystem information differently, for very basic reasons:
+
+
+
+df and du don't use the same yardsticks to measure filesystem size.
+
+
+
+df:
+
+
+
+df relies mostly on system information, supplied by various files and built-in reporting mechanisms that may, or may not, be correct at any given time.
+
+
+
+du:
+
+
+
+du relies on what it can "see" at the particular moment in time that you run it.
+
+
+
+Summation: du is the better tool to use if you are interested in knowing how much space is actually being used on your filesystem "right now." df is great for "ballpark estimates" and is preferred if you need to know how big df thinks your filesystem is (so it will agree with other incorrect system statistics).
+
+
+
+3. The really easy, and simple to blurt-out, explanation:
+
+
+
+If du and df don't agree on what size your filesystem is, du is more correct than df is.
+
+
+
+See; it's all very simple ;)
+
+
+
+Cheers,
+
+
+
+, Mike
+
+
+
+
+
+
+
+Please note that this blog accepts comments via. See ourfor further details.|||
+
+Linux and Unix scripts and advice. Shell scripts, Perl scripts and tips for users of all skill levels.  From Solaris to Redhat.  Financial Intelligence Program

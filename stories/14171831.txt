@@ -1,0 +1,81 @@
+Wire is a secure, end-to-end encrypted messenger that supports sending images, files, links, videos, text and much more. Sharing content from other apps to Wire — a picture from the Photos, for example — should be a natural part of the user experience.
+
+Implementing share extension posed a number of challenges because of Wire’s use of end-to-end encryption (E2EE) for all of its communication. This article goes into details of the problems Wire’s iOS team faced and solutions they came up with. Wire is open source, so anyone can take a look at the code.
+
+Different E2EE communication products solve the challenge of implementing share extension differently — or don’t solve it at all. A short introduction to Wire’s encryption helps to understand the challenges involved.
+
+Wire’s E2EE is based on Proteus and Cryptobox, an open source implementation of the Axolotl protocol, implemented by Wire in a Rust library (Proteus and Cryptobox) and then wrapped in a Swift library for ease of use on iOS (wire-ios-cryptobox). Details about the protocol are available in our security whitepaper.
+
+Wire’s E2EE relies on sessions established between devices. A user can run Wire on multiple devices at the same time and they will be in sync with each other. Each device is considered a unique endpoint when sending and receiving messages.
+
+If your friend Alice wants to send you a message, her device will send a separate encrypted version of the message to each of your devices — your phone and laptop, for example. Each message is encrypted specifically for that device and can only be understood from the Wire app on that device. No one else — including attackers eavesdropping on the connection — can decrypt it.
+
+Any two devices (e.g. Alice’s phone and your laptop) have a cryptographic session established between them. This session allows you to decrypt messages that you receive from Alice’s phone, and encrypt messages in a way that only Alice’s phone can understand them.
+
+Instead of reusing the same encryption keys for every message, the session rotates the encryption key, generating a new key with every message exchange. The keys need to be constantly updated with each new message, and using an old key would result in a failure to decrypt.
+
+To maintain the security, the share extension needs to use the same encryption algorithm as the Wire main app. In order for the Wire app and the share extension to be considered as a single endpoint in the encryption protocol, they need to share access to the cryptographic sessions to decrypt messages and modify keys as messages are exchanged. This is easier said than done.
+
+The first challenge when developing a share extension for iOS is that the extension will run in a separate process. The main app may or may not be still running when the user shares something to Wire from another process.
+
+The extension shares no memory with the main app, and you can’t have shared objects, singletons, global variables, or any other kind of shared memory. All the data belonging to the main app that needs to be accessed by the share extension, for example a list of conversations, needs to be shared through other channels.
+
+No matter which channel we looked at, there didn’t seem to be a reliable way to wake up or start the main application if it wasn’t already running.
+
+The team considered a few alternatives: using native IPC mechanisms (like Darwin notifications), monitoring file system changes, displaying a clickable link in the share extension to start the main app, even sending a network request to the backend from the share extension to trigger a notification to reach the main app using the APNs system.
+
+None of these were a viable solution — they are unreliable and ultimately against Apple’s intended share extension design. iOS is missing the concept of custom background service that apps and extensions can connect to, something that makes such problems simpler to solve on Android. On iOS we are stuck with two separate processes that can’t talk to each other reliably because the main app may or may not be running.
+
+This would not be a problem if the share extension could talk to the Wire backend independently, without the need to share any data with the main app. However, because of E2EE there are at least two pieces of information that need to be shared between the main app and the share extension:
+
+While the authentication cookie does not change too often, the cryptographic sessions will need to be updated fairly often by both the main app and the share extension, requiring some sort of coordination between the two to avoid concurrent writes.
+
+It would also be nice for the share extension to access locally cached data from the main app to avoid re-downloading data from the backend.
+
+Finally, one last challenge lies in the lifetime of the share extension. Let’s say that the share extension starts the process of sending an image — this requires scaling and rotating it locally, sending it to the backend, and potentially establishing a few cryptographic sessions in-between.
+
+If the user leaves the share extension before the process is completed, should the main app pick up the process to continue it at its next start? Once the share extension is dismissed, it cannot continue to reliably execute code in the background and the process might get stuck at some random stage.
+
+The only reliable solution to share data between the main app and the share extension is to set up an App group that can access a shared container. This is a shared directory on the file system that has the same security features of the main app container, with the only difference that it can be accessed by all processes signed with the same app group ID.
+
+The same applies for the keychain, where Wire stores the authentication cookie. Once configured properly, app groups can be used to share keychain items between the main app and the extension.
+
+Every time separate processes write to the same files, access to those files should be coordinated or the files will turn to garbage quickly. Wire uses Core Data to cache some data (such as the list of conversation) that should be available to the share extension. Luckily Core Data automatically handles file coordination for us, so we only had to move the database inside the shared container. Unfortunately, iOS versions between 8.0 and 8.3 had a bug with file coordination that cause deadlocking or data corruption. This means we had to disable the share extension in any iOS version lower than 8.3.
+
+Cryptographic sessions stored through Cryptobox require a different solution though. This library manages its own files and writes to them as needed, but performs no coordination as it does not support concurrent access. To coordinate access to those files without introducing too many changes to the library itself, each use of Cryptobox API that can potentially read/write to those files was wrapped with a POSIX file lock on the entire directory that contains the cryptographic sessions.
+
+This might not be the most refined approach — you could instead only lock individual session files, and only for writes — but we didn’t see this as a significant performance issue as people only send a few messages at a time with the share extension.
+
+The solution to deal with the lifecycle problem and risk of interrupting the process at a random stage was to ask the user to wait a brief moment until the content is sent.
+
+If the user hits the cancel button, or dismisses the share extension before that then the sharing process is aborted completely.
+
+The alternative is to pick up the sharing process from the main app, but since there is no reliable way to start the main app automatically, this could happen hours later.
+
+Once the content, a photo, for example, has been sent the share extension could just forget about it and let the main app retrieve it from the backend as if it was a message sent by another user. This would work, but would be unnecessarily slow. Since the share extension processed the content locally, and the two processes already have a common storage, there is no reason why the share extension couldn’t just insert the sent data in the main app database.
+
+There is one complication though for common data that rests inside Core Data. As mentioned earlier, Core Data performs file coordination automatically, allowing two processes to share the same database. However, this guarantees data consistency only at the persistent store level.
+
+Once a process has loaded a database in memory (in a NSManagedObjectContext), it will receive no notifications when another process modifies the underlying data on disk. At best, that managed object context will generate a merge conflict with the persistent store during next save, if it touches the same records that the other process modified. If those records were previously loaded in memory and later never modified, the process will never know that the records have changed. The main app would display outdated and incomplete information.
+
+To solve this issue, internal save notifications generated by the NSManagedObjectContext in the share extension at every save need to be passed to the NSManagedObjectContext already loaded in memory in the main app. Once again the solution relies on files on the shared container.
+
+It is safe to assume that when a user sends content from the share extension, the main app is in the background. Wire’s solution, inspired by these posts [1] [2], is to save the content of save notifications to a file, every time there is a save in the share extension. When the main app comes to the foreground it check if such file exists. It then extract the list of object IDs that changed, and makes sure that the objects are re-fetched from the persistent store to get the most up-to-date information.
+
+Implementing the share extension was a challenging and educational project way beyond the team’s initial estimations. The iOS team learned some valuable lessons along the road that are worth sharing.
+
+Wire started with a local database inside the application container. When implementing the share extension, that database needed to be inside the shared container instead. Because of E2EE there is no “backup” of the messages on the backend that the app could re-fetch to populate the new database. We had the move old database to a new location and in case of large databases this can take significant time when starting the app after the update. This is poor user experience, not to mention the development effort needed to perform the migration.
+
+The shared container has the same level of security as the application container plus allows apps with the same app group ID to access its contents. Populating your local cache in that from day one is a smart way to future proof your development.
+
+If the share extension performs network requests, it’s logical to try to offload some of them to the background NSURLSession, so that they will be completed even if the share extension is dismissed. However, the completion handler for those NSURLSessionTask might be received by the main app instead, if it has a NSURLSession with the same identifier. This is a problem for Wire’s implementation as it uses in-memory closures as completion handlers for network requests, that are therefore not shared between separate process.
+
+The main app can make some very relaxed assumptions about memory. Singletons and unique global variables that are leaking will go unnoticed as they have no side effect. The app is only initialized once, and if it is terminated, its memory will be gone and the leaked objects will disappear. At the next start, it will just recreate those objects, effectively only keeping one copy at any given the time. Wire had some leaks but without negative consequences for the main app.
+
+The share extension on the other hand lives inside another process. Every time Wire share sheet is presented, it is allocated inside the memory of that process. The process might live even after the sharing sheet is dismissed, outliving the sharing session. If the share sheet is summoned again inside the same process, new instances will be created, while old, leaked ones will still be around.
+
+This leads to increased memory consumption and to potential issues with stale, outdated objects unexpectedly responding to notifications. This was enough motivation to clean the leaks. Making sure you are not in the same situation before starting to work on a share extension.
+
+A shout out to the whole iOS team who helped to pull this post together. By the way, Wire is hiring.|||
+
+Wire is a secure, end-to-end encrypted messenger that supports sending images, files, links, videos, text and much more. Sharing content from other apps to Wire — a picture from the Photos, for…

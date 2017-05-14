@@ -1,0 +1,123 @@
+Despite the speaker’s calm voice and the slides showing almost nothing but code in C++ (which isn’t what you’d normally expect from a keynote), Louis Dionne’s talk on metaprogramming at Meeting C++ 2016 was a truly exciting one.
+
+It’s been years since last time I did some metaprogramming in C++, and this talk brought me back old memories of that feeling when I’d put together some incredibly clever pieces of template black magic and it finally worked. Oh, that was soo cunning. I’m the best hacker. I’m sure you know that feeling too.
+
+I was happy to learn that the picture has changed significantly since that time, and cluttering the code with many nested levels of angle brackets adorned here and there with some double colons is no longer the thing. With Hana you basically write code that looks like your usual runtime function or operator calls, but under the hood these functions are generics that operate on the information carried in types of their arguments. There’s no run-time state involved in these operations, so in the generated machine code they are all optimized out. Impressive.
+
+Let’s take a look at the example discussed in the talk (starting at about 38:30). If you’ve watched it already, you can skip this part. I’ll copy the entire example here so that it’s close at hand for reference in further discussion.
+
+Consider an event system that identifies events by their names. We can register any number of callbacks (handlers) to be called when an event is triggered. Later, we trigger the events, expecting that all callbacks registered for a given event will execute.
+
+We start with a Java-style run-time only implementation. We use a hash map to find a vector of functions to call given an event name. Initially, an empty vector is inserted into the map for each known event.
+
+Now, to register a callback, we find the right vector in the map, and push the callback at its end.
+
+Finally, triggering an event causes calling all callbacks in the vector for the specified event.
+
+That’s all well and good, but frequently it’s already known at design time what the possible events are and when they should be triggered. So why do we have to pay for the search in map each time we trigger an event? And worse, if we mistype the name of an event, we may be unlucky enough to only know it when it’s too late.
+
+Hana can save us such annoyances by allowing us to do the lookup at compile time, with only cosmetic changes to the above code. First, we update the call site with compile-time string literals in place of the run-time ones.
+
+Note the suffix on all event names. It requires a special string literal operator which will probably make it into the C++ standard in 2020, but it’s already implemented in Clang and GCC, so why not using it now? The operator builds a stateless object where the string itself is stored in the object’s type, e.g. becomes an instance of .
+
+Now let’s replace the run-time map with , declaring a vector of callbacks for each event with a bit of template parameter pack expansion magic.
+
+Now we can just default construct the , which will default construct , and consequently all the vectors of callbacks it contains will be initialized to empty vectors.
+
+Finally, we replace the run-time lookup with its compile-time equivalent.
+
+What happens here is that the vector that should be accessed is determined at compile time, and each instantiation of the function templates above just accesses its own vector. We expect that there’s no additional run-time cost compared to hand written functions for each event, e.g.
+
+If your application triggers events frequently, changing from dynamic to static dispatch may result in a noticeable speedup. The chart below shows the time to call for an event with exactly one callback registered. With compile-time lookup based on it’s about 14 times faster than run-time lookup in , and only about 15% slower than just calling an .
+
+There are cases in which the event to be triggered will be decided only at run time, e.g.:
+
+Our event system can be easily extended to handle such cases. Just like in the first version with run-time only lookup, we use an unordered map. We don’t want to store the callback vectors twice, so the values in the map are pointers to vectors already stored inside the static map.
+
+Being able to trigger the run-time-determined event is now just a matter of overloading the trigger method that does exactly the same as the one we had in the pure run-time implementation.
+
+At this point in the talk (59:30) you’ll hear Louis saying:
+
+It was obvious to me that D could do it better, and it took me about 10 minutes to sketch an equivalent implementation. But I can understand: if I were to advertise effects of years of hard work I’d done, I wouldn’t want people to look for something else. ;)
+
+Don’t you know D? You could’ve heard of it as “C++ done right”, but that’s not entirely true. D also has its own baggage of bad decisions and quirks. Over time, it’s collected ad-hoc standard library additions in completely different styles. Its documentation is sometimes outdated or misses that one thing you’re looking for. Its community and the support it receives from the industry are incomparably smaller to that received by C++. But leaving all of that aside, after years of using D for various tasks, I must agree that it really lives up to its promise of being “a practical language for practical programmers who need to get the job done quickly, reliably, and leave behind maintainable, easy to understand code.”
+
+So let’s see if D can do The Overload Trick and at least match the C++/Hana duo in expressiveness in this use case.
+
+Let’s start with what we expect at the call site.
+
+It looks pretty similar to what we had in C++. The most important difference is that in D, there’s no special syntax for compile-time strings, and regular strings can be passed as template parameters. For this reason, the idea of stateless objects with strings encoded in types won’t add any value here (but it is technically possible to implement it, see below).
+
+The struct template can be instantiated by just passing the event names as arguments, and the default static initializers are sufficient for all its members, so there’s no need for a factory function.
+
+Function templates and also accept compile-time s. Since each string is a single token, the parentheses around the template argument lists can be skipped, just as those around an empty run-time argument list. This minor syntactic quirk turned into less cluttered .
+
+The distiction between run-time and compile-time arguments is preserved with regular language rules. You don’t need to remember that in this particular case the suffix implies a compile-time entity. Note that we trigger and via static dispatch, but we also expect that an overload is available that accepts a run-time evaluated event name when we trigger .
+
+Now on to the implementation:
+
+There’s no equivalent of in Phobos, but since all values in the map are of the same type, we can declare a fixed-length array of them and use to map event names to indices in the array. The argument list that this struct template receives as may include various compile-time entities, including types, template names, constant values of different primitive or composite types. In particular, s will do just fine.
+
+The implementation of and also looks pretty similar to the C++ version, except that first we look for the index of the requested vector of callbacks, and then get the vector from the array via this index.
+
+Note the in place where C++ version used . The type is also inferred automatically, but using forces to be computed at compile time and only then it can be used in .
+
+The lookup (compile-time linear search with ) is done only once per instantiation (i.e. once per key), and there is no run-time cost associated with it. Also, indexing the array via statically known index doesn’t add any run-time overhead.
+
+And now, the overload of accepting a dynamic key. There’s nothing unusual in having both template and non-template overloads side by side, so let’s focus only on the implementation of run-time lookup. One way would be to use a built-in associative array, populated during construction of the map object (you can try it yourself), but for a small number of keys, a linear search comparing the requested key with all known keys shouldn’t be much worse.
+
+What’s going on here? The outer iterates over which is a compile-time tuple of s. It’s not really a loop–the compiler pastes the body of this static once for each element of the tuple, substituting that element for and its index for . The result is as if we have three s one after another:
+
+That’s all. You can download both versions, stare at the code for a while and compile them. The D version can be compiled with DMD, GDC or LDC. On my machine, it consistently compiles noticeably faster than the C++ one (minimum of 10 consecutive attempts, all compiled on x86_64 with -O3):
+
+I wouldn’t draw any serious conclusions from the time it takes to compile a tiny toy program, but in general, D was designed for fast compilation, not to mention that the volume of library code brought in is much smaller.
+
+And what if we mistyped a name of an event? The D frontend (common for all 3 major compilers) tries to balance between the volume and usefulness of error messages, and here it does the job very well. The only thing we’ll see is:
+
+And in C++? In my shell I had to scroll up through about a hundred lines of heavily punctuated messages to see that important one coming from the (although with Clang’s highlighting it wasn’t as bad as with GCC’s). There used to be a tool for transforming C++ error messages into something digestible for humans. Is it still around?
+
+The last thing to check is if we didn’t lose performance. In the graph below you can see the comparison of D vs. C++ version for both static and dynamic dispatch. The D version seems to be slightly faster in both cases, but it’s only a limited microbenchmark. The D dynamic lookup might just perform better here because we use a different algorithm that favors small sets. And the ~10% speedup for the static lookup most likely comes from doing a bit more work on each call than does (check the assembly: D, C++.) It won’t be noticed in a larger application doing anything meaningful in the callback, so let’s just assume both versions perform equally well.
+
+In conclusion, with D we’ve achieved a similar result as in C++, but without resorting to a complex library. The D implementation looks straightforward, and uses only a few basic features of the language and standard library. There’s no feeling of being super-clever nor did I have to learn anything new. But isn’t it exactly what we expect from maintainable, easy to understand code?
+
+So is it really better? There’s no absolute scale for that, but if other factors aren’t more important, I’d likely be in favor of a solution that doesn’t rely on an external library, compiles faster and produces less scary error messages if something goes wrong.
+
+But what if we wanted a data structure in D that behaves like ? After all, we won’t always have values of the same type, and using an intermediate integer index feels a little bit unprofessional. Is it possible?
+
+It turns out, the only obstacle is that a compile-time entity (type or value) cannot be used as a run-time argument to overloaded indexing operators. To overcome this, the same technique as Hana uses can be applied in D. Consider a struct template parameterized with a single value or type. I don’t know how to name it so let it be an .
+
+We can instantiate concrete struct types and create objects by writing e.g. or . Such objects have no state, but their types will select different instantiations of template functions.
+
+Unlike regular function calls, constructing a struct object requires parentheses, which makes it a bit more verbose than Hana’s and suffixes. There is a number of ways to make it more concise, parameterized being one of them:
+
+Similar syntax for user-defined literals was reportedly used first in .
+
+Now let’s get to the map itself. We want something that can store values of different types (like , and where keys are types or compile-time values, instantiated like this:
+
+We need to separate the interleaving keys and value types and declare storage for the values themselves:
+
+and aren’t standard things, but we can quickly implement them on our own:
+
+Now, is a built-in tuple consisting of elements of all types in the type list . It can be indexed using a constant integer, e.g. . It can also be iterated over using the “static ” construct we saw before. That means we’ve got iteration over keys or values for free. Try:
+
+Hana offers free function template to check whether a given key is in the map. In D, the operator is usually used. It can be overloaded by implementing . Since it only depends on compile-time information (types of its arguments), it can be declared :
+
+Let’s see if it works:
+
+To look up a value using a compile-time key, we use and add a meaningful message if the key is not found:
+
+This can be used to implement indexing operators. Why not a single one? Unlike in C++, where returns an lvalue reference which can be further manipulated using e.g. assignment operators, in D the operators for read-only indexing, indexing with simple assignment, and indexing with compound assignment are overloaded separately.
+
+In all cases, and are inferred from the types of the arguments. Evaluation of and indexing in are both done at compile time. Let’s test it:
+
+That’s all! We have a map that allows lookup and iteration in compile time with run-time-like syntax, just like , and it’s nothing special–just a bunch of your everyday trivial one-liners.
+
+You may want to try modifying to use that we’ve just implemented. If you’re impatient, you can find one possible implementation in the same archive. I couldn’t notice any measurable difference in compilation time between this version and the previous one, and the run-time performance is also very similar, as shown in the graph below.
+
+The question is whether this would be the right design choice in D. Operators and are just syntactic sugar that could easily be replaced with “normal” template functions like and , making the awkward unnecessary. Iteration over a list of compile-time entities or elements of value tuples is a built-in language feature, and doesn’t need it either.
+
+This isn’t the first attempt at emulating Hana in D. See for example this post on type objects, with an interesting example of quicksort on types. Hana’s tricks making metafunctions look like regular run-time code are applicable in D, but thanks to D’s built-in metaprogramming features they do not substantially improve code readability or programmer productivity. Until the new CTFE engine is complete and merged, they will probably only hurt build times without giving much in return.
+
+The talk concludes with a few examples of what will be possible with features proposed for C++20 – named arguments, over a type list, and serialization to JSON with reflection. You probably won’t be surprised that all of this have been possible in D for years, but with a cleaner syntax and less intellectual effort required, stripping metaprogramming of all the fun you could have doing it in C++.|||
+
+Despite the speaker’s calm voice and the slides showing almost nothing but code in C++ (which isn’t what you’d normally expect from a keynote), Louis Dionne’...

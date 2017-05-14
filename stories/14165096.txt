@@ -1,0 +1,60 @@
+With the new release of Spark 2.1, the event-time capabilities of Spark Structured Streaming have been expanded. It is time to take a closer look at the state of support and compare it with Apache Flink – which comes with a broad support for event time processing. . In this article, I will describe how three basic solutions for event processing – watermarks, triggers and accumulators – work and then compare their implementation in Spark and Flink. Base of the comparison is Spark in version 2.1 and Flink in version 1.2.
+
+For a broader comparison of the frameworks refer to Distributed Stream Processing Frameworks for Fast & Big Data. The linked article also describes further basics, which are presupposed for this comparison, for example stafeful & window stream processing as well as the difference between event and processing time.
+
+The central problems of event processing are unsorted as well as delayed events. Events are not observed by the system exactly at the time they occur. The difference between the event time and the processing time is not constant. Especially in the case of temporal evaluations, this increases the complexity of the system and thus also the coding. If, for example, all events between 12 and 13 o’clock are to be processed (a typical window operation), multiple question arise: How to deal with late events? How long to wait for delayed entries? How to update the result in case of delayed entries? Google has presented various solutions for these problems with the Dataflow API, which has now been released in Apache Beam. Both Spark and Flink do not explicitly follow the Dataflow API, but the concepts are similar and therefore can be compared.
+
+The concepts used in the Dataflow API are one way to tackle event-time processing problems. Kafka Streams for example takes other strategies for event-time support. More on this hopefully in a following blog post.
+
+To determine up to which time events have already been processed, there are watermarks. These show – as with a water level – the so far reached “time level”. When a watermark is reached, the result of the calculation is materialized. For example, if the watermark is defined as the time of the latest event minus a fixed buffer of 30 seconds, it means “It is assumed that now all events have arrived until the time x”. x is in this case the watermark defined as time(newest event) – 30 seconds.
+
+There are also heuristic watermarks where the buffer is dynamically adapted, for example based on empirical measurements. Thus the system could observe that events are always received at night with a clear delay. The buffer could be increased on this basis. Likewise, the expected delay could be extrapolated from the delay of the last hour. In addition, there is also the – mostly unrealistic – perfect watermark, where the event is processed directly when it occurs.
+
+In the context of watermarks, the “allowed lateness” is often mentioned. For Spark, for example, this is the watermark buffer described above. In the Dataflow Model, however, allowed lateness is an additional period after the watermark, in which events are not ignored, but can subsequently influence the result. Therefore rules are defined – for example by means of triggers – how and how often events are to be processed that occur within allowed lateness.
+
+Regardless of the interpretation of allowed lateness, all data for the calculation of the result must remain stored until the allowed lateness has elapsed in order to update the results. The data is then automatically deleted.
+
+While watermarks display the current state of the data received, triggers materialize the calculation. The watermark trigger is the easiest way to do this: it is fired as soon as the watermark reaches the end of the window – for example, 1:00 pm with a window from 12 am to 1 pm. With the watermark defined above with a fixed buffer of 30 seconds, this will be the case at 13:00:30.
+
+Other triggers are possible:
+
+Triggers are typically used to determine intermediate results before the watermark is reached, or to update the results for delayed events. It would be possible, for example, with a window of 10 minutes to trigger every minute, then again at the watermark and finally at each delayed event until the allowed lateness is reached.
+
+If the result is calculated more than once by the use of triggers, the developer must define how the individual partial results are handled. There are three variants:
+
+The choice of the appropriate accumulation strategy depends strongly on the subsequent processing and the final sink. If this is able to update results, the accumulating mode can be used. If, however, every partial result must only serve once as input for the next step, the discarding mode must be used.
+
+Spark does not need a special mode for event processing. Internally, nothing is different from the processing time. To define a window for the event time in Spark, you must first group it by the window
+
+This is not significantly different from a groupBy on a key, but with a time window as key. In this case it is a window of 10 minutes length with a sliding interval of 5 minutes. In addition, the entries can still be grouped by a non-technical key, in this case the “word”. With the count at the end you get a word count for a 10 minutes window.
+
+In the example above, all data is stored indefinitely so that the result can be updated even in the case of delayed events. With watermarks this time can be limited:
+
+Now spark only waits 10 minutes for delayed data. The data for this window is then deleted. Currently only a watermark with a fixed allowed delay can be used. At Spark, the watermark is currently equal to the allowed lateness.
+
+Spark currently implements two different modes to output the result:
+
+In conjunction with watermarks, only the append mode can be used, since all the existing data must be available for the complete mode and can not be deleted after reaching the watermark.
+
+Spark thus offers a rudimentary support for watermarks (only fixed delay) and triggers (only on processing time). For the accumulations, the implemented output modes of Spark most likely correspond to the accumulating mode of the DataFlow API, since the complete result for a time window is always determined after expiration of the allowed delay.
+
+It must first be indicated to Flink that the processing is to take place on the event time. This is done by
+
+Depending on the time characteristic, for example, the different window implementations behave differently. In addition, the event time of the stream source is taken into account. If the source does not provide an event time, the event time must be manually extracted from the event using timestamp assigners. The watermark must also be defined for these events.
+
+The developer can completely implement the assigner himself or extend predefined implementations. In particular, different implementations are possible for watermarks:
+
+The watermark is used to determine the time when most of data for a window was processed. At this time, a calculation is executed. In addition to the watermark, an allowed lateness can be specified. This is the period of time that an event may be delayed beyond the watermark. The allowed lateness is always defined in conjunction with a window operation..
+
+A sliding window with a length of 15 minutes, a sliding interval of 5 minutes and an allowed lateness of 2 minutes.
+
+When it comes to calculating a window, Flink offers additional triggers besides the watermark. These triggers can react to a certain number (for example all 100 events), to the time (either event or processing time) or to a mixture of both.. It is also possible to dynamically register triggers, which are executed in the future, for example a certain time after an event.
+
+Last but not least the question about the accumulators: By default the complete updated data is passed on to subsequent operations within the streaming application. Instead, a fire and purge trigger can be used, in which all current data is deleted after the trigger and all other triggers only pass on the new data. This is then effectively a discarding accumulator.
+
+As a result, Flink offers extensive support during event processing with its various watermarks and flexible triggers as well as windows. Despite the flexibility, it is possible to implement standard cases without major effort.
+
+It is obvious that Flink has been working much longer on support for event processing. So it is to be explained that significantly more concepts are already supported. In addition, Flink continuously works on supporting the dataflow concepts, for example with the implementation of the retractable accumulator.
+
+Spark, on the other hand, has only started to support event processing with Structured Streaming. So far the basic principles have been created and the first concepts have been implemented with version 2.1. It is to be expected that Spark will implement the essential functions in the course of the year. But if you need stream processing with event processing now, you should start with Flink.|||
+

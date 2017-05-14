@@ -1,0 +1,114 @@
+In part 1, we looked at locals and , and hinted at a connection to “spans”; this time we’re going to take a deeper look at what this connection might be, and how we can use make use of it.
+
+I’m mostly on the outside of this - looking in at the public artefacts, playing with the API etc - maybe the odd PR or issue report. It is entirely possible that I’ve misunderstood some things, and it is possible that things will change between now and general availability.
+
+By spans, I mean , which is part of .NET Core, living in the assembly. It is also available for .NET via the package. But please note: it is a loaded gun to use at the moment - you can currently compile code that has undefined behavior, and which may not compile at some point in the future. Although to be fair, to get into any of the terrible scenarios you need to use the keyword, at which point you already said “I take full responsibility for everything that goes wrong here”. I’ll discuss this more below, but I wanted to mention that at the top in case you stop reading and don’t get to that important point.
+
+Note that some of the code in this post uses unreleased features; I’m using:
+
+Obviously all bets are off with preview code; things may change.
+
+We saw previously how can be used similarly to pointers ( ) to represent a reference to a single value. Basically, anything that allows us to talk about complex scenarios without needing pointers is a good thing. But: representing a single value is not the only use-case of pointers. The much more common scenario for pointers is for talking about a range of contiguous data, usually when paired with a count of the elements.
+
+At the most basic level, a represents a strongly typed contiguous chunk of elements of type with a known and enforced length. In many ways, very comparable to an array ( ) or segment ) - but… more. They also provide safe (by which I mean: not in the C# sense) access to features that would previously have required pointers ( ).
+
+I’m probably missing a few things here, but the most immediate features are:
+
+Now: if none of the above sounds like things you ever need to do, then great: you probably won’t ever need to use - and that’s perfectly OK. Most application code will never need to use these features. Ultimately, these tools are designed for lower level code (usually: library code) that is performance critical. That said, there are some great uses in regular code, that we’ll get onto.
+
+OK, OK. Conceptually, a can be thought of as a reference and a length:
+
+You would be perfectly correct to complain “but… but… in the last part you said no fields!”. That’s fair, but I did say conceptually. At least… for now!
+
+As a completely trivial (and rather pointless) example, we can see how we can use a very similarly to how we might have used a :
+
+Here we implicitly convert the to when calling the method, but at this point you would still be justified in being underwhelmed - we could have done everything here with just an array.
+
+Similarly, we can talk about just a portion of the array:
+
+And again you could observe that we could have just used . Actually, let’s be realistic: very few people use - but we could have just passed and as additional parameters, it would have worked fine. But I mentioned pointers earlier…
+
+The second way we can use is over a pointer; which could be any of:
+
+All of these will necessarily involve , but: we’ll tread carefully! Let’s have a look at a example ( is where you obtain a chunk of data directly on the call-stack):
+
+That’s… actually pretty huge! We just used the exact same processing code to handle an array and a pointer, and we didn’t need to use (except in the code that initially obtained the pointer). This opens up a huge range of possibilities, especially for things like network IO and serialization. Even better, it means that we can do all of the above with a “zero copy” mentality: rather than having managed code writing to a that later gets copied to some unmanaged chunk (for whatever IO we need), we can write directly to the unmanaged memory via a .
+
+A very common scenario when working with buffers and buffer segments is the need to sub-divide the buffer. makes this easy via the method, best illustrated by an example:
+
+This isn’t something we couldn’t do other ways, but it is very convenient here. Importantly, we haven’t allocated anything here - there’s no “new array” or similar - we just have a reference to a different part of the existing range, and / or a different length.
+
+A more interesting example is coercion; this is something that you can do with pointers, but is very hard to do with arrays. A classic scenario here would be IO / serialization: you have a chunk of bytes, and at some point in that data you need to treat the data as fixed-size , , , etc data. In the world of pointers, you just… do that:
+
+With arrays, there is no direct way to do this; you’d either need to use hacks, or you can use if the types you need are supported. But this is easy with :
+
+Not only can we do it, but we have the added advantage that it has correctly tracked the end range for us during the conversion - we will find that is equal to (since each requires 4 bytes). The important thing to realise here is that we haven’t copied any data - we’re still looking at the exact same place in memory - but instead of treating it as a , we’re treating it as a .
+
+We observed that with pointers we could coerce from to . That’s fine, but you can’t use pointers with all types. has much stronger support here. A particularly interesting illustration is SIMD, which is exposed in .NET via . A vexing limitation of pointers is that we cannot talk about a pointer (for example). This means that we can’t use pointer coercion as a convenient way of reading and writing SIMD vectors (you’ll usually have to use and instead). But we can coerce directly to from a span! Here’s an example that might come up in things like applying the web-sockets xor mask to a received frame’s payload:
+
+That’s pretty minimal code for vectorizing something; it is especially nice that we didn’t even need to do the math to figure out the vectorizable range - did everything we wanted. It would be premature for me to know for sure, but I’m also hopeful that these - loops will also elide the bounds check in the same way that array access from - elides the bounds check.
+
+Pointers are notoriously permissive; if you have a pointer: you can do anything. You can use to obtain the pointer inside a : if you change the data via the pointer, the now has different contents. is not immutable if you allow : nothing is immutable if you allow . But just as we can obtain a , we can also get a . If you only expect a method to read the data, you can give them a .
+
+In the “corefxlab” preview code, there’s a method-group with signatures along the lines of:
+
+(where the overloads allow an initial range to be specified). This gives us a that points directly at a range inside the . If we want a substring, we can just again and again - with zero allocations and zero string copying - we just have different spans over the same data. A rich set of APIs already exists in the corefxlab code for working with this type of string-like data. If you do a lot of text processing, this could have some really interesting aspects.
+
+Here’s the gotcha: in order to have the appropriate correctness guarantees when discussing something that could be a managed object, could be data on the stack, or could be unmanaged data, we run into very similar problems that make it impossible to store a local as a field. Remember that a is conceptually a (reference) and (length) - well: we still need to obey the rules imposed by that “conceptually”. For a trivial example of how we can get in a mess, we can tweak our example:
+
+Where does refer to in ? I can’t tell you. We get into similar problems with anything that used to get a pointer - the pointer is only guaranteed to make sense inside the . Conceptually the issue is not restricted to pointers - it would apply equally if we could initialize directly with a constuctor:
+
+We didn’t even need to break things this time. No such constructor currently exists, very wisely!
+
+We should be OK if we only ever use managed heap objects (arrays, etc) to initialize a , but the entire point of is to provide feature parity between things like arrays and pointers while making it hard to shoot yourself in the foot.
+
+In addition to this, we also need to worry about atomicity. The runtime and language guarantee that a single reference can be read atomically (in one CPU instruction), but it makes no guarantees about anything larger. If we have a reference and a length, we start getting into very complex issues around “torn” values (an invalid pair of the reference and length that didn’t actually exist, due to two threads squabbling). A torn value is vexing at the best of times, but in this case it would lead to valid-looking code accessing unexpected memory - a very bad thing.
+
+The example above is a perfect example of code that will compile without complaint today, but will end very very badly - although we used , so: self-inflicted. But this and the atomicity issue are both illustrations of why we have…
+
+has undefined behavior off the stack. And in the future: may not be allowed off the stack at all - this means no fields, no arrays, no boxing, etc. In the same way that only has defined behavior on the stack (locals, parameters, return values) - so only has defined behavior on the stack. You are not meant to ever put a in a field (including all those times when things look like locals but are actually fields, that I touched on last time). An immediate consequence of this is that atomicity is no longer an issue: each stack is specific to a single thread; if our value can’t escape the stack, then two threads can’t have competing reads and writes.
+
+There’s some in-progress discussion on how the rules for this requirement should work, but it looks like the concept of a “ref-like” stack-only type is being introduced. as a field would be ref-like, and would be ref-like. Any ref-like type would only be valid directly on the stack, or as an instance field (not a field) on a ref-like type. If I had to speculate at syntax, I’d expect this to look something like:
+
+Emphasis: this syntax is pure speculation based on the historic reluctance to introduce new keywords, but the here denotes a ref-like type. It could also be done via attributes or a range of other ideas, but note that we’re now allowed to embed the ref-like field. Additionally, the compiler and runtime would verify that is never used illegally as a field or in an array etc. Notionally, we could also do this for our own types that shouldn’t escape the stack, if we have similar semantics but doesn’t represent our scenario.
+
+Thinking back to the , if we wanted to safely support usage like:
+
+then presumably it could work, but we’d have to have similar logic about returning ref-like types as currently exists for , further complicated by the fact that we don’t have the single-assignment guarantee - we can reassign a . If ref-like types work in the general case, then the logic about passing and returning such a value needs ironing out. And that’s complex. I’m very happy to defer to Vladimir Sadov on this!
+
+EDIT: to clarify - it is only the pair of and (together known as a span, or ) that need to stay on the stack; the memory that we're spanning can be anywhere - and will often be part of a regular array ( ) on the managed heap. It could also be a reference to the unmanaged heap, or to a separate part of the current stack.
+
+Sure, not everything is on the stack.
+
+This isn’t as much of a limitation as it sounds. Instead of storing the itself, you just need to store something that can manifest a span. For example, if you’re actually using arrays you might have a type that contains an , but which has a property:
+
+As long as you can switch into mode when you’re inside an appropriate method, all is good.
+
+For a more unified model, the corefxlab code contains the concept, but it is still very much a work in progress. We’ll have to see how it shakes out in time.
+
+We covered a lot of details - you might feel cheated. Well, partly we needed that information to understand the stack-only semantics of . But there’s more! also exposes the directly via the aptly named method. This is a , and allows us to do any of:
+
+The latter option means that not only can we get from to , but we can go the other direction if we need:
+
+The method give us back a to the start of the range, comparable to how a pointer refers to the start of a range in pointer terms. So: can we use this to get around the range constraints? Well… yes… ish:
+
+This cheeky duo gives us a reference to whatever is 5000-integers ahead of the span we were thinking of. It might still be part of our data (if we have a large array, for example), or it might be something completely random. But the sharp eyed might have noticed some key words in that expression… “ ” and “ ”. If you keep sprinting past signs with words like that on: expect to hit rocks. There’s nothing here that you couldn’t already do with code, note.
+
+Sometimes you need to use unmanaged memory - this could be because of memory / collection issues, or could be because of interfacing with unmanaged systems - I use it in CUDA work, for example, where the CUDA driver has to allocate the memory in a special way to get optimal performance. Historically, working with unmanaged memory is hard - you will be using pointers all the time. But we can simplify everything by using spans. Here’s our dummy type that we will store in unmanaged memory:
+
+We’ll need to allocate some memory and ensure it is collected, usually via a finalizer in a wrapper class:
+
+The wrapper type needs to know about the pointers, so is going to be - but does the rest of the code need to? Sure, we could add an indexer that uses / to access individual elements, but that means copying the data constantly, which is probably not what we want - and it doesn’t help us represent ranges. But spans do: we can return a span of the data (perhaps via a API):
+
+And we can consume this pretty naturally without :
+
+If we want to talk about individual elements (rather than a range), then a local (via a ) is what we want; we could use the API on a for this, but in this case it is probably easier just to use directly:
+
+We can consume this with similar ease:
+
+And now from any code, we can talk directly to the unmanaged memory simply by passing it in as a parameter - it will never be copied, just dereferenced. If you want to talk about an isolated copy or store a copy as a field, then you can dereference, but that is easy:
+
+If you’ve ever worked with unmanaged memory from C#, this is a huge difference - and opens up a whole range of interesting scenarios for allocation-free systems without requiring the entire codebase to be . For context, in an allocation-free system, the lifetime of a set of data is strictly defined by some unit of work - processing an inbound request, for example. This means we don’t need reference tracking and garbage collection (and GC pauses can hurt high performance systems), so instead we simply take some slabs of memory, work from them (incrementing counters as we consume space), and then when we’ve finished the request we just set all the counters back to zero and we’re ready for the next request, no mess. Spans and locals and make this friendly, even in the unmanaged memory scenario. The only caveat being - once again: and cannot legally escape the stack. But as we’ve seen, we can expose on-demand a or - so it isn’t a burden.
+
+Spans; they’re very powerful if you need that kind of thing. And they force a range of new concepts into C#, giving us all the combined strong points of arrays, pointers, references and generics - with very few of the pain points. If you don’t care about pointers, buffers, etc - you probably won’t need to learn about spans. But if you do, they’re awesome. The amount of effort the .NET folks (and the community, but mostly Microsoft) have made making this span concept so rich and powerful is huge - it impacts the compiler, the JIT, the runtime, and multiple libraries both pre-existing and brand new. And it impacts both .NET and .NET Core. As someone who works a lot in the areas affected by spans and - it is also hugely appreciated. Good things are coming.|||
+
