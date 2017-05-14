@@ -1,0 +1,67 @@
+Our favourite database, PostgreSQL, had a new version released back in September 2016. It’s not a very popular version yet, but it has become the new default on, amongst others, Heroku.
+
+The biggest feature delivered in 9.6, listed as the first one in 9.6 Changelog, was the parallel execution of sequential scans, joins and aggregates. Let’s dive into this feature and see where it can help our applications work better!
+
+Obviously, we need to have PostgreSQL 9.6 installed. If you use Ubuntu (I do), this thread on AskUbuntu has instructions for all versions. Don’t worry, it won’t upgrade your existing PostgreSQL installation – it’s installed alongside the previous versions and running on a different port, so if your current PostgreSQL runs on the default port 5432, 9.6 will listen on 5433.
+
+Sequential scans are, as a rule of thumb, something you want to avoid when a given query’s execution time is important, as it means the database walks sequentially through the whole table, one-by-one, picking rows that fit the query conditions. This means a time complexity of O(n) for a simple, one-table SELECT-WHERE query. What you want for time-critical queries is an index scan, which has a way more preferred O(log(n)) complexity (for the default binary tree index).
+
+But index comes with a cost: it takes additional space in memory and increases time of INSERT and UPDATE queries. Therefore – for many scenarios – not having an index and bearing the cost of a sequential scan is actually a more viable option. This all depends on the usecases.
+
+At the moment only sequential operations can run in parallel, so we’ll focus on them, assuming we do have a usecase to tolerate sequential scans (rather than using an index).
+
+Let’s start with the simplest case: we have a lot of data, we want to get all rows matching a given criteria, and we want to speed up the query. That’s why the ability to parallelise queries landed in PostgreSQL 9.6.
+
+If you’re into reading C code (a nicely written C code!), take a look at the commit which introduced this feature.
+
+First let’s create a table with only (primary key) and columns:
+
+And let’s insert some data into it. Ten million rows should be enough to see the gains of parallelisation. Let’s give everyone a random age from the 0-100 range.
+
+Now let’s try to fetch all the people with age 6, therefore expecting about one percent of rows.
+
+This took quite some time, over a second and half. Query parallelisation is disabled by default: let’s enable it by allowing PostgreSQL to spawn a maximum of two workers. And then run the query again.
+
+Now this is way better: launching two workers lowered the execution time to below one second.
+
+It’s not down to half the original time, as launching workers and gathering data from them by the “gather” process introduces some overhead. This gathering-from-workers overhead gets bigger with every additional worker; sometimes more workers do not improve the query time at all – but in order to demonstrate it, you’d need to experiment on a database server with more physical cores than the two we usually find on laptops.
+
+There are also queries which won’t be parallelised, for example let’s try to fetch all people with age below 50 (which will return around half of our table):
+
+Why does that happen? The gathering-from-workers overhead introduced by every row matching our condition means it’s good to parallelise a query that will return only a small fraction of the whole table, but when most rows encountered by workers fulfill the condition the gathering overhead would not be worth the gains from parallelisation.
+
+How planner does that is a separate story involving the approximate statistics PostgreSQL keeps about our tables and columns; what’s interesting to us is that we can force the planner to perform a parallel sequential scan by lowering (setting to zero) the cost of something called “parallel tuple”.
+
+Yikes! The overhead is real and despite employing two workers (which means two cores of our CPU) our execution time actually got worse, growing from ~2 s to ~3.5 s.
+
+Let’s clean up after ourselves before moving onto the next section.
+
+We often use a feature called Aggregate Functions, which computes a single result from multiple rows of our table. For sure you’ve used the function, there are also other useful ones like , , or (average).
+
+Turns our they can also run in parallel now! Look at the commit that introduced this feature.
+
+Let’s s ask our database for the average age (amongst all the 10 million randomly generated people) without parallelisation:
+
+And let’s see how fast it performs after enabling parallelisation:
+
+Not bad! There’s a lot of information here, but what’s of interest to us is that we’ve managed to reduce the query execution time from 2.7 s down to 1.6 s.
+
+The third and last sequential operation which can run in parallel in PostgreSQL 9.6 is joining rows from two different tables.
+
+And once again, if you’re up for reading some nicely written C code, here is the commit that introduced join parallelisation.
+
+Let’s begin by creating a second table, , and populating it with 10 million generated entries, with being a proper foreign key with index and containing a three-letter name of species, be it or .
+
+Let’s get some data with conditions spanning both tables, at first without parallelisation:
+
+That’s almost 6 seconds! Let’s add some workers and see if it helps:
+
+That’s much better, we went down from almost 6 seconds to 1.3 s. We do have an index on the foreign key, like we always should, but the other columns ( , ) are sequentially scanned.
+
+If you remove the index, the parallel version run will be down to just 5 seconds. Seriously, even in a constrained environment, primary keys and foreign keys (as in: columns used for joining) should always have an index!
+
+Parallel sequential operations are a new feature of PostgreSQL 9.6, but it’s not only considered stable and production-ready, it’s also going to get lots of improvements in PostgreSQL 10. Before diving into any solution, always check your usecases, measure, analyze and make an informed decision based on proper research. And that’s a general tip, not only regarding this single feature of a single database!
+
+Disclaimer: the measurements in pasted results here are just that, a paste from a single run, they’re not proper benchmarks. There are no means and variances. Make sure to run a proper benchmark yourself on the database server you’re using!|||
+
+Rebased Team writing about tech we use. Languages, frameworks, libraries, tools. Certified for 0% fluff.

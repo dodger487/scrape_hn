@@ -1,0 +1,72 @@
+0:06 This is the first in a series of episodes with Brandon and Lisa, who are both iOS and Android engineers for Kickstarter. We're going to talk about the Kickstarter apps, covering topics like deep linking, Apple Pay, Playground-driven development, and test-driven development in a functional style.
+
+1:52 The entire Kickstarter team works on both iOS and Android. At first glance, the two platforms may seem like different worlds, but Kickstarter's codebase is architected in a way that makes it simple to switch back and forth between the two.
+
+2:23 Kickstarter has built both its native apps using the same Model-View-ViewModel pattern. Developers can find what they're looking for in both codebases, but they're just written in slightly different languages: Java, Swift, and Kotlin.
+
+3:18 In looking at the view controllers, we saw they're each structured in the same way. Once you've grasped how that structure works, it's easy to see what's going on in each view controller.
+
+3:44 Today we'll look at how Brandon implements Apple Pay. But first we'll set up a basic implementation before refactoring it to Kickstarter's way of programming.
+
+4:09 We have a simple app with one Buy button, and we create and present an Apple Pay view controller when the button is pressed. We need a payment request for this, which we've prepared in a local property:
+
+4:54 Pressing the Buy button now opens the Apple Pay view controller. But the Cancel and Pay buttons don't work yet because we're missing a delegate.
+
+5:15 We set as the delegate, so we have to conform to a protocol with a very long name: . Two delegate methods are relevant for now. The first one, with the label , is called after the user has used Touch ID or their passcode and an Apple Pay token has been generated, but before a payment actually occurs. The second one, , notifies us when the user either has authorized payment or wants to dismiss the view controller:
+
+6:33 This makes the Cancel button work, but nothing happens after an authorization. That's because we're not yet calling the completion handler in . If we call it with a success status, the view controller will be dismissed:
+
+7:14 The user is still not charged, because we're not doing anything with the payment token. We use — our placeholder for the payment service provider — to create a token for this payment, which gives us an optional token and an optional error to handle:
+
+8:34 We're getting ahead of ourselves by calling the completion handler with , because no payment has actually been made yet. Instead, we should send the Stripe token to a web service that will use it to charge the user. Our web service has a method, , which takes the token, the product, and a closure in which we receive the final status of the payment as a boolean:
+
+9:54 It would be a good idea to tell the user about the different statuses as we process the payment. We can set the first status text in the method and then update it when we get an error or a status back:
+
+11:36 When we cancel and dismiss the payment view controller, the status is still visible. We can fix that by clearing the status in the delegate method . However, in this method we have no information about the state of the payment process; all we know is that the view controller should be dismissed. Additionally, we should only clear the status if the payment isn't authorized. Otherwise, we might clear an error status or a confirmation set by the authorization flow. We store a flag in the view controller to keep track of the state:
+
+12:36 In , we reset the variable and then set it to in :
+
+12:46 Now when is called, we can check the flag and only clear the status label if we didn't go through the authorization flow:
+
+13:31 All of the above creates a lot of complex code, and we don't want to come back to it in a few months for changes, so it's time to refactor the code. To do so, we'll move a lot of logic into an object with a cleaner interface and better testability.
+
+13:58 We first create a struct that holds all the data representing the current state. Right now that's just the status label, but we might want to add a boolean indicating whether the Buy button should be enabled (for example, to disable it during the payment process):
+
+14:35 Next we can create an object that describes everything the wants to do. It uses a callback that lets the view naively update itself to a given state, which corresponds to the current point in the payment authorization flow. We want to move as much logic as we can into this object so that it can be tested without interacting with a PKPaymentAuthorization view controller. This object is meant to be the single source of truth for our user interface state.
+
+15:31 We name the new object . It holds a state value and a callback that will be called with new states to update the UI. During setup, we set the initial state value and call the callback once, in order to let the interface update itself with the initial state:
+
+16:56 Now we can go through the view controller and strip away logic that can be moved into actions on . We first add a property to the view controller and initialize it in . We define the callback that updates the UI as a trailing closure, marking as unowned to avoid creating a reference cycle:
+
+18:51 In the method, we need to update the status label text. We don't want to directly mess with , but we should design a very clear interface on so that its users know when to call which actions. Therefore, a better solution is to add a method on called , which updates the status label text internally:
+
+19:52 When we call , the view model updates its state, which automatically calls the callback, updating the label text in our interface.
+
+20:19 We need to decide which part of the logic moves into . Because the Stripe interaction is a third-party SDK that we don't have to test, we want to leave it out of the , so we just move the web service bits into :
+
+22:04 After we paste the code into , we can tell from the compiler errors what needs to be fixed. For one, needs the to send to the web service, so we'll add it to the initializer:
+
+22:48 We also need to call the Apple Pay completion handler from the , so we'll pass that in when we call . Then we copy the closure's signature:
+
+24:03 After fixing all compiler errors, everything works again. One last bit: we should move the flag into as well, in order to make it testable. We won't put it inside the struct, because that should only hold values that are directly visible in the user interface. Instead, we treat the flag as an implementation detail of the itself:
+
+25:35 Back in the view controller, we should call methods on the . In , we'll call the view model's corresponding .
+
+26:25 Then in , we call . The UIKit stuff — the dismissal of the payment view controller — shouldn't move to the because that makes it hard to test.
+
+27:41 We ended up with a much simpler view controller. All the UI logic is in the view model now, and the public interface of the view model makes it clear what it wants from its users.
+
+28:24 If we were to test the view model, we'd construct a value of and attach a callback that, instead of applying changes to a user interface, appends received states to an array. Then we could go through a user script — open the app, press Buy, press Cancel — after which we could check that we received the correct sequence of states. In other words, we call the methods on and then check that in our states array, the status label text goes from to and then back to .
+
+29:02 Our refactored implementation looks a lot like Kickstarter's app, except Kickstarter uses reactive programming with signals to more declaratively describe what's going on. In our code, we set the status label text in a few different places, but had we done it in a more reactive manner, we could've set it in one place by using a composition of signals.
+
+30:06 As an example, Brandon shows the , where Kickstarter users can change an amount they want to pledge to a project, tweak the shipping, and ultimately pay. All actions the user can take are described as inputs to the view model. Under the hood, those inputs are transformed into signals, which are then combined into new signals that describe the side effects to the view, such as the status label, the button's enabled state, etc.
+
+30:47 In the view controller code, we see a lot of code similar to what we implemented before, in that a lot of methods simply forward calls to the view model:
+
+31:52 In the view model, we find an example of a state element that's comparable to our status label text: the signal. This is the single source of truth for whether the authorization was completed. Instead of scattering a flag all over the code, three different signals were merged in one place: a signal for whether or not the authorization process started, a signal for if the error returned from the Stripe token creation is , and a signal for if the token isn't . These three signals together define a successful payment:
+
+32:56 The merged signal can be used for other things too, e.g. analytics tracking. We can simply use the one signal to check whether the Apple Pay flow has started or finished successfully, or maybe to see if an error occurred in the Stripe stage or some time later, and all of this knowledge can be used to make granular business decisions.
+
+33:39 The demo code is very close to what Kickstarter does in its app, so it was cool to see code that actually works in production.|||
+

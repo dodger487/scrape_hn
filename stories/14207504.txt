@@ -1,0 +1,132 @@
+I recently completed a pretty large project at work, moving the desktop Twitter site from a legacy set of tools for bundling JavaScript onto webpack, 1 one of the best supported and most feature-rich options for JS heavy sites.
+
+Webpack bundles things for websites. It reads source files and transforms them into output files to be loaded by a web browser. The simplest use takes multiple JavaScript files and outputs a single JS file. If you have 15 minutes, this “Webpack from First Principles” screencast describes webpack in excellent detail:
+
+twitter.com is a big website and a pretty old website–much of the code, especially in the bundling and deployment pipeline, is several years old. For loading and bundling JS files, we used two libraries: loadrunner for loading JS modules, and loadbuilder for bundling those modules into efficient bundles for frontend delivery.
+
+These projects, originally written by Dan Webb and maintained by Kenneth Kufluk, were crucial parts of Twitter’s infrastructure for many years. Unfortunately, as the site grew and the JS community moved on, some of the technical decisions became a burden. For example:
+
+Loadrunner and loadbuilder were wonderful tools for their time, but ultimately we wanted to move over to something better supported with more modern functionality.
+
+Most honestly, the main reason we chose webpack was its adoption by the Twitter Lite team and subsequently some other teams at the company. It works great for them, and we expected to work just as well for us.
+
+Webpack answers all of our concerns about the old build system. Most important is the last one: webpack is under active development and has a thriving community. The core team are engaged with their users, and we were able to reach out to them for any problems we had.
+
+The biggest complaint I’ve seen about webpack is the complexity of configuration, since there seems to be an option for any behaviour conceivable. For a greenfield project, this can be overwhelming and is usually overkill. However it’s ideal for a big complex established app like Twitter, and I was very grateful for some of the more abstruse features that let me get this project shipped. 2
+
+One of the incidental problems I dealt with during this migration was moving away from the “check-in ” approach we were using on the site. Checking your into your git repo is a great way to save a few minutes in development, while also condemning your team and your future self to unending pain. Don’t do it.
+
+The motivation behind checking into source is to lock down specific version of dependencies–ensuring everybody has the same copy of each dependency on their machine, and ensuring older versions of the code can be checked out and run exactly as they would have been (reproducible builds). Npm, for all of its joys, had made this incredibly difficult in previous experience. When I worked on mobile.twitter.com, the frequent bugs between npm version 2’s shrinkwrap feature (intended to solve this problem), and the peerDependencies field used by certain modules was a regular nightmare. npm version 3 solved most of these issues, at the cost of a dramatically slower client experience. 3
+
+Some smart people from Facebook and other places ran into similar issues and built a replacement npm client called yarn. Yarn solved all our problems, is really fast, and just works. It works great any time you need a JS project to run on another computer.
+
+Our biggest challenge was doing two things at once. We couldn’t migrate to webpack in a single commit: the amount of changes required was too large and would have been too high risk. Instead, we had to ensure all of our application code worked in both the webpack build and the loadrunner build, to avoid blocking continual feature development on the site.
+
+A close second problem was the size of the codebase–our production build consists of about 1300 JS modules, that generate about 20 JS files for deployment. We couldn’t pause development on the site while working on this migration, so any changes would have to work for all of our modules, and continue to pass our unit, integration, and end-to-end test suites.
+
+A few specific problems, with solutions/hacks/workarounds, are described below.
+
+One of the biggest headaches was the difference between scripts and modules - these are usually transparent to developers but turn out to be quite complicated. Our loadrunner setup treated modules quite loosely, and we had three main use cases:
+
+Webpack’s ProvidePlugin helps with migrating from global scripts to a more modular system–any free references to an identifier (such as $) are transformed to locally imported module references.
+
+For example, a file like 4
+
+For other scripts, it was a bit more complicated. We used a custom webpack loader called script-loader to load other scripts. script-loader can read the contents of a JS file as a string at compile time, then call it at runtime with . This caused 2 problems:
+
+For problem #1 we used another loader, expose-loader, to provide jQuery as a global object (at this point, you may wonder if it wouldn’t have been easier to just load jQuery as a global outside of webpack in the first place). 5
+
+Problem #2 was insurmountable in a scripted way until we got rid of loadrunner entirely: I couldn’t figure out a way to get both builds loading the source code in development and the minified code in production. I ended up pre-minifying those files and requiring the minified code, then modifying those files to use UMD syntax after we killed off loadrunner.
+
+The fundamental design difference between loadrunner and webpack is module resolution: in loadrunner, all module resolution happens at runtime (based on a manifest generated by loadbuilder), whereas webpack tries very hard to resolve all modules at compile time.
+
+When splitting a large application into multiple independent JS files (chunks), it’s important to know where each split happens. Since all module imports in loadrunner are asynchronous, the JS code doesn’t specify these split points - takes a string and a callback, and figures out when the callback can be called. A separate configuration file for loadbuilder describes what each chunk should contain.
+
+If you’re not careful, it’s very easy to end up loading more code than you need. And on a large app with dozens of contributors over multiple years, not everyone is careful all of the time.
+
+By contrast, imports are synchronous in webpack unless the developer explicitly uses an asynchronous form - in webpack version 1, or in webpack 2. The biggest change was to our navigation code. Roughly, our old navigation code looked like:
+
+We had to create a separate routing config that turned this dynamic function into a static set of routes that call webpack’s - something like:
+
+With this example, webpack generates a new chunk called that contains the module and all of its dependencies (that are not in the entry chunk or the common chunk). You can omit the chunk name, but using it lets us add the right tag on the server to preload the right JS file for each route.
+
+In order to work in both loadrunner and webpack, I was able to use ProvidePlugin again, this time for ad-hoc dependency injection. That is, the webpack config had:
+
+And the navigation function (used by both loadrunner and webpack) was (with eslint comments included for illustration):
+
+The compatibility code has now all been cleaned up, and the webpack approach (with split points defined in the JS code itself) is much nicer. We’re looking into using code-splitting more to help defer loading of some of our more expensive components, outside of route-based splitting that was implemented for the migration.
+
+When I worked on the Twitter Lite team, I spent a while setting up that site’s i18n system: we were starting a greenfield project, so we were able to pick the best available approach.
+
+We settled on Globalize, an excellent library managed by the JS Foundation and maintained by the inexhaustible Rafael Xaviers. Globalize has a number of related projects for integrating with webpack and React. Globalize’s webpack integration generates distinct chunks for each locale, each of which contains all of the phrases for all of the pages/screens in the app.
+
+By contrast, the home-grown desktop web localization process translates each chunk in place per locale. This is very helpful for Mustache integration, has lower runtime overhead, and only loads the phrases for code that’s executed, but is very expensive to compile.
+
+That’s a little dense, so it’s easier to illustrate with an example. If you have an app with 5 chunks that’s localized for 5 languages, the globalize process would compile once and output 10 chunks:
+
+By contrast, our i18n process would output 25 chunks, since each chunk would be localized in place (it’s quite similar to this open source i18n plugin):
+
+Unfortunately, because of the structure of this plugin, webpack can share none of the compilation between different locales–for example, all of the JS files have to be re-parsed for every locale. When you have 50+ locales, this can take over 10 minutes on my expensive Apple computer–worse, a memory leak I’ve yet to isolate 6 causes webpack to crash its node.js process by running out of space in v8’s heap.
+
+We have worked around this by using Trivago’s fine parallel-webpack module, which splits compilations across multiple worker processes. I am not happy with this piece of our pipeline–we may assess adopting Globalize in the next few months, at the cost of slightly higher runtime execution time.
+
+Most of the HTML for twitter.com is generated by our Scala server, but we still use the hogan.js library to render the same mustache templates on client as well. We looked at an existing mustache-loader library for webpack, but unfortunately we have enough customizations to our mustache process (needing to pre-localize templates, for instance) that it was faster to write a custom solution than figure out a branch we could contribute back to the open source project.
+
+A long-standing problem we’ve had with hogan.js is its treatment of template partials. Because hogan pre-compiles templates into JavaScript functions, with no knowledge of the environment, loader, or bundler that will call that function, it expects a JS object parameter with references to all of the partial functions the template may call, and any partial functions called by partials inside the parent template, for as deep as this goes (for some of our server templates especially, that can be very deep).
+
+Our approach for a long time was to provide a single import - called - that included all of the hogan templates from our client templates directory (which were mainly symlinks to the the server templates directory). This meant any code that used mustache templates had to require every mustache template–and in practice, all of those templates went in the initial chunk.
+
+I was able to reproduce this old behaviour in webpack, but I thought we could do better. With a bit of work, we came up with a custom twitter-mustache-loader that resolves mustache partials at compile time, allowing the code that requires a template to only import the template code needed.
+
+This saved about 120kb from the minified size of our (too large) entry chunk, which was about 20kb after gzipping. It’s the kind of improvement that would have required a lot more custom code to work on our old system, but was solvable with webpack without a whole lot of effort.
+
+We use jasmine and karma to run the ten thousand or so JS unit tests for our desktop site. I am not very opinionated about testing frameworks–these ones work well enough and help us find bugs–and both worked fine in our old setup and have good integrations with webpack.
+
+Our biggest issue with unit testing was with dynamic loading in test helpers. In particular, we used a helper function called for testing Flight components, that looked like:
+
+The careful reader will remember that webpack is not fond of runtime module resolution, but it was possible to hack a dynamic require statement into here using webpack’s require.context feature–essentially, we created a giant context with every module in the app and did the module resolution ourselves in (cough) user-land.
+
+This helped us get off loadrunner, but was very very slow. In particular, given a test file like:
+
+There was no way for webpack to know that was a module to be imported. Instead, it had to go through the dynamic require context, and parse every JS file in the project.
+
+In a similar way, the integration we were using between karma and webpack depended on a single entry point that finds all of the test files– see this example from Nicolas Gallagher of the Twitter Lite team: 7
+
+Thanks to our smart new hire Greg Baker we were able to fix this after loadrunner was gone: firstly by bulk transforming all of the existing test files to use a new form of , that did not call or :
+
+And then by writing a custom loader to accept a list of test files or directories passed on the command line, we allow webpack to avoid parsing the whole project and speeding up incremental test times by a ton.
+
+The most obscure webpack feature we depend on is probably - see this GitHub issue for some detail. Our integration tests run with a randomized set of hostnames in our CI environment, so webpack can’t know the URL for loading asynchronous chunks at compile time. fixes exactly this issue.
+
+We use the CommonsChunkPlugin to put common modules (in our case, modules shared between 12 chunks) in a separate JS chunk. It feel like more of an art than a science to figure out the right values to put into the config for this plugin (Nicolas at one point joked that we should use machine learning to generate our webpack config–I’ve heard that Facebook does that in practice for some of their custom module bundling).
+
+We have been very happy with source map integration: for development we use and for staging and production we use , to avoid configuration for developers in those environments. Thanks to some hard work from Ben McGraw, we upload our source maps to Sentry to help diagnose production issues.
+
+Using full source maps with our fully localized builds generates lots and lots of bytes on disk–about 1.6GB per production build–which has resulted in some hilarious outcomes, like our internal-cloud scheduler killing our staging servers for exceeding disk quota. We only upload a couple of languages to Sentry.
+
+We’ve seen performance improvements (improving time to first tweet) across all of our main pages. Modularizing mustache loading was the biggest example of a perf win that fell out of the new setup; another benefit has been knowing the maximum number of tags we put on any page, so we can add a tag for each one of those scripts at the top of the page.
+
+Performance wasn’t a primary goal of this migration, though setting up structures for future performance improvements was certainly one. We’ll need to improve our dependency tree structure and code-loading patterns to get more substantive gains on the performance metrics we care about. Moving to a well-supported tool like webpack, of course, gives us great tools for analyzing and improving the bundles we output: here is one good overview of tools available.
+
+We’re also much much faster to make incremental improvements–like the changes to our unit test performance–now that we’re on a supported open source platform rather than a neglected internal project. It’s unsurprising, but using well-maintained tools helps us maintain our site.
+
+We’ve also been able to adopt other modern JS tools: using Babel has been the obvious next step. We’ve been trying to reinvest in letting web developers across Twitter adopt modern tooling, and foundational projects like webpack and Babel give us the scope to make improvements across the front-end stack. 8
+
+Our biggest pain point with webpack right now is very long compile times, especially for i18n. This makes us reticent to put more work on the compiler by generating more variants of the app. For example, we’d love to build assets with different Babel presets, so we could ship ES2015+ to modern browsers and ES5 to our still-very-high proportion of IE11 users. But that would double our compile times.
+
+Ideally we would want to do more of this dynamically–a webpack-prod-server, if you will–to allow for a greater number of targeted builds, for efficiency, experimentation, or whatever else. There is some prior art for doing on-demand bundling at scale, but it is quite custom and has a lot more operational overhead than simply pushing static bundles to a CDN.
+
+It is encouraging to see other engineers in the industry experiment with doing this with webpack– a recent talk from Oliver Woodings of Qubit describes one approach, to meet a very different set of constraints. As more teams at Twitter move to webpack, I’m hopeful we can help the core open source team and the community experiment with some new solutions.
+
+After cleaning up the cruft from loadrunner and loadbuilder, I’ve taken a break from webpack config wrangling for the moment.
+
+The next major project for us is upgrading to webpack 2–between my starting on this migration and completing it, webpack 2 went from a early beta release to production ready, and I’m excited to move us up there. As we’ve only recently added Babel to our toolchain, a next step will be codemodding the codebase over to and 9 to enable tree-shaking; I’d rather tackle this before the next webpack upgrade.
+
+The other thing I’d love to take on is moving our CSS into webpack too (it is also on a fairly creaky old build system). Having a real dependency tree for our CSS would allow us to better eliminate unused CSS rules and share code, so CSS modules bundled by webpack are very attractive. It would be challenging to integrate with our Scala server’s HTML rendering, but what’s wrong with a challenge?
+
+Thanks to the webpack team, especially Sean T Larkin and Tobias Koppers: first and foremost for building such an excellent project, and for helping with Twitter specific issues and advice.
+
+Thanks to Kenneth Kufluk for beginning this work, before realizing it was way too much for a manager to do in one night a week and letting me take it on full-time. Thanks also to Cameron Hunter and Rob Berry for complaining loudly about loadrunner.
+
+Thanks to anyone who read all this. If you’re the type of person who can do that, you may be interested in working on it.|||
+

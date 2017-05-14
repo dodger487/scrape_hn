@@ -1,0 +1,91 @@
+In my previous publication, we have started analyzing JIT compilation. Today we are going to explore method dispatch of interfaces and generics (both for classes and separate methods along with real signatures), as well as how to debug release-mode assemblies with optimization. In addition, we’ll figure out the true purpose of System.__Canon.
+
+At first, we need to set up Visual Studio for debugging release-mode assemblies.
+
+We are going to use VS 2013. Thus, I recommend doing the following:
+
+Now, we can move on to our analysis.
+
+CLR is constantly monitoring the whole code, especially interfaces. In addition, it has several strategies for updating method’s native code.
+
+This feature appeared in CLR 2.0 in 2006. Since then it remained the same in many ways with new heuristics addition.
+
+Consider the following example:
+
+Take a look at the call dword ptr ds:[00450010h]instruction.
+
+To find out a value by the 0x00450010 address, open the Memory window (Debug -> Windows-> Memory-> Memory1).
+
+At this stage, JIT has not created a required call node yet. Thus, the environment interprets a call of the interface method. It means that we can see a linear search of the required method at the runtime.
+
+However, let’s run this code twice. After that, we will see that the value of the address has been changed:
+
+To check the 00457012 value, load SOS.dll:
+
+The jmp 006300E0 instruction is a call to the required interface method. You can check it using this code:
+
+Well… Let’s figure out what the cmp dword ptr [ecx],443108h instruction compares.
+
+Compare this to the FirstCallableImpl type (i.e. MethodTable). If it is true, call the FirstCallableImpl.DoSomething() method.
+
+The jne 0045A011 instruction is fallback to a linear search (as it has been before caching).
+
+When it comes to calling the next type – SecondCallableImpl, it will still be checked in the call-site exactly FirstCallableImpl, rather than SecondCallableImpl.
+
+Still, it is not effective! Thus, after several iterations of code invocations, the environment will exchange the node with cache for a linear search.
+
+Thus, caching is quite effective when we call methods of collections, for example.
+
+The release of CLR 2.0 along with generics led to important changes in the runtime environment. Before we needed only the EEClass structure to describe a particular type. Now, we need binding EEClass+MethodTable.
+
+Moreover, List<string> and List<int> will have different EEClass.
+
+Consider an example:
+
+To check it, we will use the !dumpheap command:
+
+As you can see, the environment has created two different specializations of the HolderOf<T> class:
+
+In the above-mentioned dump, we are interested in HolderOf<T>.GetPointer(). Consider:
+
+Thus, we can see that both Methodtable and a native code (CodeAddr) differ.
+
+Please notice that there is no System.Object for Holderof<object>. Instead, we have System.__Canon
+
+In short, it is usually considered that for reference types, the environment uses the System.__Canon type code sharing. But that’s not the point. Really.
+
+The fact is that generic types may contain circular dependencies to other types which may lead to creating unlimited specializations of the code. For example:
+
+However, this code won’t fail, but rather output GenericClassTwo`1[System.Object].
+
+So, what about dependencies?
+
+Type loader scans each generic type to find circular dependencies and assigns the order of priority – LoadLevel for a class. Though System.__Canon serves as a type argument for all specializations for reference types, it is a consequence, rather than a cause.
+
+For SSLCI (Rotor), The code responsible for scanning is in the file sscli20/clr/src/vm/Generics.cpp.
+
+For CoreCLR, a code has been changed towards ООP.
+
+Thus, reference types have code sharing, while value types don’t. Why? After all, if it comes down to the size of the type (ref is the word size, In32 is 4 bytes, double is 8 bytes, etc.), then we can share DateTime’ and long’ specialization.
+
+First, it is incorrect from the point of semantics. Second, the developers of CLR decided not to do this.
+
+We have analyzed the code specialization for generic types. But how to find single methods outside the class.
+
+Consider an example:
+
+At the breakpoint in the Disassembly window, you can see the following assembly code for method Test():
+
+As for Test2(), consider the following:
+
+The ECX register contains a pointer to this (calling convention — FastCall). However, GetPointer() has no arguments. In this case, what is written into EDX?
+
+Bingo! The MethodDesc structure is passed, which contains a pointer to MethodTable (note: both descriptors point to the same MethodTable  ) and serves as a metadata source.
+
+Thus, when calling generic methods, an additional parameter is passed with MethodDesc.
+
+The addresses and themselves are the traps that forward the real specialized (for int, object, etc.) native code.
+
+Due to fact that the descriptor itself also stores generic parameters, we gained in the reduction of the number of arguments passed, especially in the case of several generic parameters like Some<T, TU, TResult>(), for example.|||
+
+This article describes method dispatch of interfaces and generics, as well as debugging release-mode assemblies with optimization

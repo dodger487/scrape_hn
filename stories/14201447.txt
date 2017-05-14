@@ -1,0 +1,162 @@
+The week before Christmas I hunkered down and took on a nagging issue in Geary I’m almost embarrassed to discuss.  The long and short of it is, prior to this commit, Geary never deleted emails from its internal SQLite database, even if they were deleted on the server.  It was a classic problem of garbage collection and reference counting.  (If you’re interested in the problem and why Geary didn’t simply delete an email when it was not visible in a mail folder, the original ticket is a good place to start.)
+
+When I first ran the new garbage collector on my four year-old 2.7GB SQLite database, it detected a tremendous number of emails to remove—almost 50,000 messages.  (Yeah, fixing this bug was long overdue.)  After it deleted them I quickly checked the size of the file to see what kind of disk savings I’d just earned for myself.  As you might imagine, I was surprised to see the file size had not changed—but only for a moment.
+
+As is true so often in programming, closing one door tends to open two or more new doors.  In this case, by deleting a significant amount of data from the database I now confronted a question all applications using SQLite face at some point: to VACUUM or not to VACUUM?
+
+Why would you want to VACUUM an SQLite database?  To conserve disk space and improve performance.  (There’s a third, more esoteric reason: certain configuration changes require a VACUUM.  More on that later.)
+
+Conserving disk space and improving performance are really tantilizing things.  If you look around the Internet, you’ll find lots of people asking how to achieve one or both with SQLite.  VACUUM sounds like a magic pill, this one-shot solution that will solve all your problems.  But the solution comes at a price, and a pretty steep one.
+
+To step back, what exactly does VACUUM do?  According to SQLite’s documentation, VACUUM “rebuilds the entire database.”  Okay…so what does that do?
+
+Here’s my guess as to the simplified steps SQLite actually performs when instructed to VACUUM a database:
+
+There’s more to the process than this, but I suspect conceptually that’s the bulk of the operation.  Note that SQLite is doing this in a transaction-safe way, that is, if the power fails at any step, you’re not hosed.
+
+What does this buy you?  It helps to think of the SQLite database as a kind of dynamically resizable filesystem-in-miniature.  Like a filesystem, it has free pages and pages in-use.  Writing a new row to a table is like writing a new file: free pages are removed from a free list, the data is written to those pages, and then they’re linked to an internal index (which marks them as in-use).  The difference is, most filesystems have a static number of pages to work with (i.e. a fixed partition size).  With SQLite, if it runs out of free pages, it expands the file to create new ones.  When you delete a file the filesystem merely marks those pages as free.  Same with SQLite; when you delete a row, its pages are added to the free list and can be re-used later.
+
+Imagine if you insert 1,000 rows to an empty SQLite database.  SQLite will expand the file to generate the space needed to store all that information.  Now delete 999 rows.  In its default configuration, SQLite does not magically move that last row to the beginning of file and truncate (thereby returning the free space to the operating system).  Instead, the last row remains in place and the pages for the 999 deleted rows are marked as free.  If your 1,000 row database takes 1MB on disk and you delete 999 rows, the file remains 1MB in size.
+
+Judging from the SQLite forums and Stack Overflow questions I’ve read, this simple detail has caused considerable anguish.  But from an implementation point of view, the approach has a certain logic.  If you needed 1,000 rows at one point, you’ll probably need most or all of that space again later.
+
+Now take that 1MB one-row database and run it through steps 1–5 above.  You’ll quickly understand why VACUUM can conserve disk space.  Because SQLite is lazy about allocating pages, the new database file will only be large enough for that one row.  1MB becomes 1K (or so).
+
+What about improved performance?  Vacuuming a database sequentially re-serializes each row’s data in the new file.  If the row requires multiple pages, those pages may be spread all over the original file.  Vacuuming stores them side-by-side in the new file.  That means VACUUM can create cache locality effects.  Related data will be located closer together, so traditional performance gains (fewer disk seeks, filesystem cache hits, L2 cache hits, and so forth) come into play.  Not only will your data be closer together, but SQLite’s internal lookup tables will be compacted as well, improving access times.  Remember disk defragmenters?  VACUUM defragments your database.  That’s the performance improvement.
+
+So VACUUM sounds like a pretty sweet deal: less disk space, speedier performance, what’s not to like?  There are, of course, trade-offs and warnings to be aware of.
+
+The first one is the deal-breaker for most people: the database is completely locked during a VACUUM, which can take minutes (or tens of minutes) to complete, depending on its size.  No database access is possible during a VACUUM.  And VACUUM is not an asynchronous or non-blocking operation; if you want to update the user interface while it’s working (a progress bar or busy spinner, for example), you’ll need to VACUUM in a background thread or a separate process.  Oh yeah—you’ll want to read SQLite’s warnings about threads before going down that path.
+
+The technical note in step #3 (above) about INTEGER PRIMARY KEY should not be ignored.  If you forgot to include explicit primary key declarations in your schema and your relational structure cannot handle every single row being assigned a new rowid, then VACUUM is not for you.
+
+VACUUM creates a new file.  It never happens in-place.  That means your disk requirements could as much as double while vacuuming.
+
+The amount of time VACUUM takes is dependent on the number of used pages in your database.  Vacuuming a database you’ve just vacuumed will not complete instantly.  It will take just as much time the second iteration as the first, only to produce a byte-for-byte copy.
+
+I know of no way to cancel a VACUUM.  I’d be happy to hear about a safe, sane way of doing so.
+
+When I was researching the issue I closely studied this 2011 blog post on how the Liferea RSS reader attacked the question of vacuuming.  (It appears the Liferea developers have been worried about VACUUM since 2008.  I know VACUUM has been a recurring issue for Firefox too, which uses SQLite for maintaining bookmarks, history, places, and more.)  The Liferea post details many different questions and discoveries about vacuuming and it’s well worth a read.
+
+At one point Liferea was running vacuum every time the application started, and later once a day, causing the blog writer to state:
+
+I wholeheartedly agree.  VACUUM sounds like a magic solution, but it’s more like a magic drastic solution.  VACUUM is not a fine-tuned solver of problems, it’s a big red RESET button on your database’s on-disk layout.  It really is the nuclear option.
+
+One page on the Firefox wiki (“Avoid SQLite In Your Next Firefox Feature”—overkill, but it makes some good points) lays down this dictum:
+
+
+
+I have to agree: any application using SQLite should devise a VACUUM policy early on.  It’s almost as important as planning your table schemas.
+
+My advice?  Anyone considering VACUUM should first ask themselves if it’s necessary at all.
+
+Your database may never need to be vacuumed, ever.
+
+One bit of lore spread around is that an SQLite database will grow without bounds if you don’t VACUUM.  That’s not true; free pages will be reused.  Without vacuuming, an SQLite database will expand to its largest size and remain that size.  That’s a little different than growing without bounds.
+
+If you’re worried about disk space, ask yourself at what threshold the savings are worth it.  If VACUUM saves anything less than 50MB for a modern desktop application, I would say it’s not worth it.  (Some might even go as high as 500MB, or higher.)  You should also consider auto_vacuum, which I explain below.
+
+As far as page fragmentation, that’s a harder metric to come up with, but at least understand that if your application is slow, VACUUM is not a magic bullet to make it faster.  Projects wanting to speed up SQLite should look closer at their SQL, schemas, and parallelization before turning to VACUUM.
+
+If vacuuming is necessary, I recommend coding a trigger mechanism, one or more heuristics that decides when vacuuming is due.  Don’t just blindly fire off VACUUMs at regular intervals hoping they will solve your performance woes.
+
+If you’re interested in conserving disk space, the database has to have free pages to release back to the filesystem; it’s as simple as that.  One heuristic is to examine the free versus in-use page counts and trigger a vacuum when a certain threshold is reached (say, 25% of the total pages are free).  That information is available via SQLite’s page_count and freelist_count PRAGMAs.
+
+Another possibility is to multiply the free pages by the page_size PRAGMA and trigger when an absolute size is reached.  This is smarter than vacuuming at a certain ratio, since 25% of 1MB on a modern desktop machine does not represent significant savings in an era of terabyte hard drives.
+
+I also suggest subsequent vacuums only occur after a period of time has elapsed.
+
+Consider a user who opens an application, waits for a vacuum to complete, deletes a lot of data, closes the app, then re-runs it—and has to endure another vacuum.  It makes more sense to wait a period of time (a day, a week, a month, or more) before allowing a second vacuum, regardless of the free page count.  Not only is this good for the user’s sanity, it acknowledges that those freed pages stand to be re-used in the near future.
+
+A more advanced heuristic might only trigger when a certain amount of free pages exists for a duration of time, suggesting the user won’t be needing them soon, if ever.
+
+I’ve yet to find a straightforward way to retrieve or calculate page fragmentation.  One could imagine a number of black-box schemes to determine when performance is suboptimal—timing transactions, for example—but that risks running a VACUUM for bogus reasons, such as another application hammering on the disk.
+
+If the rows in your tables are, on average, of similar size, or if your database is not hit particularly hard with UPDATEs, INSERTs, and/or DELETEs, then it may make sense to never VACUUM it for fragmentation reasons.  (For example, a web browser’s bookmark file.)  If your tables are populated with data blobs of widely varied sizes and is actively updated (such as a web browser’s cache), then periodic vacuuming might make sense even if the free page ratio is low, just to defragment it.
+
+It might sound like over-engineering, but you could track the number of UPDATE/INSERT/DELETE transactions made on the database (in, say, a special table) and code your heuristic to vacuum when a threshold is reached.  It’s no guarantee of significant fragmentation, though, just an indicator of the activity that can lead to it.
+
+There is another reason your application may need to vacuum the database.  If you adjust the database’s page_size or auto_vacuum PRAGMAs after you’ve created any tables, those changes won’t go into effect until a VACUUM is performed.  This is a big motivator to get those values right the first time.
+
+I discuss auto_vacuum later so I won’t go into that yet.  As for page_size, I’ll pass on an anecdote.
+
+During Geary’s development, we discovered a major problem with startup time after adding a Full-Text Search (FTS) table to the database.  When the FTS table was first touched by our code, SQLite would block for an excruciatingly long amount of time—database locked—with no indication why.  It didn’t matter what kind of transaction was performed, simple or complex, read or write, the first transaction against the FTS table always set off a storm of disk thrashing.
+
+Without going into the whole story, how we solved that problem was fairly simple: we increased the page_size from its default (1024 bytes on most Linux systems) to 4096 bytes and vacuumed the database.  That was it.  VACUUM didn’t solve the problem, page_size did.
+
+For any non-trivial application using SQLite on a modern desktop operating system, I strongly recommend a 4096 page size minimum.  (Read the discussion about page_size in SQLite’s documentation before deciding on the value right for your project.)  Larger page sizes might make sense for your needs, but I doubt anything less than 4KB is right for any desktop application.  (Mobile and embedded devices are a different story.)  New applications should also investigate write-ahead logging.
+
+If you’re using journaling or specialized locking modes, it’s also worth reading the documentation on the journal_size_limit PRAGMA and how VACUUM affects the rollback file.
+
+First, a few tips about running VACUUM.
+
+As mentioned earlier, executing the VACUUM command will block the current thread, so it makes sense to run it in a background thread if your application needs to remain responsive to the user.
+
+VACUUM cannot run from within a transaction.  This will fail:
+
+It also cannot be executed when transactions are open on other connections; it will fail immediately.  It’s upon you, the application writer, to ensure VACUUM is invoked when no other work is being performed on the database.
+
+The Firefox wiki has some interesting numbers on improving VACUUM’s speed.  Adjusting the journal_mode and synchronous PRAGMAs can improve the time it takes to complete a VACUUM at the cost of database integrity.  Turning off synchronous risks data loss if VACUUM is interrupted at the wrong time.  Changing journal_mode to MEMORY or OFF risks losing rollback and atomicity, but it’s unclear to me how important those are for VACUUM.  The original database is not altered until it’s deleted and replaced with the new file, which is where synchronous, not journal_mode, is important.  (And would you ever want to roll back a VACUUM?)  But don’t take my word for it.
+
+If you change synchronous or journal_mode to speed up VACUUM, remember to reset them to their original values when it completes.
+
+With that out of the way, how can your application work around VACUUM’s limitations?  What follows is a compilation of approaches I’ve discovered while searching around the web.  All assume you’re using a trigger mechanism with a heuristic and not simply vacuuming the database every time.
+
+At start time, throw up a busy indicator for the user and run VACUUM in a background thread.
+
+This is the most common approach and the one developers and users dread.  For some people, this is simply unacceptable.
+
+When the application’s exiting, close or hide the UI but keep the process running as it vacuums the database.
+
+Some users will hate you for seeing a busy indicator on their drive light even though nothing appears to be running.  Since your application is technically executing and the database is locked, what do you do if the user turns around and re-runs your program?
+
+Leaving the UI on the screen is a possibility (with a busy indicator), but users will hate you for that too.  You’ll need to account for the variety of ways an application can be stopped, too.  You can count on users starting your program, but you can’t count on it being cleanly shut down every time.
+
+When a vacuum is required, ask the user if they want to do so.  (This is discussed in the Liferea blog post.)  Or, have a menu option or a button that launches VACUUM.  Instead of starting immediately, either approach could store some state that indicates VACUUM should run the next time the application starts (i.e. delayed startup).
+
+It seems fairly antiquated in 2015 to be asking the end-user a technical question about databases.  Although the delayed startup approach is generally hated, users do understand when an application says “Please wait while updating…”  (This often happens after a software upgrade, for example.)  Asking a user “Do you want to compact your database?” wasn’t even acceptable in the 1990s.  There may be an elegant way to do this, but I’m at a loss.
+
+Wait until the application (or system?) is idle, indicating the user is away from the machine, and launch VACUUM.  Another variation is to use a cron/at job that executes in the middle of the night.
+
+The user isn’t inconvenienced, but note that not all applications access their database solely due to user events, so “idle” may mean different things.  (For example, an email client, where mail may arrive at any time.)  You also need to deal with the situation where the user returns in the middle of a VACUUM.  As mentioned, I have yet to find a way to sanely cancel the command.
+
+As for cron or at jobs, most SQLite applications don’t deal well with separate processes modifying the database.  (If your program stores even a single rowid in memory between transactions, it’s one such application.)  The background job would probably need to abort if it detects the application is already running.  For applications people leave open all the time (again, an email client), that might be a problem.  And nightly jobs are not reliably launched on devices that are often sleeping, such as notebooks.
+
+Copy the database file and vacuum the duplicate in a background thread.  Since the application remains open and usable, track all subsequent database changes and apply them to the vacuumed database when it’s ready.
+
+This one was suggested in the comments section of the Liferea blog post and on Stack Overflow (I’ve lost the link to it, though).  This approach sounds like the best of all possible worlds: the operation happens in the background, the user is not notified or queried, and the application is not locked.  It’s also the hardest one to get right.
+
+First, remember that VACUUM already generates a copy of the database.  Even if the vacuumed file is one-half the size of the original, with this approach you have three copies on disk: the working database, the copy being vacuumed, and the final vacuumed version.  For my 2.7GB Geary file, that’s 2.7GB + 2.7GB + 1.4GB = 6.8GB, all for a process whose ultimate goal is to conserve disk space.  (The worst case?  8.1 gigabytes.)
+
+Second, copying an SQLite file is not without its cost.  It takes time to copy large files, and to do it right, you’ll need to block all writes to the source file while duplicating those bits.
+
+Third, there’s the rather large question of how to apply subsequent changes to the vacuumed database.  One approach is to walk every row in every table in both databases and apply detected changes.  That’s not a trivial algorithm to write (and don’t forget that rowids can be reassigned without INTEGER PRIMARY KEY).  Like copying the file, writes to the original database will need to be blocked while this is occurring.
+
+Another approach would be to journal all changes, but that opens up another can of worms: where to save this journal?  If it’s in memory, you risk losing the journal if the app crashes.  If on disk, is that in a new database, a special table in the original database, or neither?
+
+For both approaches, unless it’s completely generic, any change to the database’s schema or relations must be reflected in the synchronization/journaling code.
+
+This strategy seems rife with possibilities of data loss and maintenance headaches.  Writing a database synchronizer or an ad hoc journaling system for the occasional VACUUM seems a big pill to swallow.  I can’t advocate this approach for any project unless they can bring considerable resources to bear.
+
+SQLite offers auto_vacuum.  You might wonder why I didn’t mention this first.  After all, if SQLite will automatically vacuum the database, doesn’t that solve all the problems already discussed?  Not really.
+
+auto_vacuum has three modes: NONE (the default), FULL, and INCREMENTAL.  Like page_size, enabling or disabling auto_vacuum after creating tables requires rebuilding the entire database with VACUUM.  Thus, it’s worth pondering page_size and auto_vacuum (and write-ahead logging) before you start building your database.  (Note that you can switch between INCREMENTAL and FULL once auto_vacuum is in place.)
+
+When auto_vacuum=FULL is enabled, after each transaction SQLite moves freed pages to the end of the file and truncates them.  This is the magic “re-mapping” of rows I alluded to earlier.
+
+Unfortunately, FULL does not compact used pages, so re-mapping could actually worsen fragmentation.  If pages can be re-mapped after a transaction, they are, meaning you have no control over how often it occurs or how much time it takes.  That results in longer write and EXCLUSIVE lock times, especially important if your application relies on simultaneous transactions.
+
+The way I read SQLite’s documentation, if every transaction on a database is performed with FULL auto-vacuuming, at the end of each transaction there will be no free pages in a database file.  This could lead to a kind of thrashing, where successive transactions free pages, then allocate pages, then free pages, then allocate pages, and so on.
+
+INCREMENTAL is a potential solution to FULL’s shortcomings.  It only re-maps pages when you invoke PRAGMA incremental_vacuum.  The PRAGMA accepts a page count as an argument, meaning you can control how many pages are re-mapped at any one time.  This at least offers some degree of control over the vacuum process without locking the database for an indeterminate amount of time.  The fragmentation problem remains, however.  As I’ve never used INCREMENTAL, I can’t vouch for how much time it takes for SQLite to locate and move those free pages.  (Remember, pages aren’t really “moved,” they’re copied from one file offset to another file offset.)
+
+There’s a lot of confusion out there about auto_vacuum.  I suspect its name is the problem, which makes it sound like a full-blown alternative to VACUUM.  auto_compact or auto_release_pages would have been more appropriate.
+
+One auto_vacuum strategy would be to use auto_vacuum=FULL, eat the incurred write costs, and enjoy the disk savings while accepting potential performance degradation.
+
+Another would be to use auto_vacuum=INCREMENTAL and run incremental_vacuum when the free page ratio hits a certain cut-off point.  The maximum number of vacuumed pages could be capped to prevent long lock times.
+
+Another is to use INCREMENTAL and blindly run incremental_vacuum at each startup with a small page count to limit the amount of time it takes.  If the database file has a lot of free pages, this will chip away at them slowly over time without inconveniencing the user.  You could do something similar in a background idle thread.
+
+At the end of the day, I’ve yet to see a major application relying on SQLite that wasn’t worried about its performance.  If you go the auto_vacuum route and your application hits the database hard, updating it with a variety of blobs big and small, you probably need to VACUUM occasionally, if only to defragment the pages.  It doesn’t seem there’s any way around it.|||
+
