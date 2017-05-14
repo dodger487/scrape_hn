@@ -1,0 +1,77 @@
+This is a blog post about our latest paper, Get To The Point: Summarization with Pointer-Generator Networks, to appear at ACL 2017. The code is available here.
+
+The internet age has brought unfathomably massive amounts of information to the fingertips of billions – if only we had time to read it. Though our lives have been transformed by ready access to limitless data, we also find ourselves ensnared by information overload. For this reason, automatic text summarization – the task of automatically condensing a piece of text to a shorter version – is becoming increasingly vital.
+
+There are broadly two approaches to automatic text summarization: extractive and abstractive.
+
+The great majority of existing approaches to automatic summarization are extractive – mostly because it is much easier to select text than it is to generate text from scratch. For example, if your extractive approach involves selecting and rearranging whole sentences from the source text, you are guaranteed to produce a summary that is grammatical, fairly readable, and related to the source text. These systems (several are available online) can be reasonably successful when applied to mid-length factual text such as news articles and technical documents.
+
+On the other hand, the extractive approach is too restrictive to produce human-like summaries – especially of longer, more complex text. Imagine trying to write a Wikipedia-style plot synopsis of a novel – say, Great Expectations – solely by selecting and rearranging sentences from the book. This would be impossible. For one thing, Great Expectations is written in the first person whereas a synopsis should be in the third person. More importantly, condensing whole chapters of action down to a sentence like Pip visits Miss Havisham and falls in love with her adopted daughter Estella requires powerful paraphrasing that is possible only in an abstractive framework.
+
+In short: abstractive summarization may be difficult, but it’s essential!
+
+If you’re unfamiliar with Recurrent Neural Networks or the attention mechanism, check out the excellent tutorials by WildML, Andrej Karpathy and Distill.
+
+In the past few years, the Recurrent Neural Network (RNN) – a type of neural network that can perform calculations on sequential data (e.g. sequences of words) – has become the standard approach for many Natural Language Processing tasks. In particular, the sequence-to-sequence model with attention, illustrated below, has become popular for summarization. Let’s step through the diagram!
+
+In this example, our source text is a news article that begins Germany emerge victorious in 2-0 win against Argentina on Saturday, and we’re in the process of producing the abstractive summary Germany beat Argentina 2-0. First, the reads in the source text word-by-word, producing a sequence of . (There are arrows in both directions because our encoder is bidirectional, but that’s not important here).
+
+Once the encoder has read the entire source text, the begins to output a sequence of words that should form a summary. On each step, the decoder receives as input the previous word of the summary (on the first step, this is a special <START> token which is the signal to begin writing) and uses it to update the . This is used to calculate the , which is a probability distribution over the words in the source text. Intuitively, the attention distribution tells the network “where to look” to help it produce the next word. In the diagram above, the decoder has so far produced the first word Germany, and is concentrating on the source words win and victorious in order to generate the next word beat.
+
+Next, the attention distribution is used to produce a weighted sum of the encoder hidden states, known as the . The context vector can be regarded as “what has been read from the source text” on this step of the decoder. Finally, the context vector and the decoder hidden state are used to calculate the , which is a probability distribution over all the words in a large fixed vocabulary (typically tens or hundreds of thousands of words). The word with the largest probability (on this step, beat) is chosen as output, and the decoder moves on to the next step.
+
+The decoder’s ability to freely generate words in any order – including words such as beat that do not appear in the source text – makes the sequence-to-sequence model a potentially powerful solution to abstractive summarization.
+
+Unfortunately, this approach to summarization suffers from two big problems:
+
+: The summaries sometimes reproduce factual details inaccurately (e.g. Germany beat Argentina 3-2). This is especially common for rare or out-of-vocabulary words such as 2-0.
+
+: The summaries sometimes repeat themselves (e.g. Germany beat Germany beat Germany beat…)
+
+In fact, these problems are common for RNNs in general. As always in deep learning, it’s difficult to explain why the network exhibits any particular behavior. For those who are interested, I offer the following conjectures. If you’re not interested, skip ahead to the solutions.
+
+: The sequence-to-sequence-with-attention model makes it too difficult to copy a word w from the source text. The network must somehow recover the original word after the information has passed through several layers of computation (including mapping w to its word embedding).
+
+In particular, if w is a rare word that appeared infrequently during training and therefore has a poor word embedding (i.e. it is clustered with completely unrelated words), then w is, from the perspective of the network, indistinguishable from many other words, thus impossible to reproduce.
+
+Even if w has a good word embedding, the network may still have difficulty reproducing the word. For example, RNN summarization systems often replace a name with another name (e.g. Anna → Emily) or a city with another city (e.g. Delhi → Mumbai). This is because the word embeddings for e.g. female names or Indian cities tend to cluster together, which may cause confusion when attempting to reconstruct the original word.
+
+In short, this seems like an unnecessarily difficult way to perform a simple operation – copying – that is a fundamental operation in summarization.
+
+: Repetition may be caused by the decoder’s over-reliance on the decoder input (i.e. previous summary word), rather than storing longer-term information in the decoder state. This can be seen by the fact that a single repeated word commonly triggers an endless repetitive cycle. For example, a single substitution error Germany beat Germany leads to the catastrophic Germany beat Germany beat Germany beat…, and not the less-wrong Germany beat Germany 2-0.
+
+Our solution for Problem 1 (inaccurate copying) is the pointer-generator network. This is a hybrid network that can choose to copy words from the source via pointing, while retaining the ability to generate words from the fixed vocabulary. Let’s step through the diagram!
+
+This diagram shows the third step of the decoder, when we have so far generated the partial summary Germany beat. As before, we calculate an and a . However, we also calculate the , which is a scalar value between 0 and 1. This represents the probability of generating a word from the vocabulary, versus copying a word from the source. The generation probability is used to weight and combine the (which we use for generating) and the (which we use for pointing to source words ) into the final distribution via the following formula:
+
+This formula just says that the probability of producing word is equal to the probability of generating it from the vocabulary (multiplied by the generation probability) plus the probability of pointing to it anywhere it appears in the source text (multiplied by the copying probability).
+
+Compared to the sequence-to-sequence-with-attention system, the pointer-generator network has several advantages:
+
+In this way, the pointer-generator network is a best of both worlds, combining both extraction (pointing) and abstraction (generating).
+
+To tackle Problem 2 (repetitive summaries), we use a technique called coverage. The idea is that we use the attention distribution to keep track of what’s been covered so far, and penalize the network for attending to same parts again.
+
+On each timestep of the decoder, the coverage vector is the sum of all the attention distributions so far:
+
+In other words, the coverage of a particular source word is equal to the amount of attention it has received so far. In our running example, the coverage vector may build up like so (where yellow shading intensity represents coverage):
+
+Lastly, we introduce an extra loss term to penalize any overlap between the coverage vector and the new attention distribution :
+
+This discourages the network from attending to (thus summarizing) anything that’s already been covered.
+
+Let’s see a comparison of the systems on some real data! We trained and tested our networks on the CNN / Daily Mail dataset, which contains news articles paired with multi-sentence summaries.
+
+The example below shows the source text (a news article about rugby) alongside the reference summary that originally accompanied the article, plus the three automatic summaries produced by our three systems. By hovering your cursor over a word from one of the automatic summaries, you can view the attention distribution projected in yellow on the source text. This tells you where the network was “looking” when it produced that word.
+
+For the pointer-generator models, the value of the generation probability is also visualized in green. Hovering the cursor over a word from one of those summaries will show you the value of the generation probability for that word.
+
+Note: you may need to zoom out using your browser window to view the demo all on one screen. Does not work for mobile.
+
+Not by a long way! Though we’ve shown that these improvements help to tame some of the wild behavior of Recurrent Neural Networks, there are still many unsolved problems:
+
+I believe the most important direction for future research is interpretability. The attention mechanism, by revealing what the network is “looking at”, shines some precious light into the black box of neural networks, helping us to “debug” problems like repetition and copying. To make further advances, we need greater insight into what RNNs are learning from text and how that knowledge is represented.
+
+But that’s a story for another day! In the meantime, check out the paper for more details on our work.|||
+
+This is a blog post about our latest paper, Get To The Point: Summarization with Pointer-Generator Networks, to appear at ACL 2017. The code is available here.

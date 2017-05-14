@@ -1,0 +1,56 @@
+Modern web applications now use huge amounts of Javascript. Javascript is often given a bad rep because of its lack of strong typing, namespaces and many other features that would help keep a large project tidy and maintainable. Because of this, TypeScript, CoffeeScript and a few other languages have been made which generate Javascript, enforce type safety and provide other modern language features which help developers write cleaner code.
+
+Before we dive in, you can download the example project here. Or view it on GitHub here.
+
+Breaking down your large Javascript application into more manageable pieces like reusable classes/modules will help improve maintainability but typically Javascript on a webpage is loaded in a file at a time. Modern web browsers will try to load these files in asynchronously but are restricted by the number of connections to the same domain which is usually only 2 files per domain at a time. Now imagine your application has a few hundred individual Javascript files, this limitation starts to become really noticeable adding seconds of waiting time before your page is responsive.
+
+Enter Bundling! There are many different ways you can bundle your assets for distribution, the requirejs optimizer, webpack even MVC has built in support for bundling. Bundling assets together into a single massive bundle may seem like a good idea and for small applications it may be, but if you have a huge application, the last thing you want is a massive Javascript file which needs to be downloaded and parsed by the Javascript engine before your page becomes responsive. Instead you want to load just enough in the first bundle that you end up with a page that becomes responsive as soon as possible and doesn’t need to load many additional files.
+
+In the example above, we have gone from 40 js files down to 16 js files and from 419ms of loading to 140ms of loading.
+
+So, now that you know about the benefits of Javascript transpilers and the benefits of bundling, let’s put the pieces together. In this post we will be using TypeScript and requirejs as our AMD loader.
+
+While developers are working on adding features, they don’t want to have to worry about remembering to add new assets to bundles, the project structure should allow the devs to get on with their work and any new assets that they have created should ideally be added to the correct bundle at publish time.
+
+Let’s imagine we have a large single page application where different sections are loaded on demand. There could be a dashboard module which you see when you first login, then from the dashboard, clicking a link may load in a second or third module. Each of these modules uses knockout and jquery. Because we are using TypeScript we will make each plugin inherit an abstract base class.
+
+Let’s take a look at the project structure. We have a folder called “ts” this is where our TypeScript files will go. We have a folder called “lib” this is where any 3rd party Javascript packages will go that have been loaded in via bower in this scenario that will be knockout and jquery. Then finally we have a folder called “js” this is where our transpiled TypeScript will end up. Developers should never be editing anything in this folder. It’s important that we have our TypeScript files inside our webroot folder and not in the project root because when we press run, IISExpress will only serve files from within the wwwroot folder and we want to be able to access our TypeScript files (only at development time) via the web browser. When TypeScript creates the Javascript files, it also creates .js.map files. These files are loaded by your web browser’s dev tools to allow you to put breakpoints in your TypeScript files instead of having to trawl through generated Javascript files while debugging.
+
+In this scenario, the best bundling strategy would be to include the dashboard plugin, abstract base plugin, knockout and jquery in the main bundle, then have a separate bundle for each of the other plugins.
+
+So how do we go about creating these bundles? Visual Studio 2015 added support for Gulp as a first class feature. We are using Visual Studio 2017 here but the process is the same. Start by creating a file in the root of your project called gulpfile.js. Once you have created this file, a good place to start would be to take a basic example from here. You will then see these gulp tasks in your Task Runner Explorer window.
+
+I like to prepare my final files in a separate folder to keep the webroot folder clean and containing only the development files. Then publish this new dist folder. This also makes it harder to accidentally publish source files that you didn’t intend to publish. Let’s update the gulpfile to use a dist folder for the final output.
+
+So at this point we should be able to run our “min” task and we should get a dist folder with our minified Javascript all shoved into a single file called site.min.js. This isn’t ideal, so let’s have a look at how we can use requirejs optimizer to create multiple bundles. For this we will be using gulp-requirejs-optimize which basically wraps the requirejs optimizer.
+
+At runtime we need to configure requirejs to tell it what bundles each module is in. This is done by calling requirejs.config.
+
+Now, we could just create a separate gulp task to create each bundle and manually configure what is in each bundle in the gulpfile.js. But that would require that every developer working on the project have knowledge on how gulp works, the bundling strategy and just remember in general that every time they create a new file, they have to put it in a bundle or the project will fail when published. Instead we want to bundle by convention. The reason we created a Plugins folder and have a separate folder for each plugin within that folder is because the bundling convention we intend to use here is to create a separate bundle for each sub folder in the plugins folder and one main bundle containing everything else.
+
+This is where things get interesting. We can hook into the writing event of requirejsOptimize using the onBuildWrite function. This event is fired for each javascript file that is getting written out to the bundle. This means that we can return an empty string when it is trying to write a file that we don’t want in the current bundle.
+
+If we call requirejsOptimize for each bundle that we want to write we can exclude any modules that don’t match the convention, which will leave only the modules that we want in each bundle. Because we don’t want to include a module in a Plugin bundle that has already been included in the main bundle, we will need to run these requirejsOptimize tasks synchronously and keep track of what has been added to the main bundle to avoid including a module in multiple bundles. This also has the happy side effect of us having a list of which modules are in which bundles and we can use that information to generate a bundle.config.js file.
+
+As gulp tasks are run asynchronously, we will need to do all of the above in a single gulp task and use promises to ensure that they are run synchronously.
+
+This gulp task will run the main function, then the plugins function then the bundleConfig function in that order, every time. Let’s take a look at how we create the main bundle.
+
+In order to allow for new plugins that may be added in the future, we don’t want to hard code anything in the gulpfile, instead we will use fs to enumerate the folders in the plugins folder. Here is a helper function that we will use in our gulpfile
+
+Then we can use this in our plugins requirejsOptimize tasks.
+
+Notice how we aren’t starting with a gulp.src method here. We instead start with a file which is part of gulp-file and allows us to create a file from scratch rather than starting from any source files. We then pipe into it a call to requirejsOptimize but include our plugin’s entry point. This will cause requirejsOptimize to start from this plugin and add all of its dependencies to the bundle. In this scenario it would also include our abstract BasePlugin class, but that has been already included in our main bundle and we are checking if the module is in the main bundle before we add the current module to the current bundle.
+
+Finally let’s look at how we generate the bundle.config.js file.
+
+Again this uses file rather than gulp.src because we are creating this file from nothing. We simply stringify the bundles object we have been populating and wrap it with the requirejs.config call. To keep it simple, we have also added the require main function call which means that my index page points to the bundle.config.js as the entry point. But you could instead have this bundle.js.config information injected into the top of your main bundle and keep your main bundle as the entry point for the application.
+
+You should now have gone from this…
+
+And that’s it. We now have a project setup where any developer can create a new plugin or add new modules to an existing plugin and not have to worry about how things get bundled, then at publish time everything comes together and just works. While this plugin convention may work for some applications, it may not work for others, but bundling by some kind of convention rather than manual bundling will save you a lot of time in the long run, especially on larger projects.
+
+Feel free to use our TypeScript requirejs example project from GitHub as a starting point for your projects.
+
+Have fun guys, and if you got this far, thanks for reading!|||
+

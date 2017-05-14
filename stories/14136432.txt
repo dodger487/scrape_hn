@@ -1,0 +1,45 @@
+This Sunday, over 100 million viewers will watch the Super Bowl. Whether they’re catching the match-up between the Falcons and the Patriots, or there for the commercials between the action, that’s a lot of eyeballs—and that’s only counting America. But all that attention doesn’t just stay on the screen, it gets directed to the web, and if you’re not prepared curious visitors could be rewarded with a sad error page.
+
+The Super Bowl makes us misty-eyed because our first big flash sale happened in 2007, after the Colts beat the Bears. Fans rushed online for T-shirts celebrating the win, giving us a taste of what can happen when a flood of people convene on one site in a very short duration of time. Since then, we’ve been continually levelling up our ability to handle flash sales, and our merchants have put us to the test: on any given day, they’ll hurl Super Bowl-sized traffic, often without notice.
+
+My name is Emil Stolarsky and I work on the Performance and Capacity Planning team at Shopify. This series shares the problems we faced due to overwhelming traffic from flash sales and the thrifty (and nifty!) solution we created that allowed merchants to continue running sales without requiring a major overhaul of our platform.
+
+While not every company faces flash sales, many need to handle high-traffic events that can overload their system, and we hope this post provides inspiration for solutions that can be implemented with a small team and some elbow grease.
+
+One of the merchants who can cause sizeable traffic is Kylie Cosmetics, which sells lip kits created by Kylie Jenner of the Kardashian family. When Kylie joined Shopify, her sales took us by surprise, throwing more traffic than we reasonably expected. It became a pattern. Kylie announced a sale and placed new product on the site. Customers immediately logged on hoping to be fast enough to snag something into their carts. Items quickly sold out, sometimes in minutes. It happened again a week later and then another week later, and so on.
+
+The pounding waves of traffic arrived regularly—like having the chaos of a Black Friday sale online not every year but every seven or eight days—and tested the resiliency of our platform. And then, she figuratively broke the internet with her sale in February 2016 and took down not just her store, but all others on the database shard where her store was allocated. It made news. We needed a solution that would prevent another crash.
+
+One of Shopify’s secret weapons is our edge tier, which uses a combination of Nginx and OpenResty’s Lua module. This module integrates into Nginx’s event model allowing us to write Lua scripts which operate on requests and responses. This is especially powerful because it allows a small team of production engineers to have impact on the entire Shopify core Rails app without doing open heart surgery. It’s similar to a Rack middleware, but one that operates at the service level.
+
+To give you a taste, here’s an example Nginx (built with OpenResty’s Lua module) config adding a header with the time since epoch to responses:
+
+We’ve found this approach useful in many cases, including to build out an HTTP router to enable us to go multi-DC, to fanout requests across shards, and as a DDoS mitigation layer. The diagram below shows all the different entry points for Lua execution (a subject we’ll explore more in a future blog post).
+
+Faced with a limited time between flash sales, we chose to solve our load problem with Nginx, banking on our past experience with Nginx and Lua, and Nginx’s ability to handle high load. We needed to teach the Shopify platform a way of giving off back pressure when faced with too much traffic.
+
+Back pressure is a term from flow control theory: a boiler tank, for example, has a secondary vent to prevent an explosion. Similarly, when an application can’t handle anymore load, it informs the client in a user-friendly manner to hold off on sending additional requests. A common use case for this is rate limits. When an API is hit hard by a client, it’ll typically be throttled. The same was necessary here.
+
+Unlike for an API client however, a simple rate limit returning a 429 TOO MANY REQUESTS wasn’t an option. For customers anything that looked like the website crashing would be interpreted as such. We had to come up with something that kept with the customer experience.
+
+The new page informing customers they were waiting in queue.
+
+We developed a dynamic caching layer (also to be shared about in a future post): it helped but not enough. Checkout with its massive number of writes was still taking down segments of the platform. Past technical decisions that’d made sense then were haunting us in this situation: every checkout session created a new record in MySQL and, exacerbating that, every step in the flow modified that same record.
+
+The ideal solution would be a refactor of the entire checkout flow to condense the number of writes into one. The problem is such a project wouldn’t be feasible in time, especially since the next crippling sale was the following week. Going that direction would mean outages for sale upon sale, and the pain incurred while waiting for a full solution was too much to ask of merchants and their customers. We needed a short-term option that could bridge us until a refactor could happen.
+
+The solution we landed on was to throttle users using a leaky bucket algorithm built into our edge tier. You can think of a leaky bucket as a gatekeeper to your application that only lets a certain number of requests per period. Once you know how much load your app can handle, you set that as the limit; all requests after the limit are then rejected. The number of requests served would be reset every period (in our case, 5 seconds), and it was up to us to inform the client when to retry a rejected request.
+
+To keep a friendly customer experience, once the limit was hit, we redirected customers to a queue page rendered by Shopify, but cached in Nginx. The page informed customers they were in line to reach the checkout area. The design for the queue page was provided by the merchant, but we injected a Javascript snippet that constantly polled the `/checkout` endpoint. If users made it through the bucket, we’d assign them a securely signed cookie that let them skip the throttle for the rest of their session. For users with Javascript disabled, we use meta refresh.
+
+When the next sale hit, Shopify successfully handled the high load. As we were breathing a sigh of relief for the successful sale we noticed complaints on Twitter (which functions as a pretty good real-time customer-sentiment monitoring service). Users were upset about waiting on the queue page for up to 40 minutes—pretty unacceptable considering the sale itself was only 40 minutes.
+
+We quickly realized what had happened. Though we advertised to customers they were in a queue, in reality they were randomly polling the throttle. Since the polling was based on a random timeout, if you didn’t get past the throttle, you were essentially placed into a lottery with everyone else who hadn’t gotten through. If luck wasn’t on your side, your turn came too late to catch the sale.
+
+Our mistake had been underestimating the impact of not giving preference to customers who’d entered the queue at the beginning of the sale. We assumed that it might affect customers on the order of seconds, not an entire sale—with the unexpected result of random reselection meaning customers facing a sold out result. While the platform was protected, we couldn’t leave a solution that ruined the customer experience.
+
+In my next post, available here, I’ll share our solution to improve checkout throttle and the results after we implemented it. We needed to improve the customer experience, but still ensure the resiliency of our platform. It led us to build a stateless queue by drawing inspiration from control theory.
+
+Feel free to add comments or ask questions below. I’m looking forward to answering any questions about what we built, Nginx + OpenResty, or working at Shopify.|||
+
+This Sunday, over 100 million viewers will watch the Super Bowl. Whether they’re catching the match-up between the Falcons and the Patriots, or there for the co
