@@ -1,0 +1,65 @@
+The runtime topic of the .NET platform has been discussed for many times, while JIT itself, as well as a resulting code and interoperability with the execution environment, have not.
+
+We will explore a rationale for the lack of inheritance in structs, unbound delegate roots, as well as a technique of invoking any method without reflection.
+
+Structs in the .NET framework are plain old structures (in terms of layout, mutability, etc.). They support OOP and .NET, the inheritance from System.ValueType, which is derived from System.Object, etc.).
+
+To better understand why structs cannot be derived from other types, it is necessary to dig into CLR’s method organization.
+
+Instance-level methods have an implicit argument ‘this’, which is explicit indeed. While compiling a code, JIT creates the following signature:
+
+However, it is for reference types only.
+
+As for value types, it has the following signature:
+
+This is done to support mutability for structs, i.e. so that we can modify this pointer.
+
+So, why is it impossible to derive structs from other types?
+
+Suppose we have a virtual method of a base reference class. What should a compiler do in this case? Nothing. Constantly guessing and generating different code specializations (with either byval or byref semantics) in addition to vtable dispatch is ineffective. Also, we are adding boxing, which is required to correctly dispatch virtual method.
+
+But… the ToString, GetHashCode, and Equals methods are virtual methods of the parent System.Object class (a reference type).
+
+They are exceptions. JIT knows about them and generates binding and specialization only for these methods.
+
+Reflection in the .NET framework allows us to create a delegate for both static and instance-level methods. However, there is a small issue – it is necessary to create a new delegate per object’s instance.
+
+Consider the example:
+
+In order to do this, you need to use unbound delegates. However, they have one feature – a different signature, where an additional argument is prepended – a reference to an instance.
+
+Thus, unbound delegates are the references to a real method.
+
+As you can see, the Add(int secondOperand) signature will turn into the Add(Calc this, int secondOperand) signature.
+
+Now declare the Calc type as struct and run the code again. ArgumentException would be thrown.
+
+But we need to pass this byref argument to Func<Calc,int,int>.
+
+How to do this?!
+
+Now, change the code again:
+
+As you can see, the application will exit with NullReferenceException when calling CallTest().
+
+Well, let’s fix this situation by running ildasm.
+
+Open the stored file msiltricks_patch.il in any text editor and find a body of the CallTest method:
+
+Delete the IL_0001: isinst MSILTricks.Program line, i.e. isinst operator invocation (the as operator in C#).
+
+The same should be done to the CallTestWithExlicitCasting method:
+
+Delete the IL_0001: castclass MSILTricks.Program line, i.e. castclass operator invocation (the cast operator in C#).
+
+Thus, there are no exceptions, even AccessViolationException.
+
+The thing is that our Test method does not have side effects and does not use this in its body.
+
+We work with hardware. Variables of reference types are just addresses in memory – DWORD. Casting types is nothing more than abstraction and protection at the compile time. The CPU works with memory addresses only. CLR provides these addresses while JIT compiles code using them.
+
+By the way, callvirt instruction does not check for correctness of an object. For example, to get AccessViolationException just add a virtual method to the Program class and call it in the Test method’s body.
+
+Age of JIT compilation. Part 2. CLR is watching you|||
+
+This article describes the lack of inheritance in structs, unbound delegates, as well as a technique of invoking any methods without reflection

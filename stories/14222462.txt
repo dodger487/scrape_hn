@@ -1,0 +1,38 @@
+I mentioned that we are doing some work to enable de-virtualization of our code, as well as getting ready for CoreCLR changes that will get the JIT to do more de-virtualization.
+
+I was asked (by Maayan) about this, more specifically:
+
+And the answer is that Maayan is correct, C# is defined (for various reasons related to ECMA approval process over 15 years ago) to always dispatch methods using CallVirt. But CallVirt is an IL instruction, not an assembly one.
+
+Here is some code for various code, as well as the relevant assembly being generated for it (CoreCLR 1.1, X64, Release). Don’t worry about the assembly, I have detailed explanations below for each part.
+
+This is pretty simple (non inlined) set of methods that are just there to make sure that you can see what ends up actually running. The actual method just end up calling Console.WriteLine, but that is about it.
+
+Now, let us inspect each of those behaviors one at a time, first let us look at how an interface dispatch work.
+
+If you want the gory details, you can look for those  in the Book of the Runtime. But basically, we are jumping to a code location that will find the proper code that we need to execute. Note that there is still additional work there to actually route the method to the appropriate place, which is hidden from us by the runtime, JIT, etc.
+
+Note that the funny cmp method there? It is there to generate a dereference of the address by the CPU, which will cause it raise a trap if the address is invalid, and if the address is 0, the CLR will convert that to a NullReferenceException.
+
+Now, what about a virtual method call? That is actually simpler, since is it similar to how I learned it when I worked with C++.
+
+Basically, at the end of the object we have a method table pointer, and we dereference that, and then another pointer to the specific method we want to invoke. Part of the reason that virtual calls are expensive is exactly this, we have to jump around in memory a lot, and that means that we both have to issue more instructions, and more to the point, we have to touch a lot more memory, which can can cause cache lines to be evicted, forcing us to stall.
+
+What about a struct method call? To make things easier, I made sure that it couldn’t be inlined, which generated:
+
+In this case, I’m using an empty struct, so it has as much size as a pointer, which is why you can see it being passed around like it was just a pointer. If I had a bigger struct, I would see very different code.
+
+Why is the code simpler when the struct is bigger? Well, the answer is quite simple, we are looking at the actual method that was called with this parameter, but the job of actually sending the parameter is done by the caller, so we aren’t seeing it here.
+
+What is going on is that as long as your struct is empty or have a single value that is an 4 / 8 bytes long, the CLR can optimize that to be a regular parameter, making it effectively free. In such cases, you can see the struct being passed around in registers (the struct itself, since it is copied, not the address to it).
+
+However, if you have a struct that is composed of multiple fields, that require us to copy each field to the stack before call, which on large stacks can take a bit.
+
+I mentioned that this was done with a struct that we disabled inlining for, what happens if we allow inlining (the default)?
+
+This looks completely different then anything we have seen so far. And in fact, it is. What we are seeing here is the result of inlining the struct method invocation. Because the compiler was able to figure out what the end target of the call is, and because it is small enough to be inlined, we can skip calling the method entirely and just directly run the code.
+
+As it turns out, this can have dramatic affect on performance (on both directions, mind), and something that you need to carefully consider when you analyze your application performance.
+
+But the short of it is, the fewer jumps and dereferences we have, the better it is for us. And you can see the various methods (pun intended) that the CLR uses to dispatch them. In my next post, I’ll talk about how we can make use of this behavior.|||
+

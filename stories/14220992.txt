@@ -1,0 +1,62 @@
+One of the more interesting classes of security vulnerabilities are those affecting interoperability technology. This is because these vulnerabilities typically affect any application using the technology, regardless of what the application actually does. Also in many cases they’re difficult for a developer to mitigate outside of not using that technology, something which isn’t always possible.
+
+I discovered one such vulnerability class in the Component Object Model (COM) interoperability layers of .NET which make the use of .NET for Distributed COM (DCOM) across privilege boundaries inherently insecure. This blog post will describe a couple of ways this could be abused, first to gain elevated privileges and then as a remote code execution vulnerability.
+
+// Register COM class with COM services.
+
+A client can now connect to the COM server using it’s CLSID (defined by the ). This is in fact so simple to do that a large number of core classes in .NET are marked as COM visible and registered for use by any COM client even those not written in .NET.
+
+To make this all work the .NET runtime hides a large amount of boilerplate from the developer. There are a couple of mechanisms to influence this boilerplate interoperability code, such as the attribute which defines whether the COM interface is derived from but for the most part you get what you’re given.
+
+We can enumerate what interfaces are exposed by the CCW. Taking as an example the following table shows what interfaces are supported along with how each interface is implemented, either dynamically at runtime or statically implemented inside the runtime.
+
+interface refers to the COM visible representation of the class which is the root of all .NET objects, it must be generated dynamically as it’s dependent on the .NET object being exposed. On the other hand is implemented by the runtime itself and the implementation is shared across all CCWs.
+
+The second issue was more subtle and is a byproduct of a feature of .NET interop which presumably no-one realized would be a security liability. Loading the .NET runtime requires quite a lot of additional resources, therefore the default for a native COM client calling methods on a .NET COM server is to let COM and the CCW manage the communication, even if this is a performance hit. Microsoft could have chosen to use the COM marshaler to force .NET to be loaded in the client but this seems overzealous, not even counting the possibility that the client might not even have a compatible version of .NET installed.
+
+Both steps 2 and 3 sound like a bad idea. For example while in 2 the per-runtime GUID can’t be guessed; if you have access to any other object in the same process (such as the COM object exposed by the server itself) you can call on the object and replay the GUID and AppDomain ID back to the server. This doesn’t really gain you much though, the CCW value is just a number not a pointer so at best you’ll be able to extract objects which already have a CCW in place.
+
+How can we get a COM server written in .NET to do the arbitrary deserialization? We need the server to try and create an RCW for a serializable .NET object exposed over COM. It would be nice if this could also been done generically; it just so happens that on the standard interface there exists a function we can pass an arbitrary object to, the is to compare two objects for equality. If we pass a .NET COM object to the server’s method the runtime must try and convert it to an RCW so that the managed implementation can use it. At this point the runtime wants to be helpful and checks if it’s really a CCW wrapped .NET object. The server runtime calls which results in arbitrary deserialization in the server process.
+
+Finding a new instance of the bug class focussed my mind on its other implications. The first thing to stress is the server itself isn’t vulnerable, instead it’s only when we can force the server to act as a DCOM client calling back to the attacking application that the vulnerability can be exploited. Any .NET application which calls a DCOM object through managed COM interop should have a similar issue, not just servers. Is there likely to be any common use case for DCOM, especially in a modern Enterprise environment?
+
+My immediate thought was Windows Management Instrumentation (WMI). Modern versions of Windows can connect to remote WMI instances using the WS-Management (WSMAN) protocol but for legacy reasons WMI still supports a DCOM transport. One use case for WMI is to scan enterprise machines for potentially malicious behavior. One of the reasons for this resurgence is  Powershell (which is implemented in .NET) having easy to use support for WMI. Perhaps PS or .NET itself will be vulnerable to this attack if they try and access a compromised workstation in the network?
+
+At this point we could jump straight into RE of the .NET and PS class libraries, but there’s an easier way. It’s likely we’d be able to see whether the .NET client queries for by observing the DCOM RPC traffic to a WMI server. Wireshark already has a DCOM dissector saving us a lot of trouble. For a test I set up two VMs, one with Windows Server 2016 acting as a domain controller and one with Windows 10 as a client on the domain. Then from a Domain Administrator on the client I issued a simple WMI PS command ‘ ’ while monitoring the network using Wireshark. The following image shows what I observed:
+
+If we successfully injected a serialized stream then we’d expect the PS process to try and lookup a file and using Process Monitor that’s exactly what we find.
+
+When exploiting the deserialization for local privilege escalation we can be sure that we can connect back to the server and run an arbitrary delegate. We don’t have any such guarantees in the RCE case. If the WMI client has default Windows Firewall rules enabled then we almost certainly wouldn’t be able to connect to the RPC endpoint made by the delegate object. We also need to be allowed to login over the network to the machine running the WMI client, our compromised machine might not have a login to the domain or the enterprise policy might block anyone but the owner from logging in to the client machine.
+
+We therefore need a slightly different plan, instead of actively attacking the client through exposing a new delegate object we’ll instead pass it a byte stream which when deserialized executes a desired action. In an ideal world we’d find that one serializable class which just executes arbitrary code for us. Sadly (as far as I know of) no such class exists. So instead we’ll need to find a series of “Gadget” classes which when chained together perform the desired effect.
+
+The only weird thing about this code is . It’s a long standing issue that .NET delegates don’t always enforce their type signature, especially the return value. In this case we create a two entry multicast delegate (a delegate which will run multiple single delegates sequentially), setting one delegate to which returns an int, and another to which returns an instance of the class. This works, even when deserialized and invokes the two separate methods. It will then return the created process object as an integer, which just means it will return the pointer to the instance of the process object. So we end up with chain which looks like the following:
+
+While this is a pretty simple chain it has a couple of problems which makes it less than ideal for our use:
+
+So we’ll need to find something better. We want something which works at a minimum on .NET 3.5, which would be the version on Windows 7 which Windows Update would automatically update you to. Also it shouldn’t rely on undefined behaviour or loading our code from outside of the DCOM channel such as over a HTTP connection. Sounds like a challenge to me.
+
+class seems to work almost too well. This class totally destroys any hope of securing an untrusted stream and it’s available from .NET 3.0. Any class which didn’t mark itself as serializable is now a target. It’s going to be pretty easy to find a class which while invoke an arbitrary delegate during deserialization as the developer will not be doing anything to guard against such an attack vector.
+
+Now just to choose a target to build out our deserialization chain. I could have chosen to poke further at the Workflow classes, but the API is horrible (in fact in .NET 4 Microsoft replaced the old APIs with a new, slightly nicer one). Instead I’ll pick a really easy to use target, Language Integrated Query (LINQ).
+
+LINQ was introduced in .NET 3.5 as a core language feature. A new SQL-like syntax was introduced to the C# and VB compilers to perform queries across enumerable objects, such as Lists or Dictionaries. An example of the syntax which filters a list of names based on length and returns the list uppercased is as follows:
+
+The methods such as take two parameters, a list object (this is hidden in the above example) and a delegate to invoke for each entry in the enumerable list. The delegate is typically provided by the application, however there’s nothing to stop you replacing the delegates with system methods. The important thing to bear in mind is that the delegates are not invoked until the list is enumerated. This means we can build an enumerable list using LINQ methods, serialize it using the (LINQ classes are not themselves serializable) then if we can force the deserialized list to be enumerated it will execute arbitrary code.
+
+Using LINQ as a primitive we can create a list which when enumerated maps a byte array to an instance of a type in that byte array by the following sequence:
+
+The only non-obvious part of the C# implementation is the delegate for . What we need is a delegate which takes an is an instance method the default would be to capture the class and store it inside the delegate object, which would result in a delegate which took no parameters and returned a list of . We can get around this by using the reflection APIs to create an open delegate to an instance member. An open delegate doesn’t store the object instance, instead it exposes it as an additional parameter, exactly what we want.
+
+With our enumerable list we can get the assembly loaded and our own code executed, but how do we get the list enumerated to start the chain? For this decided I’d try and find a class which when calling (a pretty common method) would enumerate the list. This is easy in Java, almost all the collection classes have this exact behavior. Sadly it seems .NET doesn't follow Java in this respect. So I modified my analysis tools to try and hunt for gadgets which would get us there. To cut a long story short I found a chain from through three separate classes. The chain looks something like the following:
+
+The key is passed to within the values array as well as a reference to a resource string. The resource string is looked up and along with the key passed to . The resulting resource string has formatting codes so when encounters the non-string value it calls on the object to format it. This results in being called during deserialization kicking off the chain of events which leads to us loading an arbitrary .NET assembly from memory and executing code in the context of the WMI client.
+
+Microsoft fixed the RCE issue by ensuring that the classes never directly creates an RCW for a WMI object. However this fix doesn’t affect any other use of DCOM in .NET, so privileged .NET DCOM servers are still vulnerable and other remote DCOM applications could also be attacked.
+
+Also this should be a lesson to never deserialize untrusted data using the .NET class. It’s a dangerous thing to do at the best of times, but it seems that the developers have abandoned any hope of making secure serializable classes. The presence of effectively means that every class in the runtime is serializable, whether the original developer wanted them to be or not.
+
+And as a final thought you should always be skeptical about the security implementation of middleware especially if you can’t inspect what it does. The fact that the issue with
+
+is designed in and hard to remove makes it very difficult to fix correctly.|||
+

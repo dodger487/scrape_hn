@@ -1,0 +1,47 @@
+Crowbar is a tool that combines afl-persistent’s instrumentation with quickcheck-like property-based testing. afl-fuzz is a great tool for detecting crashes, but Crowbar helps us go a step farther and automatically discover inputs which cause our program to no longer have the properties we expect it to have.
+
+For reasons that don’t need exploring at this juncture, I first thought to apply Crowbar to charrua-client, a library which implements the DHCP state machine from a client perspective. Code snippets below are taken from the dhcp directory in my somerandompacket repository on GitHub.
+
+which can then be used by a specific implementation that sends packets and manages timeouts. With Crowbar, we can randomize the parameters to these functions, and make sure that the properties we expect still hold.
+
+In order to do much with the code above, we’ll need to get a , and the only way to do that is via , which needs a (six bytes corresponding to a MAC address) and a (a list of DHCP options to request in the initial message). To start with, we can write a Crowbar generator for a , a generator for s, and use those as arguments to :
+
+Given and generators, we can then use to get a client and a suggested first message. We can check to see whether the message asks for the option codes as we expect:
+
+The generators for are fairly complicated because nearly all possible option types are handled — if you’re interested, you can see generators.ml in the source repository for the code discussed here.
+
+To construct more tests for charrua-client in Crowbar, it’s necessary to think about the properties a client should have. Here are some simpler ones:
+
+A troublesome feature of code which includes a state machine is some dependency on state. Since the client’s reaction to various inputs is not purely expressed by the code and the input alone, but is also a function of the current state (and therefore the set of previously-sent input which was accepted), it’s helpful for us to include tests which get the client into various states. Then we can quickly discover new paths, rather than having to wait for the fuzzer to discover sets of input which result in them from the initial state. (When using , this is commonly done by including examples of input which advance the state machine in the directory, so that ’s mutation of the input begins from an “interesting” point.)
+
+Notably, the in our module is abstract, and no interface to the current state of the client is exposed. A user of the module can only find out whether a client has a lease or doesn’t, and what to do in response to input. It’s tempting to expose the state directly for easier testing (e.g., “after calling with a packet, the state is ”), but that information isn’t necessary to expose in common use — we want our library to make the right decisions, not to punt them to the user. Instead, we can use “generates a new response or notes a new valid lease” as a proxy for “changed state”.
+
+We also want to make an assertion about the client: that given a server that responds “reasonably” to client requests, the client’s state also advances as we’d expect it to. In more concrete terms, we want to assert that usually, the following conversation happens:
+
+and that when the client hears , it notes that it now has a valid lease and exposes this information to any caller.
+
+In other words, the test we want to write is:
+
+In order to write such a test, we need to have some “reasonable” server. Luckily, the module in exposes the configuration record, so we can automatically generate one in Crowbar:
+
+As a precondition for the test we’d actually like to write, it’s sensible to write a more basic one first:
+
+which looks like this:
+
+and once this passes, we can do something more complicated:
+
+is, at its heart, a fairly simple wrapper around . In particular, mostly exposes interfaces which deal with input and output in terms of (which is a ), but itself immediately calls on the supplied to , and similarly calls on a constructed just before returning a . Several of the tests above hinted at inconsistent behavior in and , so perhaps some direct testing is warranted.
+
+is exposed in ’s public interface, so we can write a generator for s. (The generator for s is quite a bit more involved than any of the generators above, as it also includes reference to a generator for s, a type with over 100 variants.)
+
+A common test for sets of functions like and is to see whether the is the same after being serialized and then deserialized. Hopefully, a round-trip through and won’t gain or lose any information.
+
+The full test suite includes a few more tests which are less visually interesting (or too long to reproduce here!).
+
+A number of these bugs would have had bad implications had they been in a program written in a language that wasn’t memory safe.
+
+After my experiences with charrua-core’s predecessor, I was very impressed by how hard I had to try to find bugs in . I was additionally impressed by how easy it was to fix said bugs once I had discovered them — generally it took only minutes or tens of minutes to discover and isolate the problem, and the fix was fairly obvious. I would caution against concluding that is a low-quality library based on these findings; it is very hard to write software that doesn’t have any bugs. If you think you’ve done so, I recommend seeing whether Crowbar agrees!
+
+Thanks to Stephen Dolan for Crowbar, Christiano Haesbaert and Gina Maini for charrua-core, and to Thomas Leonard and Hannes Mehnert for comments on this post.|||
+
+Crowbar is a tool that combines afl-persistent’s instrumentation with quickcheck-like property-based testing. afl-fuzz is a great tool for …

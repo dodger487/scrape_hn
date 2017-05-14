@@ -1,0 +1,53 @@
+From developers to operations, teams often struggle with lack of visibility in key areas. Even if an application or process is already well instrumented, additional instrumentation may be required to diagnose specific conditions that were previously unknown.
+
+This story plays out often in post-mortems: the team notices a problem, forms a hypothesis, instruments related code, corrects hypothesis based on the data, deploys a fix, and confirms the application behavior has improved.
+
+Sometimes a problem occurs not in the application itself, but in a hard to reach area like a datastore or legacy component that is relatively difficult to instrument. Often the existing application instrumentation can hint at a problem, but provides only indirect metrics.
+
+In this post, I'll show how we at Rocana have applied some creativity and lightweight StatsD instrumentation to directly diagnose a performance bottleneck in our flagship product, Rocana Ops.
+
+Let’s get started with a bit of background. Rocana Ops includes several components that read events from Apache Kafka, which are termed consumers.
+
+One of these components is our metadata consumer, which gathers metadata about events (such as their host, location, and service) and stores this metadata in Postgres.
+
+Recently, we rewrote the metadata consumer component to improve scalability as the number of event sources increased. This effort was largely successful – the metadata consumer processed a higher number of events per second, batched updates drastically reduced the number of transactions per second in Postgres, and adding more threads provided an almost linear increase in capacity.
+
+Unfortunately, while the changes were well-suited to smaller environments, larger environments with millions of distinct, active event sources produced much more IO activity on Postgres. The previous implementation utilized Hibernate’s second level cache to avoid sending rows to Postgres that it knew already existed. Due to the nature of batch updates in the new implementation, we couldn’t make use of the same Hibernate facility because the batch updates bypassed the second level cache.
+
+The primary symptom of the problem in these large environments was the size of Postgres WAL (Write-Ahead Logging) updates, which were much higher than before and led to significantly higher IO activity.
+
+While the new metadata consumer implementation was definitely causing the increase in WAL activity, the SQL INSERT and UPDATE commands issued by the metadata consumer only control the WAL indirectly by table update activity. We had no direct control or visibility into this process.
+
+Because of this lack of visibility, it was difficult to concretely measure how much WAL activity was actually happening, and therefore doubly difficult to confirm how any code changes to the metadata consumer would affect the WAL.
+
+While newer versions of Postgres collect statistics about WAL activity through the pg_stat_archiver view, the data provided is somewhat limiting for the needs of our customers. When measuring the WAL activity, we would only know the total number of WAL files successfully archived and would need to constantly poll the archived_count and last_archived_wal fields to reliably know when WAL files were archived. It's certainly possible, but requires keeping state and running a process that polls the database, which is less than ideal.
+
+StatsD is a lightweight, text-based protocol for metrics. Supported by the Rocana Agent, we can easily signal WAL activity as it occurs for display in Rocana Ops dashboards.
+
+To do this, we make use of the Postgres configuration option archive_command. The command provided here is invoked each time Postgres archives a WAL file, and is likely already used in a production setting where WAL files are shipped off for point-in-time and disaster recovery purposes.
+
+archive_command can be set to a shell script from postgresql.conf. In this case we’ll use a bash script:
+
+The pg_archive.sh file should be readable and executable by the postgres user. Inside the script we can form our StatsD metric:
+
+Typically this script would copy the WAL segment file to a backup location as desired, but that’s another topic for another blog post.
+
+In this case, we write the StatsD metric named postgres.archive_command.count with a value of 1 and type counter to UDP port 8125 on the local system where a Rocana Agent is listening. We use the net-redirection capability provided by the bash shell, but netcat or similar tooling could do the same. Note that the metric name, value, and type is arbitrary; StatsD allows us to create new metrics on the fly without registration, and we’re also free to instrument other aspects of the script. At this point, we’re only interested in the total number of WAL archives performed, so this will serve our purpose.
+
+With this instrumentation in place, we could now iterate on the metadata consumer code and determine the exact impact our changes will have on the WAL.
+
+Indeed, after reevaluating some assumptions on how the metadata consumer inserts new records and manually caching records through ehcache, the resulting Rocana Ops dashboard showed much better WAL behavior:
+
+In the stacked dashboard above, the currently released implementation is in blue, and the new caching changes in yellow.
+
+When starting from an empty database, both implementations show similar amounts of WAL activity – about 30 archives per minute. Once database and cache have been populated, the currently released metadata consumer continues with roughly the same amount of WAL activity, while the caching implementation is especially light on Postgres, allowing us to scale to even more data sources. Success!
+
+In this case, lightweight StatsD instrumentation helped our development team gain critical insight into code changes that ensured the best performance in large environments. In addition, we gained specific, direct instrumentation of Postgres WAL archives that application instrumentation couldn’t expose.
+
+StatsD metrics are often integrated directly into applications. But as shown, they can be emitted from unconventional places and in an ad-hoc manner such as other databases, cron jobs, legacy processing tools, long-running scripts, and anywhere else you can imagine. While the presented technique isn’t a good solution in every case, a little instrumentation creativity combined with some hard metrics can produce extremely valuable insights.
+
+Armed with these metrics, teams can gain visibility into many aspects of their infrastructure. Businesses gain greater team productivity, reduced time to issue resolution, and greater confidence that problems are resolved the first time around.
+
+Best of all, the Rocana Agent natively supports StatsD, so Rocana Ops can help you maintain StatsD metrics in full fidelity for years to come. That’s the kind of total visibility firepower we’re proud to bring to our customers every day.|||
+
+Even if an application or process is already well instrumented, additional instrumentation may be required to diagnose specific conditions. In this post, I'll show how we at Rocana have applied some creativity and lightweight StatsD instrumentation to directly diagnose a performance bottleneck in our flagship product, Rocana Ops.

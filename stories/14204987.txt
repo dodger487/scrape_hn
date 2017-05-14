@@ -1,0 +1,73 @@
+Using microservices to solve real-world problems always involves more than simply writing the code. You need to test your services. You need to figure out how to do continuous deployment. You need to work out clean, elegant, resilient ways for them to talk to each other.
+
+A really interesting tool that can help with the “talk to each other” bit is Lyft’s Envoy.
+
+Lyft Envoy is a modern, high performance, small footprint edge and service proxy. Envoy adds resilience and observability to your services, and it does so in a way that’s transparent to your service implementation. It might feel odd to see us call out something that identifies itself as a proxy – after all, there are a ton of proxies out there, and the 800-pound gorillas are NGINX and HAProxy, right? Here’s some of what’s interesting about Envoy:
+
+Envoy is also extensible in some fairly sophisticated — and complex — ways, but we’ll dig into that later — possibly much later. For now we’re going to keep it simple. (If you’re interested in more details about Envoy, Matt Klein gave a great talk at the 2017 Microservices Practitioner Summit.)
+
+Being able to proxy any TCP protocol, including using SSL, is a pretty big deal. Want to proxy Websockets? Postgres? Raw TCP? Go for it. Also note that Envoy can both accept and originate SSL connections, which can be handy at times: you can let Envoy do client certificate validation, but still have an SSL connection to your service from Envoy.
+
+Of course, HAProxy can do arbitrary TCP and SSL too — but all it can do with HTTP/2 is forward the whole stream to a single backend server that supports it. NGINX can’t do arbitrary protocols (although to be fair, Envoy can’t do e.g. FastCGI, because Envoy isn’t a web server). Neither open-source NGINX nor HAProxy handle service discovery very well (though NGINX Plus has some options here). And neither has quite the same stats support that a properly-configured Envoy does.
+
+Overall, what we’re finding is that Envoy is looking promising for being able to support many of our needs with just a single piece of software, rather than needing to mix and match things.
+
+While I said that Envoy is less of a nightmare to set up than some other things I worked with, you’ll note that I didn’t say it was necessarily easy. Envoy’s learning curve is a bit steep at first, and it’s instructive to look at why.
+
+Let’s say you want to write an HTTP network proxy. There are two obvious ways to approach this: work at the level of HTTP, or work at the level of TCP.
+
+At the HTTP level, you’d read an entire HTTP request off the wire, parse it, look at the headers and the URL, and decide what to do. Then you’d read the entire response from the back end, and send it to the client. This is an OSI Layer 7 (Application) proxy: the proxy has full knowledge of what exactly the user is trying to accomplish, and it gets to use that knowledge to do very clever things.
+
+The downside is that it’s complex and slow  – think of the latency it’s introducing reading and parsing the entire request before making any decisions! Worse, sometimes the highest-level protocol simply doesn’t have the information that you need for your decisions. A good example of this is SSL: before the SRI extension was added, the SSL client would never state which host it was trying to connect to — so although HTTP servers handled virtual hosts just fine (with the HTTP/1.1 header), as soon as SSL was involved you had to dedicate an IP address to your server, because a layer 7 proxy simply didn’t have the information needed to proxy SSL correctly.
+
+So maybe a better choice is operating down at the TCP level: just read and write bytes, and use IP addresses, TCP port numbers, etc., to make your decisions about how to handle things. This is an OSI Layer 3 (Network) or Layer 4 (Transport) proxy, depending on who you talk to. We’ll borrow from Envoy’s terminology and call it a Layer 3/4 proxy.
+
+Things can be very fast in this model, and certain things become very elegant and simple (see our SSL example above). On the other hand, suppose you want to proxy different URLs to different back ends? That’s not possible with the typical L3/4 proxy: higher-level application information isn’t accessible down at these layers.
+
+Envoy deals with the fact that both of these approaches have real limitations by operating at layers 3, 4, and 7 simultaneously. This is extremely powerful, and can be very performant… but you generally pay for it with configuration complexity.
+
+The challenge is to keep simple things simple while allowing complex things to be possible, and Envoy does a tolerably good job of that for things like HTTP proxying.
+
+The next bit that’s a little surprising about Envoy is that most applications involve two layers of Envoys, not one:
+
+Note that you could, of course, only use the edge Envoy, and dispense with the service Envoys. However, with the full mesh, the service Envoys can do health monitoring and such, and let the mesh know if it’s pointless to try to contact a down service. Also, Envoy’s statistics gathering works best with the full mesh (more on that in a separate article, though).
+
+All the Envoys in the mesh run the same code, but they are of course configured differently… which brings us to the Envoy configuration file.
+
+Envoy’s configuration starts out looking simple: it consists primarily of listeners and clusters.
+
+A listener tells Envoy a TCP port on which it should listen, and a set of filters with which Envoy should process what it hears. A cluster tells Envoy about one or more backend hosts to which Envoy can proxy incoming requests. So far so good. There are two big ways that things get much less simple, though:
+
+Since we’ve been talking about HTTP proxying, let’s continue with a look at the filter. This filter operates at layer 3/4, so it has access to information from IP and TCP (like the host and port numbers for both ends of the connection), but it also understands the HTTP protocol well enough to have access to the HTTP URL, headers, etc., both for HTTP/1.1 and HTTP/2. Whenever a new connection arrives, the uses all this information to decide which Envoy cluster is best suited to handle the connection. The Envoy cluster then uses its load balancing algorithm to pick a single member to handle the HTTP connection.
+
+The filter configuration for is a dictionary with quite a few options, but the most critical one for our purposes at the moment is the array, which defines how exactly the filter will make routing decisions. Each element in the array is a dictionary containing the following attributes:
+
+Each route dictionary needs to include, at minimum:
+
+All of this means that the simplest case of HTTP proxying — listening on a specified port for HTTP, then routing to different hosts depending on the URL — is actually pretty simple to configure in Envoy.
+
+An example: to proxy URLs starting with to a cluster named , and URLs starting with to a cluster named , you could use:
+
+That’s it. Note that we use to indicate that we don’t much care which host is being requested, and also note that we can add more routes as needed. Finally, this listener configuration is basically the same between the edge Envoy and service Envoy(s): the main difference is that a service Envoy will likely have only one route, and it will proxy only to the service on localhost rather than a cluster containing multiple hosts.
+
+Of course, we would still need to define the and clusters referenced in the section above. We do this is in the configuration section, which is also a dictionary and also has one critical component, called . Its value is, again, an array of dictionaries:
+
+The possible values for are:
+
+And the possible values for are:
+
+One interesting note about load balancing: a cluster can also define a panic threshold where, if the number of healthy hosts in the cluster falls below the panic threshold, the cluster will decide that the health-check algorithm is broken, and assume all the hosts in the cluster are healthy. This could lead to surprises, so it’s good to be aware of it!
+
+A simple case for an edge Envoy might be something like
+
+Since we’ve marked this cluster with type , we’ll rely on finding and in the DNS, and we’ll assume that any new service instances coming up will be added to the DNS — this is probably appropriate for something like a setup using , for example. For a service Envoy (say for ), we might go a more direct route:
+
+Same idea, just a different target: rather than redirecting to some other host, we always go to our service on the local host.
+
+So that’s the ten-thousand-foot view of Envoy, plus a bit of a dive down into Envoy’s background and configuration. Next up, we’ll tackle actually deploying a simple application using Kubernetes, Postgres, Flask, and Envoy, and watch how things go as we scale it up and down. Stay tuned.
+
+We’ll be publishing more articles on Envoy and microservices in the Microservices Architecture Guide in the near future. If you’re looking into Envoy for microservices, we’d love to exchange notes.
+
+We’re happy to help! Look for answers in the rest of the Microservices Architecture Guide, join our Gitter chat, send us an email at hello@datawire.io, or contact our sales team.|||
+
+Getting started with Lyft Envoy for microservices resilience

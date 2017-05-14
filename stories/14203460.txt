@@ -1,0 +1,71 @@
+Recently I’ve been playing with a big dataset called “WikiReading” that researchers at Google have used in a couple of new NLP papers. It consists of the text of Wikipedia articles mapped to Wikidata statements (e.g. Australia → (deepest point, Lake Eyre)), and adds up to 208GB of JSON.
+
+My initial aim was to run it through Facebook’s fastText and compare the text classification performance to Google’s deep learning methods. So I munged the JSON into a format that fastText could use, and while I was waiting for it to run (it is after all fastText, not instantText), I found what seem to be serious discrepancies between the data used in the papers and the publicly available data (along with a worrying data quality issue), which make it hard to do meaningful comparisons.
+
+However! While I was messing around with different ways of processing those large JSON files, I stumbled on something I found mysterious, and today I’m going to try to solve the mystery and learn something in the process.
+
+I was running some Clojure code to read in lines of JSON, parse them, do some calculations, and spit out a map of results. The computer I was using (a Google Compute Engine instance) could:
+
+And yet, when I tried to read from disk AND parse JSON in my program, the best I could do was 208GB in 21 minutes, or about 166MB/s. So what gives?
+
+I looked at htop while it was running, and could see that the cores weren’t being maxed out:
+
+But then iotop showed that neither was the disk throughput:
+
+Another wrinkle: it seems to start the processing at 240, then over a period of about 10 seconds, it drops down to 140.
+
+Just to be thorough, here’s JvmTop showing memory usage, which seems fine:
+
+There’s one core out of 16 that’s going crazy, though:
+
+Is that where the bottleneck is? What is it even doing?
+
+To answer the question, I want to move away from the messy real world problem for a second, and set up a little workbench on my laptop where I can learn about disks and parallelism.
+
+First up, how fast is my SSD?
+
+I have a 10GB JSON file, and when I run
+
+I find it takes 6.3 seconds, so let’s take 1750MB/s read as an upper bound.
+
+How quickly can I count the lines in a file?
+
+The built-in wc command takes ~11 seconds, so about 900MB/s on average. Here’s a screenshot from Activity Monitor while I was running wc:
+
+Interestingly, wc looks to be CPU bound, which I hadn’t expected before trying. Reading up on how it works led me to an interesting blog post by Brendan Gregg, who shows how he used dtrace to speed up a grep + wc he was doing by 2000x.
+
+Anyway, if wc can do 900MB/s, how about Clojure?
+
+On my mid-2015 MBP, that takes 30 seconds, and shows 100% on one of the cores. We’re looking at about 166MB/s, which isn’t exactly what we’re after.
+
+Just out of curiosity, I tried to read in the file byte-by-byte without a buffer:
+
+It did about 2.5MB/s. Buffers matter! The above code ends up making way too many costly system calls.
+
+I also tried removing the line-seq part of the code, which constructs a lazy sequence, just to see what impact it would have:
+
+It almost doubled the speed of the line count! But 300MB/s is still not good enough, and there’s not much left to optimise out from this tight loop (I also tried it with type hints; it barely made a difference). As a sanity check that it wasn’t a problem with Clojure, I wrote a Java program (my very first!) which essentially does the same thing:
+
+It took about the same amount of time.
+
+At this point I jumped into the source code behind BufferedReader. It’s more complicated than I expected! 600 lines of dense Java. It made we want to write a buffering system written in pure Clojure on top of the most basic IO primitives, just to work out how to do it. But another day!
+
+So, I was curious about what readLine was doing that was so slow. I attached the YourKit profiler to the above program as it ran, and saw this:
+
+.readLine() decodes the bytes as they come in, and it’s a fairly expensive thing to do, apparently. I can imagine a system which had all the sensible buffering properties of BufferedReader but which didn’t do UTF-8 decoding, and just handed the bytes off to other cores to do things with, which would free it up to take in more data from the disk. But it doesn’t seem to exist? I think I’d have to write it myself! (Please let me know if that’s not true!)
+
+What are some ways around this?
+
+After reading the promisingly-named “Parallelizing File Processing with Reducers” from the Clojure Cookbook, I tried using iota in conjunction with core.reducers, and then with tesser. It didn’t make much of an improvement at all. I wish I knew more about memory mapped files so I could point out why, but that’ll have to wait for another time.
+
+Then I tried splitting the files up (using the split command line tool) so I could process them in parallel with pmap:
+
+9 seconds! That’s over 1GB/s, and runs faster than word count. All because it’s able to run the surprisingly CPU-hungry readLines on different threads.
+
+So! I learnt today that with a fast enough SSD, doing the most basic processing on files can actually be CPU-bound.
+
+I’m curious to see if there’s a way of replacing BufferedReader + readLines with something that takes better advantage of multiple cores.
+
+Another fun project would be writing a line-counting program in Rust or C to see what kind of throughput I can get on a single core.|||
+
+Recently I’ve been playing with a big dataset called “WikiReading” that researchers at Google have used in a couple of new NLP papers. It consists of the text of Wikipedia articles mapped to Wikidata…

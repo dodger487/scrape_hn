@@ -1,0 +1,58 @@
+In this post I will show how to optimize NgUpgrade through lazy loading.
+
+NgUpgrade is the bridge that allows AngularJS and Angular code to coexist in the same application. It's meant to be a temporary measure while you are working on converting the entire application to the latest version of Angular.
+
+One of the challenges when doing NgUpgrade is limiting the impact of running two versions of Angular in the same application.
+
+In the following example I will show how to optimize an NgUpgrade application by doing lazy loading.
+
+Using Webpack I will show how to isolate the AngularJS dependency. The goal is to not even load AngularJS unless you route to an AngularJS portion of your application.
+
+I have put the code on Github if you are interested in checking it out.
+
+Lazy loading is handled by the new Angular router, but there is also internal ui-router routing in the AngularJS portion.
+
+The first step is to create an application shell in Angular. The shell consists of three parts: app.module.ts, app.component.ts and app-routing.module.ts.
+
+import {NgModule} from '@angular/core'; import {BrowserModule} from '@angular/platform-browser'; import {RouterModule} from '@angular/router'; import {NgUpgradeService} from './angular/ng-upgrade/ng-upgrade.service'; import {AppRoutingModule} from './app-routing.module'; import {AppComponent} from './app.component'; @NgModule({ declarations: [AppComponent], imports: [BrowserModule, AppRoutingModule], bootstrap: [AppComponent], providers: [ NgUpgradeService ], }) export class AppModule {}
+
+A you can see the shell sets up some lazy routes, as well as a simple component with two sibling router outlets. We need two outlets to support the Angular router (router-outlet) and ui-router (ui-view).
+
+The key part here is that the AngularJS part of the application will only be loaded if we route to the “empty” route. All other bundles omit the AngularJS dependencies.
+
+If you follow along in the browser's network tab you will see the different bundles load on demand per lazy route.
+
+In addition to the lazy loaded bundles, there is a “shared” core bundle with shared Angular resources (core, common, platform-browser, router).
+
+If an Angular dependency is only needed by a single lazy route, it's pushed out to that specific bundle. Here, this is the case for the HttpModule, FormsModule and UpgradeModule.
+
+The AngularJS portion has its own bundle with the AngularJS framework, ui-router and the ng-upgrade dependencies.
+
+NgUpgradeModule is a proper Angular NgModule, but this is where I package up the AngularJS dependencies like AngularJS, ui-router and the AngularJS application code.
+
+It's also where I bootstrap the AngularJS application.
+
+Again, the AngularJS portion will only be bootstrapped if someone actually routes there.
+
+import {NgModule} from '@angular/core'; import {RouterModule} from '@angular/router'; import {UpgradeModule} from '@angular/upgrade/static'; import {NgUpgradeComponent} from './ng-upgrade.component'; import {SurveyDemo} from '../survey/survey-demo'; import 'angular/angular'; import 'angular-ui-router/release/angular-ui-router.min'; import 'src/angular-js/app.js'; import 'src/angular-js/friends/friends.component.js'; @NgModule({ imports: [RouterModule.forChild([ {path: '**', component: NgUpgradeComponent} ]), UpgradeModule ], declarations: [NgUpgradeComponent], entryComponents: [SurveyDemo] }) export class NgUpgradeModule {}
+
+import {Component} from '@angular/core'; import {UpgradeModule, downgradeComponent} from '@angular/upgrade/static'; import {setUpLocationSync} from '@angular/router/upgrade'; import {NgUpgradeService} from './ng-upgrade.service'; import {SurveyDemo} from '../survey/survey-demo'; declare var angular: any; @Component({ template: '' }) export class NgUpgradeComponent { constructor(upgrade: UpgradeModule, upgradeService: NgUpgradeService) { if(upgradeService.bootstrapped === false) { angular.module('awesome').directive('survey', downgradeComponent({component: SurveyDemo})); upgrade.bootstrap(document.querySelector('#awesome'), ['awesome']); upgradeService.bootstrapped = true; } } }
+
+The Angular router defines a ** route, which allows the ui-router to pick it up from there. Once the user routes to the AngularJS part, ui-router will start working based on the following config:
+
+angular.module('awesome', ['ui.router']); angular.module('awesome').config(['$stateProvider', '$locationProvider', function($stateProvider, $locationProvider) { $locationProvider.html5Mode(true); $stateProvider .state('home', { url: '/', templateUrl: '/src/angular-js/home/home.html' }) // Define empty templates for routes controlled by new angular router // Needed to clear out the ui-router view after transitioning .state('spreadsheet', { url:'/spreadsheet', template: '' }) .state('treeview', { url:'/treeview', template: '' }) .state('survey', { url:'/survey', template: '' }) .state('friends', { url: '/friends', templateUrl: '/src/angular-js/friends/friends.html' }); }]);
+
+Notice the empty templates for Angular router controlled routes. I had to add these to clear out the previous AngularJS view. Otherwise they would show up on top of each other.
+
+I am using Webpack with the @ngtools/webpack plugin to AoT compile and configure the lazy loading boundaries.
+
+Here is the Webpack configuration file:
+
+const ngToolsWebpack = require('@ngtools/webpack'); var webpack = require('webpack'); module.exports = { resolve: { extensions: ['.ts', '.js'] }, entry: './src/bootstrap.ts', output: { filename: 'dist/build.js' }, devtool: 'source-map', plugins: [ new ngToolsWebpack.AotPlugin({ tsConfigPath: './tsconfig.json' }), new webpack.LoaderOptionsPlugin({ minimize: true, debug: false }), new webpack.optimize.UglifyJsPlugin({ beautify: false, output: { comments: false }, mangle: { screw_ie8: true }, compress: { screw_ie8: true, warnings: false, conditionals: true, unused: true, comparisons: true, sequences: true, dead_code: true, evaluate: true, if_return: true, join_vars: true, negate_iife: false }, sourceMap: true }) ], module: { loaders: [ { test: /\.css$/, loader: 'raw-loader' }, { test: /\.html$/, loader: 'raw-loader' }, { test: /\.ts$/, loader: '@ngtools/webpack' } ] } };
+
+I have discovered one interesting side effect of this approach. It appears that something in Angular is adding a global click handler.
+
+This handler causes digest cycles in the AngularJS part if you click anywhere on the view. I suspect this is zone related, but it requires more research to figure out why this global handler is needed.
+
+In my example you can see this if you click anywhere in the “friends” view. I have a console log statement that fires on every digest. Clicking the view causes it to log.|||
+

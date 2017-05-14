@@ -1,0 +1,110 @@
+If you prefer video over blog posts, here is my talk on this at GopherCon 2016: https://www.youtube.com/watch?v=KyuFeiG3Y60
+
+One of the strongest sides of Go programming language is a built-in concurrency based on Tony Hoare’s CSP paper. Go is designed with concurrency in mind and allows us to build complex concurrent pipelines. But have you ever wondered - how various concurrency patterns look like?
+
+Of course, you have. We’re all thinking mostly by visualization in one form or another. If I ask you something involving “numbers from 1 to 100” you will have your own image of the series in your head, even without realizing it. For example, I imagine it as a line going from me with numbers from 1 to 20, then it turns 90 degrees to the right and continues to the 1000+. I recall from very young period of my life that in our kindergarten there were numbers in a cloakroom, written along the wall, and number 20 was exactly at the corner. You probably have your own image of numbers. Another common example is the visual representation of the full year with four seasons - some people see it as a box, other - as a circle.
+
+Anyway, I want to show you my attempt to visualize common concurrency patterns using Go and WebGL. It more or less represents the way I see concurrent programs in my head. Would be pretty interesting to hear how much it differs from images in your head. I especially would love to see how Rob Pike or Sameer Ajmani imagine concurrency. I bet I’d be quite interesting.
+
+So, let’s start with the very basic “Hello, Concurrent World” example, to get ourselves familiar with the concept of my attempt.
+
+The code is quite simple - single channel, single goroutine, one write, one read.
+
+Here the blue lines represent goroutines running down through time. Thin blue lines connecting ‘main’ and ‘go #19’ are marks for start and stop goroutine, revealing parent-children relation and, finally, red arrow shows us the send/recv action. While it’s actually two separate actions, I try to animate as a single event “send from A to B”. The “#19” in the goroutine name is the actual goroutine internal ID, obtained from runtime with a trick suggested by Scott Mansfield in “Goroutine IDs” article.
+
+In fact, you can build a simple timer with this approach - create a channel, start goroutine which writes to this channel after given duration and returns this channel to the caller of your func. The caller then blocks on reading from the channel for the exact amount of time. Let’s run such timer 24 times and try to visualize it.
+
+This nice concurrency example was found in a great talk by googler Sameer Ajmani “Advanced Go Concurrency Patterns”. Of course, this pattern isn’t very advanced, but for those who only get themselves familiar with Go concurrency it may look quite fresh and interesting.
+
+Here we have a channel as a table of the ping-pong game. The ball is an integer variable, and two goroutines-players that ‘hit’ the ball, increasing its value (hits counter).
+
+Go to interactive WebGL animation At this point I’d suggest you to click that link above to the interactive WebGL animation (Ctrl/Cmd-Click to open it in a new tab) and play around with interactively. You can slowdown animation, speedup and see it in different angles.
+
+Now, let’s run three players instead of two.
+
+Go to interactive WebGL animation We can see here that each player takes its turn sequentially and you may wonder why is it so. Why we see this strict order in goroutines receiving the ball?
+
+The answer is because Go runtime holds waiting FIFO queue for receivers (goroutines ready to receive on the particular channel), and in our case every player gets ready just after he passed the ball on the table. Let’s check it with more complex example and run 100 table tennis players.
+
+Go to interactive WebGL animation The FIFO order is now obvious, isn’t it? We can spawn a million goroutines (they’re cheap), but for our goal that would be overkill. Let’s see something different to play with. For example, common messaging patterns.
+
+One of the popular patterns in the concurrent world is a so called fan-in pattern. It’s the opposite of the fan-out pattern, which we will cover later. To be short, fan-in is a function reading from the multiple inputs and multiplexing all into the single channel.
+
+Go to interactive WebGL animation As we can see, first producer generates values each 100 milliseconds, and second one - each 250 milliseconds, but reader receives values from both producers immediately. Effectively, multiplexing happens in a range loop in main.
+
+The opposite pattern to fan-in is a fan-out or workers pattern. Multiple goroutines can read from a single channel, distributing an amount of work between CPU cores, hence the workers name. In Go, this pattern is easy to implement - just start a number of goroutines with channel as parameter, and just send values to that channel - distributing and multiplexing will be done by Go runtime, automagically :)
+
+Go to interactive WebGL animation One thing worth to note here: the parallelism. As you can see, all goroutines ‘run’ in parallel, waiting for channel to give them ‘work’ to do. Given the animation above, it’s easy to spot that goroutines receive their work almost immediately one after another. Unfortunately, this animation doesn’t show in color where goroutine really does work or just waits for input, but this exact animation was recorded with GOMAXPROCS=4, so only 4 goroutines effectively run in parallel. We will get to this subject shortly.
+
+For now, let’s do something more complex, and start workers that have their own workers (subworkers).
+
+Go to interactive WebGL animation Nice. Of course, we can set number of workers and subworkers to much higher values, but I tried to make animations clear and understandable.
+
+There are even cooler fan-out patterns do exist, like the dynamic amount of workers/subworkers, with sending channels over channels, but the idea of fan-out should be clear for now.
+
+Next common pattern is similar to fan-out, but with goroutines spawned for the short period of time, just to accomplish some task. It’s typically used for implementing servers - create a listener, run accept() in a loop and start goroutine for each accepted connection. It’s very expressive and allows to implement server handlers as simple as possible. Take a look at this simple example:
+
+Go to interactive WebGL animation It’s not very interesting - it seems there is nothing happens in terms of concurrency. Of course, under the hood there is a ton of complexity, which is deliberately hidden from us. “Simplicity is complicated”.
+
+But let’s go back to concurrency and add some interaction to our server. Let’s say, each handler wants to write asynchronously to the logger. Logger itself, in our example, is a separate goroutine which does the job.
+
+Go to interactive WebGL animation Quite demonstrative, isn’t it? But it’s easy to see that our logger goroutine can quickly become a bottleneck if the number of requests increase and logging action take some time (preparing and encoding data, for example). We can use an already known fan-out pattern. Let’s do it.
+
+Server with worker example is a bit advanced version of the logger. It not only does some work but sends the result of its work back to the pool using results channel. Not a big deal, but it extends our logger example to something more practical.
+
+Let’s see the code and animation:
+
+Go to interactive WebGL animation We distributed work between 4 goroutines, effectively improving the throughput of the logger, but from this animation, we can see that logger still may be the source of problems. Thousands of connections converge in a single channel before being distributed and it may result in a logger being bottleneck again. But, of course, it will happen on much higher loads.
+
+Enough fan-in/fan-out fun. Let’s see more sophisticated concurrency algorithms. One of my favorite examples is a Concurrent Prime Sieve, found in “Go Concurrency Patterns” talk. Prime Sieve, or Sieve of Eratosthenes is an ancient algorithm for finding prime number up to the given limit. It works by eliminating multiples of all primes in a sequential manner. Naive algorithm is not really efficient, especially on multicore machines.
+
+The concurrent variant of this algorithm uses goroutines for filtering numbers - one goroutine per every prime discovered, and channels for sending numbers from the generator to filters. When prime is found, it’s being sent via the channel to the main for output. Of course, this algorithm is also not very efficient, especially if you want to find large primes and look for the lowest Big O complexity, but I find it extremely elegant.
+
+Go to interactive WebGL animation Feel free to play with this animation in interactive mode. I like how illustrative it is - it really can help understand this algorithm better. The generate goroutine emits every integer number, starting from 2, and each new goroutine filters out only specific prime multiples - 2, 3, 5, 7…, sending first found prime to main. If you rotate it to see from the top, you’ll see all numbers being sent from goroutines to main are prime numbers. Beautiful algorithm, especially in 3D.
+
+Now, let’s go back to our workers example. Remember, I told that it was run with GOMAXPROCS=4? That’s because all these animations are not art work, they are real traces of real programs.
+
+Let’s refresh our memory on what GOMAXPROCS is.
+
+CPU means logical CPU, of course. I modified workers example a bit to make a real work (not just sleep) and use real CPU time. Then I ran the code without any modification except setting different GOMAXPROCS value. The Linux box had 2 CPUs with 12 cores each, resulting in 24 cores.
+
+So, the first run demonstrates the program running on 1 core, and second - using the power of all 24 cores availiable.
+
+WebGL animation - 1 | WebGL animation - 24 The time speed in these animations are different (I wanted all animations to fit the same time/height), so the difference is obvious. With GOMAXPROCS=1, next worker start real work only after previous has finish it’s work. With GOMAXPROCS=24 the speedup is huge, and overhead for multiplexing is negligible.
+
+It’s important to understand, though, that increasing GOMAXPROCS not always boosts performance, and there cases when it actually makes it worse.
+
+What else we can demonstrate from concurrent things in Go? The one thing that comes to my mind is a goroutines leak. A leak can happen, for example, if you start goroutine but it falls out of scope. Or you simply forget to add finish condition, and run a for {} loop.
+
+First time I’ve encountered goroutine leak in my code, the scary image appeared in my head and I wrote expvarmon next weekend. And now I can visualize that scary image with WebGL.
+
+Go to interactive WebGL animation I feel pain even simply by looking at this :) All those lines are wasted resources and a ticking bomb for your program.
+
+The last thing I want to illustrate is a difference between parallelism and concurrency. This topic is well covered, and there is a great talk by Rob Pike on the subject. One of the #mustwatch videos, really.
+
+Thus, the concurrent program may or may not be parallel, these concepts are somehow orthogonal. We have seen this earlier in a demonstration of GOMAXPROCS setting effects.
+
+I can repeat all those linked articles and talks, but a picture is worth a thousand words. What I can do here is to visualize the difference. So, this is parallelism. Many things running in parallel.
+
+And this is also parallelism:
+
+But this is concurrency:
+
+And this is also concurrency:
+
+To create these animations, I wrote two programs: gotracer and gothree.js library. First, gotracer does the following:
+
+Example of the resulting JSON:
+
+Next, gothree.js uses the power of an amazing Three.js library to draw 3D lines and objects using WebGL. Little wrapper to fit into single html page - and there it is.
+
+This approach, though, is super limited. I have to accurately choose examples, rename channels and goroutines to make more or less complex code to produce a correct trace. With this approach, there is no easy way to correllate channels between goroutines if they have different names. Not to mention channels sent over channels of type chan. There are also huge issues with timing - output to stdout can take more time than sending value, so in some cases I had to place time.Sleep(some amount of milliseconds) to get proper animation.
+
+Basically, that is a reason why I’m not open-sourcing the code yet. I’m playing with Dmitry Vyukov’s execution tracer, it seems to provide good level of details of events, but do not contain info on which values are being sent. Maybe there are better ways to achieve the desired goal. Write me in twiter or in comments here, if you have ideas. It would be super great to extend this two-weekends tool to be a real debugging/tracing instrument suitable for any Go program.
+
+I also would be happy to visualize more interesting concurrent algorithms and patterns not listed here. Feel free to write ones in the comments.
+
+UPD: This tool is available at github.com/divan/gotrace and using Go Execution Tracer and patched runtime to generate trace.
+
+Also, I’m open for the new job, so if you’re interesting company/team, have challenging problems to solve, use Go, open for remote (or you’re in Barcelona) and hiring, let me know :)|||
+

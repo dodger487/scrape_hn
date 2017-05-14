@@ -1,0 +1,99 @@
+"How good is the encryption. What do you use?"
+
+
+
+We use 2048 bit public/private keys to secure a symmetric AES 128 bit key that changes for every backup "session" on your computer (usually this is once per hour).  You can read about our approach here:  https://www.backblaze.com/blog/how-to-make-strong-encryption-easy-to-use/ (We copied the design of Microsoft's Encrypted File System , we didn't invent any of this, it is all off-the-shelf OpenSSL library stuff.)
+
+After we encrypt the files, we *THEN* push them through HTTPS (SSL, port 443) which is actually kind of double-encryption, but then we just wanted to make sure customers were comfortable with the encryption and HTTPS doesn't hurt anything and actually has some nice side effects (it separates backups onto a separate port than the majority of your web traffic, allows for traffic shaping if you want to do it).
+
+"What mode of operation (http://en.wikipedia.org/wiki/Block_cipher_modes_of_operation) is AES used in?"
+
+When it is time to back up a file, the Backblaze client reads your file from disk ONCE, then all in RAM it generates an AES-128 (CBC) key and Initialization Vector (IV) and bundles up the file in a little encrypted bundle which includes the AES-128 key IV.
+
+The "payload" is the file which is encrypted with the AES-128 key because symmetric AES-128-CBC is very fast, and the AES-128 key is encrypted by the userPub.pem key. Notice at this point, on the client, the file is absolutely not decodable because  the client does not have the userPriv.pem key. (This design is the basis of most good encrypted file systems, very standard, you can read about it on Wikipedia or anywhere about Microsoft's EFS.)
+
+The bundled file, the AES-128 key, the whole thing is NEVER written to disk in any way, it is transmitted directly through HTTPS (yes, full two level utterly separate redundant encryption) to the Backblaze datacenter. We happen to use libCURL for the HTTPS layer which links with OpenSSL to implement the SSL layer.
+
+"Depending on the block-cipher mode being used; how do you select the IV to be used for each operation?"
+
+
+
+The IV is randomly generated using /dev/urandom on Mac and CryptAcquireContext(PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)/CryptGenRandom on Windows.
+
+How Protected Am I and When?
+
+"Is a separate AES encryption done on my computer before the data is sent to your server?
+
+If not, how does the key generation work?"
+
+At a higher level, Backblaze uses OpenSSL -> so the answer to most of your questions is found by reading up on that technology.  Luckily this is the widest known encryption  library and technology on earth. At Backblaze we specialize in making what is normally only for rocket scientists usable by Mom and Pop consumer.
+
+To answer your question, at installation time, a 2048 bit pub/priv key pair is generated on your laptop, and the private key is transmitted through HTTPS.  The priv key is NEVER written to disk on your system,it is then thrown away after transmission. The public key can be found on your local system here on a Windows PC (ask if you want to know on a Macintosh):  C:\Program Files\Backblaze\userPub.pem This is a standard "OpenSSL PEM File" as decribed here: http://www.openssl.org/docs/crypto/pem.html#PEM_ENCRYPTION_FORMAT.
+
+You can read these files with Notepad or Wordpad, but be very very careful not to write out any changes or it will effectively destroy your backup -> make it unrecoverable/unreadable.
+
+The private key stored in your account in the Backblaze datacenter is *ALSO* a PEM file, and by default it is  secured (encrypted) by our standard pass phrase. But if you change the encryption on the PEM file this done on the privateKey PEM file on our servers.  Then you are seriously, SERIOUSLY protected, if you forget your password nobody on earth could read those files, not the US government, not Backblaze, not you, nobody.   If you look at this web page: http://www.openssl.org/docs/apps/rsa.html then search for the term "pass phrase" you can find out more than you probably want to know.
+
+"Is the password used directly as the symmetric key, or is the symmetric key derived somehow through an algorithm?
+
+If so, what algorithm is used to derive the symmetric key?"
+
+Not derived.  The symmetric AES key is randomly generated for each "backup session" (about once per hour), then the symmetric key is THEN encrypted with the pub/priv key system and the whole thing is appended to the original file with a checksum at the very end.
+
+What if I am a Very Paranoid User?
+
+"If a user is paranoid (hi! :]) and chooses to protect their RSA private key with a passphrase of their own;
+
+why does the private key (encrypted, with that password, yes?) still need to be sent to your datacenter,
+
+and not simply reside on the client-side?
+
+How do you protect the RSA private key with the user-supplied password? PBKDF2 or similar?
+
+If so, can you share those details? e.g. the number of iterations, underlying hashing algorithm used, etc."
+
+Our product is designed to be secure yet still easy to use. As you point out, if we stored the private key on theclient then we would have to make sure the user understood how important it was to safeguard it against loss or theft.  Because of this we choose to store the key on the server and (optionally) protect that key with a password that *only* the user (you) knows. When a password is used, the private key is encrypted with EVP_aes_128_cbc in OpenSSL using the password supplied by the user.
+
+"How is the integrity of backed-up data verified?"
+
+Each file ends with a checksum, and each "batch of files" has an additional checksum.  Every few weeks *ALL* of the files in the datacenter are passed over and re-read and the checksums are recalculated. If a cosmic ray has thrown a bit, we ask your computer to retransmit that particular file.  This rarely, rarely happens, but in our datacenter of quadrillions of trillions of files in 25 petabytes of customer data. It *DOES* occur once in a while.
+
+Finally, in addition, inside the encrypted bundle of data is a SHA-1 (a type of checksum) of the plain text version. We cannot get at this until you prepare a restore (because it is part of the encrypted bundle) but once we prepare and the original contents have come out in the original glory.  (They always do, but it was code we put in there years ago and it helps us sleep at night.)
+
+I Don't Trust You, but I am Expecting an Honest Answer.
+
+"If I opt to password-protect my private key, are BackBlaze servers still able to decrypt my data?
+
+Or is my data only able to be decrypted on the client?"
+
+ABSOLUTELY NOT.  Once the password is set do not forget it, there is no way to recover it. Once protected by a private encryption key Backblaze can only decrypt the backup files when the user supplies the password. This is done during the restore process and the supplied password is never saved on our systems, although never to disk, only to RAM.
+
+What it Comes Down to is Trust, but, Unfortunately, I Just Can't Trust You.
+
+"Having the private key outside my computer is unacceptable.
+
+The unfortunate thing is that I can't trust you.  I'm not allowed to trust you.
+
+So, I guess my question is why do I have to? It makes most sense that I shouldn't -have- to trust you..."
+
+I understand.  What you are describing is conceptually perfect and provably more secure than what Backblaze provides , unfortunately it is not easy to use.  Backblaze focuses on ease of use.  It is backup for people who need backup and "pretty good security" and who aren't computer professionals.  It is not a perfect choice for all users on earth, you are unfortunately outside our scope.
+
+Take our default security model -> it is about as secure as a Facebook account.  It uses a username and password.  You can recover (reset) your password if you have access to your email. That mode is good for many, many people on earth, people who have pictures of their children they don't want to lose.  Music they would rather not repurchase.  And a few Quicken docs that they would not like a malicious person to have, but they will not *DIE* if somebody reads them.  And it's SUPER convenient to recover their password.  What a great system!
+
+Our second level is really, really much more secure.  You cannot recover the password to access to your email account does not give you access to the backup, and even a malicious hacker in our datacenter could not possibly compromise your data.  Now while it is more secure, it is also harder to use -> if you forget that password you have actually lost the backup, your wedding photos are gone forever.  That's very secure, but it's not as secure as what you describe.
+
+We stand by our reputation as trustworthy, careful programmers who have worked in the security field for over a decade.  You can check us out on LinkedIn, through colleagues that have worked with us, through the publicly traded companies that have acquired our companies in the past. Here is our team page: https://www.backblaze.com/team.html  We live and work in Silicon Valley, we've been here for 20 years, and we plan to keep doing this for a long, long time, and therefore we have *LOTS* of interest in keeping our reputations rock solid and utterly clean.
+
+Previously we fought phishing fraud, fought email viruses, and fought spam at a company called MailFrontier. We are totally customer focused and all around good people, ask ANYBODY. If you come here to our offices, I'll buy you a cup of coffee.
+
+"When retrieving backup data, is it sent over https or over http?"
+
+Short answer: HTTPS.  But here is the longer answer:
+
+The answer shows a weak point in the Backblaze system. As you prepare a restore, you must type in your private passphrase into the restore server. This is not written to disk, but held in RAM and for the period of time of decrypting all your files, and they are then stored in "clear text" on our very highly secured servers until they are ZIPPED up and offered to you to be downloaded. At that moment you can download them (by HTTPS only), then you can "delete the restore zip" which means you close the window of time that your files are available in plain text.
+
+So to recap: if you never actually prepare a restore, we cannot possibly know what is in your files, but if you prepare a restore (let's say of a few files) then for the couple minutes they are being prepared and downloaded they are in "plain text" on a HIGHLY SECURE system in the Backblaze datacenter.  At that moment, if a Backblaze employee were malicious enough and dedicated enough and was watching (which is actually pretty hard, we get thousands of restores every day so it would fly by quickly) they could see your filenames appear on the Linux servers right before they are  ZIPPED up into a new bundle.  A few minutes of exposure.
+
+We actually want to improve this to provide a  password encrypted ZIP file for download, and then the FINAL improvement is to actually allow you to download the private encryption key, download the encrypted files, and provide the pass phrase in the privacy of your computer. We hope to add this functionality in the future.|||
+
+Security Q&A In General "How good is the encryption. What do you use?" We use 2048 bit public/private keys to secure a...

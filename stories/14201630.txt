@@ -1,0 +1,71 @@
+We have recently moved our main product’s Javascript stack from Rails asset pipeline and RequireJS to Webpack. There is a lot of stuff online about the benefits of Webpack, so I won’t be covering it in this post but I will try to give you the reasoning from our own experience with asset pipeline and RequireJS here at Skroutz.
+
+We used to have a mixture of Rails asset pipeline and RequireJS in our main product. As you know asset pipeline does not take into account Javascript module systems and various frontend features such as lazy-loading on demand Javascript files. This was the reason we also had incorporated the popular RequireJS library in our stack. We used it for managing our modules and dependencies as well as to lazy-load some non-critical Javascript files. In order to make it work together with Rails we used our own fork of the requirejs-rails gem.
+
+This setup stayed with us for a long time but unfortunately had also some serious issues. First and foremost, we were bound to AMD modules. This made it difficult to use current Javascript libraries and the rich NodeJS modules ecosystem. We had to shim everything that was non-AMD.
+
+Also, the requirejs gem added a lot of complexity in our setup. We had to “double compile” our assets. Sprockets had to produce both digested and non-digested files to be used in RequireJS bundling, we had to maintain 2 manifest files, and we had to decide manually which file is needed in which bundle. This resulted in error prone builds that very few of our devs understood how to fix.
+
+We also had to find a “manual” way (commit-hash based) for cache-busting. Rails’ asset cache busting mechanism was not an option because we were using requirejs-generated bundles that we lazy-loaded. Last but not least, we had no easy way to incorporate gradually in our stack ES2015 (we were using Coffeescript at the time).
+
+For adding and managing external libraries to use in our product we used Bower. Although Bower was a good solution and has made it until today with us, we had also some issues with it. For example some packages we needed were not in the registry. The main problem though was that we did not trust the availability of packages so we were checking in our packages to version control. This made the workflow of package management seem more complicated and less intuitive to our devs. We wanted to try the promising Yarn package manager and an easy way to incorporate it in our stack and use our external dependencies.
+
+Lately the Javascript ecosystem has been advancing a lot and Rails has not been able to catch up with the pace of these changes (unmaintained gems, asset pipeline not keeping up with module systems etc). The time had come to move to something better so the journey to a better Javascript stack begun.
+
+Before settling to Webpack we had to define our needs and research the available tools that could fill our needs. We examined various options for bundling and loading such as Browserify, Webpack, JSPM, another take on RequireJS etc etc. After 2-3 minimum setups trying out the various tools, the winner for us became clear. It was Webpack. This does not mean that the other tools are not good, just that Webpack was exactly what met our needs. I have to admit here that we didn’t think Webpack would be the winner right from the start. That’s why this step was really important. You can find various comparisons online on these tools but I suggest that you skip the hype on various Javascript tools and really dive into your application’s specific needs because you might end up trying to kill a mosquito with a shotgun!
+
+For us the minimum requirements were:
+
+Our stack is based on Ruby on Rails, so adding a tool that needs a lot of tweaking to work with Rails was not an option. We actually already had a bitter experience with such a stack. In this case, it seems that Rails and Webpack play nice together, since they are agnostic to each other. Moreover, Rails 5.1 will be incorporating Webpack for Javascript management so it felt like making the inevitable step ahead.
+
+Performance is quite important for us (even more than it is for everyone). Since the app is getting bigger and bigger every day, we need features such as lazy loading, bundling and serving only what is necessary on every page (or after different user actions) without much manual configuration. We try to keep our bundles minimal and safe from developers bloating the critical ones by mistake.
+
+Since our product is being actively enhanced every day (various deploys daily), we do not have the luxury to freeze our feature development and make thorough changes on our codebase. Therefore we needed to pick a tool that would enable us to make changes on our stack gradually without holding back our development at all. In order to make the initial minimum changes and then apply any changes gradually, we needed a tool that would support various things from our current stack, like AMD modules for example.
+
+It was also important to pick a tool that would stay with us for a long time, so being actively supported and seeing a future in our tool of preference was a priority too. While trying out Webpack 1, Webpack 2 was already on its way to be released and we had to migrate. The active community behind the tool and its ecosystem, as well as the seamless migration to v2 made us feel safe for its support and confident for the growing community behind it.
+
+Webpack met the above requirements and a lot more as we found out on the way.
+
+The journey to Webpack was not quite easy but that would be true for us with any other bundling or loading tool because our Javascript codebase, pipelining and workflow was tightly coupled with Rails. This was something we wanted to change and we found out that this was our chance to do it!
+
+In the rest of this post I’ll try to explain the problems we came across and how we tried to solve them one step at a time while migrating to Webpack.
+
+In order to add Webpack and Yarn to our stack we needed to upgrade our development and deployer machines’ from Node 0.10 to version 4.7.2 since Webpack requires at least node v4.3. It might come as a surprise that we had such an old Node version but it’s not really given that our machines run on Debian Jessie stable (see here). At that time we had to backport NodeJS 4.7 and added Yarn to our internal Debian repository.
+
+We were now able to add Webpack to our codebase through Yarn. We also added the webpack-rails gem to our Rails project mainly to get some asset path helpers and setup out of the box. We also added webpack-dev-server for the development environment. Ιn order to simplify the workflow for our developers we added Foreman to run the Webpack dev server concurrently with the Rails server.
+
+With a minimum Webpack configuration we were able to load a basic entry file for our Javascript app. From this point, everything was a matter of configuration. For example a coffee loader for our Coffeescript files, a handlebars template loader for our .hbs templates, exports-loader for libraries defining global variables etc etc.
+
+Here is a (simplified) part of our Webpack config:
+
+Lines 1-9: Here we tell Webpack where to look for modules and which file extensions to look for. We have simply added Rails along with node modules folder and our templates folder here.
+
+Lines 11-13: Here we add the entry file of our application. All of its dependencies and the dependencies’ dependencies are resolved and added to a bundle automatically!
+
+Lines 15-22: Here we define how the output of Webpack should be. Namely, the files should be digested and put in .
+
+Lines 24-32: Here we define some rules for our modules. For example highcharts and modernizr libraries should return a global variable as their module export. Also, .hbs and .coffee files should be preprocessed by their corresponding loaders.
+
+With webpack’s async code-splitting feature we were also able to easily define split points to our application where we load extra files asynchronously when they are needed.
+
+Along with step 2 we had a blocking issue with our current Javascript codebase. It was coupled with Rails. We were using some Sprockets directives here and there and there were files where we used embedded Ruby.
+
+Sprockets directives were easily replaced. For example, we were using sprockets directives to load our Handlebars templates. Using a handlebars template loader and since Webpack treats every file as a module, we were able to replace these Sprockets directives with Javascript module require calls.
+
+As for Javascript modules with embedded Ruby we tried using a rails-loader for Webpack. We noticed though that loading the Rails environment was adding a big delay to the compilation step so we decided that it was not worth it. We had already discussed that embedding Ruby seemed like a bad practice to us. Besides, the main reason we used embedded Ruby was to use in our Javascript files some variables or settings from our backend. For example a product id or our google API key. Therefore we decided to discard this practice. We gathered all these settings and variables in a small blocking inline script in our Rails layout so that every Javascript module could use them.
+
+Since our product is translated into 3 languages (skroutz.gr, alve.com, scrooge.co.uk) we are using the FastGettext gem as the backend of I18n. We also use the gettext_i18n_rails plugin for integrating FastGettext into Rails. In order to be able to use gettext methods in our .js and .hbs files we were using once again embedded Ruby, which we had to drop.
+
+This setup was also problematic for another reason. We were not able to use some gettext methods in .erb files, for example plurals since the methods had to be evaluated at compile time. Therefore we decided to switch to a Javascript translations’ setup.
+
+We added the gettext_i18n_rails_js gem in order to parse our .js and .hbs files for strings marked with double underscore. Then, at compile time, with the help of a Webpack .po file loader we replace marked strings with their translations. For example, in order to be able to use plurals, we replace them with Javascript methods that evaluate the appropriate translation at runtime. For all these to work in both Javascript and .hbs files we had to write a custom Webpack plugin (we are considering making this open source). So for example the translation for is being evaluated at compile time to “Hello” but the translation of is being replaced with a method that decides at runtime if it should be “shop” or “shops” according to .
+
+Decoupling of our Javascript app with Rails enabled us to improve our testing mechanism. We were using the Teaspoon framework for running our mocha tests. With Teaspoon we run our suite both headlessly and in a browser while we also had configured it to run with our CI (Jenkins). We had a very good experience with this framework but there was no reason in keeping it since we did not need the integration with Rails anymore. Therefore we switched to Karma runner and karma-webpack. This resulted in a much faster run for our spec suite (reduced to about half the time).
+
+After +1804/−1613 lines of code and 650 files changed, we shipped the minimum possible changes for switching to Webpack.
+
+We are currently gradually switching our external Javascript dependencies to be added with Yarn instead of Bower. Yarn has enhanced our workflow and external libraries management. Moreover, we added Babel and we can now gradually move from writing Coffeescript to ES2015. We just added the packages and one line of configuration to Webpack so that a different Webpack loader takes care of our ES2015 code:
+
+Switching to Webpack was not a piece of cake for us mainly because it unlocked various issues in our codebase, like the coupling with Rails, the lack of a sane translation mechanism for our Javascript application, etc. After deploying and having lived with it for some time, I can tell you that it was surely worth it because it not only forced us to tackle these issues, it also made it possible to simplify our workflow for compiling, bundling and loading Javascript. By adding Yarn to our workflow, external library management feels much more intuitive to us while its times are very good. The same is true for asset compilation and test suite running times. This setup has been working for about a month now with no issues and has also opened the way for us to gradually move to ES2015. It might not be perfect but it surely makes much more sense to us and feels like it is a solid base to build upon in the future. Besides, “Life is a journey, not a destination”.|||
+
+Our journey from Rails asset pipelne and RequireJS to Webpack

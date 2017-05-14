@@ -1,0 +1,48 @@
+Making models for Android apps frequently involves writing a lot of boilerplate code by hand. This process can be time-consuming, error-prone, and lead to hard-to-spot bugs when done incorrectly. To address this at Uber, we built a custom stack to generate AutoValue models and network clients from Thrift Specs.
+
+In this article, we explore how models in Uber’s Android apps ended up being mutable despite using AutoValue; we illustrate some of the pitfalls of mutability and detail a class of bugs caused by using mutable collection classes in our AutoValue models; and, finally, we explain how we safely performed a large migration that had no compile-time safety to move to immutable collection classes without impacting the stability of our apps.
+
+Even though the transport mechanism for our apps is JavaScript Object Notation (JSON), we use Thrift in our model generation stack to define shared specs between the client and backend. This makes service calls more consistent and prevents service definitions from becoming out-of-sync. To generate models for our Android apps, Thrifty is used to parse the specs and JavaPoet is used to create AutoValue classes.
+
+AutoValue enables us to easily produce immutable value classes by creating abstract classes and annotating them with @AutoValue. AutoValue then runs its annotation processor over the abstract classes to generate backing implementations of them. However, if you are not careful, these models can inadvertently become mutable and cause bugs. We ran into inadvertent mutability when including collection classes in our AutoValue models.
+
+The Rider model below is an AutoValue model generated from a Thrift spec:
+
+Rider Model Gist: A model that represents a rider (someone that requests an Uber).
+
+Since the model defines properties that use the collection interfaces List and Map, it is not truly immutable unless the model is created withImmutableList and ImmutableMap implementations.
+
+We send the Rider model over the Network as JavaScript Object Notation (JSON) and deserialize it with Gson. Out of the box, Gson returns mutable implementations of collection interfaces when deserializing network responses. This allowed us to write code that mutated collections in models we thought were “immutable.” Being able to mutate collections in models resulted in bugs that were hard-to-spot and difficult to reproduce.
+
+One kind of bug that appeared frequently throughout our apps materialized when we backed Reactive Data Streams with collections from models. Trouble arose when these collections would get modified in order to populated Views. The PricedVehicles class shows an example of this:
+
+Reactive Stream Mutation Gist: A class that provides a stream of vehicles with a price via a Reactive Streams API.
+
+The PricedVehicles class filters out vehicles that do not have prices that are present in VehicleStream, and the leftover vehicles (the ones that have prices) are exposed via the PricedVehicles.stream() API. The problem here is that PricedVehicles.filterVehiclesWithoutPrice() mutates the list of vehicles that backs VehicleStream. So VehicleStream will not return all vehicles after filterVehiclesWithoutPrice() has been called.
+
+This resulted in inconsistent data being shown to users since streams are shared between views. These kinds of bugs can be hard to track down since it requires a user to access views in a particular order. In this case, inconsistent data is only shown if PricedVehicles.filterVehiclesWithoutPrice() is called before the view that wants to show all the vehicles in VehicleStream.
+
+If our models used immutable collection classes, these kinds of bugs can not occur; immutable objects are safe to share between classes because they can not be modified. For additional clarification on why they are safe to share, we suggest reading Effective Java Second Edition: Item 15 Minimize Mutability by Joshua Block.
+
+We want our models to return immutable collection classes, not mutable ones. At Uber, we use a small fork of guava which provides us with immutable collections. The Rider model below specifies ImmutableMap and ImmutableList should be returned when paymentProfiles()and thirdPartyIdentities() is called:
+
+Rider with Immutable Collections Gist: Our Rider model that uses immutable collections.
+
+However, moving from collection interfaces to immutable concrete classes was not as simple as making all our models return ImmutableList and ImmutableMap. These classes do not offer any compile time safety against mutations and crash at runtime when modified. This is because guava’s collections throw UnsupportedOperationException when a collection method that mutates state is called.
+
+Recall, guava’s immutable collections implement java.util collection interfaces which define methods such as add() and remove(). In order to ensure no crashes would occur after moving to immutable concrete classes, we would have to vet the entire app. This is not practical as our apps have hundreds of contributors.
+
+To migrate to immutable collection classes without crashing production users, we made an API-invisible change at the network serialization layer (via Gson’s TypeAdapters) that returns a special implementation of each java.util collection interface. This allowed us to keep using collection interfaces in our model APIs, but back them under the hood with tracked mutable collections (TMCs).
+
+A TMC is a special kind of collection implementation that allowed us to crash when a collection was mutated in the debug build variant of our apps and log in release. To crash in the debug variant of our apps, we used a Timber.Tree that rethrows Timber.e() invocations. Our Tracked Mutable Collections gist  shows each of our TMCs and the TypeAdapterFactories used to create them. You will notice each TMC calls Timber.e() when mutate methods are invoked.
+
+By logging mutations in production, we were able to detect all of the places where collections were mutated without manually vetting the entire app ourselves. After two months, we stopped seeing mutations being logged in production and moved all our models to use immutable collections instead of collection interfaces. Since TMCs provided us with a high degree of safety, this large, one shot migration allowed us to switch over to concrete immutable classes without impacting any users in production.
+
+Working with a custom stack to generate models and network clients enabled us to make model API changes quickly across all of our apps. Performing a large migration like this one frequently involves engineering safety into the process, often in unique ways. Since moving to immutable collections, we have invested in catching collection mutations in models at compile time with static analysis.
+
+If you are interested in tackling the challenges of scaling software to millions of users and hundreds of contributors, consider joining our team.
+
+Warren Smith is an engineer at Uber working on mobile application architecture. Molly Vorwerck is the technical editor of the Uber Engineering Blog.
+
+Photo Header Credit: “Brown chromis school safely and stably moving toward an immutable collections future in their underwater environment” by Conor Myhrvold, Bonaire, Caribbean Netherlands.|||
+
