@@ -1,0 +1,408 @@
+Written by Kabuto of TiTAN during the development of Overdrive 2
+
+This is the first of a series of documents about Overdrive 2 and its development.
+
+This document specifically contains what I figured out about the Mega Drive hardware during the course of 4 years. Nearly all of this has been through running my own tests and guesswork, some information was gathered from the web and from discussions with others (I tried to cite everything correctly).
+
+I did not include information that is well documented elsewhere (e.g. how the CPUs behave).
+
+I hope this will be helpful for emulator and demo developers. And please fix your emulators, even for not so obvious issues (e.g. music playback)! My music player relies on the Z80 getting delayed for ROM accesses and plays samples too fast and distorted when it’s off, just using a default value of 3.3 should already do the trick here.
+
+Regarding all the VDP tricks used, these are of different complexities. Some (128k mode) are probably just a few lines of code, others (VDP debug register) maybe 100 lines of code; the most difficult thing to get right will probably be the twisters, they require exact DMA and FIFO stall timing, otherwise they will break. Also, when debugging overdrive 2 effects, please ensure that the music is still running properly, if it isn’t the Z80 might as well be running around in the mapped ROM area and thus causing lots of 68k delays, breaking effects. At least that happened to me many times during development when I accidentally broke things.
+
+I need to thank all those people who pointed out that there is something (“$c0001c does weird stuff”) and spawned my interest to dig deeper, and those who encouraged me with their claims of something being impossible ;)
+
+The biggest part of this document describes the VDP since that’s what I spent most time on. Since all other parts are so much smaller I put them first.
+
+If you find anything wrong or have questions just post a message on the gendev forum or in #titandemo on EFNet.
+
+When the Z80 accesses ROM the bus arbiter needs to pause the 68k, let the Z80 finish its request, then unpause the 68k again. Since all those components run asynchronously timing is barely predictable, also if the 68k is just about to access the bus itself it finishes its own access cycle first before releasing the bus. This typically means that the Z80’s 68k bus accesses will be delayed by 2 to 5 cycles. IIRC reads and writes behave exactly the same way. The average Z80 delay is around 3.3 Z80 cycles, whereas the average 68k delay is around 11 68k cycles.[1]
+
+If the Z80 tries to access the bus while the VDP is doing a DMA from RAM/ROM or the 68k is halted because it tried to read from the VDP while its FIFO is empty or write to the VDP while its FIFO is full it has to wait for that to complete first.
+
+IIRC If the Z80 tries to access ROM while the VDP is doing a DMA from 68k RAM this can lead to corruption of RAM contents due to glitchy signals on the address bus (similar to the C64’s VSP bug).[2]
+
+The 68k is a bit slower than expected because something on the bus steals 2 out of every 128 cycles. This is visible when measuring the bus because everytime 128 cycles have passed the next bus access is slowed down by 2 cycles. The slowdown even affects the Z80 if it happens to hit its ROM access. Interestingly if this hits when the 68k is writing to the VDP (no matter which port) then the slowdown doesn't happen. Tampering with internal registers didn't seem to affect this at all. And this doesn't seem to be the RAM refresh logic since RAM accesses get their own further slowdowns. (I did not try to investigate this further, I just noticed that code accessing RAM instead of ROM is slightly slower.) Maybe it's a leftover from development kits that are based on DRAM cartridges that need to be refreshed as well. After all these slowdowns the 68K seems to be running at roughly 480 cycles per raster line instead of the theoretical 488+4/7 ones.[3]
+
+I did not see hints of those slowdowns during DMAs, probably the VDP accounts for that itself by not fetching fresh data during DMA for 2 consecutive cycles whenever it’s spending 1 internal cycle on VRAM refresh. For fast DMA this means that 10 slots are lost every rasterline (these are limited by how fast the VDP can fetch fresh data), for slow DMA (to VRAM in 64k mode) thus only 5 slots are lost (limited by how fast the VDP can write to VRAM).
+
+YM2612 registers $30..$FF are special as they only exist in a shift register that rotates all the time, but this also means that the YM2612 must wait until it reached the desired register before it can overwrite it. That’s what’s limiting the maximum write speed to ½ the duration of a YM2612 cycle, or 33.6 Z80 cycles. Probably slightly more due to latching overhead. I.e. after writing a register value one needs to wait that long before writing the next register’s address.
+
+The YM2612’s busy flag is useless as already documented elsewhere.
+
+It’s not possible to reliably write both register number and data with a Z80 word write, that seems to be too fast for the YM2612.
+
+The YM2612 samples the PCM register once every cycle. The point in time when that happens differs between MD1s and MD2s I tested (and is different again in emulators, but unfortunately I can’t give any precise values here, I’d have to dig for my test code), it also seemed to be more stable on MD1 and varying a bit or sampled for longer than just an instant on MD2.
+
+I tried to account for both in my music routine to keep jitter down to an inaudible or at least barely audible level. And beware of the music routine in general, I developed it from scratch to support 26 kHz sample playback with nearly no jitter, and for that used every available trick. Also it reads the VDP’s V counter, make sure your emulator supports this when there are music issues.
+
+The DAC works a bit differently in MD1 and MD2. On MD1 it just outputs a short pulse for each voice, one voice after another in a cycle, on MD2 it holds the value for quite a while (but still just a fraction of that voice’s slot which is 1/6th of the YM2612 clock (about 53 kHz)). Maybe the YM2612 allows for replacing the DAC value for as long as the DAC is being held which would explain the behaviour seen on MD2s.
+
+To measure the audio quality I wrote an analysis tool that measures a number of parameters:
+
+The leftmost 2 diagrams are voltage levels of the DAC, first one with the 9th DAC bit set to 0, second one with that bit set to 1 (that bit is normally set to 0 when playing PCM). As you can see there’s quite a jump of 3 samples between $7F and $80 (exactly in the middle) and a few further values are quite off too.
+
+The 3rd diagram measures frequency response from 0 to 26391 Hz. Blue is expected outcome, black is measured and red is noise floor. The way I measured this (playing white noise and phase correlation with measurement) allows telling apart signal and noise quite well.
+
+The 4rd diagram is the frequency response of a sine sweep. A bit of nonlinearities here, but nothing to worry about IMO. These might be due to DAC nonlinearities already.
+
+Those jumps in the DAC are mostly gone and longer DAC output should in theory mean lower noise floor, but… the amplifier circuitry destroys it all, introduces severe nonlinearities, and instead of the MD1’s 1st order filter there’s a 2nd order filter for no obvious reason. Distortion is quite high too, very well audible.
+
+The MD2 sounds noisy, muffled and heavily distorted, I clearly prefer the MD1. I measured a few more MD1s and MD2s but their responses look pretty much like those shown here.[4]
+
+I also tested the “loud PCM” debug bit. It amplified the volume around 5-fold on MD2 as expected and about 30-fold on MD1 (which typically leads to heavy distortions as the MD1’s amplifier does not expect to see anything louder than all 6 FM voices being played at once at maximum volume).
+
+The VDP’s command port is directly connected to its internal address buffer without any latching (or rather, the respective half thereof; after writing the 1st half of an address the next write will go to the 2nd half unless you e.g. write to the data port first). However depending on the value written certain actions can be triggered:
+
+The address buffer is incremented after each VRAM/VSRAM/CRAM read or write (by adding the value from register $f). When writing a value to the VDP’s data port (or the VDP does that internally through DMA) both value and current address are appended to its internal FIFO, so the address is incremented immediately even if the VDP could not actually write the value to its memory yet. And if the FIFO was full then the CPU is blocked for a bit first. In either case this means that the CPU could not potentially access the control port while the VDP is incrementing it internally and cause any trouble… except for 2 corner cases:
+
+Normally an image consists of the following raster lines:
+
+The horizontal image size is 13 additional left border pixels + 14 additional right border pixels. Probably alike for H32 mode.
+
+Also, in H40 mode the VDP slows down its clock for a number of cycles during HBlank (32 pixel clocks according to my oscilloscope tests) - starting 24 pixels after the right edge (or 10 after the last rendered pixel), so doesn't affect visible pixels. It's just the actual hsync/colour-burst area that seems to be affected.
+
+Vblank is switched roughly 32 pixels before hblank starts. This means that the last hblank raster line has that number of valid pixels displayed at its end while the same number of pixels is missing from the end of the last raster line before vblank. Jorge suggests that this probably happens because the VBlank signal directly affects output and does not have to go through the long pixel pipeline first, and in interlace mode, for odd (or even?) fields the blanking at the bottom of the screen starts in the middle of the raster line, but the unblanking at the top still happens in the same spot.
+
+All blanking in HBlank and VBlank is done after palette lookups, so not even CRAM dots will appear in there.
+
+----------------------------------------------------
+
+|         Mode |H32     (RSx=00) |H40     (RSx=11) |
+
+|--------------------------------------------------|
+
+|HCounter      |0x00-0x93,       |0x00-0xB6,       |
+
+|progression   |0xE9-0xFF        |0xE4-0xFF        |
+
+|--------------------------------------------------|
+
+|VCounter      |HCounter changes |HCounter changes |
+
+|increment     |from 0x84 to 0x85|from 0xA4 to 0xA5|
+
+|--------------------------------------------------|
+
+|HBlank set    |HCounter changes |HCounter changes |
+
+|              |from 0x92 to 0x93|from 0xB2 to 0xB3|
+
+|--------------------------------------------------|
+
+|HBlank cleared|HCounter changes |HCounter changes |
+
+|              |from 0x04 to 0x05|from 0x05 to 0x06|
+
+----------------------------------------------------  
+
+
+
+-------------------------------------------------------------------------------------
+
+|        Video |PAL             |NTSC             |PAL             |NTSC            |
+
+|              |V28     (M2=0)  |V28     (M2=0)   |V30     (M2=1)  |V30     (M2=1)  |
+
+|-----------------------------------------------------------------------------------|
+
+|VCounter      |0x000-0x102,    |0x000-0x0EA,     |0x000-0x10A,    |0x000-0x1FF     |
+
+|progression   |0x1CA-0x1FF     |0x1E5-0x1FF      |0x1D2-0x1FF     |                |
+
+|-----------------------------------------------------------------------------------|
+
+|VBlank set    |Vcounter changes from 0xDF to 0xE0|Vcounter changes from 0xEF to 0xF0 
+
+|-----------------------------------------------------------------------------------|
+
+|VBlank cleared|              Vcounter changes from 0x1FE to 0x1FF                  |
+
+|-----------------------------------------------------------------------------------|
+
+|F flag set    |HCounter changes from 0x00 to 0x01|HCounter changes from 0x00 to 0x01
+
+|              |while VCounter is set to 0xE0     |while VCounter is set to 0xF0    |
+
+-------------------------------------------------------------------------------------
+
+
+
+The picture always starts at raster line 0. When switching between V28 and V30 the only thing that changes are the raster lines in which to switch vertical border / vblank / vsync as you can see in the table above.
+
+When switching to V30 within active scan and back to V28 after line 224 but before line 240 then the VDP will “forget” to start the vertical border and keep display active all the time. (This is similar to C64, except that while the C64 tests the border flag twice per raster line the VDP tests it constantly, so having V28 active for a single VDP cycle during line 224 or V30 for line 240 will start the border.) The resulting picture is still stable since vblank still works normally. This trick works on NTSC too, allowing for 243 instead of 224 vertical lines without a rolling picture.
+
+Sprites and HScroll work as expected in the vertical border area (though just the lowmost 8 bits of the raster line are used for HScroll lookup), also both planes work normally unless a plane size of 256x1024 pixels is used because the raster counter just uses 9 bits so graphics in the upper border will be vertically off by 512 pixels. (And this affects raster line -1 too which will be explained below).
+
+When opening the vertical border this way HIRQ runs continuously and is not reset before the start of each frame.
+
+The VDP has an internal sprite cache that caches the Y and size/link fields of each sprite in order to quickly determine visibility of sprites without having to access VRAM. This is implemented as a write-through cache - the moment a write to VRAM occurs the VDP checks whether it goes to the current location of the sprite table, and if it does and affects an Y or size/link field then the respective cache table entry is updated. And this is the only way of updating the cache, moving the sprite table address will NOT update cache contents (so contents of the cache and underlying memory will differ). Also, this mechanism is sensitive to the entire 128 KB address range even in 64 KB mode, so when setting bit 16 for the sprite table address but not for the Write/DMA target address (or the other way round) the sprite table in memory will get updated but the cache won’t.
+
+TODO what happens to the sprite cache when writing to odd addresses (64 KB mode)?
+
+2 H-borders before the raster line to be rendered the VDP checks all 80 sprites. It iterates over the cached portion of the linked sprite list (sizes and Y positions) using the link fields and identifies the first 20 sprites that are visible by examining Y position and vertical sizes. The VDP iterates a maximum of 80 (64) sprites, starting with sprite 0, following the link attribute, potentially looping (if there's an endless loop) and rendering sprites multiple times (which normally has no actual effect, though), but a link attribute of 0 makes it stop scanning the list further instead of re-evaluating sprite 0.
+
+Every VDP cycle 2 sprites are checked, that means one sprite every pixel. This scanning seems to start 6 cycles after the first sprite tile fetch and continues for exactly 40 cycles. No sprites are checked while display is disabled, also during the access slot in the middle of sprite fetches probably no scanning is done either. Modifying the sprite table during this slot does not affect the first 34 sprites but only the 46 sprites after those. (It is difficult to exactly determine when those checks occur since they only use cached data, evidence gathered so far includes this access slot and display disabled behaviour, including disabling display for the very first sprite tiles fetches for which the number of available sprite slots is not reduced. Still there are some discrepancies such as why the numbers of access slots lost due to disabled display are not exactly identical for phase 1 and 3 when they should be.)
+
+The outcome of this phase is stored in a shift register with 20 slots containing numbers of sprites deemed to be visible - as long as the register isn't full yet, every time a sprite is determined to be visible it's shifted into the shift register from the right.
+
+1 raster line before the VDP iterates over the visible sprites and fetches their X position and tile info. If there are less than 20 ones visible then they're checked late. No idea what memory accesses are being done for unused sprites. Furthermore, vertical position and size are fetched again from the sprite cache as well so they are evaluated twice per sprite and raster line.
+
+TODO I’m not entirely sure the following description is correct. The VDP clearly fetches Y and size from its cache during active scan here, at the same time it fetches X and pattern, but there are indications that it only evaluates this data during phase 3 (x=0 bug and sprite >= 80 behaviour) but there are also indications for what was written here (phase 3 sprites retaining their last slot address each).
+
+For each sprite checked 1 to 4 sprite tiles are scheduled for fetching and added to another list that consists of 40 slots. This list contains the address (14 or 15 bits, omitting the lowermost 2 address bits, not sure about bit 16) as well as X position, horizontal mirror flag, palette index and priority for each slot.
+
+Tiles of horizontally mirrored sprites are enqueued in the same order as if the sprite wasn't mirrored.
+
+The VDP just considers the lowermost 5 bits of the difference of sprite Y coordinate and raster line and adds it to the address of that sprite column’s top. This matters if the sprite’s Y coordinate is changed after it was determined to be visible in phase 1 - it is always rendered during this phase even if its new Y coordinate is no longer in range as if it was always 32 pixels high and just repeating after that. This for example means that sprite column 0 will always show tiles 0123 on top of one another in this order, repeating again and again, though normally the Phase 1 check will make sure only a subset, just as large as the sprite’s actual size, will be visible. I did not test vertically flipped sprites; according to Tiido for sprite height 1 these will show the column in order 0123 with each tile vertically flipped, for 2 tiles the column order is 1032, for 3 tiles the order is 2103 and for 4 tiles it is 3210. I am however not really sure about the first case since it’s a bit of an outlier, this should really be checked again.
+
+In the horizontal blanking gap immediately preceding each raster line this will iterate over sprites fetched during phase 2 and for each sprite fetch as many tiles as needed, immediately rendering them into the 320 pixel wide sprite buffer.
+
+Sprite tile fetch slots that are not in use still retain the address that was used the last time they were in use and issue a fetch from that one. The result is discarded however.
+
+The line buffer sprites are rendered into contains 8 bits per pixel: colour, palette, priority, in-use flag. It was already initialized to be all zeroes during rendering.
+
+The VDP renders tile by tile into the sprite buffer. Only pixels that have their in-use flag clear will get overwritten with the 7 bits from the current sprite (plus the in-use flag set to 1 if the 4 colour bits aren't all 0). Priority and palette don't play a role at this stage. Normally this means that sprites that come earlier in the list win over sprites defined later, no matter what their priority is. Also, endless loops act as if they weren't there, because after one loop all non-zero pixels have already been written to the sprite buffer so rendering those pixels again won't have an effect (the sprite buffer kinda wins) and transparent pixels don't play a role (they have lower priority than even the backdrop). However, with certain debug flags set, transparent pixels' palettes (and in S/H mode sometimes even their priority) play an important role because these are always overwritten so the sprite which contributes last wins. So there's a difference between endless and terminated linked lists in these cases.
+
+Also, there's a strange render bug. An "iszero" flag is set when a sprite with X=0 is activated and deactivated for sprites with X!=0. When this flag is set after it was clear a "hide" flag is set that will clear all remaining sprites of that raster line. The "hide" flag is reset after each raster line(but the "iszero" flag keeps its state). No further sprite is activated after all 40 tiles have been rendered. If less than 40 tiles are used, the VDP will likely activate dummy sprites internally that have X=0 and thus "iszero" will be set at the start of the next raster line.
+
+This means that a sprite with X=0, following a sprite with X!=0, will hide all further sprites on the same raster line. If the first sprite(s) of a raster line has/have X=0 then the remainder of that raster line is only hidden if the previous raster line had all tiles in use and the last tile belonged to a sprite with X!=0 (the only way to have "iszero" cleared at the start of a raster line).
+
+No idea about 32-col mode, didn't test. No idea really where that behaviour stems from. Only rendering is skipped - tile data is still fetched. And no idea how "stealing" sprite tile fetch cycles affects this.
+
+Also no idea why the VDP behaves like that at all. Maybe these flags were added as means for suppressing sprite rendering bugs and left over…
+
+We should really also check what happens if the sprite tile list is already full so the last sprite can only contribute maybe one out of its 4 tiles, what will happen if this sprite was mirrored.
+
+How does rendering the sprite to the sprite buffer work? It needs to be very fast (one tile fetched every bus access = 2 cycles, that's all the VDP has for blitting the tile). My idea, supported by mode 4 bugs (see below), is that it's divided into 40 slots of 8 pixels each and connected with a parallel bus that feeds all pixels with fresh tile data.
+
+So upon reading a sprite tile line (pixels e.g. ABCDEFGH) the pixels are first rotated right to match the actual X position (so with X=2 this becomes GHABCDEF) and then put onto the parallel bus of the sprite cache for that access cycle. During the first half of that cycle the left half of that sprite is rendered by activating the 8-pixel slot you get by dividing X by 8, at the same time a bit-mask is applied to just write to those cells that need to be overwritten (here: 00111111 - this effectively writes ..ABCDEF with . meaning "don't write"). During the second half the next slot is addressed and the inverted bitmask is sent (here: 11000000 - writing GH......), so in total this writes the desired sprite data.
+
+How does this masking (using the "in-use" bit) work? Upon activating a segment these bits are fed into a latch, combined with the incoming pixel data mask, and only those pixels that have both conditions met are overwritten. The combined pixels are re-written back into the buffer cell. This also means that transparent pixels are always written as well even though the VDP wouldn't have to.
+
+In the actual raster line the VDP renders the sprite buffer as if it was just another plane (with priority and such).
+
+Mode 4 bugs reveal that the same addressing mechanism used for blitting sprite tiles into the buffer are also used for reading out pixel data again. At the start of every 8-pixel block that entire unit is read out - the pixels read out go into a shift register from which fresh pixel data is fed into the render pipeline. Clearing is done upon rendering the 7th pixel each, at least this is what I think based on certain bugs where disabling display for the last pixel of a raster line also seemed to disable clearing of the last 8 sprite pixels of that raster line. Clearing just sets all bits to 0.
+
+The sprite buffer is neither read nor cleared during vertical blank and while display is disabled.
+
+Tiido suggests that from his observations with display disabled in the middle of a rasterline that there must be 2 line buffers being used alternatingly, I however am a bit sceptical since some glitches I saw suggest that there is just 1.
+
+The VDP renders one raster line before the topmost one already (called raster line -1) in order to get sprites right for the topmost raster line, including the side border right before. This way it can do all the sprite processing steps needed for what's normally the first visible raster line. This raster line is normally invisible unless debug flags are used (see below).
+
+The VDP processes sprites for raster line 224 just normally, but then in the horizontal border following raster line 223 it just fetches 4 of its tiles, then in the side-border preceding raster line -1 it fetches 32 more sprite tiles (and also does phase 1 processing for all 80 sprites of raster line 0 there). All those 36 sprite tiles are normally invisible (unless forcibly enabled using debug flags, see below); if they were forced visible then normally only the first 4 tiles will show, unless there was a sprite with X=0 within those 4 sprite tiles, then this will magically enable display of those 32 sprite tiles and render them for raster line -1.
+
+Sprites >= 80 show weird behaviour. The VDP has no cache entries for those - during phase 1 it will try to latch non-existing Y/link/size values into its temp registers; this will cause the values from the previous sprite to be re-used, but bits (more or less) randomly drop off to become zero. So it will determine visibility possibly based on corrupted values and more or less randomly jump back to "ordinary" sprites. Also it will possibly enqueue a sprite index >= 80 for phase 2. That phase will fetch pattern and X just normally, as if those sprites actually existed, just no idea what Y/size info is being used. Something weird seems to be going on here… I have a separate document where I did some tests but this stuff is totally inconclusive so I do not include it here.
+
+In 40 column mode the lowmost bit of the sprite table address is ignored. In 32 column mode it is used, though the sprites 64 to 79 aren't totally ignored... Tiido pointed out that the VDP will still retain cached Y/size/link fields of sprites 64 to 79 from H40 mode and allow jumping to those and but fetch X and pattern fields for those from corresponding sprites 0 to 15 instead and show peculiar behaviour on which pixels are displayed. All this makes perfect sense when you assume that sprite Y/size fields 64 to 79 are only evaluated in phase 1, phase 2 which fetches sprite X and pattern from sprite 0 to 15 will also re-fetch sprite Y and size from just those sprites, leading to the effects seen which are similar to what would happen if you change a sprite’s Y / size fields between phase 1 and 2.
+
+The VDP does 210 accesses (171 in H32 mode) per line, one every 2 cycles. Each access is 32 bits wide (a smart decision by Sega's engineers, since that exactly equals a tile's row of pixels or 2 consecutive plane entries or a sprite's tile ref + x position or a raster line’s scroll data for both planes at once).
+
+Accesses are organized as follows:
+
+This explains the data seen in debug mode:
+
+sHssssAsaaBsbb ... AraaBSbb~~ssssssss H40
+
+~HssssAsaaBsbb ... AraaBSbb~~ssssssss H32
+
+aa  bb  aa  bb ...   aa  bb  aa  bb   when data for each plane is read
+
+
+
+i.e. plane A: sprite tiles 0 and 1 beyond and (sprite tile 33 for H40 / DMA/refresh data for H32) and hscroll data before and plane B: sprite tiles 4 and 5 beyond and sprite tiles (36 and 37 for H40 / 28 and 29 for H32) before.
+
+When display is disabled the VDP still does those refresh cycles and uses all other cycles as access slots.
+
+When disabling display with bit 6 of register 1 the VDP ceases to do all accesses since it provides nearly all of its internal accesses for data transfer. This has the following effects:
+
+Thus, mid-raster line display disable is of very limited use unfortunately - it'll always break something, both tiles and sprites. Only in-border display disable seems to be useful, at the cost of losing sprites during phase 1 and sprite tiles during phase 3.
+
+Normally the VDP shows just border colour whenever display is disabled, in reality at least the tile planes keep on outputting whatever data is on the bus. The VDP forcibly enables the border for the duration of “display disabled”, but it gets both enabled and disabled a bit too early so the garbage data fetched does still show up briefly before the VDP resumes normal display.
+
+There are 2 bits that select either H32 or H40 mode. There are 4 combinations:
+
+It is possible to quickly switch from 0x81 to 0x80 and back again. Depending on where in the line this is done various effects will happen:
+
+Switching H40 to H32 during the last 8 tiles which normally wouldn't be displayed on H40 seems to display some kind of garbage data, similar to fake H40 SMS mode.
+
+Toggling bit 7 (switching between counters) will force the VDP to switch between different clock sources which can mess up timing for a brief moment and can e.g. lead to VRAM corruption.
+
+Testing reveals that in each of the 3 different modes (64k, 128k, SMS) addressing is different.
+
+|             Rows              |            Columns            |
+
+SMS mode    | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 0 | 9 | A | B | C | D | E | F |
+
+64k mode    | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 0 | 1 | A | B | C | D | E | F |
+
+128k mode   | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 1 | A | B | C | D | E | F | G |
+
+
+
+From the perspective of the program:
+
+In 64K mode column 0 (i.e. address bit 1) is inverted, the internal byte order of the VDP is the opposite of what the 68K sees. The VDP just emulates the opposite byte order through its interface, which also means that pixels aren't really stored in natural order internally. This explains a number of issues seen, for example why bytes written by copy commands are in opposite order, bit zero seemingly being swapped when using 128K and SMS modes. And all this was done just to provide seemingly correctly ordered bytes when used by the 68K which has a different byte order compared to the Z80.
+
+Enabling this bit mid-frame doesn't seem to have any side effects, however the VDP will now read from different addresses (due to different memory layout) and since it would normally read 16 bits in parallel from both memory chips but there is only a single one installed it will not get data for the upper 64 KB and instead read the same 16 bits twice. And because of this enabling this bit usually doesn't make much sense.
+
+But for writing this is actually pretty useful. When setting 128 KB mode the VDP will ignore target address bit 0 and discard the upper byte of each word written, but it will fetch words from RAM/ROM at almost twice the normal rate (so it’ll also almost writes as much data to VRAM as it would normally do).
+
+I call this trick byte-wide DMA. Of course it’s only useful during VBlank because enabling 128 KB mode would garble display as mentioned above. Writes to address a in 128K mode end up in the 68k VRAM address (((a & 2) >> 1) ^ 1) | ((a & $400) >> 9) | a & $3FC | ((a & $1F800) >> 1), so by setting the DMA increment to 4 we can use this for updating every 4th byte, very useful for vertical stripes in tiles. Just up to 256 bytes at a time. As mentioned only the lower byte gets written, and writing to odd addresses does not seem to have an effect at all (as if the lowmost address bit was just ignored).
+
+When using this take care of the sprite cache! If the formula above happens to spit out an address that happens to be covered by the sprite cache it will get updated of course. But the other way round this could potentially be used for updating the sprite cache faster than normally possible… even though the high byte is discarded it’ll still get written to the cache since the VDP has no clue that there are only 64 KB.
+
+Switching 64k mode to 128k mode while there is still unwritten data in the FIFO (easily possible with a register write directly after a DMA even during vblank) will lead to erratic behaviour. Maybe this only occurs when the FIFO was about to write the 2nd half of the next FIFO entry. I have seen behaviour from DMAs not working to data being written to VSRAM, that could have been due to leftover flags in FIFO entries.
+
+On Genesis 3 systems this trick does not work unfortunately (probably because they totally reconfigured the platform to use a shared memory chip for both CPU and GPU but still without any kind of shared memory), instead 128k mode seems to behave like regular DMA, just at almost twice the speed. This is just my impression from seeing Overdrive 2 run on such a machine, but I did not do any tests.
+
+I did quite some Mode 4 testing but this was out of curiosity, none of this was done in Overdrive 2, because of lower palette resolution, potential timing problems (different hblank/vblank positions potentially throwing capture devices out of sync) and because I did not find a potential use case other than generating additional work for emulator developers ;)
+
+The VDP can be switched to Mode 4 which provides backward compatibility with games developed for the Sega Master System. It behaves quite differently in that mode, though this only sets the VDP's internals to mode 4, not the whole system - all other system components still act like they're in mega drive mode, also the VDP still expects 16-bit CPU accesses (unlike in real SMS mode where it expects 8-bit CPU accesses). Nonetheless, the meaning of many registers totally changes. All registers except for the 10(?) SMS registers are disabled, though values written to them before switching over are still retained and can cause various effects.
+
+I did not test this but DMA might be impossible too in SMS mode. Register writes still work like they do in MD mode (and SMS mode since the format is pretty much the same, just that it's 2 bytes instead of 1 word there). Also, DMA-specific registers are inaccessible in SMS mode.
+
+Pixels are arranged differently - while MD mode is pretty much linear - each byte holds 2 pixels - SMS mode is pseudo-planar - each byte holds one bit of 8 pixels each.
+
+Mode 4 mode only has a single plane (A) - although plane B is available using debug bits and full of glitches. Also, a broken H40 mode is available too.
+
+Overall it seems like mode 4 is of little use.
+
+Mode 4 itself might be useful for planar mode tricks: switch the VDP to 128k mode in VBlank (memory arranged almost the same as SMS mode, just shifted by 1 bit and high byte of each word discarded as usual), set interleave to 8, then we can actually DMA to a single bitplane!
+
+However switching modes is very tricky though, especially since video timings seem to be a bit different and might confuse TV sets and especially recording equipment. Also, RAM limitations (16 KB = only 458 tiles available, e.g. in a 19 by 24 tile window). And other tricks might make the same effect well feasible in mode 5 instead...
+
+Broken plane B is of little use since normal mode 5 gives us similar possibilities with way less hassle - and H40 mode is pretty useless too (rightmost 8 tiles can't be used, only 4 sprites per raster line).
+
+Out of all the other tested bits, only interlace and X window size seemed to have an effect. Though interlace is useless (rolling picture, at least on PAL) and X window size is useless too (plane can be made wider than usual but not scrolled all the way due to only 8 bits of scroll-position; the entire plane buffer can't exceed 2 KB either and so the plane will wrap within the buffer before it even reaches the maximum scroll pos).
+
+Using general VDP knowledge and all kinds of border garbage it's possible to determine roughly what's going on on the address bus:
+
+My guess about the entire raster line (r* = unknown number of refresh/access slots):
+
+The hidden plane B can be forced to be visible using the debug register - either exclusively or mixed.
+
+This plane B isn't a real plane, it just displays data the VDP happens to read anyway. It's plane B's pixel generator still running actively and rendering pixels.
+
+The additional data comes from how the memory unit works - it always reads 32 bits at a time, even though just 16 bits are requested and used. For each fetched word the additional 16 bits come from the original word's address + $200 (as seen from mode 4's memory scheme) - and this address does not wrap around $4000 but thus reaches a bit beyond.
+
+Plane B basically displays whatever data plane A's generator fetched that way for odd tiles, together with the mentioned extra word.
+
+Plane B scrolls exactly as plane A does - except that horizontal scrolling "jumps" when bit 3 changes, since e.g. when X scroll increases from 7 to 8 then plane A's generator will fetch another fresh tile at the left edge, so previously even tiles become odd and vice versa, thus the data plane 4B gets to interpret changes too.
+
+Plane B outputs its pixels with a delay of 8 pixel compared to plane A.
+
+For each such plane A column that plane B displays the following happens:
+
+This "reading another word $200 bytes ahead" has 2 side effects. $200 bytes ahead means 8 tile rows further down in the tilemap, and different reads of the same data use mostly different bits, but one bit is shared with different meanings:
+
+Also, you effectively deal with 16 by 8 pixel tiles now - you can use the first 8 ones, then need to skip the next 8 ones, use the next 8 ones again, and so on...
+
+Timing behaves just like H32 with just 2 changes: it displays 320 pixels instead of 256, moves HBlank around and appends additional cycles to each raster line while all bus access timings remain identical.
+
+The biggest consequence is that the 8 additional tiles the plane generator outputs are bug-ridden since they don't show data intended to be used for planes but just display what just happens to be on that bus instead.
+
+Also, if there are 5 to 8 sprites to be displayed on a raster line then the first 1 to 4 of these sprites will happen to be rendered during active scan which leads to sprite display bugs.
+
+However the last 4 sprites to be displayed on a raster line are still totally fine - they are even no longer clipped off by the border at X=256 and extend a bit into the area beyond. They just can't be placed there entirely since the maximum sprite X coordinate is 0.
+
+The additional cycles H40 mode offers to the VDP are left entirely unused. They probably just become additional access or refresh slots.
+
+Out of the additional 8 tiles, the first tile shows data from access cycles - it’ll just show further data from the same DRAM line the VDP fetched data from the last time (i.e. previously accessed address + offset, not wrapping around after address $4000). The second tile shows the pixels that were fetched for sprite slot 0, the third tile shows X and pattern fetched for sprite slots 2 and 3, and the fourth tile shows pixels fetched for sprite slot 3. The remaining 4 tiles just show idle DRAM data as well.
+
+The data of the 4 bugged sprites is written into the sprite buffer during active scan which leads to weird behaviour. These sprites don't show up at their intended X coordinate; instead they show up where they are prefetched, the last sprite extending all the way to the border, repeating again and again. Those prefetched sprites also overlap a bit, showing some pixel mess - there's likely some conflicts going on, but at least there don't seem to be flickering instabilities. Changing a sprite's X coordinate just "rotates" that sprite's pixels, i.e. increasing it in steps of 8 has no effects.
+
+This is probably due to how the sprite prefetcher works. It needs to quickly render pixel data into the sprite line buffer - tile pixel 0 is sent to line-buffer positions 0,8,16,24,..., pixel 1 to positions 1,9,17,25,... and so on - to make sure sprite data shows up correctly the sprite tile's 8 pixels are rotated internally first before sending (e.g. X coord 1 -> rotate to the right by 1 pixel so pixel 0 gets sent to positions 1 (where it belongs) and 9,17,25... onwards too).
+
+Normally there's a mechanism in place that restricts sprite tile writes to the correct pixels, but this mechanism doesn't seem to work here for some reason I don't understand yet. Also, this probably means that sprite rows are cleared after being displayed, not before…
+
+However, all this feels a bit weird. Judging from similar sprite display bugs on other platforms this feels a bit like sprites aren't rendered into a line-buffer (maybe they are in mode 5) but instead are rendered from one buffer for each tile (or sprite?). This buffer would be initialised with the sprite's pixels, pre-rotated, and equipped with 2 X positions for a comparator for turning it on resp. off - and pixel lookup would be used instead of pixel shifting. This would somewhat explain the bugs we saw, but it's unlikely they did something like that for all those 40 sprite tiles that could be visible at once in MD mode.
+
+Of course plane B and broken H40 mode can be combined to an even more useless mode, leading to a number of additional broken tiles for broken H40 mode too, which will (likely) use the (32-bit-extended) tile pixels fetched for sprites 0 and 3 and then just refresh data for additional columns.
+
+Sprites show up in a specific way. There are 8 columns next to the 32 valid columns. Most pixel data fetched only shows up in the following raster line, not in the raster line where it was fetched.
+
+There's nothing special about column 32. Normal sprites can reach into it and won't get clipped off but that's it about it. Sprite 0 is rendered in column 33, both left and right half. Sprite 1 is rendered in column 33 (left half) and column 34 (right half and left half). Something odd goes on with the right half. It is not just drawn normally, but also a "prior" draw occurs which happens early so it becomes visible in the previous raster line. It occurs for all sprite pixels for which the previous sprite didn't draw an opaque pixel. Pixels enabled that way (including transparent ones!) replace the pixels that would normally be output. Sprite 2 is rendered in column 34 (left half) and column 35 (right half and left half) and behaves like sprite 1. Sprite 3 is rendered in column 35 to column 39 (both halves each) and behaves like sprite 0.
+
+When writing the palette for mode 5 in mode 4 then its bits behave as follows:
+
+As seen above there are 18 access slots for a raster line in H40:
+
+DMA seems to always use the same speed, it doesn't matter whether DMA data is read from ROM or RAM. (But I forgot whether I tested fast modes.)
+
+There are only 2 kinds of transfers speed-wise: slow and fast ones. Writes to VRAM in 64k mode are slow, all other kinds of transfers (to CRAM, VSRAM as well as VRAM in 128k mode) are fast.
+
+Fast transfers cost words*2.4+5.6 68k cycles on top of what the actual 68k instructions cost.
+
+These ones are limited by how fast the video chip can fetch data - it fetches one word from RAM or ROM every internal cycle, except that it skips 2 internal cycles 5 times per raster line, whenever it does an internal refresh cycle.
+
+Slow transfers cost max(words*2.4+5.6, words*4.7-6) cycles on top of what the actual 68k instructions cost. These ones are clearly limited by how fast the data can be stored for more than 5 words because at this point the FIFO fills completely up. On the other hand the DMA ends while there is still data in the FIFO to be processed, this is why there are seemingly negative costs.
+
+For getting there I used both occam's razor (i.e. the simplest explanation is the most plausible one and to be preferred) and sega's transistor razor (the less transistors a feature needs, the better).
+
+They probably started with the first line of this (certain sprite colours darken / brighten planes) - by itself this works pretty solid, effectively gives you sprites of 50% transparent black and white, except for the obvious sprite order/priority issues (since that semi-transparency is determined after combining all sprites all semi-transparent pixels will seemingly rip holes into underlying sprites - similar to how low-prio and high-prio sprites can have different order among themselves than they have to the planes).
+
+Then someone decided "oh, why shouldn't we be able to have darkened planes too!" but for some reason they did it as mentioned above and not per pixel.
+
+The way they did it, forcing "shadow" when both planes are low priority, would, however, inadvertently force all sprites dark as well, so they added the next step - force high prio sprites back to normal (so low prio sprites could still get darkened when desired, but still with somewhat erratic behaviour since sprite darkness depends on plane tile priority, even when all plane tile pixels are transparent and thus normally wouldn't have an effect).
+
+But still there was an oversight. The first step can selectively darken or brighten pixels. Making pixels underneath sprite colour 63 (= darken) dark seems alright (dark stays dark), making normal pixels dark also seems alright (we wanted to darken, didn't we?), but forcing pixels that would normally be highlighted to dark seems a bit over the top, so they added another fix - making pixels that would both be darkened by plane priority and highlighted by sprite pixels normal again. Their thought was probably "disable shadow if we got the sprite colour corresponding to 'highlight' - even in the corner case that sprites didn't highlight because they were hidden underneath a plane that plane must be high prio so it wouldn't be dark anyway and this stage would have no effect". But the way they implemented it, not checking the palette, forces sprite colour 14 of palettes 0 to 2 to normal even if they'd normally be shadowed. Maybe this is the victim of a plan change, they might have originally repurposed colour 14 and 15 of every palette and when they changed it to just palette 3 they forgot to update this workaround accordingly.
+
+Out of these bits 6,7,8 are the really interesting ones, the other bits didn’t seem to exhibit any useful behaviour.
+
+When talking about color I mean "effective color", i.e. pixel color + palette index * 16, yielding a value from 0 to 63.
+
+Normally you’re supposed to set bit 6 before playing with bits 7 and 8 to force one plane permanently active, i.e. full-screen and including all borders. Not setting bit 6 will activate the selected plane on top of what would normally be active, thus potentially leading to 2 planes being active at the same time and typically ANDing pixel values just prior to palette lookup. In this case I will call the permanently active plane the “masking” plane. Since it is permanently active background colour won’t show anywhere since there’s always at least a single plane active.
+
+“X only” means that only that plane will be shown, including the border area where lots of glitches can be seen.
+
+“X-masked” means that plane X is forcibly enabled everywhere. The effect is that:
+
+Another way of implementing is to force background colour to 63 and then AND the entire output of rendering everything normally with plane X.
+
+S/H works as usual, just render as usual, remember the S/H flags, then do the ANDing based on the foreground pixel, lookup the palette and then apply S/H. One special case: in sprite-masked mode transparent pixels of high priority sprites will make shadowed plane pixels normal again, this is because the debug flags force plane S to be permanently active (see S/H formula above).
+
+If bit 8 is clear and bit 7 is set (S only or S masked) then horizontal and vertical border pixels will always use palette entry 0.
+
+Raster line -1 however shows parts of sprites that would have been displayed in raster line 224 (see above), but of course the sideborder still uses palette entry 0 only. Since this is officially part of the border area sprites will show here exclusively without masking with tile planes in S-masked mode.
+
+On top of the image area another dummy raster line (normally hidden by border) is being rendered, it contains a strip of tile data from just before the normal image data (except for planes 1024 tiles high, there it wraps around incorrectly and it fetches from a position offset by 512 raster lines).
+
+In all other vertical border raster lines strange bugs appear. What we see here is caused by how the memory chips behave. They have 2 access ports, one for instructions and the other one just outputting data at high speed. Internally when the VDP requests access to memory contents the memory chip copies an entire row of data of 256 bytes into an internal buffer and keeps on outputting data from it onto the high-speed bus, one byte after another, looping around, never stopping.
+
+As mentioned below data isn't arranged linearly inside memory chips, in 64 K mode each VRAM row contains 4 adjacent bytes, then the 4 adjacent bytes 1 kB ahead, always advancing in 1 kB steps after 4 bytes each and looping around when reaching the end of the 64 K memory space. So a total of 256 bytes (or 64 groups of 4 bytes each) is contained in each VRAM row.
+
+This explains the garbage we see: after the last normal bus access the memory chip just keeps on outputting data from that last accessed VRAM row all the time and the VDP doesn't care and just displays it. So what exact data is being displayed depends on the last ordinary bus access that happened, for the vertical blank area that is the last of the 4 sprite tiles fetched after the last raster line. So if there are at least 4 sprite tiles to be fetched for raster line 224 then the 4th of those determines what kind of data will be displayed in the vertical border. If not, then the 4th sprite slot will just do the fetch again it did the last time there were at least 4 sprite tiles in use in any raster line.
+
+Even though there are 64 groups the tile fetch pattern makes the VDP just use 2 consecutive groups out of every 8 groups fetched, i.e. 16 groups = 128 pixels. Also, since the number of groups fetched per raster line divided by 8 yields a remainder of 2, the next line gets different accesses. In total 4 consecutive lines each have an pattern on their own, after 4 lines a total of 840 accesses (= 13*64+8) have been seen, so the pattern is shifted to the left by 16 pixels then.
+
+Writing to the VDP, no matter whether using DMA or writing the data port, does not affect the patterns as those rights happen entirely through the access channel while the high-speed data channel just keeps on outputting its buffer contents again and again.
+
+The sprite stage, however, does not render anything during side-borders, only for raster line -1 as explained above.
+
+I saw some VRAM corruption after writing the debug register but could not reproduce it in later tests, my best guess was that writing could cause VRAM address glitches. Not sure if either test was flawed… but others reported seeing similar things so I think this is indeed an issue. So I heavily safeguarded against that in Overdrive 2, rewrote VRAM after writing to $c0001c.
+
+My best guess why that happens is that bit 5 changes the behaviour of DRAM addressing and writes to $c0001c are unlatched and can thus cause short glitches on the VDP’s address bus which in turn can confuse the VRAM chips, make them address multiple rows at the same time and mix them up.
+
+During testing we noticed that a few mega drives don't behave as expected when the debug register is used.
+
+Typical symptoms were that some pixels in regular horizontal and sometimes also vertical patterns didn't get ANDed as expected but either ORed (or just one source took precedence) or even picked up noise. Also, all those mega drives also suffer from palette corruption, where palette entries changed seemingly randomly.
+
+We have been getting a lot of reports from people running the demo that we are analyzing. It seems that the most problematic VDP chip is the original 315-5313 / 7101. Many of them, especially chips manufactured by Hitachi, exhibit this behaviour. A general rule of thumb is that VA4 and prior use this chip, while VA6 and higher use the 5313A or newer. However, this is unreliable as depending on leftover production lots of PCBs and chips, combinations such as VA4 + 5313A or VA6 + 5313 can occur.
+
+Some chips are just a bit affected (you see a tiny bit of noise and maybe a palette change per second), others are heavily affected (even when rewriting the palette every vblank it's corrupted again at the bottom of the screen - this is what lead people to describe these bits as causing screen flicker when testing with Sonic).
+
+Bottom line this means that about 30% of Model 1 and very few Model 2 systems will experience graphical glitches.
+
+The plane ANDing behaviour seems to stem from signals being mixed instead of using proper AND logic. Sega only intended one signal to be active at any given time (and that's also the case under normal circumstances) but using these bits above 2 planes can be active at the same time (but never all 3), leading to that mixing.
+
+On newer MDs this gives a clean and pretty useful AND operation. But on older MDs the result of ANDing 0 and 1 doesn't give a clean 0 but often something inbetween, which can even lead to metastability propagating into the following palette lookup stage. This can cause 2 palette entries to be accessed at the same time, and due to the way the palette lookup was implemented (always write back upon read) this will wire-combine their contents and write them back to one or both cells (which seems to be a bit random but with a tendency to AND values so black wins in the long term), maybe most of the time just one palette entry is copied to another one. Anyway, all this breaks palettes.
+
+Mixing sprites with any plane seems to create the most heavy bugs. Mixing plane A with plane B seems to be more stable in general (though we seem to have found a MD where mixing with sprites seems to be stable but mixing planes isn't).
+
+Regarding those patterns, there are bits of the VRAM address currently being accessed leaking into the mixing stage here. In one case it was like this: when address bits 3,4,5 are all 1 then mixing 0 & 1 (both ways round?) lead to 1 instead of 0, if bit 3 was 0 but bits 4 and 5 were 1 then this lead to noisy behaviour. This seemed to affect palette index bits 2 and/or 3 only (= 4-bit pixel + 16 * palette number). Also this seems to be different on different MDs, seen lots of different patterns here. More tests are totally needed!
+
+To be extended whenever I find something new or someone points out something being wrong.
+
+2017-04-20 Version 1.1: minor changes, fixed an error in the 128k mode formula|||
+

@@ -1,0 +1,101 @@
+Everyone’s talking about deep learning these days. It’s being used to drive cars and ruin strategy games, to translate between languages and rip off van Gogh. But can it be used to attempt that most quintessential human skill: judging other people’s code?
+
+Code style is an inherently subjective and difficult thing to judge. Existing linters use static analysis and hardcoded rulesets to find questionable code, but sometimes code just seems off in a way that’s hard to explain. This article will take us on a journey to teach a neural network that same sense, and probably put ourselves out of a job in the process.
+
+Before we get started, I owe a debt of gratitude to Andrej Karpathy and Justin Johnson, who have spent many years studying deep learning at Stanford and were kind enough to turn their knowledge into code usable by those of us who only study deep learning by reading about it on Hacker News.
+
+Most of what I’m going to show you is based on Karpathy’s The Unreasonable Effectiveness of Recurrent Neural Networks (913 points), but I also got a lot out of Martin Gorner’s Deep Learning Without a PhD video (218 points).
+
+The basis for what we’re doing here is called a character-level language model, which means we’re not going to parse the code or build in any specific knowledge about code structure or syntax. This is because (a) we don’t want to limit ourselves to any particular format, and (b) it’s easier.
+
+We’re using a particular kind of neural network called an LSTM, a Long Short-Term Memory network. This is because (a) LSTMs are well-suited for data with long-term structure (like code) and (b) it’s easier. Specifically, it’s easier because we’re building on top of torch-rnn, which does most of the work of building and training LSTMs for us.
+
+Full disclosure, setting up torch-rnn is kind of a pain in the axons. You need Torch (and Luajit, and Luarocks) to make it go, CUDA for graphics acceleration, some Python stuff for preprocessing, and a whole lot of Lua modules. The installation instructions are pretty detailed (OSX instructions here), but expect it to take a while. If you can train a neural network to do this step for us, you’ve earned my eternal thanks. And probably a PhD from somewhere.
+
+Once we pass through the seventh circle of dependency hell, we should be ready to run the hello world of torch-rnn: generating Shakespeare! The library comes with , a megabyte of The Bard’s finest. Let’s show him what modern technology can do.
+
+First, we turn the text into numeric data that torch-rnn can work with:
+
+Then we start the training process:
+
+Depending on your GPU, this might take a while. I have a Retina MacBook Pro 2012 Compact Space Heater Edition, so I went for a long walk and started learning Russian.
+
+Я вернулся, товарищ! Okay, the trained model data has been dumped in the directory. Let’s generate some iambs:
+
+Now we’re ready to try with some real data. I picked Node.js 4.0.0. Or, more accurately, just the and directories from Node.js 4.0.0. I wanted to use too, but it had tests for invalid unicode characters and that upset the preprocessor’s delicate digestive system.
+
+Combined, those two directories only add up to 2.7 megabytes. Ideally, we’d like more data than that, but the Node.js core team don’t seem inclined to increase their code size by a factor of 10 for no reason. Yet another sign that Node isn’t ready for the enterprise!
+
+Anyway, once we know what data we’re using, we just need to glob it up into a big file. I chose to also prefix each line with the file it came from, like so:
+
+Why did I do this? Like so much in deep learning, the short answer is “it seemed like a good idea”. The perhaps more legitimate answer is that if we want to test a given file against our data, it’s important whether it’s a  or a  file and whether it comes from or . Maybe we have different code styles for test code, or vendor code, or whatever. Also, it seemed like a good idea.
+
+Now that we have gently massaged our data into a docile and compliant state, we can shove it into the waiting jaws of our data processing machine:
+
+Perfect! No longer must we waste our hard-raised venture capital on entitled software developers with their foosball tables and ironic facial hair. Robots can crush code 24/7, and don’t even need to be replaced every few years. But the real test remains. Are they capable of a developer’s true skill: withering and sarcastic judgement?
+
+To evaluate code, we need some kind of surpriseyness metric to tell us when the neural network saw something it didn’t expect. Internally, the network already generates a set of probabilities for the next character, so we can use those and compare them to what we actually see.
+
+One way to do that would be to print it out numerically, but that’s unintuitive, and also boring. Instead, let’s turn our surpriseyness into terminal colours! That way we can easily pinpoint surprising parts of the code and check them against our own soon-to-be-obsolete intuition.
+
+This is a tricky problem, but there is a simple technique that can make it much easier: plagiarism! Most of the work for what we want is already implemented in torch-rnn. So let’s take the that we used earlier, and rewrite it just enough to get ourselves out of trouble. Here’s the meat (hidden inside ):
+
+That contains our probabilities for the next character based on the current state of the network. So let’s do this:
+
+is the current character as a number, is the current character as a string, and is a function that takes a number from 0 to 1 and a string and prints the string redder the bigger that number is. So should print out each character redder the more unexpected it is. Let’s try it!
+
+Hm. That’s not quite right. Why is the first letter of the filename always red? And the first letter of the extension? And the first letter of each line…
+
+The problem is that the more options there are, the lower the probability of each will be. Lots of different things can come after a , or a  , or a  , so the probability of any particular one is very small.
+
+In retrospect, using to measure surprise was pretty naive. It’s like being surprised at the outcome of every die roll. “Whoa! I can’t believe it’s a 4! There was only a 1/6 chance of that happening! That’s so amazing!” The die roll is unpredictable, sure, but not surprising.
+
+What we really want is some notion that captures not just how likely the outcome was, but how likely we thought it was going to be. We want to know when we were pretty certain it was going to be one thing, but actually it was something totally different. In other words, we want cross entropy.
+
+Cross entropy, so named because understanding it makes you go cross-eyed, is an entropic measure of the difference between probability distributions that uses the Kraft–McMillan inequality to measure the cost in bits of trying to store data with one distribution in a coding scheme optimised for the other.
+
+Or, to put it another way, it’s a magic voodoo formula figured out by smart maths people that tells you how surprising stuff is. Great!
+
+Luckily, cross entropy is so useful in deep learning that we can just plagiarise it yet again. It’s already implemented in Torch, and used by to measure and tune the accuracy of the network:
+
+So we just steal that and replace our old code with this:
+
+The number 10 is just what our maximum surprise level is. I picked 10 because it seemed like a good idea. So how’s it look now?
+
+Ooh, much better. We still get a bit of spurious red, but that’s likely because of our network mispredicting, not our surpriseyness being wrong. Let’s try putting some errors in:
+
+Neat. So there are a few interesting things here. We forgot the quotes after the , a fairly trivial error to spot, but sure enough we get some nice red there. We also misused , which was meant to be a pointer, and that turned up both where it was declared and in subsequent lines where it was used.
+
+We also made two other changes to the lines. We moved to a different line, which our network didn’t care about, and included anew file creatively named , which it did care about. That could be a false positive or not depending on your perspective.
+
+Up until now, we’ve been ignoring newlines because big bright red lines are annoying, but lots of errors happen on newlines cough missing semicolons cough. Let’s see what happens when we turn newline errors back on:
+
+Now this is interesting. This is the original code, no errors added, but still we see some big red blobs. It doesn’t like . Maybe our network thinks that’s meant to be an if statement? It also picks up the two empty lines in a row and, most interestingly, it flags the multi-line statement with no braces.
+
+Now, who’s to say multiple empty lines is a problem? Or if statements with no braces? Like all code style, it’s subjective, but our neural network doesn’t care about nuance. It thinks you’re wrong, and it’s going to loudly proclaim that all over your terminal.
+
+So far, pretty promising, but the best thing about deep learning is how many variables there are to twiddle. By default, torch-rnn uses a 2-layer network with 128 neurons, no dropout, and no batch normalisation.
+
+What do those things mean? You can watch Gorner’s video to find out, but it doesn’t matter that much because nobody knows what the right values are anyway! So, like all good scientists, we blindly mess with the numbers and see what happens.
+
+For this bit, I spun up an AWS p2.xlarge instance. With spot instance pricing this cost me about $5/day. This is extremely cost effective for how much power you get, especially when compared with my backup plan of buying enough Apple shares to convince Tim Cook that GPUs are useful.
+
+The number we want to look at here is the validation loss, which is just our old friend cross entropy. Torch-rnn automatically puts a proportion of the data aside that the network never sees during training, so the lower our validation loss, the less surprised it should be by normal code.
+
+Sometimes we will do much worse on our validation data than our training data, this is usually because our network cheated and just memorised all the data. Cheeky neurons! You can punish them for this by turning dropout on, which isolates a proportion of the neurons each generation to get them to rat on their friends and/or avoid overfitting to the data.
+
+Anyway, here are the values I tried, and what the output looked like:
+
+At this point we’re straying far beyond the realm of anything pretending to be scientific. To my eye, 3x512 actually looked pretty good, though. Clearly the 4-layer with 80% dropout experiment did not yield anything useful. And actually, by the look of it, the defaults were pretty decent. Probably what we would need to make these bigger numbers work for us is more data.
+
+Machine learning is the kind of thing where you can get a tantalising result in a week, and then spend years of work turning it into something reliable enough to be useful. To that end, I hereby provide a tantalising result and leave the years of work as an exercise for the reader.
+
+You can find a fork of torch-rnn including the code I used for this article on Github, under the name LiNNt, which you have to admit is pretty clever. Much as this code stands on the MIT-licensed shoulders of torch-rnn, you are likewise welcome to stand on its shoulders. It’s shoulders all the way down, baby.
+
+Some interesting future work would be to train the network on larger codebases (I tried to do the Linux kernel but it was so huge I ran into disk issues), and maybe try out supervised learning by comparing accepted vs rejected pull requests. It would also be interesting to see field reports of it being tried on real codebases, or even non-code data.
+
+Thanks for your time! I hope you’ve found this foray into deep learning useful, and if not, I hope the neural network that eventually replaces you finds it amusing enough to spare my life.
+
+This project was created as part of Prismatik Labs. Prismatik is a tech agency that specialises in fielding high-performance, high-motivation technology teams and solving hard technology problems.|||
+
+Deep learning is used to drive cars and ruin strategy games, to translate between languages and rip off van Gogh. But can it attempt that most quintessential human skill: judging other people’s code?

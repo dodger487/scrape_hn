@@ -1,0 +1,61 @@
+Yubl was a social networking app with a timeline feature similar to Twitter. The development team leveraged a serverless architecture where Lambda and Kinesis became a prominent feature of our design.
+
+As part of the design, we tried to keep in mind that the characteristics that define a system that processes Kinesis events — which for me must have at least these 3 qualities:
+
+Whilst our experience using Lambda with Kinesis was great in general, there were a couple of lessons that we had to learn along the way. Here are 3 useful tips to help you avoid some of the pitfalls we fell into and accelerate your own adoption of Lambda and Kinesis.
+
+Because of the way Lambda functions are retried, if you allow your function to err on partial failures, then the default behavior is to retry the entire batch until success or the data expires from the stream.
+
+To decide if this default behavior is right for you, you have to answer certain questions:
+
+In the case of Yubl, we found it was more important to keep the system flowing than to halt processing for any failed events, even if for a minute.
+
+For instance, when a user created a new post, we would distribute it to all of your followers by processing the event. The 2 basic choices we’re presented with are:
+
+Of course, it doesn’t have to be a binary choice. There’s plenty of room to add smarter handling for partial failures which we will discuss shortly.
+
+We encapsulated these 2 choices as part of our tooling so that we get the benefit of reusability and the developers can make an explicit choice for every Kinesis processor they create
+
+Depending on the problem you’re solving, you would apply different choices. The important thing is to always consider how partial failures would affect your system as a whole.
+
+AWS announced support for Dead Letter Queues (DLQ) at the end of 2016. While Lambda support for DLQ extends to asynchronous invocations such as SNS and S3, it does not support poll-based invocations such as Kinesis and DynamoDB streams. Until AWS updates the DLQ features, there’s nothing stopping you from applying the concepts to Kinesis streams yourself.
+
+First, let’s roll back the clock to a time when we didn’t have Lambda. Back then, we’d use long running applications to poll Kinesis streams ourselves. Heck, I even wrote my own producer and consumer libraries because when AWS rolled out Kinesis they totally ignored anyone not running on the JVM!
+
+Lambda has taken over a lot of the responsibilities — polling, tracking where you are in the stream, error handling, etc. — but as we have discussed above it doesn’t remove you from the need to think for yourself. Prior to using Lambda, my long running application to poll Kinesis would:
+
+A Lambda function that processes Kinesis events should also:
+
+Since SNS already comes with DLQ support, you can simplify your setup by sending the failed events to a SNS topic instead. Lambda would then process it a further 3 times before passing it off to the designated DLQ.
+
+We found that when a Kinesis stream has 5 or more Lambda function subscribers we would start to see lots ReadProvisionedThroughputExceeded errors in CloudWatch. Fortunately these errors are silent to us as they happen to, and are handled by, the Lambda service polling the stream.
+
+However, we occasionally see spikes in the GetRecords.IteratorAge metric, which tells us that a Lambda function will sometimes lag behind. This did not happen frequently enough to present a problem but the spikes were unpredictable and did not correlate to spikes in traffic or number of incoming Kinesis events.
+
+Increasing the number of shards in the stream made matters worse and the number of ReadProvisionedThroughputExceeded increased proportionally.
+
+According to the Kinesis documentation … each shard can support up to 5 transactions per second for reads, up to a maximum total data reads of 2 MB per second.
+
+And the Lambda documentation … If your stream has 100 active shards, there will be 100 Lambda functions running concurrently. Then, each Lambda function processes events on a shard in the order that they arrive.
+
+One would assume that each of the aforementioned Lambda functions would be polling its shard independently. Since the problem is having too many Lambda functions poll the same shard, it makes sense that adding new shards will only escalate the problem further.
+
+After speaking to the AWS support team about this, the only advice we received was to apply the fan out pattern — by adding another layer of Lambda function who would distribute the Kinesis events to others.
+
+Whilst this is simple to implement, it has some downsides:
+
+We also considered and discounted several other alternatives, including
+
+In the end, we didn’t find a truly satisfying solution and decided to reconsider if Kinesis was the right choice for our Lambda functions on a case by case basis.
+
+For subsystems that do not have to be realtime, use S3 as source instead. All our Kinesis events are persisted to S3 via Kinesis Firehose. The resulting S3 files can then be processed by these subsystems using Lambda functions. As an example, one such subsystem would stream the events to Google BigQuery for BI.
+
+For work that are task-based (i.e. order is not important), use SNS/SQS as source instead. SNS is natively supported by Lambda, and we implemented a proof-of-concept architecture for processing SQS events with recursive Lambda functions, with elastic scaling. Now that SNS has DLQ support, it would definitely be the preferred option provided that its degree of parallelism would not flood and overwhelm downstream systems such as databases, etc.
+
+For everything else, continue to use Kinesis and apply the fan out pattern as an absolute last resort.
+
+So there you have it, 3 pro tips from a group of developers who have had the pleasure of working extensively with Lambda and Kinesis.
+
+I hope you find this post useful, if you have any interesting observations or learning from your own experience working with Lambda and Kinesis, please share them in the comments section below.|||
+
+Yubl was a social networking app with a timeline feature similar to Twitter. The development team leveraged a serverless architecture where Lambda and Kinesis became a prominent feature of our design…
