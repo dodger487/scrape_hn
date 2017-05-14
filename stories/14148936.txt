@@ -1,0 +1,133 @@
+How to Utilize the “Heapster + InfluxDB + Grafana” Stack in Kubernetes for Monitoring Pods
+
+After you have successfully setup your Kubernetes cluster, have built Docker images with your applications or microservices, and see them running, the next step is to configure a proper monitoring and alerting mechanism so that you’re aware of any possible problems with your worker nodes, pods, and services.
+
+For this you have a few options, for the purposes of this article we’ll share our experience using the following open source tools:
+
+Let’s begin with describing each component role and possible setup solutions.
+
+Heapster collects cluster-wide metrics from all Kubelet daemons (Kubernetes agents) installed on worker nodes. Kubelet has built in cAdvisor, which collects host metrics like CPU, disk space, and memory utilization, in addition to containers metrics. Collected data can be written to InfluxDB and other time series storage solutions. Also, the current official Kubernetes dashboard relies on Heapster to display CPU/Memory utilization metrics. An open feature request exists for the dashboard to support Prometheus and possibly other pluggable monitoring solutions. However, right now it looks like Heapster is a must-have component for any production cluster.
+
+Grafana is a well-known dashboarding solution. The latest version supports basic alerting mechanisms which can be integrated with on-call systems, like OpsGenie/PagerDuty/VictorOps. It’s also possible to create separate dashboard access for different users and teams. In addition, Grafana has the concept of “organizations”, used for multi-tenancy, that enables you to group resources and give access privileges to particular users.
+
+Grafana has many plug-ins which allow different data sources to be used, such as InfluxDB, Graphite, Elasticsearch, Prometheus, and more. With it you can create custom visualization panels that include graphs, tables, and lists based on queries to a particular data source. You can also query different data sources from the same dashboard, since each “panel” has a settings-like query, alert thresholds, and data source — all of which are easily configurable through the user friendly Grafana web UI.
+
+InfluxDB is a fast time-series database optimized for massive writes of events and metrics data. It was initially based on LevelDB open source key-value store developed by Google, but latest versions came up with a custom developed new storage engine that is fine-tuned for the specific needs of InfluxDB. The database has HTTP API and command line interfaces. We will cover the query syntax of InfluxDB further in this article.
+
+Of course, we’re here to talk containers, so let’s see how you can utilize the “Heapster + InfluxDB + Grafana” stack in Kubernetes for monitoring pods.
+
+Your starting point is a working Kubernetes cluster. From here you’ll need to deploy all monitoring stack components and services which you can do from the official Kubernetes repo on Github.
+
+Next, download the YAML files with curl/wget or clone the repo with “git clone” and navigate to the “kubernetes/heapster/tree/master/deploy/kube-config/influxdb” folder. Before you run this in production you’ll need to change a few things since by default it uses ephemeral volume to store its data, causing InfluxDB and Grafana pods to lose the data when the pod is removed. Use a folder on a worker node for data storage, in both Grafana and InfluxDB deployment manifests, or you can store it somewhere else, on EBS of EFS volumes if you’re running on AWS, for example. Simply mount the chosen storage to a particular path and use the mount path as “hostPath:” directive in the manifest instead of “emptyDir: {}”. Here’s an example of such a modification in “influxdb-deployment.yaml”.
+
+With this (assuming you mounted the needed EBS/EFS volume at
+
+Also, pay attention to Grafana service definition. You may wish to uncomment the “ ” field in “grafana-service.yaml” to be able to access Grafana directly on a host IP, in case you don’t have an ingress resource and ingress controller handling your traffic.
+
+To create the resources, after making changes in yaml files, run:
+
+This will create all resources from files in the current folder. You’ll see the pods created in your Kubernetes dashboard.
+
+When you see the pods are up and running, try to access the Grafana service URL using the NodePort specified in your dashboard. If you chose to use random and not manually assigned, to find the port browse into namespace “kube-system”, then “services” and click the Grafana service. You’ll see something that looks like the following:
+
+Or issue this command to find the external port:
+
+Then, navigate to Grafana and you will see two predefined dashboards, one named “Cluster” and one named “Pods”:
+
+The “Cluster” dashboard shows all worker nodes, and their CPU/Memory metrics. Type in a node name to see its collected metrics during a chosen period of time.
+
+The “Pods” dashboard allows you to see resource utilization of every pod in the cluster. As with nodes, you can filter which pod details are viewable by typing its name in the top filter box.
+
+If you’re familiar with Grafana, you can easily create custom dashboards to show particular cluster-wide statistics or important information about a static set of pods. If you use a StatefulSet, for example, its pods keep their names static all the time, so once you’ve created the set, you can automatically create a dashboard that will show only those pods, filtered by name using a custom query to InfluxDB date source.
+
+Let’s do a quick lab, in which we deploy a demo nginx StatefulSet, and create a custom dashboard that shows only those pods statistics.
+
+We begin by following this simple chapter in official Kubernetes documentation:
+
+Start by copying the manifest and run “kubectl create” on it. If you have difficulties with PersistentVolume resource creation (for example, if your dynamic volume provisioning is not yet set, or not set correctly, which might happen on AWS when your newly-created EBS volumes land in another availability zone from the hosts to which you constrained the pods and can’t be attached after creation), delete all sections starting from line “ ” down to the end of file. Then try “kubectl create -f your_yaml_file” again (make sure to use the latest kubectl version).
+
+When you’ve finished deploying the nginx set, run this command to find out your exact pod names:
+
+At the bottom of the description, you will see the nginx pod names as “web-0” and “web-1”.
+
+Next, we want to explore the data collected by Heapster, which is stored in InfluxDB. Do not try to use “kubectl exec -it influxdb-pod-name — /bin/sh” with later “influx” command to explore the database, because only the server component “influxd” is installed in this pod. You need to install InfluxDB client on one of your machines from which you want to explore the database, following the official guide.
+
+Next, find your InfluxDB service and port using this command (or just browse the dashboard in “kube-system” namespace to find it):
+
+Note the IP and port of “monitoring-influxdb” service, as this is where we need to connect with “influx” client. Execute:
+
+This gets you into the database shell (similar to mysql), where you can start typing InfluxDB commands and queries directly and see the results.
+
+In the following screenshot you can see all steps needed to start exploring the metrics in this database.
+
+Type “show databases” to see all existing databases (in future versions of Kubernetes/Heapster, default naming might change, so we should not assume that “k8s” is the database name).
+
+In our case, we have “_internal” and “k8s”, so type “use k8s” to switch to this database.
+
+Now, as opposed to mysql, there are no “tables” here, but “measurements”, “tags”, “fields”, and “series”. We can type “show measurements” to see the full list of possible metrics to explore (you can also try the “show tag keys” to see which tags you can select in every measurement. Think of tags as “columns” in mysql, and “measurements” as “tables”. The command “show field keys” will allow you to find field names to select, but in our case all fields are called “value” in all measurements.
+
+All this will make more sense in a minute, when we proceed with the tutorial. I recommend you use the official Heapster storage schema as reference when trying to write new queries for your custom dashboards.
+
+Here is how to display the “cpu/usage_rate” of our Heapster pod for example (limited to last hour):
+
+As you can see, query syntax is very SQL-like (read more about the similarities and differences with SQL). Here is query explanation step by step:
+
+1. “SELECT value”. This defines which field we want to select.
+
+2. FROM “cpu/usage_rate” is the measurement we want to query from.
+
+3. WHERE “type” = ‘pod_container’ AND “namespace_name” =~ /kube-system/ AND “pod_name” =~ /heapster/. Those are tag filters for our query. The “=~” is a regex match operator, you can use regex between the / and / characters. Read more details here.
+
+4. “AND time > now() — 1h” will limit the time frame for selection to last hour. You can use UNIX timestamp format (with nanosecond precision), or full RFC3339 format like “AND time > ‘2017–03–27T23:10:25Z”.
+
+The result will appear as timestamps and values, and is not very useful unless drawn on a pretty Grafana dashboard, so let’s create one, and display there our nginx StatefulSet metrics.
+
+Here is a simple query to verify that we indeed have data collected from our new “web-0” and “web-1” pods (here I chose to query the “memory/usage”, because cpu is idle anyway in those pods, and we’d just see zeroes, but the memory is in use a little bit, so we see some data). Be patient, it may take a while.
+
+Now we can create a new dashboard in Grafana. See below:
+
+You can also navigate to main menu at the top, and select “dashboards” -> ”new”.
+
+Then chose the “graph” panel type (or anything else that you want to display your data with). If you feel confident proceeding directly to creating the dashboards you need, it’s an intuitive process. Select a panel type, add your custom queries, chose colors, create alarms for thresholds, etc.:
+
+You will see several tabs at the bottom. The “metrics” tab is open by default, which is exactly what we need. Notice the “A” blue letter, it’s the first default query that we need to modify. We can add more queries and display many metrics at once.
+
+Click the query itself, and it will expand to an editor where you can start typing a field name or tag name, and use autocompletion to construct the needed query.
+
+You should construct something like this, for both pods “web-0” and “web-1”:
+
+I chose to label them as “nginx-pod-0” and “nginx-pod-1” on the panel, using “ALIAS BY”.
+
+A quick tip: when you’re familiar enough with the schema and know exactly what you need upfront, it might be useful to switch to “plain text query” mode, where you can just type it, or copy paste from the InfluxDB shell after verifying that it works and shows needed data. To switch mode, use this button on the right side:
+
+Our CPU graph queries look like this:
+
+You can edit panel title text in the “general” tab. Then click “back to dashboard” at the top to exit panel edit mode. Changes are kept when you go back but the dashboard must be saved. Click the save button and give it a name. Now here’s how to add a new panel — hover over the small three dots on the left side of the screen, and select “Add Panel”.
+
+This time repeat all steps. Select memory utilization instead of CPU. The final queries are:
+
+Also, don’t forget to fill in “ALIAS BY” fields for custom labels. When you go back to the dashboard, select a shorter timeframe than what’s activated by default:
+
+I chose the last 15 minutes to be able to easily see the effect of our quick “stress test” that we will apply to those nginx pods now. Let’s find the IP of one of those nginx pods:
+
+Then use whichever tool you like, AB, Jmeter, Siege, or plain “curl” which I will use in this example, to generate some traffic (my pod IP is 10.32.0.3, replace it with your nginx pod IP):
+
+After a few minutes, refresh the dashboard to see the effect of our 10 requests per second:
+
+It reached about 2% of its allowed CPU. Let’s remove the “sleep 0.1” command that limits us to 10 requests per second (“sleep 0.1” adds a 100ms pause after each ‘curl’) and allow the server to send requests one after another with no delay:
+
+And here is the result, 25% usage. However, I have no idea how many requests per second it was. To find this out, we would need to configure Heapster to allow custom metrics since it doesn’t support “requests count” out-of-the-box — that’s a whole new topic for another tutorial.
+
+Now, to create an alert when the CPU/RAM or other resource (such as disk space) is reaching a critical usage level, you’ll need to edit a chosen panel and navigate to “Alert” tab:
+
+Click on “New Alert” and modify the needed thresholds. You can drag the “heart” icon on the right side of the screen to set a threshold number while looking at the graphs. It also helps you to set correct values instead of writing them manually into the “IS ABOVE / IS BELOW” text box. In my example I chose the “disk utilization” panel from default “Cluster” dashboard and created an alert at around 35GB disk space usage. Then, using the “Notifications” menu item on the left, you can add emails to send alerts to (and use Opsgenie/VictorOps/PagerDuty on-call system to receive those alerts and trigger something, like a voice call to the current person in on-call rotation shift). Of course, it’s just to demonstrate the editing tools, but in a real life scenario, I would create both dashboards and panels with all their alerting and graphing settings automatically pre-configured in JSON format during server provisioning with Ansible/Chef or whatever fits best at the moment and during new environment or deployment creations in cluster.
+
+To create a dashboard from JSON file, use the HTTP API. There’s also an option to create dynamic “scripted dashboards” that accept URL parameters. Depending on what you pass in there, it will show different metrics, queries, panels, etc. It’s a very powerful feature, you can see an example here.
+
+You can have a look at the default dashboards and learn from them to make your new custom ones. Export them in JSON format to create a custom template making it easy to fill-in the values when you create new services, deployments, and submit through the API to dynamically create the needed dashboard simultaneously to your new services being created.
+
+We hope this tutorial was useful, and don’t hesitate to ask questions and leave comments below.
+
+Need a user-friendly tool to set up and manage your K8S cluster? Sign up for Kublr’s private beta. To learn more, visit kublr.com.|||
+
+After you have successfully setup your Kubernetes cluster, have built Docker images with your applications or microservices, and see them running, the next step is to configure a proper monitoring…

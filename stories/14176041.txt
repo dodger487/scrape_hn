@@ -1,0 +1,92 @@
+One week ago today, the Shadow Brokers (an unknown hacking entity) leaked the Equation Group's (NSA) FuzzBunch software, an exploitation framework similar to Metasploit. In the framework were several unauthenticated, remote exploits for Windows (such as the exploits codenamed EternalBlue, EternalRomance, and EternalSynergy). Many of the vulnerabilities that are exploited were fixed in MS17-010, perhaps the most critical Windows patch in almost a decade.
+
+Side note: You can use my MS17-010 Metasploit auxiliary module to scan your networks for systems missing this patch (uncredentialed and non-intrusive). If a missing patch is found, it will also check for an existing DoublePulsar infection.
+
+For those unfamiliar, DoublePulsar is the primary payload used in SMB and RDP exploits in FuzzBunch. Analysis was performed using the EternalBlue SMBv1/SMBv2 exploit against Windows Server 2008 R2 SP1 x64.
+
+The shellcode, in tl;dr fashion, essentially performs the following:
+
+After exploitation, you can see the missing symbol in the SrvTransaction2DispatchTable. There are supposed to be 2 handlers here with the SrvTransactionNotImplemented symbol. This is the DoublePulsar backdoor (array index 14):
+
+Honestly, you don't usually wake up in the morning and feel like spending time dissecting ~3600 some odd bytes of Ring-0 shellcode, but I felt productive today. Also I was really curious about this payload and didn't see many details about it outside of Countercept's analysis of the DLL injection code. But I was interested in how the initial SMB backdoor is installed, which is what this post is about.
+
+Zach Harding, Dylan Davis, and I kind of rushed through it in a few hours in our red team lab at RiskSense. There is some interesting setup in the EternalBlue exploit with the IA32_LSTAR syscall MSR (0xc000082) and a region of the Srv.sys containing FEFEs, but I will instead focus on just the raw DoublePulsar methodology... Much like the EXTRABACON shellcode, this one is crafty and does not simply spawn a shell.
+
+Inside the Shadow Brokers dump you can find DoublePulsar.exe and EternalBlue.exe. When you use DoublePulsar in FuzzBunch, there is an option to spit its shellcode out to a file. We found out this is a red herring, and that the EternalBlue.exe contained its own payload.
+
+The main payload is quite large because it contains shellcode for both x86 and x64. The first few bytes use opcode trickery to branch to the correct architecture (see my previous article on assembly architecture detection).
+
+Here is how x86 sees the first few bytes.
+
+You'll notice that inc eax means the je (jump equal/zero) instruction is not taken. What follows is a call and a pop, which is to get the current instruction pointer.
+
+And here is how x64 sees it:
+
+The inc eax byte is instead the REX preamble for a NOP. So the zero flag is still set from the xor eax, eax operation. Since x64 has RIP-relative addressing it doesn't need to get the RIP register.
+
+The x86 payload is essentially the same thing as the x64 so this post only focuses on x64.
+
+Since the NOP was a true NOP on x64, I overwrote the 40 90 with cc cc (int 3) using a hex editor. Interrupt 3 is how debuggers set software breakpoints.
+
+Now when the system is exploited, our attached kernel debugger will automatically break when the shellcode starts executing.
+
+Once the shellcode figures out it is x64 it begins to search for the base of ntoskrnl.exe. This is done with the following stub:
+
+Fairly straightforward code. In user mode, the GS segment for x64 contains the Thread Information Block (TIB), which holds the Process Environment Block (PEB), a struct which contains all kinds of information about the current running process. In kernel mode, this segment instead contains the Kernel Process Control Region (KPCR), a struct which at offset zero actually contains the current process PEB.
+
+This code grabs offset 0x38 of the KPCR, which is the "IdtBase" and contains a pointer struct of KIDTENTRY64. Those familiar with the x86 family will know this is the Interrupt Descriptor Table.
+
+At offset 4 into the KIDENTRY64 struct you can get a function pointer to the interrupt handler, which is code defined inside of ntoskrnl.exe. From there it searches backwards in memory in 0x1000 increments (page size) for the .exe DOS MZ header (cmp bx, 0x5a4d).
+
+Once you know where the MZ header of a PE file is, you can peek into defined offsets for the export directory and get the relative virtual address (RVA) of any function you want. Userland shellcode does this all the time, usually to find necessary functions it needs out of ntdll.dll and kernel32.dll. Just like most userland shellcode, this ring 0 shellcode also uses a hashing algorithm instead of hard-coded strings in order to find the necessary functions.
+
+The following functions are found:
+
+ExAllocatePool can be used to create regions of executable memory, and ExFreePool can clean it up when done. These are important so the shellcode can allocate space for its hooks and other functions. ZwQuerySystemInformation is important in the next step.
+
+A feature of ZwQuerySystemInformation is a constant named SystemQueryModuleInformation, with the value 0xb. This gives a list of all loaded drivers in the system.
+
+The shellcode then searched this list for two different hashes, and it landed on Srv.sys, which is one of the main drivers that SMB runs on.
+
+The process here is basically equivalent to getting PEB->Ldr in userland, which lets you iterate loaded DLLs. Instead, it was looking for the SMB driver.
+
+Now that the DoublePulsar shellcode has the main SMB driver, it iterates over the .sys PE sections until it gets to the .data section.
+
+Inside of the .data section is generally global read/write memory, and stored here is the SrvTransaction2DispatchTable, an array of function pointers that handle different SMB tasks.
+
+The shellcode allocates some memory and copies over the code for its function hook.
+
+Next the shellcode stores the function pointer for the dispatch named SrvTransactionNotImplemented() (so that it can call it from within the hook code). It then overwrites this member inside SrvTransaction2DispatchTable with the hook.
+
+That's it. The backdoor is complete. Now it just returns up its own call stack and does some small cleanup chores.
+
+Now when DoublePulsar sends its specific "knock" requests (which are seen as invalid SMB calls), the dispatch table calls the hooked fake SrvTransactionNotImplemented() function. Odd behavior is observed: normally the SMB response MultiplexID must match the SMB request MultiplexID, but instead it is incremented by a delta, which serves as a status code.
+
+Operations are hidden in plain sight via steganography, which do not have proper dissectors in Wireshark.
+
+The status codes (via MultiplexID delta) are:
+
+The opcode list is as follows:
+
+You can tell which opcode was called by using the following algorithm:
+
+Conversely, you can make the packet using this algorithm, where k is randomly generated:
+
+Sending a ping opcode in a Trans2 SESSION_SETUP request will yield a response that holds part of a XOR key that needs to be calculated for exec requests.
+
+More shellcode can be sent with a Trans2 SESSION_SETUP request and exec opcode. The shellcode is sent in the "data payload" part of the packet 4096 bytes at a time, using the XOR key as a basic stream cipher. The backdoor will allocate an executable region of memory, decrypt and copy over the shellcode, and run it. The Inject DLL payload is simply some DLL loading shellcode prepended to the DLL you actually want to inject.
+
+We can see the hook is installed at SrvTransaction2DispatchTable+0x70 (112/8 = index 14):
+
+And of course the full disassembly listing.
+
+There you have it, a highly sophisticated, multi-architecture SMB backdoor. The world probably did not need a remote Windows kernel payload this advanced being spammed across the Internet. It's an unique payload, because you can infect a system, lay low for a little bit, and come back later when you want to do something more intrusive. It also finds a nice place in the system to hide out and not alert built-in defenses like PatchGuard. It is unclear if newer versions of PatchGuard, such as those in Windows 10, already detect this hook. We can expect them to be added if not.
+
+Usually we only get to see kernel shellcode in local exploits, as it swaps process tokens in order to privilege escalate. However, Microsoft does many networking things in the kernel, such as Srv.sys and HTTP.sys. The techniques demonstrated are in many ways completely analagous to how usermode shellcode operates during remote exploits.
+
+If/when this gets ported over to Metasploit, I would probably not copy this verbatim, and rather skip the backdoor idea. It isn't the most secure thing to do, as it's not a big secret anymore and anyone else can come along and use your backdoor.
+
+Here's what can be done instead:
+
+Every major malware family, from botnets to ransomware to banking spyware, will eventually add the exploits in the FuzzBunch toolkit to their arsenal. This payload is simply a mechanism to load more malware with full system privileges. It does not open new ports, or have any real encryption or other features to prevent others from taking advantage of the same hole, making the attribution game for digital forensic investigators even more difficult. This is a jewel compared to the scraps that were given to Stuxnet. It comes in a more dangerous era than the days of Conficker. Given the persistence of the missing MS08-067 patch, we could be in store for a decade of breaches emanating from MS17-010 exploits. It is the perfect storm for one of the most damaging malware infections in computing history.|||
+

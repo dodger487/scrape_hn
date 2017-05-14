@@ -1,0 +1,46 @@
+Go is a language which supports automatic memory management, such as memory allocation and garbage collection. So Go programmers can do programming without handling the underlying memory management. This saves Go programmers lots of time.
+
+Although knowing the underlying memory management implementation details is not necessary for Go programmers to write Go code, understanding some concepts and being aware of some facts in the memory management implementation by the official Go compiler and runtime is very helpful for Go programmers to write high quality Go code.
+
+This article will explain some concepts and facts of memory block allocation and garbage collection by the official Go compiler and runtime. Other aspects, such as memory apply and memory release, in memory management will not be touched in this article.
+
+We must clarify what is a value in this article to continue following content.
+
+In Go, each value always has a direct part. Some values each has only a direct part, for example, values of bool, numeric, pointer, array and custom struct types. Some values each is composed of a direct part and several indirect underlying parts, for example, non-nil values of map, slice, function and channel types. For any one of such mult-part values, its direct part is a pointer or a pointer wrapper which references its indirect underlying part(s).
+
+In the remaining of this article, unless otherwise specified, a value may be either a direct part or an underlying part mentioned above. In other words, a value is never composed of multiple parts.
+
+A memory block is a continuous memory segment to host values at run time. Different memory blocks may have different sizes, to host different values. One memory block may host multiple values at the same time, but each value can only be hosted within one memory block, no matter how large the size of that value is. In other words, for any value, it will not be located crossing memory blocks.
+
+Here, we extend the definition by saying a memory block is referenced by all the values it hosts. So if a value is referenced by another value, then the other value also references the memory block hosting , indirectly.
+
+For the official Go compiler and runtime, in every Go program, each goroutine will maintain a stack, a big memory block at run time. The initial stack size of each goroutine is several kilobytes. The stack size will grow and shrink as needed.
+
+Memory blocks allocated on the stack of a goroutine can only be used (referenced) in the goroutine internally. They are goroutine localized resources. They are not safe to be referenced crossing goroutines.
+
+Heap is a singleton in each program. Memory blocks allocated on heap can be accessed by multiple goroutines. In other words, they can be accessed concurrently. Their assessments should be synchronized when needed.
+
+Heap is a conservative place to register memory blocks. If compilers detect a memory block will be referenced crossing goroutines or can't easily make sure the memory block is safe to be put on stacks, then the memory block will be allocated on heap at run time. This means some values can be safely allocated on stacks may be also allocated on heap.
+
+If a memory block is allocated somewhere, we can also say the values hosted within the memory block are allocated on the same place.
+
+If a local value is allocated on heap, we can say the value escapes to heap. By using the official Go SDK, we can run to check which local values will escape to heap at run time. As above has mentioned, the current escape analyzer in the official Go compiler is still not perfect, many local values can be allocated on stacks safely will escape to heap.
+
+When a local variable value of type escapes to heap, what that really means is that Go runtime also creates an implicit pointer of type on the stack of the current goroutine. The value of the pointer stores the address of the memory block allocated on heap (a.k.a., the address of the local variable of type ). Go compiler has already replaced all references to the variable to the deferences of the pointer value at compile time.
+
+Global values (package-level values) will be allocated neither on stacks nor heap. A value referenced by any global value and any value allocated on heap will be allocated on heap if the value is not a global value. Global values and values allocated on heap values will never reference values allocated on stacks. Values allocated on a stack can only be referenced by values allocated on the same stack.
+
+A memory block created by calling function may be allocated on heap or stacks. This is different to C++.
+
+Memory blocks allocated for global values will never be collected.
+
+Each stack, as a big memory block, will be collected when the corresponding goroutine exits. So there is no need to collect the memory blocks allocated on stacks, individually, one by one. Collecting big stack memory blocks is not a duty of the garbage collector (see next section).
+
+For a memory block allocated on heap, it can be safely collected only when it is not referenced (either directly or indirectly) by all global values and all values allocated on goroutine stacks any more. We call such memory blocks as unused memory blocks. Here the global values include not only explicit package-level values, but also some runtime internal global values. Unused memory blocks on heap will be collected by garbage collector.
+
+Go runtime will collect unused heap memory blocks (garbage) to reuse or release memory. The current official Go compiler (v1.8) uses a concurrent, tri-color, mark-sweep garbage collector. Here this article will not explain the detailed implementation. Just some facts are listed below.
+
+There is a stop-the-world phase in garbage collecting. All goroutines must be paused in this phase. After many improvements from version to version, the current v1.8 collector makes typical worst-case stop-the-world duration less than 100μs (0.1 millisecond). This generally removes noticeable lags at run time.
+
+The collector is a non-compacting one, so it will not move memory blocks to rearrange them.|||
+

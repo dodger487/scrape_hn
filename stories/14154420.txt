@@ -1,0 +1,28 @@
+Playing a track in response to a user’s intent simply requires adding a in the response (code written in Kotlin).
+
+// These constructors don't actually exist, just used for brevity val stream = Stream(url = "https://test.com/path/to/my/audio.mp3", token = "audio.mp3", offsetInMilliseconds = 0) val audioItem = AudioItem(stream = stream) val directive = PlayDirective(audioItem = audioItem, playBehavior = PlayBehavior.REPLACE_ALL) val response = SpeechletResponse(directives = asList(directive))
+
+The most important properties here are and . The token is used as sort of an identifier that will be available in all further requests while the stream is playing.
+
+Of course you usually want to listen to more than one track. So let’s say the initial intent of the user was
+
+So how and when do we tell Alexa to play the next track? In case of an audio player enabled skill, Alexa will automatically send some special requests to the skill implementation. On the JVM we can react to these by implementing the interface in our . It provides a hook that will be called shortly before a track reaches the end of its playback.
+
+class SoundcloudSpeechlet : SpeechletV2, AudioPlayer { override fun onPlaybackNearlyFinished(env: SpeechletRequestEnvelope<PlaybackNearlyFinishedRequest>): SpeechletResponse? { val state = env.context.getState(SystemInterface::class.java, SystemState::class.java) val userId = state.user.userId val nextTrack = loadNextTrack(userId) val stream = Stream(url = track.streamUrl, token = track.id, expectedPreviousToken = envelope.request.token, offsetInMilliseconds = 0) val audioItem = AudioItem(stream = stream) val directive = PlayDirective(audioItem = audioItem, playBehavior = PlayBehaviour.ENQUEUE) val response = SpeechletResponse(directives = asList(directive)) return response } // Other overrides }
+
+So how to store the list of tracks to play? Luckily we get a unique identifier with each request, even the ones without session: the user id. In a request that has a session it is available via . In requests without a session (i.e. everything from the interface) it is a bit harder to access, at least in the Java SDK. It’s hidden away in the . Above you can see how to load it from there.
+
+Since my skill implementation is hosted on AWS Lambda I decided to use DynamoDB for the persistence. I used the as the primary key and stored the list of tracks to play, the current position and some other metadata under it.
+
+In addition to the special requests from the interface there are special intents that the user can say without needing the name of the skill that plays audio. For example and can be just used with
+
+Since these are handled as normal intent requests the current token and play offset have to be accessed differently. They are stored in the audio player state.
+
+With this information it is possible to determine the next track in an intent request. Of course the user id is also accessible via the property.
+
+The update of the player state for a user is best done in the request handlers, though. Only then you can be sure Alexa has reacted correctly.
+
+override fun onIntent(env: SpeechletRequestEnvelope<IntentRequest>): SpeechletResponse { when (env.request.intent.name) { "AMAZON.PauseIntent" -> { // Do NOT store the current offset here, just tell Alexa to stop: return stopDirectiveResponse() } } } override fun onPlaybackStopped(env: SpeechletRequestEnvelope<PlaybackStoppedRequest>): SpeechletResponse? { // Now we are sure that playback has stopped: Store the offset val state = env.context.getState(SystemInterface::class.java, SystemState::class.java) storeOffset(state.user.userId, env.request.offsetInMilliseconds) return null // AudioPlayer methods may return null as responses }
+
+I have a good grasp on how to handle audio playing Alexa skills now. It is definitely harder than „normal“ skills since tracking the current state of the audio player and deciding what to persist when requires a lot of attention.|||
+

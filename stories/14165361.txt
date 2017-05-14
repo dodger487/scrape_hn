@@ -1,0 +1,75 @@
+In Part 1 of this series, I discussed the strategy taken to prepare a toolchain based on Ubuntu 16.04 on Travis CI, using the provided Ubuntu 14.04 container as a base.
+
+In this discussion, we’ll look at the dependencies that are specific to Visual Studio Code, and how we can abstract away the architecture to get a build script that is truly platform-agnostic.
+
+Thankfully, the GNU compiler collection is structured in a way that keeps the disparate toolchains isolated from each other and clearly laid out, based on triplets.
+
+A triplet (for our purposes) is effectively a naming convention that composes cpu, vendor and operating system into a label that is de-limited by hyphens. For example, the target triplet you would (in most cases) use for amd64, on a Linux system would be:
+
+Simple, and for the most part, clean.
+
+The only caveat we encounter with this format that’s of particular relevance to us is that we’re on a Debian-derived Linux, so we’ll be using an extrapolated version of this format based on Debian Multiarch tuples.
+
+This is where things get a little more complicated.
+
+You may already be familiar with the notion that there are two primary instruction sets that are most popular among personal computers, IA-32 and x86_64, more commonly referred to collectively as x86 (which includes less popular instruction sets and extensions thereof).
+
+Now, commonly these instruction sets are referred to as 32-bit and 64-bit Intel, but not among those working directly with them, because there is actually a 64-bit Intel instruction set, Itanium (IA-64), that we don’t talk about, because it largely lost out to x86_64, which was actually designed by AMD. But IA-64 is still out in the wild, in servers. Mostly.
+
+This does get a little confusing, so I’ve included this short clip from actor/musician Donald “Childish Gambino” Glover which re-enacts my thought process while originally working through this:
+
+Bear with me, we’ll come back to this.
+
+There is an anecdotal conversation between a scientist and an old lady which features in the opening of Stephen Hawking’s seminal A Brief History of Time, which is attributed in this instance to Bertrand Russell.
+
+This was clearly not an analogy for cross-compiling on Linux, but it does illustrate pretty effectively the rabbit hole we’ve fallen into with multi-arch compilation.
+
+In order to compile our project (in this case Visual Studio Code) for a different target architecture, we’ll need the pre-requisite dependencies to target that architecture (e.g. Electron, ripgrep, peg) and the internal, compiled dependencies to be built to that architecture also (e.g. oniguruma, husky, native-keymap).
+
+Cross-compiling these internal dependencies to a given (alternative) target will mean satisfying the dependent packages for both the compiling architecture (in this case, amd64) and the target architecture (which will be a given variation of ARM). Thanks to our work in Part 1, we now have a toolchain that meets this requirement, so we can start identifying our dependencies. The apt-cache tool is our friend here.
+
+This command will list the dependencies for our core toolchain packages which we can then install into our 16.04 build configuration. I’m not going to list them all here, but you can see them in the .travis.yml script if you’re curious.
+
+Now, we need to round up those tuples.
+
+We know we need to consider two primary variants of x86, and we’ve heard that ARM (being RISC-based) is a much simpler architecture, so how will that impact our goal of targeting these chips?
+
+Well, we have three main variants of ARM to consider too, as it turns out.
+
+armel is a target for the most basic ARM processors currently in useful circulation. We’re going to de-prioritize this one for now, as due to the characteristics of this configuration (software-based floating point computation, largely superceeded by armhf), hardware that utilizes this architecture is of an age and performance level that makes it unlikely to be able to run Visual Studio Code meaningfully (but we’ll make it easy to add support later just in case).
+
+armhf is the most common ARM target presently in use, and is the target to use for all variants of the popular Raspberry Pi single-board computer, among others, and a great majority of Chromebook laptops as well.
+
+aarch64 is the 64-bit configuration of ARM (analogous to the transition from IA-32 to x86_64) introduced in ARMv8. Processors based on this architecture are backwards compatible with armhf, so would be able to run the code compiled for that architecture directly. As certain dependencies of Electron do not yet make this distinction, we will need to rely on some armhf compiled code in this configuration, but ideally we want to compile as much as possible for the aarch64 target directly, and we can migrate the rest later when the dependencies catch up.
+
+So, that means the tuples we need are:
+
+Now, these tuples are little endian. The reason we use these specific targets is that little-endianness is the accepted default for ARMv3 and above, so that’s what we need to compile for. Our next step is to get from these tuples to working builds.
+
+Taking what we’ve now learned we can derive the names of the toolchain packages we need based on the following format:
+
+Great. Now, one last point to note before moving on is that for our ARM targets, we’re in the realm of what is classified as non-default multilib architectures, which will require a couple of additional packages, in the format:
+
+For multilib support, our armhf target will use the same tuple as the compiler, and for aarch64, we’ll also target armhf for multilib support. Once these packages are installed we just need to add the dependencies we identified above and we’re ready to proceed.
+
+We should at this point have a compiler toolchain that is stacked full of lovely dependencies and is ready to start crunching through the code-base en-route to throwing us out some shiny, finished binaries.
+
+The last steps we need to do are let npm and Electron know that we have our multi-arch toolchain in place, and that we’re ready to get down to the brass tacks of compiling.
+
+Something that will immediately jump out at you above is that nowhere in these two statements are we specifying which of the three primary ARM derivatives we are referring to.
+
+Currently, Electron does not provide an aarch64 target, which is unfortunate for us, but thanks to the flexible nature of our toolchain and the ARMv8 platform, we can proceed with 32-bit Electron binaries until such time as it’s made available.
+
+We’re almost finished, but before we wrap up we’ve a little bit of cleaning up we should do first. We know we need to specify the relevant tuple for our target, the multilib tuple for the architecture, and we need to specify the npm and Electron architectures for our pre-requisites. That’s a whole lot of configuration to have to repeat every time we want to add something here, so let’s try to rework our configuration to be more modular, using YAML references.
+
+This is much more modular. In future, if we want to add support for a different architecture such as PowerPC (powerpc64-linux-gnu), or even a different operating system such as Windows via MinGW (x86_64-w64-mingw32) we just need to add a handful of variables and a line to the build matrix.
+
+It’s now time to commit our changes and see what the server thinks.
+
+If everything has gone as it’s supposed to have we should now be staring at a build screen that looks like this:
+
+Now we just need to download our binaries (there are a few ways to go about this; pushing them to a third-party storage system during the build script or using Github Releases being two of the best options), and execute the following:
+
+And with any luck…|||
+
+In Part 1 of this series, I discussed the strategy taken to prepare a toolchain based on Ubuntu 16.04 on Travis CI, using the provided Ubuntu 14.04 container as a base. In this discussion, we’ll look…

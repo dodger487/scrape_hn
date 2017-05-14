@@ -1,0 +1,104 @@
+This tutorial will help you learn how to bootstrap a Docker Swarm cluster on Amazon Web Services, and deploy a simple service.
+
+Containers have recently become a very popular delivery mechanism for software applications. This is in part due to the popularity of the microservices software architecture pattern, which encourages delivering applications as a set of discrete, independent, loosely-coupled services. A microservice is an ideal payload for the container abstraction. Perhaps, the biggest influence, however, has been the Moby project, which has literally rendered the container abstraction, a commodity.
+
+Working with containers on a single Docker host for development purposes is a relatively straightforward experience. However, what happens when we want to deploy our application into a production environment? We need resilience, the ability to scale our services, and to update them 'in flight', amongst other things. This is difficult to achieve on a single Docker host, and has given rise to the notion of container orchestration.
+
+This is the first tutorial in our series that unravels some of the concepts and features associated with container orchestration. It focuses on the Docker project's native orchestration capability, provided through the open source toolkit, Swarmkit.
+
+In this first article, we'll explore how to bootstrap a Swarm cluster on AWS, using the Docker Machine provisioning tool. We'll discuss some cluster concepts, and differentiate between different node roles, before deploying and scaling a simple service across the cluster.
+
+In order to follow the tutorial, the following items are required:
+
+In order to provide a suitable environment for running containers at scale, we require an orchestration platform, or cluster, to host the containers. There are several options available from the open source community, but this series of articles will focus on the Docker project's native orchestration capability, Swarm.
+
+Swarm, just like the other peer orchestration tools, requires a cluster of compute nodes in order to function. In the case of Swarm, these nodes all run the Docker Engine, and co-operate together as a tightly-coupled unit, for deploying containerized workloads.
+
+The nodes in the cluster, will be delegated a role — a manager or a worker. Manager nodes take part in the management of the cluster, maintaining its state and scheduling container workloads, whilst the workers are recipients of the container workloads. Unless directed otherwise, a manager will also perform the worker role, and will host container workloads as well perform management functions.
+
+In order to demonstrate how to establish a Swarm cluster, we need a Docker host. We can establish a Docker host in the cloud, and this tutorial uses Amazon Web Services (AWS). There are numerous ways to do this, but for simplicity's sake, we're going to use Docker Machine. Docker Machine is a command line tool for creating remote Docker hosts. A pre-built binary can be downloaded from the project's GitHub repository, where there are further instructions for installing the binary.
+
+To create a Docker host, we need to run the command, specifying the driver, an appropriate AWS region for the instance, and a name for the Docker host - in this case:
+
+Docker Machine is smart enough to retrieve the AWS credentials from their default location in your home directory (or they can be provided as command line options, or set as environment variables), and can take a number of different configuration options to nuance the creation of the instance on AWS.
+
+Once has been created, and assuming we have a local Docker client installed, we can point our Docker client at the remote Docker host and test communication with the following commands:
+
+The first command sets some environment variables necessary for the local Docker client to find the remote Docker host, and to configure TLS-encrypted communication, whilst the second queries the remote Docker daemon for the host's name.
+
+All that is required to establish a Swarm cluster, is in-built into the Docker daemon running on the remote Docker host. Unlike other orchestration tools, Docker's native orchestration capability does not rely on any external dependencies. Hence, in order to initiate 'Swarm Mode', it only requires the execution of a simple Docker CLI command:
+
+We now have a Swarm cluster, with a single manager node - that's all it takes.
+
+Maintaining the state of the cluster is crucial to its ongoing operation. If the state of the cluster is compromised, whilst existing containers will continue to run, management of the cluster (including the scheduling of new containers) will not be possible.
+
+For this reason, orchestration tools, including Swarm, make use of the Raft Consensus algorithm in order to maintain cluster state. For the interested reader, Raft Consensus is explained in more detail here.
+
+In practical terms, our cluster requires multiple manager nodes to ensure the maintenance of the cluster state. If we deploy manager nodes, the cluster requires a quorum of manager nodes, and can tolerate manager node failures. Typically, an odd number of manager nodes should be deployed, but too many will encumber the cluster in continually maintaining state. Three, five or seven is considered best practice, dependent on attitude to risk. Each manager node in the cluster maintains its own copy of the Raft log, which represents the cluster state, and in so doing, enables it to assume the leadership role, if required.
+
+When a Swarm cluster is initiated and additional managers are added to the cluster, Docker establishes secure, mutual-TLS encrypted connections between the manager nodes. The diagram below, depicts the arrangement:
+
+For the purposes of our scenario, we love risk, so we'll go with a single manager node.
+
+At this point, we have a cluster with a single manager node - a cluster, albeit meagre in substance.
+
+Before we augment the cluster with additional nodes, we need to attend to an AWS configuration detail. Docker Machine will have created an AWS security group (in the absence of our specifying the use of an existing security group), called . It's created with ingress configured on ports (for SSH) and (for remote Docker client and server communication). This is insufficient for a Swarm cluster, and we need to allow ingress on ports (cluster management communication), and (intra-node communication), and (overlay network traffic).
+
+We can make this configuration change through the AWS console, or via the AWS command line interface. If you are operating on a local Docker host, you can use a Docker container to perform this action (parsing of the JSON returned by the AWS CLI needs to be performed by the jq command line processor):
+
+Now that the security group is configured correctly, let's add some worker nodes, by creating three new Docker hosts, and joining them to the cluster. First, we can use Docker Machine to create three new Docker hosts on AWS:
+
+Once this has completed, we should have four Docker hosts running on AWS, which we can check using the following command:
+
+When we created the cluster using the command, the output from the command provided instructions for joining a worker to the cluster. The joining command, which needs to be executed on the Docker host joining the cluster, is . It requires a token to be passed as an argument, as well as a TCP socket, which is where a cluster manager is serving the Swarm Mode API.
+
+When the cluster is created, two tokens are created, one for managers and one for workers. If we don't have access to the original output from the command, we can query a manager node for the relevant token. To retrieve the worker token, along with details of how to join the cluster, execute the following commands:
+
+Having pointed our local Docker client to , we can issue the command to join the node to the cluster:
+
+So, what's the purpose of the token? The token comprises of two parts seperated by a ; a hash of the certificate associated with the Certificate Authority used by the cluster to establish mutual TLS connections between cluster nodes, and a cluster unique secret for the relevant node role, i.e. worker or manager. When a node seeks to join the cluster, it requests the CA certificate from the manager, and checks the certificate by comparing the hash of the received certificate with the hash contained in the token. The role secret is used to authorise the joining node as a worker or manager, depending on the content of the secret, by way of the manager issuing a certificate containing a unique cluster ID for the joining node, as well as a definition of its permitted role.
+
+The steps above can be repeated for and in order to add them to the cluster as workers.
+
+In order to obtain an overview of the cluster we've established, the Docker CLI provides the command, which must be executed on a manager node:
+
+This output summarises the overall cluster status, by listing each node by its cryptographic ID and hostname, and providing its state, availability for scheduling purposes, and its managerial status (if it's a manager). Our cluster has one manager, and three healthy workers.
+
+Let's assume for a moment, that we have become more adverse to risk, and want our cluster to be more resilient to failure. We decide to promote and to join as managers. To do this, we can execute the command on an existing manager:
+
+We can now promote using either of the two current managers:
+
+Getting an updated status of the cluster, now shows that and are 'reachable' as managers in the cluster:
+
+We can use the command to return our promoted nodes back to worker nodes:
+
+On a single Docker host, workloads are generally deployed as discrete containers, using the command. In a cluster of Docker hosts, however, working at the container level of abstraction is not efficient. We would quickly become overwhelmed if we tried to manage every individual container, particularity if we needed to scale individual services.
+
+For that reason, when deploying workloads on a Swarm cluster, we work with a 'service' abstraction. A service is based on a specific Docker image, and is comprised of one or more identical tasks, which are the atomic unit for scheduling purposes, and are implemented as individual containers.
+
+Sometimes, it's more convenient to conceive our application as a set of multiple services, interacting as consumers and providers. Swarm allows us to define and operate such a set of services as a 'stack'. This is a further level of abstraction, which we'll cover in a later tutorial in this series. For now, we'll focus on services.
+
+A service shares a number of the characteristics associated with a container, but as we learned above, is abstract in nature. A service is created using the command, which takes the following form:
+
+The tasks that constitute an implementation of a service are governed by the Docker image specified at service creation time, but can be nuanced with the options and command and/or arg parameters.
+
+In order to deploy a service based on the official Nginx Docker image, we would issue the following command against a manager node:
+
+The service is created with the name , and the ID of the service is returned. We can get information about the service using the command:
+
+The output indicates that we have just one replica instance or task for our service, but which node in the cluster is it running on? The command enables us to find out:
+
+This provides us with a list of the tasks associated with the service, and our single task was scheduled to run on , our manager node. In a future article in this series, we'll learn how to exclude scheduling on manager nodes.
+
+In order to scale our Nginx service, all we have to do is issue a command against a manager node. Let's assume we wanted to scale the Nginx service to eight replicas, and watch as these replicas are deployed across our cluster:
+
+The output of the command will show how Swarm's scheduler invokes tasks on the cluster's nodes, changing the 'current state' of each task from assigned (to a cluster node), to preparing (whilst the Docker image is retrieved from a registry), to running (as a container on the assigned node). Eventually, the service will comprise of eight tasks, two running on each of the four nodes. The scheduler uses a 'spread' strategy for evenly distributing the tasks across the nodes in the cluster.
+
+When we've finished with the service, we can remove it, along with its associated tasks, using :
+
+This tutorial has outlined some of the features associated with Docker's native orchestration capability, Swarm. In particular, we've seen how to bootstrap a swarm mode cluster in the cloud using Docker Machine, manage the cluster nodes and their roles, as well as deploy and scale a simple service on the cluster. In the next tutorial, we'll take a more in-depth view of scheduling services.
+
+If you have any questions and comments, feel free to leave them in the section below.
+
+Want to continuously deliver your applications made with Docker? Check out Semaphore’s Docker platform with full layer caching for tagged Docker images.|||
+

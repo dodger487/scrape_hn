@@ -1,0 +1,85 @@
+Late last year, I wrote about wanting to bring Microsoft’s Visual Studio Code editor to Chromebooks and ARM single-board computers (SBCs) like the Raspberry Pi.
+
+The primary driver for this was the relatively low price of ARM SBCs, and specifically the targeting of the Raspberry Pi and Chromebooks (predominantly ARM-based devices) at the education sector.
+
+A few people found these builds useful, and I was glad to have gotten involved in my own small way in helping a few folks I know (and hopefully more that I don’t) into coding for the first time.
+
+My approach was to prepare build scripts that would make the necessary patches to the toolchain to allow for targeting ARM (specifically 32-bit ARM with hardware VFP), and this worked fairly well once I had the process automated.
+
+I soon realised that there were two problems with my approach.
+
+Firstly, as time passed it became harder to patch my scripts to reflect the latest changes in the upstream repository. Visual Studio Code is a rapidly changing project, with quite a few contributors, and many more stakeholders.
+
+Secondly, I realised late last year that maintaining a derivative set of builds over the long term is not only impractical with such a rapidly changing codebase, but unhelpful too. Having private build scripts with the specific incantations necessary to conjure a capable compiler toolchain are useless to other projects if I’m the only person that has access to them, and while this was unintentional (originally I did not realize the value of this specific part of the process), I’ve since come to appreciate that this is the knowledge that most needed to be shared if the goal is to bring more tools to ARM platforms.
+
+So in this post, I want to walk through how I arrived at preparing ARM scripts for submitting back to the core repository on GitHub, and where I plan on taking this work next. I am in no way an expert on this topic, so I would definitely appreciate feedback on anything I’ve gotten wrong either by way of assumptions or the implementation, as I’m hoping to learn as much or more from writing this out as I expect anyone else to learn from reading it.
+
+The first step to getting the scripts ready was to get compilation of the project happening in situ (i.e. getting a full compilation running and working on my trusty Raspberry Pi V2). Scott Hanselman wrote about exactly this in March of last year, which was helpful in making a start on this. My compile times were in the realm of 20–25 minutes, but it was quickly producing working builds. The full script I needed to run is below:
+
+Et voila, a working Visual Studio Code installation on my Raspbian desktop (don’t try to run the code above, it’s very unlikely to work anymore due to missing dependencies. Rapidly changing project, remember?)
+
+Now, if the end goal had been to just churn out daily builds of the project ad infinitum, this would have sufficed. I could have had my Pi 2 running 24/7 quite cheaply, hooked up a cron job to run nightly, and just left it to push out DEB and RPM packages on a schedule. I considered doing just that for a quick win.
+
+The big glaring problem with me just producing builds forever by myself is that the users of those builds would forever be second-class citizens in the wider community; I would be of limited capacity to help when problems would occur (as there’s one of me, juggling this with my work and family time), and they would never be able to get support from the larger community because anyone trying to help them would have no way of knowing if the bug was with Visual Studio Code or “Some guy called @headmelted’s custom builds of Visual Studio Code for an unsupported architecture”.
+
+This was going to be a problem, sooner or later. This work clearly needed to be in the core repository eventually, with official support, if it was going to be of real use to people in the future. And that meant two things.
+
+The first rule of contributing to an open-source software repository, especially one under the stewardship of someone else (although I think this is sound advice for any collaborative effort), is to avoid breaking anything unless it is absolutely unavoidable to do so.
+
+Not only will you interrupt other people’s work, which is at the least a bit rude, but it’s not a great way to say hello when you’re trying to get your changes accepted and contribute to the greater good of the whole.
+
+I realize that there are scenarios were it might be beneficial to cause a break in something for performance reasons, or because the old implementation was “poor”. Still no. When you’re a guest in someone else’s house, they decide where to put the furniture.
+
+What this means in our case is that the builds will need to be done on Travis CI, and the existing build configurations (for amd64 on Linux and OSX), must stay as is. Primum non nocere.
+
+So I decided on a simple plan. I would start by preparing some scripts that would allow for the building and releasing of my own builds for the two armhf targets I had in my posession (an ASUS Chromebook C100PA, powered by a Rockchip RK3288 Cortex A-17 processor) and a Raspberry Pi 2 (powered by a Broadcom BCM2836 Cortex-A7 processor).
+
+Incidentally, it’s this build script that still produces the releases at https://code.headmelted.com, which will soon transition to the Microsoft releases once the pull request makes it to production.
+
+These are both ARMv7-A processors, so it should all be sunshine and unicorns, right?
+
+As I got further into testing the builds I started experiencing shades of the dependency hell I thought I’d left behind a long time ago when the industry started transitioning from 32-bit to 64-bit Intel CPUs in the mid-noughties.
+
+In short, while amd64 and i386 support among the major package repositories in the Linux world has been generally consistent and up-to-date, armhf package coverage is notoriously patchy. This issue is compounded by the fact that in many cases the package will be available, but will be well out-of-date in relation to the associated amd64 packages, causing dependency breaks during cross-compilation.
+
+So.. how should we address this?
+
+Well the first step is finding the missing dependencies in a repository we can actually use.
+
+The first place I checked was Raspbian, reasoning that the script above to target armhf would have been using that repository to resolve it’s dependencies, so they must be there. And they were. Unfortunately, cross-compiling requires that the dependency is resolvable and either present or obtainable for both the current and the target architecture. And they must both satisfy the version conditions specified by the dependent package.
+
+I tried combining the Raspbian repository (scoped to armhf) with the existing Ubuntu 14.04 repositories (scoped to amd64) in the hope that a matching set of dependencies would somehow be resolvable across both sources.
+
+Next I looked at Emdebian. This repository had many of the packages that would have been needed, and I got some way into finding amd64 matches for a few of the dependencies in Jessie that would have allowed me to start putting together a cross-compilation toolchain based on Debian. The dependencies, while they existed in Emdebian, were in some cases too old to satisfy the version requirements of Electron(Emdebian updates ceased in July 2014).
+
+I was beginning to lose hope that I’d find a way to collect the right versions of the right packages to actually get a working build within Travis CI.
+
+Fortunately, as time has passed, the support for non-traditional processors on Linux (and the ARM family of architectures in particular) has improved notably.
+
+After working through the cascading list of dependencies required by the project I realized that Ubuntu 16.04 LTS (if I referenced Ubuntu Ports for the cross-targeted architecture), would be able to satisfy all of the pre-requisites for multi-arch compilation.
+
+Travis CI does not support Xenial Xerus containers, but supports adding alternative package sources in YAML. So I set about adding the Xenial Xerus sources and testing this theory in a fork of the live repository, which thankfully I had thought would pose no great difficulty. Not so.
+
+As it turns out, Travis CI has indefinitely frozen the list of package sources they’re allowing to run in their containers.
+
+A setback certainly, but not a huge one.
+
+If we mark our cross-compilation builds as requiring sudo, then we can delete the pre-defined source lists and replace them with our own at runtime, update APT, and we should be in a position to build a working toolchain from whatever packages we want. True, this will be a hybrid environment running on 14.04 with package sources pointing to 16.04, but unless we start making big changes to the system, this should be fine. Should. Let’s find out.
+
+The key to our building a multi-arch toolchain then will be in sourcing our amd64 packages from the standard Xenial Xerus repository, and sourcing our alternative architecture packages (in this case armhf) from Ubuntu Ports. The code to do this is below:
+
+The key to clearing all package sources from a Debian-based distribution that uses APT, is to remove all of the entries in the /etc/apt/sources.list file, and all files in the /etc/apt/sources.list.d/** directory. The first two lines above take care of this for us.
+
+Now we need to specify our new list of packages, which is what the rest of the script above is doing. What we should end up with is a sources.list file with the following three entries:
+
+The [arch=amd64,i386] statement tells Ubuntu to search the Xenial repository at http://archive.ubuntu.com/ubuntu for Intel packages. The next directive points to the Xenial repository at Ubuntu Ports for the armhf packages. The final directive is again pointed to the main archive for source code requests.
+
+We’re not done yet, however. Downloading packages for a different architecture from the one we’re currently executing on requires letting dpkg know, which we do by issuing the following command:
+
+Now we have our sources ready, but we need to tell APT to reload from the file we just created before we can use them. The final command in this series then is:
+
+Now, if everything has worked correctly we should receive no errors and the following feedback message on screen:
+
+And we’re ready to start working on this cross-compilation toolchain. Part 2 is now published, Where I go into the dependencies needed, and how we can get actual builds up-and-running on Travis CI (and how we can adapt the scripts for other projects to add ARM support!).|||
+
+Late last year, I wrote about wanting to bring Microsoft’s Visual Studio Code editor to Chromebooks and ARM single-board computers (SBCs) like the Raspberry Pi. The primary driver for this was the…

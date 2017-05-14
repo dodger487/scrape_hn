@@ -1,0 +1,31 @@
+When previous approaches tried to avoid small writes to disk, they were trying to address the broader OLTP problem of UPDATEs to random locations. But as we just established, time-series workloads are different: writes are primarily INSERTS (not UPDATES), to a recent time interval (not a random location). In other words, time-series workloads are append only.
+
+This is interesting: it means that, if data is sorted by time, we would always be writing towards the “end” of our dataset. Organizing data by time would also allow us to keep the actual working set of database pages rather small, and maintain them in memory. And reads, which we have spent less time discussing, could also benefit: if many read queries are to recent intervals (e.g., for real-time dashboarding), then this data would be already cached in memory.
+
+At first glance, it may seem like indexing on time would give us efficient writes and reads for free. But once we want any other indexes (e.g., another primary key like server/device ID, or any secondary indexes), then this naive approach would revert us back to making random inserts into our B-tree for that index.
+
+There is another way, which we call, “adaptive time/space chunking”. This is what we use in TimescaleDB.
+
+Instead of just indexing by time, TimescaleDB builds distinct tables by splitting data according to two dimensions: the time interval and a primary key (e.g., server/device/asset ID). We refer to these as chunks to differentiate them from partitions, which are typically defined by splitting the primary key space. Because each of these chunks are stored as a database table itself, and the query planner is aware of the chunk’s ranges (in time and keyspace), the query planner can immediately tell to which chunk(s) an operation’s data belongs. (This applies both for inserting rows, as well as for pruning the set of chunks that need to be touched when executing queries.)
+
+The key benefit of this approach is that now all of our indexes are built only across these much smaller chunks (tables), rather than a single table representing the entire dataset. So if we size these chunks properly, we can fit the latest tables (and their B-trees) completely in memory, and avoid this swap-to-disk problem, while maintaining support for multiple indexes.
+
+The two intuitive approaches to design this time/space chunking each have significant limitations:
+
+Under this approach, all chunks can have fixed, identical time intervals, e.g., 1 day. This works well if the volume of data collected per interval does not change. However, as services become popular, their infrastructure correspondingly expands, leading to more servers and more monitoring data. Similarly, successful IoT products will deploy ever more numbers of devices. And once we start writing too much data to each chunk, we’re regularly swapping to disk (and will find ourselves back at square one). On the flip side, choosing too-small intervals to start with leads to other performance downsides, e.g., having to touch many tables at query time.
+
+With this approach, all chunks have fixed target sizes, e.g., 1GB. A chunk is written to until it reaches its maximum size, at which point it becomes “closed” and its time interval constraints become fixed. Later data falling within the chunk’s “closed” interval will still be written to the chunk, however, in order to preserve the correctness of the chunk’s time constraints.
+
+A key challenge is that the time interval of the chunk depends on the order of data. Consider if data (even a single datapoint) arrives “early” by hours or even days, potentially due to a non-synchronized clock, or because of varying delays in systems with intermittent connectivity. This early datapoint will stretch out the time interval of the “open” chunk, while subsequent on-time data can drive the chunk over its target size. The insert logic for this approach is also more complex and expensive, driving down throughput for large batch writes (such as large COPY operations), as the database needs to make sure it inserts data in temporal order to determine when a new chunk should be created (even in the middle of an operation). Other problems exist for fixed- or max-size chunks as well, including time intervals that may not align well with data retention policies (“delete data after 30 days”).
+
+TimescaleDB takes a third approach that couples the strengths of both approaches.
+
+Chunks are created with a fixed interval, but the interval adapts from chunk-to-chunk based on changes in data volumes in order to hit maximum target sizes.
+
+By avoiding open-ended intervals, this approach ensures that data arriving early doesn’t create too-long time intervals that will subsequently lead to over-large chunks. Further, like static intervals, it more naturally supports retention policies specified on time, e.g., “delete data after 30 days”. Given TimescaleDB’s time-based chunking, such policies are implemented by simply dropping chunks (tables) in the database. This means that individual files in the underlying file system can simply be deleted, rather than needing to delete individual rows, which requires erasing/invalidating portions of the underlying file. Such an approach therefore avoids fragmentation in the underlying database files, which in turn avoids the need for vacuuming. And this vacuuming can be prohibitively expensive in very large tables.
+
+Still, this approach ensures that chunks are sized appropriately so that the latest ones can be maintained in memory, even as data volumes may change.
+
+Partitioning by primary key then takes each time interval and further splits it into a number of smaller chunks, which all share the same time interval but are disjoint in terms of their primary keyspace. This enables better parallelization both on servers with multiple disks — for both inserts and queries — — as well as multiple servers. More on these issues in a later post.|||
+
+These days, time-series data applications (e.g., data center / server / microservice / container monitoring, sensor / IoT analytics, financial data analysis, etc.) are proliferating. As a result…

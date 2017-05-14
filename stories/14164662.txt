@@ -1,0 +1,50 @@
+Roughtime is a protocol designed to provide internet-scale secure time synchronization and address shortcomings of older protocols like NTP.
+
+Many aspects of day-to-day computing assume an accurate local clock. This assumption extends to security-critical operations like certificate expiry, OSCP stapling, and Kerberos tickets. An attacker that subverts time sync could violate the security of these operations.
+
+The dominant internet time-sync protocol, Network Time Protocol (NTP), is showing its age. Amongst other things:
+
+Roughtime attempts to improve on the status quo. Paraphrasing its design goals:
+
+Bellow I’ll explore some of the interesting aspects of Roughtime that may not be immediately obvious.
+
+For those unfamiliar, below is a very abbreviated description of how Roughtime works. The specification and project page details the actual protocol: A brand new client generates a 64 byte random nonce and sends it to a Roughtime server. The Roughtime server replies with the current time, the client’s nonce, and a signature of both. Subsequent client requests generate their nonce by combining the reply in #2 with a random value (a blind ). Clients know that server responses are A) fresh because they include their nonce, and B) authentic because they are signed. By deriving future requests from prior responses, the client establishes a chain of happens-before ordering between requests and replies. Sending chained requests to multiple servers extends the total order across all participating servers (e.g. send to server1 and receive ; send to server2 and receive ; send to server3 and receive , and so on).
+
+A Roughtime server signs its responses using the Ed25519 public-key signature system. Ed25519 signatures are quite fast: according to eBATS an Intel Skylake CPU takes about ~49,000 cycles to compute an Ed25519 signature. Assuming a 3.0 GHz clock speed that’s ~61,000 signatures per second on a single core. Signatures are also compact: 64 bytes each.
+
+To scale the signing workload, Roughtime uses a Merkle Tree to sign a batch of client requests with a single signature operation. The root of the tree is signed and included in all responses. With a batch size of 64 a single 3.0 GHz Skylake core can sign 3.9 million requests per second.
+
+Another design feature helps limit per-client processing: the non-client-specific parts of a response are identical for all replies in a single batch . Servers can calculate these values once and re-use them in each reply.
+
+All Roughtime requests are required to be at least 1024 bytes long and any request shorter is simply dropped. Why? To ensure that a Roughtime server cannot be used as a DDoS amplifier.
+
+The 1 KiB request size requirement ensures an attacker has no size gain on traffic sent to a Roughtime server; replies are always smaller than requests, even under load (when batching responses).
+
+This also naturally rate-limits requests: at 1 KiB per request a 10 Gbps link can deliver a maximum of 1.2 million requests per second. As shown above, that rate is easily handled by a single Skylake core.
+
+You probably noticed the response size when batching 64 requests is suspiciously small: 744 bytes. This is not a typo.
+
+Recall that Roughtime uses a Merkle Tree of client requests to construct its batched response. A Roughtime server does not send the whole tree when replying to clients. It sends the signed root plus only those nodes each client needs to verify that its request was included in the tree . Being a complete tree, the maximum number of path elements required by any client is .
+
+An example might help. Consider this simplified Merkle Tree constructed from seven requests, though :
+
+Imagine constructing a response to client C that needs to verify its request is in the tree:
+
+Thus client C is sent , , and .
+
+Hopefully it’s clearer how the 744 byte response size for a server batching 64 requests is obtained: and . Minimum Roughtime response size of 360 bytes + 384 bytes of tree path data = 744 bytes total.
+
+Now to examine how request/response chaining allows clients to detect and tattle on misbehaving servers. The diagram below illustrates a sequence of chained requests and responses between one client and two servers:
+
+Proof of server misbehavior emerges from two interlocking properties of the protocol:
+
+A client sending nonce which was derived from can be certain that response (and the time associated with it) came after response (and its associated time). If the client sees a time in response that is before the time in then something is obviously wrong.
+
+By querying several servers (assuming no collusion) a client can identify not only ordering issues but also time quality problems. One server reporting a time way off the others will be obvious and the collection of cross-signed request/responses will supply proof.
+
+A client can store a log of request and response chains. There are no secret values in Roughtime requests or responses so this log can be provided to an audit service or other third-party. This protobuf definition from the Roughtime project is intended as the standard JSON format for such chain files.
+
+Roughtime is elegant and simple but several of its clever features only become apparent after digging in. Hopefully this post helps spread the word. I didn’t touch on other neat ideas in Roughtime like deliberate response fault injection or use of key delegation to limit exposure of long-term keys.
+
+If you’re interested in learning more:|||
+

@@ -1,0 +1,51 @@
+Introduced with iOS9, the kernel integrity protection aka watchtower aka KPP, posed a new problem to arm64 jailbreaks. Effectively, it was observed that after patching the kernel code - customary in older jailbreaks - the device would silently panic after a while. It soon became obvious that some thing was checking the kernel code. That thing was outside the kernel, and it became evident pretty quickly that there was a kind of hypervisor at work.
+
+To this day, I’m still surprised nobody did a write-up on the KPP – at least none that I know of. So, I will try to explain how the hypervision works. Specific implementation details will maybe come at a later time, provided I have the time for it. Now, without further ado, here we go…
+
+The KPP lies in a Mach-O executable file appended right after the compressed kernel chunk, inside the kernelcache img4. The iBoot carves out the KPP image, loads it at and runs it in EL3.
+
+The structure received upon entry looks like this:
+
+The KPP overwrites its own Mach-O header at with a trampoline which calls and installs two exception handlers, and . Recall the AArch64 exception table:
+
+ExceptionVector with location of the two handlers.
+
+Next, it parses the kernel and its kexts (from __PRELINK_INFO):
+
+Finally, if – which always is – it sets (among others) the following registers:
+
+will escalate to EL3 into hypervisor’s :
+
+When something goes wrong, sets a global variable and signals the kernel by:
+
+Execution is then transferred down as SError back into kernel’s ExceptionTable:
+
+Otherwise, if everything is fine and dandy, execution resumes in the kernel, right after .
+
+This was the setup phase, required in order to let the kernel set-up the write-once memory locations. Next, onto the heartbeat phase…
+
+Meanwhile, userland runs code. When a FPU instruction is executed, causes a trap in kernel.
+
+In the running kernel, and all eventually tail to
+
+When CPACR_EL1 is hit, it is trapped by EL3, as per and execution is transferred to EL3 .
+
+// CPTR_EL3.TCPAC=0, accesses to CPACR_EL1 will not trap from EL2 and EL1 to EL3 // CPACR_EL1.FPEN=3, does not cause any FPU instruction to be trapped // SCR_EL3.IRQ=1, When executing at any Exception level, physical IRQ interrupts are taken to EL3 // SCR_EL3.SMD=1, SMC instructions are UNDEFINED at EL1 and above // SCR_EL3.SIF=1, Secure state instruction fetches from Non-secure memory are NOT permitted
+
+As you can see, it skips a few beats once in a while ( ==4) to go easy on CPU usage and/or battery. It also slowly but surely crawl over all protected areas in a sequential manner.
+
+If all checks pass, the hypervisor disables FPU trapping (allowing the FPU to finally execute), enables IRQ to EL3 (to make sure it is hit again), resumes kernel right after CPACR_EL1 hit and waits.
+
+Kernel/userland runs happily. When the next IRQ fires, it is taken to hypervisor’s EL3 IRQ handler.
+
+That is: reset IRQs back to EL1, re-enable FPU trapping, re-enable trap for CPACR_EL1 accesses.
+
+These last 4 steps are then repeated forever.
+
+In summary: KPP makes sure the FPU always trap and the trap cannot be disabled. When FPU hits (tick) the kernel tries to disable the trapping but is immediately taken to KPP. KPP then runs its checks, frees the FPU, but routes the IRQs to itself. As soon as any IRQ fires (tock) it makes the FPU trap again and de-routes the IRQs.
+
+This is the engine that keeps the hypervisor beating. If you patch away the trigger, that is, CPACR_EL1 access, the FPU can’t execute. However, there is one catch. We can “steal” away the CPACR_EL1 access to a separate trampoline:
+
+This bypass was demo-ed by @qwertyoruiop in yalu102.|||
+
+Introduced with iOS9, the kernel integrity protection aka watchtower aka KPP, posed a new problem to arm64 jailbreaks. Effectively, it was observed that afte...

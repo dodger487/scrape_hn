@@ -1,0 +1,99 @@
+How to create a very intimate hotspot for Android smartphones.
+
+In my previous blog post, I showed how to leverage Host Card Emulation on Android to run a custom protocol on top of ISO/IEC 7816–4 APDUs. This post generalizes those ideas and shows how to tunnel TCP/IP socket operations over NFC, transparently enabling any application-level protocol such as HTTPS or SSH over NFC.
+
+Full source code for everything in this blog post is available on Github: https://github.com/classycodeoss/nfc-sockets (Apache 2.0 licesnse)
+
+Berkeley sockets are the underlying mechanism for networking on UNIX-based operating systems. Sockets provide an API for two-way communication over a networking protocol stack, typically TCP/IP. The internet is full of socket programming examples (like this one on Wikipedia), so I will not bother you with one.
+
+What is important is that all networking you do, regardless of whether its HTTP, SSH, or some other application protocol, at some point there will be a socket involved from which you (or most likely the library) reads and writes data.
+
+If we limit ourselves to client-side sockets (we don’t want to implement a server), a typical socket interaction will involve the following steps:
+
+Setup phase: Socket is initialized and connected to an endpoint (IP address and port) using socket() and connect() functions. A file descriptor is allocated and used as handle for subsequent calls.
+
+Transaction phase: Data is sent and received to/from the socket using send() and recv() functions.
+
+Teardown phase: The socket is closed using the close() function.
+
+We can convert these function calls and their results to messages that can be serialized and exchanged between a socket client (something that wants to use a socket) and a socket provider (something that can provide a socket). For a simple exchange of the strings ‘hello’ and ‘world’ we might get the following picture:
+
+The exchange shown here is simplified a bit. Socket interactions can occur concurrently, so we need to assign identifiers to messages and reference them in the responses. We also need to encode the type of the message into the message so that the provider can parse it.
+
+In our case, we want to exchange these messages over NFC, using ISO/IEC 7816–4 APDUs, between an Android smartphone (the socket client) that supports Host Card Emulation and an NFC reader connected to the Internet (the socket provider):
+
+The socket provider is a RaspberryPi with a PN532-based reader connected via SPI. It’s connected to internet via Wi-Fi. This turned out to be a great setup for playing with NFC. For short instructions on getting the setup to work, see my last blog post.
+
+The application is written in C and uses libnfc to access the NFC reader. It has no other dependencies, and is fairly compact. It consists of three modules:
+
+Operations that might block (e.g. reading a number of bytes from a socket) are executed asynchronously. The results are stored and returned to the smartphone when they are ready.
+
+Now that we have a provider that exposes sockets via APDUs, how do we use it on Android? We can leverage a couple of useful things:
+
+Sockets are expected to provide java.io.InputStream and java.io.OutputStream instances for reading from/writing to the socket. These can also be overridden.
+
+This is where things started to get exciting. We can replace the core building block of network communication on Android, and we can translate operations on it to messages exchanged over NFC. An architectural picture of the socket client was taking shape:
+
+Can we tunnel arbitrary protocols over this mechanism? Not so fast, hotshot. Let’s start with something simple to validate our assumptions.
+
+To mock up a server that just echoes back what it receives, we don’t even need to write code — we can use Netcat, the “Networking Swiss Army knife”:
+
+This will make Netcat listen (-l) on port 12345 (-p), execute /bin/cat which will echo the input, and conveniently keep running (-k) after the connection is closed, because we surely won’t get this right the first time. Your distribution-specific variant of Netcat might not support all those options.
+
+Let’s exchange some data, shall we? We’ll send a greeting and see what comes back.
+
+Pretty neat, no? Let’s take a look at the output of the socket provider:
+
+Everything looks fine, exactly what we expect.
+
+While basic I/O over TCP/IP is nothing to snear at, being able to do HTTPS would be far more useful. Its ubiquituous nature and features such as encryption and mutual authentication make it an obvious candidate for experimentation.
+
+On Java platforms, the software stack enabling an HTTPS exchange is usually comprised of the following layers:
+
+Our game plan is to replace the default socket implementation with our NFC socket, and the OS networking stack with an Android Service that does Host Card Emulation to exchange data with an NFC reader:
+
+Instantiating an HTTP client that uses our NFC socket implementation is easy. We chose okhttp as HTTP Client library as Android’s HttpURLConnection does not provide a means to provide alternative SocketFactory instances on a per-connection basis. We also disable timeouts as our NFCSocket does not support them yet.
+
+With WiFi disconnected or in airplane mode, let’s perform a single request to fetch the front page of a well-known new site, and see how it goes.
+
+Unfortunately this does not immediately work. Instead we get an exception:
+
+We completely forgot that in order to resolve the name news.ycombinator.com to an IP address, we need to do a DNS lookup which requires connectivity. Talk about taking things for granted!
+
+Android/Java does not provide a way to override DNS lookup, but fortunately for us, okhttp allows pluggable DNS via the Dns interface:
+
+Great news! We can implement this interface and circumvent the OS name resolution. Of course we don’t want to write our own DNS client, so we just use the MiniDNS library instead. A small pull request was all that was required to extend minidns to allow for a custom SocketFactory. Kudos to @Flowdalic for merging this on the same day!
+
+Plugging a DNS implementation into okhttp that uses MiniDNS and an NFC socket for communication was fairly straightforward. If you’re interested, have a look at the NFCDnsSource (MiniDNS NFC Socket backend) and OkDns (OkDns to MiniDNS bridge) classes.
+
+Let’s try the request again with our shiny new DNS capability. Again, no luck, but another useful exception:
+
+JSSE (Java Secure Socket Extension) is a Java framework that enables transparent SSL/TLS over sockets. To quote the guide:
+
+The JSSE is designed to be pluggable (like all Java crypto components). The default implementation on recent Android versions is conscrypt, which uses BoringSSL (Google’s OpenSSL fork) for the heavy SSL/TLS lifting. As OpenSSL is implemented in C, Conscrypt uses JNI (Java Native Interface) to call into the native code.
+
+OpenSSL of course can not use a java socket, but instead relies on a file descriptor, which is the low-level handle for a socket. Conscrypt obtains the socket file descriptor through reflection by accessing a private field, and passes it to OpenSSL:
+
+Why is this problematic for us? Because Conscrypt assumes that we use a regular socket that has a file descriptor, when that is in fact the exact thing we want to replace.
+
+Again, a plugin mechanism comes to the rescue. The entire Java cryptography infrastructure is inherently pluggable through so-called security providers. All we need is a JSSE implementation that does not depend on OpenSSL and uses pure Java sockets instead. The Graz University of Technology offers a commercially licensed, pure-Java JSSE called iSaSiLk which is freely available for Open Source projects. Special thanks to Dieter Bratko for providing me support for iSaSiLk!
+
+We load iSaSiLk and IAIK (the companion crypto provider) at the start of our app:
+
+You probably want to skip the first 20 seconds of the video if you don’t like blank screens, spinning loading indicators and boring terminal output.
+
+Success! We downloaded the Hacker News front page via NFC, securely, including the stylesheet and image resources in just over 30 seconds. Which is an eternity of course.
+
+With a Google Pixel and the PN532 reader chip, we get a measly bandwidth of around 1.5 KB/s. Yes, you can browse the web with this. You can even do so securely. But you won’t enjoy it.
+
+On a side note, my first modem was a US Robotics Sportster, and it looked pretty similar to this one. Its maximum speed is similar to that of the NFC socket.
+
+Somehow, it didn’t seem that slow back then. For me, the excitement of my computer reaching out to somewhere else outweighed it all. If you remember those days, using an NFC socket might make you feel a bit nostalgic.
+
+We created this post partly to show that NFC can be used for more than just payment and loyalty use cases, but mainly because we enjoy fiddling with stuff.
+
+Mimicking sockets over NFC certainly has its advantages, mainly the wealth of existing networking libraries and protocols that can be readily used. The demo app includes examples for HTTPS and SSH, for instance. For real world use cases, you will probably be better served with an optimized, custom protocol.
+
+Please recommend this article if you enjoyed reading it. And please, for the love of god, do not use this code for anything remotely important. :-)|||
+
+In my previous blog post, I showed how to leverage Host Card Emulation on Android to run a custom protocol on top of ISO/IEC 7816–4 APDUs. This post generalizes those ideas and shows how to tunnel…

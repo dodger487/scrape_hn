@@ -1,0 +1,109 @@
+Then we have a “seq” section which describes how to parse the file — that’s an list of fields. Each field must have a name (“id”) — and that’s exactly we’re working for — and description of its contents. We were using 2 clauses here:
+
+Nothing too that scary, isn’t it? Actually, .ksy is just a plain YAML files. That “meta” section is made up of our early findings — i.e. that we’re working on “ykc” files, the application that it uses is called “Yuka Engine” (it’s just a friendly reminder for fellow researchers, like a comment — it doesn’t really affect parsing) and we’ll be using little endian integers by default (that is “endian: le”).
+
+I don’t know what “18 00 00 00 │ 00 00 00 00” is yet, but it doesn’t really matter as it’s all the same everywhere. The other two fields are much more interesting — they look a lot like two 4-byte integers. So, it’s time to grab onto Kaitai Struct and start hacking away a rough sketch of our format:
+
+Basic theory suggests that every archive would have some sort of header, something an application would start reading its archive with, and 99% of file would be filled with archive contents — either files or some blocks of data. Note the header is not always at the very beginning of the file — it might be at some offset at the end of file, or at some offset from the beginning. It’s highly unlikely, though, that the header would be right in the middle of contents.
+
+Yeah, it applies some compression, but not too much. Chances are that it’s uncompressed, or at least some files would be uncompressed. Actually, if there are .pngs or .oggs in that archive, they are already well-compressed, so it looks like the truth.
+
+Another quick check: let’s see if they are compressed. Just take any compressor and try to compress one file, then check compression ratio. I’ve just used zip:
+
+Let’s check if these files all have the same format. Judging from that they all follow the same “data*.ykc” pattern — they do. Checking beginnings of the files reveals that they all start with “YKC001\0\0” — which proves us right.
+
+Ok, time to roll up our sleeves and get our hands dirty. There are several files — that is actually very good news too. If you do reverse engineering, having several specimens could be a very valuable asset, as you can fully employ statistical methods, comparing these specimens to each other. It’s much harder to guess what that 7F 02 00 00 might mean if that’s the only thing you have.
+
+It’s also a good idea to look for stuff like “version”, “copyright”, “compiler”, “engine”, “script” — and, given that it’s a Windows exe, don’t forget to look for it in 2-byte encodings like UTF16-LE — chances are that you’ll end up with something interesting. In our case, we’ve got “Yuka Compiler Error”, “YukaWindowClass”, “YukaApplicationWindowClass”, “YukaSystemRunning”, and mentions of “start.yks” and “system.ykg”. It would be a fair bet to say that developers named their engine “Yuka” and all the files related to it have extensions which start with “yk” — “ykc”, “yks”, “ykg”. Also we can spot “CDPlayMode” and “CDPlayTime” — probably it means that the engine can play music tracks from Audio CDs, and “MIDIStop” with “MIDIPlay” suggest that there’s support for MIDI music too.
+
+It could come useful to do a quick inspection of exe file in a hex editor. Most modern developers are sane enough and have finally switched to use popular ready-made libraries for image / music / sound processing, instead of inventing their own in-house compression formats. And all these libraries usually bear some signatures which can be easily spotted by a naked eye. Things to look for:
+
+So, here we have a single .exe file (obviously, an executable engine), a few enormous .ykc files (most likely —content archives or containers) and op.mpg —an opening video (one can easily open it with any video player).
+
+Having downloaded it, let’s start with the basic intelligence. What do we know already about our target? At least the version we’ve downloaded runs on Windows OS using Intel CPUs (actually there *is* an Android version that runs on ARMs, but it’s sold only at Japanese app markets, and it’s not so easy to extract from a phone). So, what can we assume given that it’s Windows/Intel?
+
+That blue list with numbers on the left is actually a pack of mirror links — you can use any one them to download the distro.
+
+There we go, now we need an object of our dissection, which is a visual novel distribution. We’ve got lucky here, PeasSoft legally offers trial versions of their visual novels for free download at their site. Trial version is more than enough for us to get acquantied with their formats. Seek for the page that looks like this at their site:
+
+First of all, let’s take a look at the list of stuff we’ll need:
+
+To make it practical and demonstrate typical stuff one encounters while doing basic reverse engineering work, I propose that we start with something not-so-trivial, namely a beautiful visual novel called Koisuru Shimai no Rokujuso (originally 恋する姉妹の六重奏) by PeasSoft. It’s a fun, easy-going romantic comedy with a splendid visual part that’s PeasSoft is usually famous for. As a reverse engineering object, it’s also nice thing to explore, as it looks like we’ll be kind of breaking fresh ground. And it’s much more interesting that just duplicating work of others on well-explored stuff like Kirikiri or Ren’Py .
+
+Yeah, the visualizer is console based, so you can start feeling like a Real Hacker they show in the movies right about now. But let’s take a look at the tree structure first:
+
+One can use arrow keys in the visualizer to walk through all these fields, use “Tab” to jump to hex viewer and back and use “Enter” to open closed tree nodes, show the instances (we’ll talk about them later) and view the hex dumps full screen. To make article easier to read, I won’t be showing full screenshots of the visualizer, only the interesting parts of the tree as text.
+
+Ok, that was data01.ykc, let’s check out data02.ykc:
+
+Not that much, actually. There’s not a file directory or anything. Let’s note the sizes of original container files and see if any of these could be offsets or pointers inside the file:
+
+Wow, looks like we’ve hit the bullseye. Let’s check out what’s happening at that offset in the file:
+
+We’ve added another field named “unknown3”. However, this time it’s not in “seq” section, but in “instances” section. It’s actually the very same thing, but “instances” is used to describe fields which are not going in sequence, thus they can be anywhere in the stream and require note of position (“pos”) to start parsing from. So, our “unknown3” starts with “unknown_ofs” (“pos: unknown_ofs”) and spans up to the end of file (=stream, so “size-eos: true”). As we have no idea what we’ll get there, so far it will be read just as a byte stream. Nothing too fancy, but let’s take a look:
+
+Hey, note the length of that “unknown3”. It looks exactly like “unknown2”. So it turns out that the first header of YKC file is actually not the header itself, but a reference to some other point of file to find the real header. Let’s fix our .ksy file to add this knowledge:
+
+Nothing too complex here: we’ve just renamed “unknown” fields to have more meaningful names and replaced “size-eos: true” (which means reading everything up to the end of file) with “size: header_len” (which specifies exact amount of bytes to read). Probably that’s pretty close to original idea. Load it up once again and now let’s focus on that field we’ve named “header”. It looks something like that in data01.ykc:
+
+At the first glance, it doesn’t make any sense at all. On the second thought, though, a sequence of repeating bytes catches our eye. That is `e7 7f` in the first file, `2b 66` in the second, and `30 17` with `31 17` in the third. Actually, it looks very much like that we’re dealing with fixed length records here, 0x14 (20 decimal) bytes long. By the way, this hypothesis goes well with header lengths in all three files too: all three of 4660, 28400, and 58440 are divisible by 20. Let’s give it a try:
+
+Check out what happened with “header” instance here. It’s still positioned at “header_ofs” and has size of “header_len” bytes, but it’s no longer a mere byte array. It has its own type, “type: header”. This means that we can specify a custom type and this type will be used to process the given field. Here we go, it’s right below, in that “types:” section. As you might have already guessed, actually “type” follows exactly the same format as the main file (i.e. root) — one can use the same “seq” section to specify the sequence of subfields, “instances”, it can have its own subtypes (“types”), etc, etc.
+
+So, we’ve specified a “header” type, which consists of a single field — “entries”. We know that this field need to be 0x14 bytes long (“size: 0x14”), but we demand it to be repeated as long as possible (i.e. up to end of the stream — that is “repeat: eos”).
+
+By the way, note that the concept of “stream” is not the same as we’ve seen before, when “stream” actually meant “whole file”. This time we’ve dealing with a substructure that has fixed size (“size: header_len”), so that repetition will be limited by that size anyway. So we can rest assured that if there would be something beyond that length, it won’t be contaminating this structure of ours.
+
+Ok, let’s give it a try:
+
+Now it starts to make some sense, isn’t it? It really looks like a repeated structure. Let’s check out the second file too:
+
+By the way, do you see that (233 = 0xe9 entries) and (1420 = 0x58c entries)? It’s plausible to deduce that it could be number of files in the archive. Our first archive is relatively small (8 MiB), dividing it by 233 files yields us 36022 bytes per file on average. Looks legit for a bunch of scripts, configs, etc. The second archive is the largest (560 MiB), having 1420 files yields 394661 bytes per file, which looks ok for stuff like images, voice files, etc.
+
+`57 e7 7f 00`, `61 e7 7f 00`, `6c e7 7f 00` and so on look very much like an increasing sequence of integers, what could it mean? In the second file it’s `d1 2b 66 21`, `dd 2b 66 21`, `f1 2b 66 21`. Hang on a sec here, I think I’ve seen it somewhere already. Let’s roll back to the beginning of our work — that’s it! It’s close to the full length of file — thus, it looks like offsets yet again. Ok, let’s try to describe the structure of these 20-bytes records. Judging by the looks, I’d say that these are 5 integers. We’ll describe another type named “file_entry”. Giving full listings becomes a bother, so if you’ll excuse me I won’t copy-paste whole file from now on and will just show you the changed “types” section:
+
+No new .ksy features tackled here. We’ve added “type: file_entry” for entries and described this subtype as 5 sequential u4 integers. Checking it out in visualizer:
+
+Any thoughts? Yet another idea: “unknown3” is a pointer to the beginning of the file in our archive, “unknown4” is most likely being length of this file. It’s simple because 24 + 531 = 555, and 555 + 10971 = 11526. That’s simply the files that go on sequentially in the container. One might also note the same for unknown_ofs and unknown2: 8382295 + 10 = 8382305, 8382305 + 11 = 8382316. That means that “unknown2” is a length of some other subrecords which begin at “unknown_ofs” offset. “unknown5” always seems to be equal to 0.
+
+Come on, let’s add some special magic into “file_entry” to read these blocks of data, i.e. record at (unknown_ofs; unknown2) and file body at (unknown3; unknown4). It would look like that:
+
+Actually, we’ve done that trick with “instances” before, so it’s not that new. The only real new “magic” thing here is that “io: _root._io” specification. What does it do?
+
+Do you remember when I’ve mentioned that KS has concept of “stream” that’s being read, and if you effectively limit that “stream” by offset and size while parsing a substructure, it’s not the same “stream” that equals to whole file we had from the very beginning? That’s the case here. Without this “io” specification, “pos: body_ofs” would try to seek to “body_ofs” position in a stream that corresponds to our “file_entry” record, which is actually 20 bytes long — and that’s not what we want (not to mention that it would result in an error). So we need some special magic to specify that we want to read not from the current IO stream, but from IO stream that corresponds to the whole file — that is “_root._io”.
+
+Ok, what have we got with all that?
+
+It’s easier to check out with interactive visualizer, but even on this static shot it’s easy to tell that `73 74 61 72 74 2e 79 6b 73 00` is an ASCII string. Checking out string representation, it turns out that it’s “start.yks” with trailing zero byte. And `73 79 73 74 65 6d 2e 79 6b 67 00` is actually “system.ykg”. Bingo, it’s the file names. And we’re damn sure of them that they are the strings, not just some bytes. Let’s mark it up:
+
+The new stuff here is that “type: str” — it means that the bytes we’ve captured must be interpreted as a string — and “encoding: ASCII” specifies encoding (we’re not really sure, but so far it’s been ASCII). Visualizer again:
+
+Now, isn’t that nice? Looks like a job well done for me. You can even select individual file bodies, press “w” in the visualizer, type some name and export these binary blocks as local files. But this is tiresome and that’s not exactly what we wanted: we wanted to extract all the files at once, keeping their original filenames.
+
+Let’s make a script for that. What do we do to transform our format description into code? Now that’s where Kaitai Struct shines: you don’t need to retype all that type specifications into code manually. You just get the ksc compiler and run:
+
+and you’ve got yourself a nice and shiny “ykc.rb” file in your current folder, which is a library that you can plug in and use straight away. Ok, but how do we do that? Let’s start with something simple, like listing files to the screen:
+
+Cool, huh? Here we go — two lines of code (four, if you count in “require” and block termination) — and we’ve got that huge listing pumping:
+
+Let’s go through what’s going on here step-by-step:
+
+It shouldn’t be very hard to write mass extraction script, but I just want to note a couple of things before that:
+
+Do you remember the beginning of the article, when I said that crazy Japanese programmers use Shift-JIS? That’s exactly it. They use files with Japanese characters in it. Let’s change “encoding: ASCII” to “encoding: SJIS” in our filename type description for that. Don’t forget to recompile ksy → rb, and, voila:
+
+Even if you don’t read Japanese, you can check out something like Google Translator to see that 電話 is actually “phone”, so chances are “SE\00050” is a sound of phone ringing.
+
+Ultimately, our extraction script will look like this:
+
+That’s a bit more than 2 lines, but nothing fancy goes on here either. We grab a list of command line arguments (this way, you can run it using something like ./extract-ykc *.ykc), and, again, for every container file we’re iterating over all file entries. We clean up the file name (stripping trailing zero, encoding it to UTF-8 and replacing backslashes with forward slashes), derive directory name (dirname), create the folder if it doesn’t exist (mkdir_p) and, finally, we dump the `f.body` contents there to a file.
+
+Our job is complete. You can run the script to see what we’ll get. As we’ve predicted, images are really in .png format (and you can view them with any image viewer), and music and sounds are in .ogg (so you can listen to them with any player). For example, here’s the backgrounds that we’ve got in BG folder:
+
+And TA folder contains sprites which are overlaid over these backgrounds. For example, Mika looks like that:
+
+I can give out a little secret: in many Japanese VNs, “standing” sprites are named “ta” or “tati” / “tachi” / “tatsu” / “tatte”. That’s because Japanese word for “standing” is 立って (tatte) or “to stand up” is 立ち上がる (tachi ageru). That usually contrasts with “fa” or “face” sprites, which are actually used for avatar portraits in the dialogue text box, which show only character’s face.
+
+That’s it for today. The two major things left to reverse engineer here are “yks” and “ykg” files — probably “yks” is the script of the game, and “ykg” are some aux graphics or animations. Let’s try to tackle them next time.|||
+
+I’d like to make a confession: I love visual novels. For those of you who aren’t in the trend, visual novels are something inbetween of interactive books, games-that-mostly-consist-of-reading-lotsa…

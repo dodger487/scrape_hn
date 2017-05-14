@@ -1,0 +1,52 @@
+R has a number of very good packages for manipulating and aggregating data (dplyr, sqldf, ScaleR, data.table, and more), but when it comes to accumulating results the beginning R user is often at sea. The R execution model is a bit exotic so many R users are very uncertain which methods of accumulating results are efficient and which are inefficient.
+
+In this latest “R as it is” (again in collaboration with our friends at Revolution Analytics) we will quickly become expert at efficiently accumulating results in R.
+
+A number of applications (most notably simulation) require the incremental accumulation of results prior to processing. For our example, suppose we want to collect rows of data one by one into a data frame. Take the function below as a simple example source that yields a row of data each time we call it.
+
+The obvious “ -loop” solution is to collect or accumulate many rows into a data frame by repeated application of . This looks like the following function.
+
+This would be the solution most familiar to many non-R programmers. The problem is: in R the above code is incredibly slow.
+
+In R all common objects are usually immutable and can not change. So when you write an assignment like “ ” you are usually not actually adding a row to an existing data frame, but constructing a new data frame that has an additional row. This new data frame replaces your old data frame in your current execution environment (R execution environments are mutable, to implement such changes). This means to accumulate or add rows incrementally to a data frame, as in we actually build different data frames of sizes . As we do work copying each row in each data frame (since in R data frame columns can potentially be shared, but not rows) we pay the cost of processing rows of data. So: no matter how expensive creating each row is, for large enough the time wasted re-allocating rows (again and again) during the repeated s eventually dominates the calculation time. For large enough you are wasting most of your time in the repeated steps.
+
+To repeat: it isn’t just that accumulating rows one by one is “a bit less efficient than the right way for R”. Accumulating rows one by one becomes arbitrarily slower than the right way (which should only need to manipulate rows to collect rows into a single data frame) as gets large. Note: it isn’t that beginning R programmers don’t know what they are doing; it is that they are designing to the reasonable expectation that data frame is row-oriented and R objects are mutable. The fact is R data frames are column oriented and R structures are largely immutable (despite the syntax appearing to signal the opposite), so the optimal design is not what one might expect.
+
+Given this how does anyone ever get real work done in R? The answers are:
+
+The most elegant way to avoid the problem is to use R’s (or list apply) function as shown below:
+
+What we did is take the contents of the -loop body, and wrap them in a function. This function is then passed to which creates a list of rows. We then batch apply to these rows using . It isn’t that the -loop is slow (which many R users mistakingly believe), it is the incremental collection of results into a data frame is slow and that is one of the steps the method is avoiding. While you can prefer to -loops always for stylistic reasons, it is important to understand when is in fact quantitatively better than a -loop (and to know when a -loop is in fact acceptable). In fact a for-loop with a better binder such as (assuming your code can work with a which in some environments has different semantics) is among the fastest variations we have seen (as suggested by Arun Srinivasan in the comments below; another top contender are file based Split-Apply-Combine methods as suggested in comments by David Hood, ideas also seen in Map-Reduce).
+
+If you don’t want to learn about you can write fast code by collecting the rows in a list as below.
+
+The above code still uses a familiar -loop notation and is in fact fast. Below is a comparison of the time (in MS) for each of the above algorithms to assemble data frames of various sizes. The quadratic cost of the first method is seen in the slight upward curvature of its smoothing line. Again, to make this method truly fast replace with (examples here).
+
+The reason is tolerable is in some situations R can avoid creating new objects and in fact manipulate data in place. In this case the list “ ” is not in fact re-created each time we add an additional element, but in fact mutated or changed in place.
+
+(edit) The common advice is we should prefer in-place edits. We tried that, but it wasn’t until we (after getting feedback in our comments below) threw out the data frame class attribute that we got really fast code. The code and latest run are below (but definitely check out the comments following this article for the reasoning chain).
+
+Note that the in-place list of vectors method is faster than any of , , or . This is despite having nested for-loops (one for rows, one for columns; though this is also why methods of this type can speed up even more if we use ). At this point you should see: it isn’t the for-loops that are the problem, it is any sort of incremental allocation, re-allocation, and checking.
+
+At this point we are avoiding both the complexity waste (running an algorithm that takes time proportional to the square of the number of rows) and avoiding a lot of linear waste (re-allocation, type-checking, and name matching).
+
+However, any in-place change (without which the above code would again be unacceptably slow) depends critically on the list value associated with “ ” having very limited visibility. Even copying this value to another variable or passing it to another function can break the visibility heuristic and cause arbitrarily expensive object copying.
+
+The fragility of the visibility heuristic is best illustrated with an even simpler example.
+
+Consider the following code that returns a vector of the squares of the first positive integers.
+
+Now of course part of the grace of R is we never would have to write such a function. We could do this very fast using vector notation such as . But let us work with this notional example.
+
+Below is the result of running . In particular look at the lines printed by the statements and at the first field of these lines (which is the address of the value “ ” refers to).
+
+Notice that the address refers to changes only once (when the value type changes from integer to real). After the one change the address remains constant ( ) and the code runs fast as each pass of the for-loop alters a single position in the value referred to by without any object copying.
+
+Now look what happens if we re-run with :
+
+Setting causes the value referenced by “ ” to also be referenced by a new variable named “ “. Evidently this small change is enough to break the visibility heuristic as we see the address of the value “ ” refers to changes after each update. Meaning we have triggered a lot of expensive object copying. So we should consider the earlier -loop code a bit fragile as small changes in object visibility can greatly change performance.
+
+The thing to remember is: for the most part R objects are immutable. So code that appears to alter R objects is often actually simulating mutation by expensive copies. This is the concrete reason that functional transforms (like ) should be preferred to incremental or imperative appends.
+
+R code for all examples in this article can be found here (this includes methods like pre-reserving space, the original vector experiments that originally indicated the object mutation effect), and a library wrapping the efficient incremental collector.|||
+

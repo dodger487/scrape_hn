@@ -1,0 +1,66 @@
+Have you ever wanted to make a program behave differently without modifying the source code? On Linux and macOS (the operating system formerly known as OS X) you can do this with the or mechanisms respectively, which allow you to override the system and library calls from a particular process. While this may seem dangerous, it’s actually pretty easy to do and can be quite useful.
+
+When you run a program it calls out to shared libraries, and to the kernel using system calls. Overriding these calls allows you to override the program’s behavior in a variety of interesting ways.
+
+For example, your program will often need to check the current time. What if you wanted to change it to be a different value? You could change the whole system’s clock, but that’s problematic and may have unexpected side-effects on other programs.
+
+Alternatively, you can use faketime to override the calls that retrieve the current time. Instead of getting the real time a wrapped process will get whatever time you choose to set:
+
+Other uses include making a process look like root when setting file permissions, or pretending you have changed the root of the filesystem.
+
+Here at Datawire, to give another example, we’ve been working on Telepresence, a program that makes a local process appear as if it were in a remote cluster running Kubernetes. Kubernetes runs its own DNS server, with custom domain names like , and has its own internal IPs for services. We want these IPs and DNS records to be used by the local process.
+
+There are other ways to achieve this effect, but we’ve been using torsocks, which overrides TCP socket connections
+
+ and DNS lookups and routes them through a proxy. The original purpose of was to route calls through the Tor onion router network, which gives users greater privacy. Here you can see how my external IP changes when I run a process under . I send a request to ipify.org, an API that returns the callers IP address, and as you can see transparently routes my HTTP request through various Tor proxies:
+
+So how do all these programs work?
+
+When you run a program the resulting process cannot operate on its own. It needs functionality from libraries and from the kernel; the libraries may in turn depend on other libraries or on the kernel. Consider this simple C program:
+
+The size of the binary is rather large, considering what it does:
+
+That’s because we compiled it statically: all the code it relies on, other than the kernel, is included in the file. We can watch calls to the kernel, aka system calls, using the utility (or on macOS):
+
+As you can see the library call ended up calling the system call.
+
+Most binaries are not distributed as static binaries. Instead of library code being included in the binary, the binary just notes the shared libraries it relies on, and they get loaded at runtime:
+
+We’ve gone from a binary of 888k to only 8k!
+
+So what are these shared libraries the binary relies on? We can list them using (or the similar but not identical on macOS):
+
+Just like the static binary we can use to watch the system calls from running the shared binary:
+
+Notice how this time the binary loaded additional files, the shared library.
+
+In the static binary the implementation of was included in the binary itself, part of the extra 880kb of data in that binary.In the shared binary that code lives in , and we can use the utility to see that call:
+
+Remember how loads shared libraries? It also does some other useful things. In particular, if you set the environment variable it will load the shared libraries set in that variable into the process. (On macOS this variable is called .)
+
+This injected library can override functions in other shared libraries, and if we choose call back to the original version. For example, recall that we discovered that is implemented using . Let’s override with the following shared library:
+
+Now we can compile this into a library, and then use it to override the call to in our shared binary:
+
+The linker loads into the process, and all calls to get routed to our overridden version. And that’s how and and all work: by overriding system or library calls with custom versions using the mechanism.
+
+Code injection has its share of problems, of course.
+
+Remember how we compiled a program with but got a binary with instead? More broadly, the library calls you need to wrap in order to inject code are hard to predict.
+
+Some library calls will have multiple variants, some library calls will share internal private implementations with other library calls… none of them are likely to be designed for code injection.
+
+Even worse, different operating systems and compilers will require you to wrap different calls:
+
+Since and the macOS equivalent work using the dynamic linker, it doesn’t work for static binaries. Notice we don’t get a double print:
+
+Typically the only place you’ll encounter static binaries is when writing Go. The default Go compiler has its own mechanism for calling system calls directly, and tends to ship static binaries. If you want to use with Go your best bet is to use , the -based Go compiler.
+
+For security reasons doesn’t work with suid binaries: the ability to inject arbitrary code into a process running as another user has some obvious problems.
+
+On macOS there is an additional problem. Newer versions of macOS have a security subsystem called . For our purposes the problem is that it prevents injecting code via (the macOS equivalent of ) into any binary in , , and .
+
+Luckily, there’s an easy workaround. Just create a new directory, copy all the binaries from , , and into that directory, and then add it to the start of your environment variable. Once the binaries are out of those special directories code injection works just fine, and since they’re only 100MB copying them is quite fast.
+
+And if you’re a Kubernetes developer check out Telepresence, a great way to have a local development environment for a remote Kubernetes cluster.|||
+

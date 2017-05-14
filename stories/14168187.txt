@@ -1,0 +1,159 @@
+This document provides an architectural overview of the SQL layer in CockroachDB. The SQL layer is responsible for providing the "SQL API" that enables access to a CockroachDB cluster by client applications.
+
+tl;dr: I prepared this because I know people prefer pictures.
+
+Prior to the existence of this document, high-level overviews of CockroachDB would describe the architecture of CockroachDB using this diagram:
+
+More detailed presentations of the architecture during e.g. tech talks would focus on the lower layers, where CockroachDB differentiates itself most strongly from other SQL databases; the SQL layer would usually be kept abstract.
+
+Meanwhile, the source code of the SQL layer is growing. At currently (March 2017) 142 kLOCs, it has become a larger source base than the and packages combined (currently at 134 kLOCs).
+
+There is a very stark contrast between its extremely narrow interface area (described below), on the one hand, and the intricate network of data and state dependencies between its internal components on the other hand. This latter complexity has recently been growing too, due both to a moderate case of feature creep and a large amount of changes meant to fix functional and performance bugs.
+
+This document "opens the black box" and (attempts to) provide a high-level architectural overview of the state of affairs. This is done with two main goals in mind:
+
+This document complements the prior document "Life of a SQL query" by Andrei. Andrei's document is structured as an itinerary, where the reader follows the same path as a SQL query and its response data through the architecture of CockroachDB. This architecture document is a top-down perspective of all the components involved side-by-side, which names and describes the relationships between them. In short, Life of a SQL query answers the question "what happens and how" and this document answers the question "what are the parts involved".
+
+tl;dr: there is an architecture, but it is not yet visible in the source code.
+
+In most state-of-the-art software projects, there exists a relatively good correspondence between the main conceptual items of the overall architecture (and its diagrams, say) and the source code.
+
+For example, if the architecture calls out a thing called e.g. "query runner", which takes as input a logical query plan (a data structure) and outputs result rows (another data structure), you'd usually expect a thing in the source code called "query runner" that looks like a class whose instances would carry the execution's internal state, a providing some methods that take a logical plan as input, and returning result rows as results.
+
+In CockroachDB's source code, this way of thinking does not apply: instead, CockroachDB's architecture is an emergent property of its source code.
+
+"Emergent" means that while it is possible to understand the architecture by reading the source code, the idea of an architecture can only emerge in the mind of the reader after an intense and powerful mental exercise of abstraction. Without this active effort, the code just looks like a plate of spaghetti until months of grit and iterative navigation and tinkering stimulates the reader's subconscious mind to run through the abstraction exercise on its own, and to slowly and incrementally reveal the architecture, while the reader's experience builds up.
+
+There are multiple things that can be said about this state of affairs:
+
+There is probably space for a document that would outline how we wish CockroachDB's SQL architecture to look like; this is left as an exercise for a next iteration, and we will focus here on recognizing what is there without judgement.
+
+In short, the rest of this document is a model, not a specification.
+
+Also, several sections have a note "Whom to ask for details". This reflects the current advertised expertise of several team members, so as to serve as a possible point of entry for questions by newcomers, but does not intend to denote "ownership": so far I know, we don't practice "ownership" in this part of the code base.
+
+Without futher ado, here is an architectural diagram of CockroachDB's current SQL layer:
+
+There are overall five main component groups:
+
+The way this is connected (overall) can be modeled thus:
+
+The three "auxiliary" components / component groups are the lease manager, the schema change manager and the memory monitors. Although they are auxiliary to the main components above, only the memory monitor is relatively simple -- a large architectural discussion would be necessary to fully comprehend the complexity of SQL leases and schema changes. An outline is provided below.
+
+There are two main interfaces between the SQL layer and its "outside world":
+
+I call these "main" interfaces because they are fundamentally necessary to provide any kind of SQL functionality. Also they are rather conceptually narrow: the network SQL interface is more or less "SQL in, rows out" and the KV interface is more or less "KV ops out, data/acks in".
+
+In addition, there exist also a few interfaces that are a bit less visible and emerge as a side-effect of how the current source code is organized:
+
+Overall architecture: event loop, one per connection (in separate goroutines, ). Get data from network, call into executor, put data into network when executor call returns, rinse, repeat.
+
+Whom to ask for details: mattj, jordan, alfonso, tamir, nathan.
+
+This part has two relatively independent components and one component intertwined with the middle end:
+
+Reminder: "semantic analysis" as a general term is the phase in programming language transformers where the compiler determines if the input makes sense. The output of semantic analysis is thus conceptually a yes/no answer to the question "does this make sense" and the input program, optionally with some annotations.
+
+The code is a bit spread out but quite close to what every textbook suggests.
+
+Whom to ask for details: pretty much anyone.
+
+Role: check AST expressions are valid, do some preliminary optimizations on them, provide them with types.
+
+The implementation of these sub-tasks is nearly purely functional. The only wart is that spills the type of SQL placeholders ( , etc) onto the semantic context object passed through the recursion in a way that is order-sensitive.
+
+Note: it's possible to inspect the expressions without desugaring and simplification using .
+
+Whom to ask for details:
+
+Code: interleaved in the constructors, which really belong to the SQL middle-end components described in the next section.
+
+Whom to ask for details: there's no single point of expertise currently able to talk about the commonalities of "statement semantic analysis". Instead, each author working on a specific has made due diligence to follow the general checks made by other .
+
+(It's not foolproof though, and it's rather likely that some statements are not fully checked semantically or not in the same order as others -- which can/would/will/do result in inconsistent error messages in case of semantic errors by client applications).
+
+Two things are involved here:
+
+Note: some statements are not really translated to a logical plan, like . I call them "immediate". These are executed (ran) immediately in after semantic checking, and result in an "empty plan" from the perspective of the code using the logical planner. The interface exists so that these statements are ignored during SQL prepare, but this in turn also means that a SQL prepare operation is unable to run semantic checks on immediate statements.
+
+Code: the various constructors in the package.
+
+Whom to ask for details: like for semantic checks, there's no single point of expertise currently able to talk about the commonalities of logical plan construction. Some areas of expertise have emerged:
+
+Interface: takes a logical plan as input and returns an optimized logical plan.
+
+Note: ( ) calls (see above) then .
+
+Note 2: it's possible to inspect a logical plan without optimizing it using .
+
+The implementation of these sub-tasks is nearly purely functional. The only wart is that it spills into the session whether the current logical plan uses SQL stars ( ), which is needed by to spill out an error (because we don't support SQL stars in views).
+
+Whom to ask for details:
+
+Role: run SQL statements on the SQL gateway node (the node where pgwire is handling the client connection).
+
+From a software engineering perspective, it's a little weird to make and methods of the data structure they are really consuming as input (the logical plan) but not otherwise modifying. It's also weird and rather unfortunate that the internal execution state of the local runner is also carried as attributes of the logical plan, because this means the logical plan nodes must allocate space for it even when the local runner is not used.
+
+These shortcomings are an artifact from an earlier time where there was no conceptual separation between constructing the logical plan and running it, and all operations using s were implemented as methods. We're moving (slowly) away from that; eventually and will be detached too and the local runner's internal state will sit in separate data structures.
+
+Code: the and methods of all s.
+
+Whom to ask for details: the authors of the respective methods.
+
+This is conceptually a part of the local runner, but is well encapsulated in the method of nodes and is used independently by distSQL processors, so it deserves its own sub-section here.
+
+How: depth-first in-order traversal of the expression tree, returning values ( s) on the way back from the recursion.
+
+Whom to ask for details: nathan, jordan, knz
+
+Role: distribute the execution of queries and (some) statements
+
+Interface: : takes a logical plan as input, produces results (or error) as output.
+
+This is rather complicated.
+
+Overall query distribution is itself split into two phases:
+
+See the distSQL RFC and "Life of a SQL query" for details.
+
+Note: currently misses a connection to the memory monitor; allocations by distSQL are still unchecked.
+
+Whom to ask for details: radu, andrei, vivek, peter, arjun
+
+For more details, see Life of a SQL query.
+
+Whom to ask for details: radu, nathan, andrei, tamir, peter, mattj
+
+This thing is responsible for leasing cached descriptors to the rest of SQL.
+
+However the state of the lease manager is itself stored in a SQL table , and thus internally the lease manager must be able to issue SQL queries to access that table. For this, it uses the internal SQL interface. It's really like "SQL calling into itself". The reason why we don't get "turtles all the way down" is that the descriptor for is not itself cached.
+
+Note that the lease manager uses the same KV object as the ongoing SQL session, to ensure that newly leased descriptors are atomically consistent with the rest of the statements in the same transaction.
+
+Whom to ask for details: vivek, dt, andrei.
+
+This is is responsible for performing changes to the SQL schema.
+
+Adding a column to a very large table or removing a column can be very long. Instead of performing these operations atomically within the transaction where they were issued, CockroachDB runs schema changes asynchronously.
+
+Then asynchronously the schema change manager will process whatever needs to be done, such as backfilling a column or populating an index, using a sequence of separate KV transactions.
+
+Unlike the lease manager, the current state of ongoing schema changes is not stored in a SQL table (it's stored directly in the descriptors); however the schema change manager is (soon) to maintain an informational "job table" to provide insight to users about the progress of schema changes, and that is a SQL table.
+
+So like the lease manager, the schema change manager uses the internal SQL interface, and we have another instance here of "SQL calling into itself". The reason why we don't get "turtles all the way down" is that the schema change manager never issues SQL that performs schema changes, and thus never issues requests to itself.
+
+Also the schema change manager internally talks to the lease manager: leases have to stay consistent with completed schema changes!
+
+Whom to ask for details: vivek, dt.
+
+Memory monitors have a relatively simple role: remember how much memory has been allocated so far and ensure that the sum of allocations does not exceed some preset maximum.
+
+In addition a monitor can be "subservient" to another monitor, with its allocations counted against both its own budget and the budget of the monitor one level up. We (currently) use the following hierarchy of monitor:
+
+Code: ; more details in a comment at the start of .
+
+Whom to ask for details: andrei, knz
+
+Whom to ask for details: danhhz|||
+
+cockroach - CockroachDB - the scalable, survivable, strongly-consistent SQL database

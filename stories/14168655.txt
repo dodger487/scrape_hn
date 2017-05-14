@@ -1,0 +1,102 @@
+Arrays are a crucial component of any programming language, particularly for a data-oriented language like Julia. Arrays store values according to their location: in Julia, given a two-dimensional array , the expression returns the value stored at a location known as . If, for example, stores numbers, the value returned by this expression will be a single number.
+
+Julia’s arrays conventionally start numbering their axes with 1, meaning that the first element of a one-dimensional array is . The choice of 1 vs. 0 seems to generate a certain amount of discussion. A fairly recent addition to the Julia landscape is the ability to define arrays that start with an arbitrary index. The purpose of this blog post is to describe why this might be interesting. This is really a “user-oriented” blog post, hinting at some of the ways this new feature can make your life simpler. For developers who want to write code that supports arrays with arbitrary indices, see this documentation page.
+
+Sometimes arrays are used as simple lists, in which case the indices may not matter to you. But in other cases, arrays are used as a discrete representation of a continuous quantity (e.g., values defined over space or time), and in such cases the array indices correspond to “location” in a way that may be meaningful.
+
+As a simple example, consider the process of rotating an image:
+
+Many languages provide functions for rotating an image; in Julia, you can do this with the function defined in ImageTransformations.
+
+Things get a little more “interesting” when you want to compare pixels in the rotated image to those of the original image. How, exactly, do these pixels match up? In other words, for a location , what is the corresponding location in ? In many languages, figuring out these types of geometric alignments may not be a simple task; it’s no exaggeration to say that in complex situations (e.g., a three-dimensional image with a complex spatial deformation) that one can spend a day or more figuring out exactly how pixels/voxels in two images are supposed to be compared.
+
+Why is this such a hard problem? The core problem is that, in most cases, the language is essentially “lying” to you about the location of pixels: if arrays always start indexing at 1 along any given axis, the array indices don’t really correspond to an absolute spatial location. An index of 1 means “first index” rather than “spatial location 1.”
+
+So to fix this in Julia, starting with version 0.5 we support arrays with indices that don’t start with 1. Let’s illustrate this by specifying that we want the above rotation to be around a point in the head of the cameraman. Let’s load the image:
+
+shows that is a grayscale image indexed over the ranges . Using any of several approaches (e.g., ImageView and paying attention to the status bar to get the mouse pointer location), we can learn that the point is in the head of the cameraman. Consequently, let’s define a rotation around this point:
+
+This defines as the composition of a translation (shifting the head to the origin) followed by a rotation. (You can get the composition operator by typing and then hitting TAB.) If we apply this transformation to the image, we get an interesting result:
+
+Perhaps surprisingly, is indexed over the range , meaning that we access the upper left corner by and the lower right corner by . It’s not hard to see why these numbers arise, if we see how the corners of are transformed by :
+
+This makes it apparent that the output’s indices span the region of the transformed coordinates.
+
+The fact that the output preserves the coordinates makes it trivial to compare the images:
+
+pads input arrays with 0, as needed, to give them all the same indices, and inserts the grayscale images , , and into the red, green, and blue channels respectively. If we visualize , we see the following:
+
+The image on the left is for reference, showing what a rotation around the image center would look like when properly aligned. The image on the right corresponds to the steps taken above, and indeed confirms that the rotation is around the head. Alternatively, we can focus on the overlapping portions of these images like this:
+
+so that displays as
+
+Since the indices of the pixels encode absolute spatial location, it’s trivial to keep track of how different pixels align: pixel in one image corresponds to pixel in the other. This is true even if our coordinate transformation were far more complicated than a simple rotation.
+
+Having motivated why this might be useful, let’s take a step back and walk through array indices a bit more systematically.
+
+In Julia, if we define an array
+
+then we can refer to a rectangular region like this:
+
+For certain applications, one negative to extracting blocks is that there is no record indicating where the new block originated from:
+
+So corresponds to , despite the fact that, as measured by their indices, these are not the same location.
+
+To maintain consistent “naming” of our indices, let’s use the OffsetArrays package:
+
+So the indices in match those of . Indeed, doesn’t even have an element “named” :
+
+In this case we created by explicitly “wrapping” the extracted array inside a type that allows you to supply custom indices. (You can retrieve just the extracted portion with .) We could do the same thing by adjusting the indices instead:
+
+An is a range with indices that match its values, . ( would be functionally equivalent.) Let’s use and to snip out the region of the array:
+
+Consequently, if your indices have their own unconventional indices, they will be propagated forward to the next stage.
+
+This technique can also be used to create a “view”:
+
+Note that this object is a conventional (it’s not an ), but because it was passed indices it preserves the indices of the indices.
+
+As illustrated above for the image rotation example, a recent release (v0.6.0) of the Images package put both the power and responsibility for dealing with arrays with custom indices into the hands of users. One of the key functions in this package is which can be used to smooth or otherwise “filter” arrays. The idea is that starting from an array , each local neighborhood is weighted by a “kernel” , producing an output value according to the following formula:
+
+This is the formula for correlation; the formula for another operation, convolution, is very similar.
+
+Let’s start with a trivial example: let’s filter with a “delta function” kernel, meaning it has value at location 0 and is zero everywhere else. According to the correlation formula, because is 1 at , this should simply give us a copy of our original array:
+
+The warning is telling you that Images decided to make a guess about your intention, that the kernel was intended to be centered around zero. You can suppress the warning by explicitly passing the following kernel instead:
+
+By using an you have clearly specified your intended indices for .
+
+This can be used to shift an image in the following way (by default, returns its results over the same domain as the input):
+
+These are all illustrated in the following figure:
+
+In this figure, we plotted the kernel as if it were at the location corresponding to convolution rather than correlation.
+
+In other programming languages, when filtering with a kernel that has an even number of elements, it can be difficult to remember which of the two middle elements corresponds to the origin. In Julia, that’s not an issue, because you can make that choice for yourself:
+
+Likewise, sometimes we might have an application where we simply can’t handle the edges properly, and we wish to discard them. For example, consider the following quadratic function:
+
+Those weird values on the edges (for which there is no padding that will “extrapolate” the quadratic) might cause problems. Consequently, let’s only extract the values that are well-defined, meaning that all inputs to the correlation formula have explicitly-assigned values:
+
+Notice that in this case, it returned an so that the values in the result align properly with the original array.
+
+There are many more things you can do with custom indices. As one last illustration, consider the Discrete Fourier Transform, which is defined on a periodic domain. Typically, it’s rather difficult to emulate a periodic domain with arrays, because arrays have finite size. However, it’s possible to define indexing objects which possess periodic behavior. Here we use the FFTViews package, demonstrating the technique on a simple sinusoid:
+
+Now, as every student of Fourier transforms learns, the 0-frequency bin holds the sum of the values in :
+
+Since the mean of a sinusoid is zero, this is (within roundoff error) 16*0.1 = 1.6.
+
+We can also check the amplitude at the Fourier-peak, and explore the periodicity of the result:
+
+Given the periodicity of , the commonly-used function (e.g., ) can be replaced by . While very simple, these techniques make it surprisingly more pleasant to deal with what can sometimes become complex and error-prone index gymnastics.
+
+This has only scratched the surface of what’s possible with custom indices. In the opinion of the author, their main advantage is that they can increase the clarity of code by ensuring that “names” (indices) can be endowed with absolute meaning, rather than always being “referenced to whatever the first element of this particular array happens to encode.”
+
+There is quite a lot of code that hasn’t yet properly accounted for the possibility of custom indices—surely, some of it written by the author of this post! So users should be prepared for the possibility that exploiting custom indices will trigger errors in base Julia or in packages. Rather than giving up, users are encouraged to report such errors as issues, as this is the only way that custom indices will, over the course of time, have solid support.
+
+For some algorithms, there appears to be little reason to ever use arrays with anything but 1-based indices; in such cases, there may be no reason to modify existing code. But if your code has a “spatial” interpretation–where location has meaning–then you just might want to give the new facilities a try.
+
+In transitioning existing code, the author of this post has observed the following tendencies:
+
+Developers are referred to Julia’s documentation for further guidance.|||
+
