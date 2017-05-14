@@ -1,0 +1,86 @@
+Here’s a straightforward benchmark. Time how long it takes to run ( )n in a directory with a single file named 100, compared to running ( )n . Superscripts denote string repetition and parentheses are for grouping only, so that when n is 3, we’re running in a directory containing the single file … (100 ’s), compared against in the same directory.
+
+For n = 8, takes 7.19 minutes while runs in 1.56 milliseconds, making it 276,538X faster. If you’ve read my 2007 article “Regular Expression Matching Can Be Simple And Fast (but is slow in Java, Perl, PHP, Python, Ruby, …),” those graphs may look familiar. Clearly the command is using an exponential pattern-matching algorithm, while the command is using a nearly linear one.
+
+In fact it’s the shell that evaluates the glob pattern in the first command, not , so let’s repeat the experiment with a variety of shells. All the tests were run on an HP Z440 workstation with 3.5 GHz Intel Xeon E5-1650 v3 processors running Ubuntu 14.04.
+
+Basically, the same thing is going on here as in my regular expression article: backtracking was an obvious implementation strategy, so most implementations use it, causing the performance cliffs.
+
+The exception seems to be the original Berkeley csh, which runs in linear time (more precisely, time linear in n). Looking at the source code, it doesn’t attempt to perform glob expansion itself. Instead it calls the C library implementation glob(3), which runs in linear time, at least on this Linux system. So maybe we should look at programming language implementations too.
+
+Most programming languages provide some kind of glob expansion, like C’s . Let’s repeat the experiment in a variety of different programming languages:
+
+Perhaps the most interesting fact evident in the graph is that GNU glibc, the C library used on Linux systems, has a linear-time implementation, but BSD libc, the C library used on BSD and macOS systems, has an exponential-time implementation.
+
+PHP is not shown in the graph, because its glob function simply invokes the host C library’s glob(3), so that it runs in linear time on Linux and in exponential time on non-Linux systems. (I have not tested what happens on Windows.) All the languages shown in the graph, however, implement glob matching without using the host C library, so the results should not vary by host operating system.
+
+It’s not just shells and programming languages that implement glob matching. Although not mandated by the FTP RFC, most FTP servers allow glob patterns as the argument to commands like LIST and STAT. Let’s repeat the experiment with a variety of FTP server implementations:
+
+On Linux, Pure-FTPd would probably have run for a hundred or more seconds for n = 7, but instead it died and hung up the connection after 17 seconds. All the tests were run on the same Linux system as before, except tnftpd, which was run on a mid-2015 MacBook Pro with a 2.8 GHz Intel Core i7 processor running macOS 10.12.4. On that Mac system, tnftpd (which can only be enabled using the command-line, so most people don’t run it) has no such time limit: even if a client times out and hangs up (as the command-line ftp client does after 30 seconds), the server side still consumes CPU until the full pattern match finishes.
+
+The netkit ftpd runs quickly on Linux because it relies on the host C library’s function. If run on BSD, the netkit ftpd would take exponential time. ProFTPD ships a copy of the glibc , so it should run quickly even on BSD systems. Ironically, Pure-FTPd and tnftpd take exponential time on Linux because they ship a copy of the BSD function. Presumably they do this to avoid assuming that the host C library is bug-free, but, at least in this one case, the host C library is better than the one they ship.
+
+Obviously not many servers have a file named 100, but the pattern can be adapted to shorter, less unusual names. This gives a denial of service attack against some anonymous FTP servers. It appears that tnftpd is derived from the standard FreeBSD ftpd, so BSD systems may be affected as well.
+
+FTP servers and C libraries have a long history of problems with glob patterns, including buffer and heap overflows causing crashes or even remote code execution. But here let’s focus on CPU exhaustion issues around pattern matching.
+
+In 2001, CVE-2001-1501 was issued for a vulnerability in ProFTPD 1.2.1, because it could run for a very long time finding and recording the very many matches for a pattern like:
+
+In response, most implementations added a flag that can be used to limit the number of matches returned, controlling both the CPU and the memory usage for such a pattern.
+
+Unfortunately, a pattern like that can cause a lot of effort without finding any matches. In 2010, CVE-2010-2632 was issued for a variant with no matches:
+
+In response, most implementations expanded to count directory read and file stat operations in addition to matches.
+
+In 2015, CVE-2015-5917 was issued for the same vulnerability in OS X 10.10.5’s FTP server (reported in 2013), which had its own copy of the implementation and had not been patched in 2010. There have also been similar problems around FTP servers implementing brace expansion, such as CVE-2011-0418 (details).
+
+Unfortunately, none of these protections address the cost of matching a single path element of a single file name. In 2005, CVE-2005-0256 was issued for a DoS vulnerability in WU-FTPD 2.6.2, because it ran for a very long time finding even a single match during:
+
+The apparent “fix” used in some implementations is to collapse multiple adjacent stars into a single star. That solves one test case, but not the general problem. In particular it doesn’t help .
+
+The next section discusses ways to implement glob patterns efficiently, but if you have an anonymous FTP server accepting glob patterns, there are two more fundamental questions to ask: Do you really need to run an anonymous FTP server anymore? Does it really need to accept glob patterns?
+
+At the very least, most FTP servers should probably reject glob patterns with more than, say, 3 stars. Note that glob patterns are only provided as a convenience for command-line FTP users. Graphical FTP clients typically use the and commands, which have a machine-readable output format and are defined not to interpret their arguments as glob patterns.
+
+How do these implementations work? What’s going on here?
+
+The obvious implementation of glob pattern matching against a single path element is to walk the pattern and the name together, matching letters or wildcards in the pattern to letters in the name. If the walk reaches the end of the pattern at the same time as the end of the name, they match.
+
+Here’s a basic outline of that algorithm, in Go:
+
+In this code, is the index into the pattern and the index into the name. The loop runs until both pattern and name are exhausted, meaning and . If it does happen that both pattern and name are exhausted at the same time, then we have a match (the final ). Inside the loop, the code must make progress (advance or or both) and on each iteration. If not, the control flow ends up at the bottom of the loop body (marked ) and reports no match.
+
+The only difficulty is in the implementation of the variable-length wildcard pattern ( ): how much of the name should that match? In general, the code must try all possibilities from matching nothing to matching the entire remainder of the string. The obvious way to do that is with recursion:
+
+If there are e stars that can each potentially end their matches at n positions in the string, that gives ne possibilities to explore, leading to the exponential run times observed earlier. However, most of these possibilities are not worth exploring. Because is the only variable-sized wildcard in the pattern syntax and therefore the only source of possible backtracking, there’s an even easier implementation: don’t backtrack to an earlier star.
+
+Consider the pattern . If we end the first star at the first , we have the rest of the name to find the and then the . Using any later can only remove choices for and ; it cannot lead to a successful match that using the first missed. So we should implement without any second-guessing, as “find a leading , then find the earliest after that, then find the earliest after that, then find a trailing , or else give up.”
+
+We can implement this algorithm by replacing the handling of the star wildcard in our Go program:
+
+Each time the code encounters a star, it implements the repeated trials needed for that star by recording in , where to restart the search if the current match fails. Each subsequent star encountered overwrites the restart information for the previous star, in effect locking in the choice made for the previous star. If you’d like to experiment, I’ve posted both of these programs and a test harness.
+
+An alternate implementation of the algorithm would be to split the pattern on stars and then consider each of the star-separated subpatterns in turn, special-casing the first subpattern and the last, which must be anchored at the start and end of the name, respectively. Go’s src/path/filepath/match.go is an example of this implementation.
+
+Go’s (used by ), glibc’s , and vsftpd’s pattern matcher all use this algorithm.
+
+A more straightforward approach is to translate the glob pattern to a regular expression and then invoke a linear-time regular expression match. Plan 9’s ftpd does this, as does the example above. (Python also does this, but then it runs the regular expression with an exponential-time matching engine.)
+
+I have not looked at the other linear-time implementations to see what they do, but I expect they all use one of these two approaches.
+
+This post is an elaboration of an informal 2012 Google+ post showing that most shells used exponential-time glob expansion. At the time, Tom Duff, the author of Plan 9’s rc shell, commented that, “I can confirm that rc gets it wrong. My excuse, feeble as it is, is that doing it that way meant that the code took 10 minutes to write, but it took 20 years for someone to notice the problem. (That’s 10 ‘programmer minutes’, i.e. less than a day.)” I agree that’s a reasonable decision for a shell. In contrast, a language library routine, not to mention a network server, today needs to be robust against worst-case inputs that might be controlled by remote attackers, but nearly all of the code in question predates that kind of concern. I didn’t realize the connection to FTP servers until I started doing additional research for this post and came across a reference to CVE-2010-2632 in FreeBSD’s implementation.
+
+Dave Presotto, the author of Plan 9’s ftpd, avoided rc’s glob implementation not because of the algorithmic complexity but to make sure that long strings were handled safely (using a Plan 9 library for handling long strings in C). He wrote this comment at the top of Plan 9’s /sys/src/cmd/ip/glob.c, which converts glob expressions into regular expressions:
+
+As it turns out, this is untrue: the one in rc is certainly slower, at least in terms of worst-case asymptotics.
+
+If you liked this post, you may also like to browse Nelson Elhage’s Accidentally Quadratic collection. (Of course, here the glob pattern matching is accidentally exponential.)
+
+NetBSD has an updated glob pending for the next release.
+
+Perl has an updated glob pending for the next release.
+
+Pure-FTPd 1.0.46 has added a check that patterns must not have more than three stars.
+
+Thanks to js2 on Hacker News for pointing out that Python translates globs to regular expressions.|||
+

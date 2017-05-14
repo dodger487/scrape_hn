@@ -1,0 +1,348 @@
+This is a compilation of the "Perl Encryption Primer" series of articles by Timm Murray, as published on http://www.wumpus-cave.net/category/encryption/. I have taken the liberty of moving the content here (as is), formatting it as Markdown and ordering them chronologically from top to bottom to easen the reading experience. Enjoy!
+
+Timm also made a one-hour video of the presentation he gave at MadMongers, which summarizes the content below.
+
+I’ll be doing a presentation for MadMongers in April on encryption in Perl, and I’m going to try something a little different. This series of blog entries will lay out a written primer on encryption in Perl, which will then form a condensed outline for the presentation. I feel the final presentation should have high-quality information, so hopefully anything I get wrong can be pointed out and corrected before then.
+
+We’ll start with the most fundamental building block of encryption, which is random numbers. Now, a naive new programmer might jump right in and start calling rand():
+
+The int truncates the decimals; it would otherwise return a float. The parameter to rand() tells it the maximum number, which is 1 by default. The code above will return a number between 0 and 10,000.
+
+Here, we already hit two different hidden snags:
+
+The rand() function starts with a seed. You can put in your own seed with srand(), or you can start out with the seed Perl gives you by default. The means Perl uses to get that initial seed is actually quite complicated; look at util.c and search for the function “Perl_seed” for the gory details.
+
+Notably, if we put in our own seed, call rand() a few times, and then do it again, we’ll get the same output:
+
+Same pattern each time! This means that an attacker doesn’t need to know the output of rand(). They just need to know what srand() input you started with. Let’s say you give srand() a 32-bit input. You then use that generate a 128-bit key for a cipher. This means that your cipher doesn’t have 128-bits of security; the attacker only needs to brute force the 32-bits that you put into srand(), which is a far easier task.
+
+This brings us to an important consideration in security, which is building things in chains versus building things in layers. A chain is only as secure as its weakest link. In the above, the 128-bit block cipher only had 32-bits of security, because srand() was part of its chain.
+
+Building in layers is more like a castle. Breaching the outer wall doesn’t mean you’ve breached the inner walls. Breaching the inner walls still leaves you the Keep to deal with. The Keep may also be built of narrow, maze-like hallways with the defenders attacking from above. This is defense-in-depth. We won’t be explicitly covering building in layers in this post, but it’s good to keep this in mind when building security systems.
+
+For this and other reasons, rand() is not the right choice for a cryptographic-strength random number generator.
+
+There are random number generators that can take a longer seed, but this leads to another question: where did you get the seed from? If it’s a timestamp, the attacker may be able to make a rough guess of the time period when you first generated that key. That could easily end up with even less than 232 possibilities (as in the case of 32-bits of randomness). Whatever else you use, can you be confident that an attacker can’t narrow down the input seed?
+
+We end up needing to be really careful about where we get our random numbers. Since computers are such deterministic machines, we need a source that is somehow external to the computer.
+
+Preferably, all computers would come with a special piece of hardware. Intel and AMD both used to put one in their chipsets (i8xx and 76x-based motherboards, respectively), but these fell into disuse. The VIA PadLock Security Engine also has a hardware RNG on their CPUs. Intel has also returned the hardware RNGs with RdRand on IA-64 CPUs.
+
+If you don’t have a specific CPU, then there are also ways to add hardware for generating RNGs. LavaRnd was a project that used a web cam in a dark environment to pick up on cosmic background radiation, which can be used for randomness. Sadly, the project hasn’t been updated in quite some time. There are a number of other hardware RNGs to purchase, ranging from cheap to very expensive. I would urge careful research before buying any of them.
+
+If we can’t buy hardware, then there’s an option to take randomness from the world around the computer. Consider that there is a slight variation between the timing of your keystrokes and mouse movements. By having the OS kernel listen in on this data, a random number generator can use this as input. This and a few other things is what the Linux /dev/random driver does. Similar techniques are used on Windows, Mac, and most everything else.
+
+One problem with this approach is headless servers. Since they rarely have keyboard or mouse in use, the few remaining sources might not be enough. /dev/random will block until it gets more random numbers. /dev/urandom will continue onward using lower-quality sources, which isn’t what we want, either. This is where proper hardware random number generators come into play.
+
+No matter what OS you use, Crypt::Random is the Perl module to use. This will use /dev/random on systems that have it, and the userspace Entropy Gathering Daemon on systems that don’t. It’s easy to use:
+
+The Size parameter is the number of random bits to generate, and Strength set to 1 says that we won’t fallback to less-secure alternative.
+
+Next post will be on One Time Pads, which is an encryption algorithm so good that we can never use it.
+
+Part of my reason for writing this series is not just to provide a solid foundation in cryptography, but also to point out common bad advice. I ran into one such example on /r/bestof some months ago, and it’s stuck in my mind since then.
+
+First, what is a One Time Pad? Start with a bunch of random numbers, which will be your key. Now use each byte of the key to modify each byte of the plaintext. There are a few different ways we could make that modification. Since we’re using a computer, the XOR operation makes a good choice.
+
+What’s so special about XOR? It’s because it’s a reversible operation. Consider:
+
+When we XOR a piece of data with a number, and then XOR the output with that same data, we get the original number. How can we use this for encryption? We’ll use a random number (which will form our key) and XOR that with the plaintext:
+
+Let’s say Alice and Bob share a key, which is 172. Alice sends Bob the ciphertext 238. Bob knows to XOR this ciphertext with 172, which gets back the UTF-8 character for “B”. So congradulations to Alice and Bob–they’ve successfully sent the letter B to each other, and nobody else will ever know.
+
+If Alice and Bob want to send a longer message while maintaining security, they’ll need a longer key. We’ll pretend that Alice and Bob only want to send plain ASCII messages, which means we only need to generate a key of 8 bits per character. They’ll want to send a 25 character message, so we ask Crypt::Random for 25 bytes of random data:
+
+That big long number is now our key. We’ll now use the Crypt::OTP module to encrypt our plaintext message, and encoding the output in base64 so we don’t have issues with unprintable characters. We’re also dealing with a really big number, so we’ll need the help of Perl’s bigint library.
+
+To decrypt, Bob undoes the base64 encoding and passes Crypt::OTP the same key:
+
+Notice that unlike most every other algorithm you’ll find in the Crypt namespace, OTP does not have separate encrypt/decrypt subroutines. Since Crypt::OTP uses the XOR operation as we showed above, encryption and decryption use the same subroutine. It’s not strictly necessary to implement OTP this way–it could also be done with addition and subtraction–it’s just the common way to do it with computers.
+
+Alice and Bob have now shared a very important secret about pies, which they can guarantee will never, ever be read by anyone else, provided they’ve taken all the right precautions. It turns out that those precautions are a daunting challenge, which we’ll get to in a moment. For now, let’s see why we can talk so absolutely about the security of OTP (at least in theory).
+
+We’ll bring in another character that’s commonly used in these crypto stories, Mallory. Mallory is a bad guy trying to read or otherwise screw up messages sent by Alice and Bob. Mallory knows that the message is 25 bytes long, so he generates a bunch of 25 byte keys and what they would decrypt. He sees among the messages:
+
+Ignoring any real-world context, each of these messages is equally likely. How can Mallory know which is correct? He can’t. He can brute-force a list of all 25 character ASCII messages, but will have no idea which is the right one. The right message will be in there, somewhere, but he has no reason to say it’s the right one.
+
+As the last example shows, Alice and Bob could use padding to conceal the length of the right message, so Mallory only knows that the message is no more than 25 characters long.
+
+Now that I’ve hyped up OTP as the ultimate encryption method, I want you to forget all about it for any purpose besides winning arguments on the Internet.
+
+The problem comes in the provision we made earlier, that Alice and Bob have taken all the right precautions. It turns out that OTP is almost impossible to use in the real-world, for all sorts of technical and human issues. For these reasons, it is almost never used in practice. The theoretical advantages are a tempting siren song that we must ignore.
+
+First, how does Alice transfer the initial key to Bob? If Alice can deliver it in person, that’s great, but if Alice and Bob and meet regularly and be sure of the security of the data being passed, why not pass the whole message? If Alice sends things by courier instead, Mallory could bribe the courier and copy the key.
+
+If Alice encrypts the key with another cipher, we now run into the problem mentioned in the post on random numbers, which is building security in a chain. OTP is Perfectly Secure, and any other cipher will not be able to live up to that perfection. The other cipher is now part of your security chain; the key is no more secure than the cipher in question. So why not encrypt the message with that cipher instead?
+
+Let’s say that Alice and Bob have worked out all the issues with transferring the key. Things are going well for a while, but Alice notices that they’re almost to the end of the key. What to do?
+
+The naive thing to do would be to reuse the key from the beginning. This is a mistake which makes it trivial for Mallory to break the key. Let’s say Alice uses the key 0xABCD with 0×1234, and later uses the same key for 0×5678. The results are:
+
+Mallory isn’t quite sure what the first message had, but he’s pretty sure he knows what the second is. Knowing this, Mallory can XOR the second ciphertext with what he knows to be the plaintext, resulting in:
+
+Which is the original key, which means Mallory can decrypt the first message, too! This is called a “known-plaintext” attack.
+
+How would Mallory figure out the plaintext? There is invariably some underlying structure to the data being encrypted. English language text will have “the” appear quite often, among other things. A transaction to your bank might have the account information in the same location of a packet. Or Mallory could bribe a teller to get Alice’s bank account number.
+
+It’s dangerous to assume that Mallory would have zero knowledge about what you’re sending, which is why cryptographers generally avoid algorithms with known-plaintext attacks. Since there are algorithms out there that don’t have this problem, why not use one of them?
+
+So Alice and Bob have worked out the problems of transferring the key around, and they are hyper-paranoid about concealing anything that might lead to revealing the internal structure of the message. They’ve still forgotten something, which is how to generate the key in the first place.
+
+Remember from the earlier discussion on random numbers that getting true randomness on computers is very hard. Getting really long strings of high-quality random numbers is even harder.
+
+In Neal Stephenson’s book Cryptonomicon, a woman in WWII Britain is charged with generating random characters for use in OTP encryption. She is given one of those lottery machines with all the balls being blown around inside. Each ball has a letter on it, and she’s supposed to reach in, type the letter out on the ball, then stick it back in and draw another.
+
+The problem is that she speaks English, and an English speaker will tend towards preference for E’s and T’s, and not very many X’s and Z’s. So she often threw the X’s and Z’s back in when she thought she was seeing them too often, and maybe added an E or T when she thought there weren’t enough. This biased the random number generator, allowing a smart German cryptographer to break the whole British OTP system. (It should be noted that this is a fictional story based around actual events and cryptography.)
+
+All cryptosystems need good random numbers, but most of them don’t need very many. AES will do fine with only 128 or 256 bits, and it’s safe(-ish) to reuse the same key. An 8,000 bit document encrypted OTP requires an 8,000 bit key, and you can never use those random bits again.
+
+What it all comes down to is that OTPs should almost never be used. There is one notable exception, which we’ll cover when we get to quantum encryption. We also have good reason to think that 256-bit block ciphers are more than adequate no matter what improvements in conventional computing come down the pipeline (or 512-bits against quantum computers). We’ll see why in the next post on block ciphers.
+
+In 1973, the National Bureau of Standards (NBS) put out a call for a standardized encryption algorithm. The result was DES, a 56-bit block cipher that became the gold standard for decades to come. For all the time it’s been out, there haven’t been many attacks to DES that could improve significantly on brute force.
+
+The trick was that at 56-bits, brute force became feasible as iterations of Moore’s Law passed by. With a 56-bit block cipher, there are 256 different keys. To brute force, you try each one and see if you get a meaningful message (it helps if you have at least one known-plaintext, but it’s not strictly necessary). By the early 90s, people were getting nervous about specialized hardware being able to crack DES. By 1998, the EFF had done just that. It cost less than $250,000, and could break DES in 56 hours.
+
+As a stopgap measure, many switched to 3DES, where you have two 56-bit keys making a combined 112-bit key. This was awkward and slow, and work was already underway on a new standard. The old NBS had since transitioned into the National Institute of Standards and Technology (NIST), and once again put out a call for a new standard encryption algorithm.
+
+After a 5 year process of vetting submissions, an algorithm named Rijndael was announced as the winner in 2001. It supports 128, 192, and 256-bit keys. In Perl, the algorithm is still most commonly found as Crypt::Rijndael, rather than its more modern name: Advanced Encryption Standard (AES). Though we can’t be entirely sure of these things, AES has held up pretty well over the years.
+
+You might ask that, if a 56-bit key was brute forcible in 1998, how long until a 256-bit key will be broken? The answer is likely never. To show why, I’ll borrow an argument from Bruce Schneier.
+
+There’s a thermodynamic limit on how much energy it takes to flip a bit, which is 4.4×10-16 ergs. In order to brute force an encryption key, it’s clear that you would have to flip all the bits in sequence. Now, our sun puts out 1.21×1041 ergs in a year. If you had an ideal capture device running an ideal computer, the sun’s output could power 2.7×1056 bit changes, which would be enough to put a 187-bit counter through all its values.
+
+We’re not doing anything with those values yet. We’re just counting spherical chickens.
+
+Our natural intuition is that a 128-bit AES key would be a little more than twice as hard to brute force than a 56-bit DES key. But every extra bit doubles the size of the keyspace, so the relationship isn’t linear; it’s exponential. To go from the 187-bit above to a 219-bit key, we have to forget about powering the computer from our puny sun, and instead harness 100% of the energy from a 1051 erg supernova blast.
+
+Suffice it to say that brute forcing a 128-bit key is expected to be infeasible for years to come. 256-bit keys may last forever. We might imagine making an exotic computer that can overcome the thermodynamic limit. Quantum Computers change the math from 256-bit keys to needing 512-bit keys, but we’re otherwise OK there with block ciphers. Beyond that, we’re safe for any form of physics we can yet conceive.
+
+This is also more evidence that the theoretical advantages of a One Time Pad are a red herring. If 256-bit keys are good enough, why should we bother lugging around a big pad?
+
+That doesn’t mean we get to sit around. As hard as it was for mathematicians to make all the breakthroughs that eventually led to AES, we now face a larger, more intractable problem of using this stuff in practice. It’s arguably a harder problem because the mathematicians just had math to deal with; using things in practice involves politics.
+
+Before I turn this blog into “Timm’s Misanthropic Musings”, let’s see how we can use this stuff in Perl. Your boss hands you a key and some data, and tells you to transmit it securely with AES. So you start out by installing Crypt::Rijndael from CPAN and dutifully write directly off the module’s synopsis section:
+
+You wonder what this MODE_CBC stuff is, and what, exactly, is supposed to go in $iv, but it works and you send it back to your boss. Another job well done on your behalf by CPAN.
+
+What you didn’t know is that the synopsis just saved you from yourself. Well, almost. It would have been nice if it showed that $iv needs to come from a cryptographic-strength random number generator. But otherwise, disaster averted.
+
+Let’s take a step back for a moment and talk about that MODE_CBC. If the module didn’t make you pass this, it would no doubt default to working in “Electronic Cookbook Mode” (ECB). This is a fancy term for simply taking each block of plaintext in turn along with the key. Then, math happens. Then you get your output. It’s called a “cookbook” because you could hypothetically make a big book for your key where an input block mapped directly to an output block without all that math nonsense in the middle.
+
+What’s wrong with this? Remember that for a given key, input blocks can be mapped to the same output block. So if the same block is seen in two different messages, Mallory now knows that those two portions are the same.
+
+Will this matter? Consider making several bank transfers between two accounts, where the binary data is laid out like this:
+
+Mallory will see the first two 32-bit blocks stay the same, and the other 64-bits change with each transaction. Knowing that this is a bank transfer, Mallory can now make a reasonable guess as to the layout of the message. From here, he can reverse any transaction by swapping the first two 32-bit blocks, or transfer to a different account by replacing the second 32-bit block with one he found in another transaction (perhaps he goes to the same bank and caught one of his own transactions going down the wire). And he can do all of this without knowing how to decrypt the data.
+
+Maybe you’re saying to yourself that your application is totally different and wouldn’t be affected by this. You may or may not be right. Why take the chance when the hard work of fixing it is already done for you?
+
+The most common alternative fix is “Cipher-block Chaining”, or CBC. As we take each block of plaintext and encrypt it, we XOR it with the previous block (remember from the OTP post that XOR is an operation that can reverse itself). Since the first block doesn’t have a previous block to XOR itself with, we give it an Initialization Vector, which is just a bunch of random numbers (from a strong RNG).
+
+In Perl, the block cipher module you’re using doesn’t necessarily have to implement this internally. Most of them comply with Crypt::CBC‘s interface.
+
+There are downsides to CBC. It doesn’t support random access very well. Imagine having full hard drive encryption and having the CPU chug away at XORing each block with the previous one until it gets to the block you want. It also means that if you have a random bit error early on, the same bit in every subsequent block will also have an error. Finally, it can’t be parallelized across those newfangled multicore CPUs.
+
+There are a few more exotic alternatives to CBC, not all of which solve the problems above. One that does is CTR mode. Here, we take an IV and a counter, then encrypt that with our key. The resulting value is then XOR’d with the plaintext, and the counter is incremented for the next block. As you might have guessed, there’s a Crypt::Ctr for this operation, too.
+
+You might be asking why I’m bothering to go over block ciphers when you’ve heard that public key crypto can transfer a key without having to protect the key from eavesdropping. Why don’t we just use that if it solves such a glaring problem with traditional crypto? We’ll cover why in the next post on public key ciphers.
+
+Using encryption to hide secret messages may be as old as written language. For nearly all of that time, these schemes had a fundamental flaw: how do you tell the right people how to decrypt without letting the wrong people know as well?
+
+Military commanders throughout history would have loved a good answer to this question. It’s been less than a century since we found a satisfying answer.
+
+Take two big prime numbers (which are numbers that have exactly two integers that will evenly divide it: 1 and themselves). Multiply them together. Knowing that number, can you figure out how to get the original two primes?
+
+This is the Prime Number Factorization problem. We don’t actually know the answer to that question, but you probably can’t do it in a reasonable amount of time. Oh, sure, I can give you 15 and you’ll quickly give the answer of 5*3. But what about this one:
+
+There used to be a cash prize of $75,000 offered by RSA Labratories for figuring that one out.
+
+Thing is, nobody has mathematically proven that there isn’t a quick way of factoring primes. They’re part of a set of problems called “NP”. In these problems, I can give you a possible solution and you can quickly verify if it’s correct. If I offered you two prime numbers and said that they could be multiplied together to make the big composite number above, you would be able to do the multiplication yourself and check my claim. Problem is, it’s hard to get that potential answer without coming up with a bunch of guesses and trying each one–in other words, brute force.
+
+The set of “P” problems are the ones where you can generate the answer in polynomial time (which is about as slow as you can get before the computational complexity gets to be too much). The set of “NP” problems are the ones where you can take a potential answer and check if it’s right in polynomial time. The big question of complexity theory is if P and NP are the same set.
+
+There are many other such problems, some of which would be useful to solve. A salesman trying to find the fastest route between a bunch of different houses is an NP problem. Maximizing the storage space of a knapsack holding a bunch of items of different weights and values, up to a certain limit, is also in NP.
+
+One of the interesting things about NP is that if you prove any one of those problems can be solved in polynomial time, you’ll be able to generalize that approach to solve them all. At the same time, there doesn’t seem to be any reason why P and NP should be separate. But they probably are. The reason is that we’ve been trying really, really hard on some of these problems for a long time, and nobody has managed to unify the two. In the last 40 years or so, there’s been the extra incentive of breaking tons of encryption algorithms, and nobody has cracked it in that time, either. If math worked on the a posteriori evidence-based system of science rather than a priori logical proofs, then P!=NP would have been declared true years ago. (I can’t do this subject justice beyond this tl;dr version, so read the link above.)
+
+This is not so great news for the salesmen and mountaineers of the world, but it’s great news for cryptographers. If indeed P!=NP, then the RSA encryption algorithm is secure.
+
+Now, remember that RSA has to deal specifically with prime numbers. Since we can’t use just any number like we can with block ciphers, we need a much longer key length. Keys of 2048-bits are common. 4096 and 8192-bit keys are not unheard of, but there is some debate about their necessity. RSA Labs tends to argue that 2048 is good enough for most uses. This is because as the keyspace rises, memory usage tends rise faster than Moore’s Law.
+
+RSA isn’t the only form of public key crypto. DSA, Diffie-Hellman, and Elliptic Curves are also examples. You may have heard that Quantum Computers will one day destroy RSA’s security, and then the NSA will be able to steal all our credit card numbers so they can order a huge arsenal of Nerf guns off Amazon. We’ll talk about Quantum Computers in a future post, but suffice it to say for now, we have some options for replacing RSA and other public key crypto if it comes to it.
+
+When a key is generated, you’ll get a number n, which is the composite of the two original primes. This forms part of both the public and private key. You also get a number e, which is in the public part of the key. Finally, number d is only in the private key. Each of these has a mathematical relation to each other that all comes together during key generation.
+
+Let’s say Alice and Bob have each others’ public keys, and Alice would like to send a message M to Bob. Alice turns M into a straight integer m by some means. Alice then computes c = me mod n. Except this takes an awfully long time and smoke starts to come out of her computer.
+
+The reason for this has nothing to do with the P=NP nonsense from above, and everything to do with the fact that nobody has a computer with a word size that can handle a 2048-bit number. You need a bigint library to handle a number like that, and bigint libraries are slow.
+
+After airing out her house and buying a new computer, Alice tries again, only this time she does something clever. Instead of trying to encrypt a whole message with RSA, she’ll generate a fresh block cipher key, and use that to encrypt the message. Since the block cipher key isn’t any more than 256-bits long, encrypting just that with RSA is no big deal. She does that, appends it to the start of the block-cipher encrypted message, and sends it along to Bob.
+
+One thing to note here is that the block cipher is now part of the security chain. If Mallory wants to break the message, he can choose either RSA or the block cipher, depending on which one he thinks will be easier. This ultimately means that Alice has to pick a good block cipher. And once again, she has to make sure those keys come from a good random number generator.
+
+Bob gets the message and decrypts the block cipher key by doing cd mod m. He now has the block cipher key and, knowing which block cipher Alice used, can decrypt the whole message.
+
+Bob now wants to send a message of his own to Alice, but wants to make sure Alice can trust that it’s him. After all, anybody with Alice’s public key could encrypt a message and send it to her. Bob also thought he saw Mallory sneaking around the email server yesterday, and something about that guy seems off.
+
+Fortunately, RSA has a solution here, too. In addition to encryption, RSA can sign a message. Using his own private key, he uses the same formula used for encryption with the public key. Anybody with the public key would be able to decrypt this message. A valid decryption means that the message must have come from Bob, since he’s the only one who could have encrypted the message this way.
+
+Bob does this. This causes his CPU to turn into smoke. After airing out his house and buying a new computer, he takes a cryptographic hash of the message, signs that, and sends it to Alice. (The cryptographic hash would probably be somewhere between 256 and 512 bits long. We’ll talk about them more in the next post.)
+
+Now Alice can verify that the message did come from Bob. Or rather, she verifies that it was encrypted with the private key that matches her public key for Bob. Does she know that this key actually came from Bob?
+
+If she got it from Bob in person, then that’s great. If she got it over the phone, it’s probably OK, but she can’t guarantee it (can Mallory impersonate voices?). If she got it over email a long time ago and has sent many encrypted messages back and forth with Bob since then, it’s probably OK, too, but maybe not.
+
+This is the problem of trust. There have been three different widespread solutions to this problem over the years:
+
+In the early 90s, PGP came out with a web-of-trust system. It’s also used in GnuPG, which tends to be more common these days. It works like this: Alice meets Carol and exchanges key information. Carol seems pretty trustworthy, so Alice sets Carol’s key as being reliable in the key store. Carol also met with Bob and exchanged keys. Since Alice trusts Carol, Alice can also trust Bob. Of course, you don’t want to go through too many steps of trust, but with the Small World working in our favor, this can work out well as long as a lot of people are signing each others’ keys.
+
+Trouble is, only us nerds want to sign each others’ keys. Seriously, there have been nerd parties just for this.
+
+The next stab at the problem was SSL. Here, there’s a central party (called a “Certificate Authority” in SSL parlance) who everybody trusts. Alice and Bob and everybody else gives the CA their public key. The CA does some checks to see that Alice and Bob and everybody else are who they say they are, and then certifies that the key indeed belongs to this person. Your browser has a bunch of trusted CAs built in when you got it, so we avoid the nerd-party problem.
+
+Trouble is, CAs do dumb things sometimes and don’t check a person’s identity very well. Cert authorities were being paid a lot of money to do a level of verification that could be done by a small shell script. When people realized this, the CAs started charging more money for “extended validation” certificates. In other words, to do the job they were supposed to be doing all along.
+
+Those are the two most widespread solutions, but a third is done in practice by nearly everyone who uses ssh on a daily basis. When you first login to a server over ssh, you see a message like this:
+
+Have you ever called up the sysadmin and asked if that fingerprint is correct? Admit it: you just typed ‘yes’ and got on with work. Dentists are paid to scold you when you don’t floss. Cryptographers are paid to scold you when you don’t check your SSH fingerprints. On the other hand, we’ve all been doing this for years and things seem to get along OK.
+
+I won’t argue that this is at all good practice. I secretly wonder sometimes if the web-of-trust system could be revived using social networking and smartphones, where “friending” someone meant scanning the QR code containing their public key (answer: probably not; it’d just be us nerds using our highly secure social networking system to organize D&D get-togethers). But the “trust on first connection” system seems to work out.
+
+Wasn’t this supposed to be a Perl encryption primer? Let’s do some Perl.
+
+The GnuPG Perl module is directly based on GnuPG, which itself is an implementation of OpenPGP as standardized in RFC4880. The details of key generation, encryption, and signatures are done for you. Since it all works with the GnuPG executable, you can use the command line or graphic tools to manage your keys and web of trust.
+
+The public key itself will be encrypted with a passphrase. Any other tools you use with this key will ask for the same passphrase before they can do anything. Be sure to use something typeable that you can remember.
+
+We can now save those public and private keys back to the GnuPG database:
+
+Without the secret parameter, only public keys will be exported. Later on, we can import keys back with import_keys():
+
+Now that we have our keys, we can encrypt a message in a file:
+
+We assume here that a key matching the email ‘bob@example.com’ will be loaded. Despite the name, armor doesn’t provide any additional security; instead, it encodes the encrypted message in a variation of Base64. Pretty handy if you’re going to send the message over email or another system that tends to prefer text over binary. The sign parameter adds a cryptographic signature to the message in addition to encryption. Since we’re signing the message with our default key in addition to encrypting, we’ll need to set passphrase to the same value we used when we generated the key.
+
+You can also do the signature alone with sign():
+
+After this, file.txt.asc will be ready to send to Bob. Bob can now verify Alice’s signature with:
+
+This method will croak if the signature is not valid.
+
+When Bob gets an encrypted message from Alice, he can do:
+
+Once again, we need to set passphrase to the value we used to generate the key.
+
+There are alternatives to the GnuPG module in Perl, such as Crypt::OpenPGP, which follows a broadly similar interface. OpenSSL also implements things in its own way, which you can use with Crypt::OpenSSL::RSA. In fact, there’s a whole suite of modules under the Crypt::OpenSSL namespace.
+
+Cryptography isn’t just about keeping secrets, though. There is also the matter of verifying the message. We’ll be covering that in the next post on Hashes.
+
+Hashes come in many different classes for different purposes, not all of them for encryption. What we refer to as hash datatypes in Perl uses a hash algorithm internally to map a lookup string to a memory location. This algorithm is faster and shorter than the ones we use for encryption. Other hashes protect data from accidental changes, such as CRC or Adler. These are often used in networking protocols or inside file formats to check that the data has remained intact. They rarely go over 32-bits in length, and won’t withstand an attacker deliberately trying to change the data.
+
+The kind of hashes we’re interested in here are cryptographic strength, which are designed to stop such a deliberate attack. They also have an “avalanche effect”, where changing just one bit of input creates a completely different output. Finally, it has to be difficult to figure out the original data if you only have the hash.
+
+These goals are complicated by something called The Birthday Problem. Let’s say you’re planning a party, and want to know how many people you need to invite to have a 50% chance of someone having the same birthday as you (assuming your friends all have evenly distributed birthdays throughout the year). If you work it all out, you’ll find that the answer is 253 people.
+
+Let’s change the problem slightly. Instead of choosing a person ahead of time (yourself) to find a match, we want there to be a 50% chance of any two people sharing a birthday. In this case, we only need 23 people.
+
+The difference of selecting a datapoint to match ahead of time, versus allowing any two datapoints to match, makes a huge difference. Hashes face the same difference in these two problems:
+
+You may wonder if a 256-bit hash is just as hard to brute force as a 256-bit block cipher. Due to the Birthday Problem, we have to double the size; all else being equal, a 512-bit hash is equivalent to a 256-bit block cipher.
+
+Cryptographic hashes have a number of failed attempts over the years. MD4 was published in 1990 as a 128-bit hash. It strongly influenced both MD5 (also 128-bit) and SHA1 (160-bit), which were also hugely popular for a number of years. MD4 has since been completely blown away as a viable hash algorithm. By the late 90s, MD5 had also been exposed as weak, and while it wasn’t as crushing as MD4, attacks were only going to get better. Cryptographers at that time tended to recommend SHA1.
+
+Backing up a little bit, NIST had published SHA-1 as an official US government standard in 1993. Unlike the open contests that produced DES and AES, the algorithm was originally developed internally by the NSA. Although SHA1 is similar to MD5 and MD4, it contained a number of improvements that resisted attacks against its predecessors. While cryptographers are cautious about trusting the NSA, it held up to the best public scrutiny they could throw against it for many years.
+
+That changed in 2005, when new attacks showed a weakness in SHA-1. This sent cryptographers scrambling for an alternative. As a stop-gap measure, the SHA-2 standards started to be recommended (which had already been published by NIST in 2001). SHA-2 is actually a group of algorithms that stretch from 224 to 512-bits.
+
+There’s still some similarity to SHA-1 inside SHA-2. Since the whole family going back to MD4 has had problems, cryptographers were still nervous. So this time, NIST put out a public contest for a new hash function, which would become SHA-3. Unfortunately, these things take time, since the new algorithms have to be validated through several rounds of consideration, with papers published in cryptographic journals that analyze their security. By the end of 2010, five finalists were selected, and the winner was finally announced in 2012, which was Keccak.
+
+In the meantime, cryptographers had still been chipping away at SHA-1 and 2. As the years of the NIST contest went by, nobody was making much progress on generalizing SHA-1 attacks to SHA-2. It seems that the initial paranoia over SHA-2 was unjustified (this time). Before the SHA-3 winner was announced, Bruce Schneier suggested that there be no award.
+
+Regardless, we now have a bunch of new cryptographic hashes around, so if one of them goes down, we can hop to a new one. It’s good to have options.
+
+CPAN has all of these available under the Digest:: namespace. Not all of the modules under there are cryptographic digests–Digest::CRC and Digest::Adler32 are two in particular. These have their place, but not in cryptography. Older algorithms like Digest::MD4 and Digest::MD5 are in there, too. Please, don’t use them for anything new, and strongly consider migrating anything old.
+
+All the SHA-3 contest finalist ciphers–BLAKE, Grøstl, JH, Keccak and Skein–are all in there. Unlike what happened with AES/Rijndael in the Crypt:: namespace, Keccak is now available as Digest::SHA3.
+
+Nearly everything in the Digest:: namespace has a consistent interface. There is a functional interface of [name][length][encoding]():
+
+And an object oriented interface. In OO, the constructor is called with the hash size. You can then use add() or addfile() to add to the data that’s going to be hashed. These can be called multiple times to keep adding data. Finally, call digest(), hexdigest(), or b64digest() for the hash value in the encoding you want:
+
+Note that as soon as you call for the digest, the internal state is flushed, so if you call it again, you’ll only hash what was added after the last call:
+
+Cryptographic hashes find many uses in cryptography for verifying the integrity of data. One place where you shouldn’t be using them is for storing passwords. We’ll discuss why in the next post.
+
+We’ve covered most of the major building blocks of encryption and how you can use them in Perl. With those building blocks in mind, we can cover one of the most common uses of encryption that a programmer will encounter, which is how to handle passwords.
+
+Password handling has a long history, most of it bleak. Many systems started without any passwords at all; keeping the computer physically locked in the room was considered good enough. As time went on, the machines got passwords, but CPU time was still expensive, and programmers hadn’t thought much about the security implications of storing passwords in plaintext. And that is what they did.
+
+Still more time passes, and somebody figures that having a big database of passwords in plaintext isn’t such a good idea, so the crypt() function on Unix is used to encrypt things. This was originally based on DES (which, as we know from the block cipher post, is no longer good enough), and it truncates your password to 8 characters of 7-bits each. It then uses that password with a 12-bit salt to encrypt a string of all zeros.
+
+What’s a salt? It’s a random value appended to the string, which should be unique for each user. We use these to thwart an attack called a Rainbow Table. Here, an attacker knows that you don’t use a salt, or knows the salt you use on all your passwords. With that information, the attacker can precompute a list of passwords and their assoicated hashes.
+
+In the example below, we assume the same salt (“12345″) is used for crypt() (like much of the standard C library, this function is available to us directly in Perl). We start with the password “aaaaaaaa” and iterate through a few possibilities using the magic string mode of the ++ operator:
+
+Combined with a dictionary of common passwords (and variations like “p4ssw0rD”), the attacker doesn’t need to brute force each password individually. They just need to match the hashed value to the plaintext value. With a bit of googling, you’re sure to find textfiles of precomputed Rainbow Tables, so the attacker doesn’t even have to do the hard part themselves.
+
+Getting back to crypt(), we once again note that it forces an 8-character password of 7-bits per character (plain ASCII). This would be 8 * 7 = 56 bits, which is the DES key length. We already know that this is inadaquate against modern brute force attempts. On top of that, even security-concious users don’t use passwords with the entire ASCII range, and many applications will break if you tried (ever use a password with a vertical tab in it?). That puts further limits on the size of the search space.
+
+In short, crypt() should be completely avoided.
+
+The next generation used a cryptographic hash. The advantage of this method is that the original plaintext password can’t be feasibly recovered, even by the people who own the database or write all the code. (If a web site’s password recovery system ever emails you back your original plaintext password, that means they didn’t do it right.)
+
+Doing things this way usually started with MD5:
+
+As weaknesses in MD5 were exposed, things moved to SHA1 and others, but it was the same idea. When the user wants to be authenticated, we hash the provided password with the same salt (the part before the colon above) and check if we get the same value as our stored hash.
+
+One weakness happens with Timing Attacks. With the standard string eq comparison (or equivilent in most other languages), a string is matched by going through character-by-character to see if each one matches in turn. It fails as soon as it hits a non-matching character.
+
+This means that "aaaaab" eq "aaaaac" takes slightly longer to fail than "aaaaab" eq "aac". Mallory can use this slight difference in speed over many different requests to see if he’s getting closer to the right password, somewhat like the Mastermind game. This fail-fast property helps keep programs speedy, but it’s a problem here.
+
+You might think that this difference in speed would be too small to be practical over the Internet, but in fact it was sucesssfully done against OAuth and OpenID.
+
+Mallory’s attempt is complicated by salt and hashing, but making the system completely immune is not difficult, so why not just do it? Here’s how:
+
+We start by checking that the strings are the same length. If we were matching plaintext passwords, this would tell Mallory that he needs a longer or shorter attempt. Note that hashed passwords of the same encoding type will always match in length.
+
+Next, we split the strings into individual characters and iterate over them. With each loop iteration, we XOR the same location in the strings with each other. We then OR that with the current result. If this result ends up staying zero all the way to the end, the strings match.
+
+So far, we know that we should use an irreversible method of encryption, we should use a salt from a cryptographic random source, and we should match the hashed strings in a way that does not fail-fast. Up until a few years ago, that would have protected you against any practical attack out there.
+
+As tends to happen, something new came along. Graphics Processing Units were being used in more and more general computing tasks, and it was found that a GPU could be used to crack hashed passwords. The massive parallel processing speeds offered by GPUs allowed all our then-best schemes to fail.
+
+The mistake we made is that general cryptographic hash algorithms are meant to be fast. Not so fast that they tradeoff security, but all things being equal, a fast algorithm is obviously better than a slow one. Trouble is, if it’s fast to hash a password on your end, it’s equally fast for an attacker to do it on their end.
+
+We are saved here by the fact that a user logging in to a system generally doesn’t mind if it takes an extra second for that one request. But for an attacker making millions of attempts to brute force a password, that extra second adds up. Since we get to choose the algorithm, we should choose one that’s delibrately slow, perhaps one that we can tune to make slower as Moore’s law picks up.
+
+This is where bcrypt comes in (so called because it’s a variation on the Blowfish block cipher). With bcrypt, there is a “cost” parameter that can be tuned upwards as Moore’s Law makes CPUs and GPUs faster. This parameter controls how many loops the algorithm will go through before producing the final output.
+
+The advancements don’t stop with bcrypt, either. GPUs are good at raw processing, but terrible when moving things in and out of memory. So if you use an algorithm that forces you to move things in and out of memory a lot, Mallory can all but give up on cracking passwords with GPUs. This is what scrypt does. The algorithm is still a bit new and hasn’t been completely vetted yet by the cryptographic community, but it may become the new gold standard for storing passwords.
+
+How should we implement all this? One observation from all the above is that for a few decades now, there’s been a war between new attacks and new ways to thwart attacks. We don’t appear to be anywhere near the end of it. That means we should code our apps in a way that can absorb a new algorithm easily. If tommorow morning, bcrypt turned out to be totally broken, you should be able to switch to scrypt in production by early that afternoon at the latest.
+
+When we store the password, we need to store something that shows how it was encrypted. We then have a configuration value somewhere that lists the preferred encryption method for passwords. For algorithms that have cost parameters, like bcrypt and scrypt, we also need to encode that information and configure it alongside the encryption type.
+
+Fortunately, Authen::Passphrase gets very close to doing everything right. Using a string representation based on RFC 2307, it encodes the encryption type, salt, any cost parameters, and encrypted string into a single compact value. The one thing it doesn’t do is match strings in a way that protects against timing attacks.
+
+I also think it could benefit from a plugin system. The current implementation uses lexical hashes within the package to map encryption types to the implementing class, with no way of adding to those hashes outside of the lexical scope (at least, not that I’ve found). New encryption types could be added by CPAN dists more easily if there was a way to add new types dynamically. By breaking out existing classes into separate dists with a plugin system, it could also fix a criticism in one of its CPAN reviews, which is that it’s a maze of twisty dependencies.
+
+Regardless of the above, this is still the best CPAN module I’ve found for storing passwords in Perl.
+
+Let’s say we have a new user signed up with their passphrase in $passphrase. Do this:
+
+We now save the $hashed_passphrase string into our user database.
+
+Later, the user comes back and wants to login. With our stored encrypted password in $db_passphrase, and the incoming passphrase to be checked in $passphrase, we first check if the password matches. If it does, change the encryption if necessary:
+
+That covers the technical end of things. What is sometimes overlooked in these articles is the political game. If you’re working on an existing system with an outdated password scheme, how do you convince your boss that this is important and needs to be fixed?
+
+It’s common for managers to say “Well, that only matters if someone had already broken into our system, so we’ll just protect against that”. Now, you might recall our earlier discussion on security as a chain vs. security as layers. If you’re relying only on boarder firewalls to keep the evil out, then breaking just that firewall gets the attacker everything. If the attacker also has to contend with breaking an encrypted password database, you now have security in layers. Layers are Just Better.
+
+Explaining this to the more clueless managers still won’t be enough, so instead, point out some high-profile breakins. Sony was broke into a while back, and it was found that their password database was in plaintext. Gawker also had a data breach, and their passwords were using the outdated crypt(). These are two well-known tech companies who were utterly embarrassed by their password handling practices.
+
+Perhaps there were a few employees at both those companies who wanted to change things, and perhaps they were stopped by a manager who thought that a data breach would never happen to them.
+
+Don’t let this be a reason for doing nothing, but given the sad state of the industry, I suspect that if you’re currently using salted passwords with SHA1, you’re ahead of far too many companies out there.
+
+We’re almost finished with this series, but there is one more thing I’d like to discuss because there’s so much bad information out there: Quantum Computers and Quantum Encryption. That’ll be in the next post.|||
+

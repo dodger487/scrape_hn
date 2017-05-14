@@ -1,0 +1,77 @@
+DISCLAIMER: Any losses incurred based on the content of this post are the responsibility of the trader, not the author. The author takes no responsibility for the conduct of others nor offers any guarantees.
+
+You may have noticed I’ve been writing a lot about quantstrat, an R package for developing and backtesting trading strategies. The package strikes me as being so flexible, there’s still more to write about. So far I’ve introduced the package here and here, then recently discussed the important of accounting for transaction costs (and how to do so).
+
+Next up, I want to look at modelling different kinds of orders. The strategy I’ve been looking at so far places orders as they happen. However, traders may desire to place orders such as a stop-loss (to prevent further losses, with the belief that if a stock’s price moves down it will continue to move down, causing further losses), a target price (there should be a target price that, when reached, terminates a trade, locking in gains), and sometimes a trailing stop (if a stock has made gains, better to lock them in at a slightly lower price should a slight reversal be seen than lose all gains in a major reversal). When I took a class on trading, a recommended rule was to have an order representing the target price and a stop-loss order, always. This was mostly to enforce structure and trading discipline, helping take emotions out of the equation. Furthermore, the loss that would result from a stop-loss’s trigger should be half of potential gain, as per the justification that if half the time you “win” and half the time you “lose”, your gains would be twice as large as your losses.
+
+I don’t have nearly enough experience in trading to have a respectable opinion, but what opinion I do have doesn’t look favorably on stop-loss orders as I learned them. I would implement the so-called 2-to-1 rule (that is, target profits are twice maximum losses) in simulations and watch as my orders would be wiped out by large, spurious, immediately corrected movements. It seemed as if reversals would inevitably follow the trigger of the stop-loss that closed my position, locking in losses in addition to transaction costs. I also closely tied, in my mind, the 2-to-1 rule with stop-loss orders in general, and it doesn’t take long to realize the logic of that rule is total bunk. If price movements are a random walk, having a shorter stop-loss means that there’s a good chance the stop-loss would be triggered before the profitable exit order. You might be making twice as much for profitable orders, but you’re triggering the stop-loss twice as often, nullifying the effect (while driving up transaction costs). If you were setting your profit target shorter than the stop-loss, at least more trades would be profits instead of most being losses. (In the random-walk situation it makes no difference; expected profits are zero in either case. But at least it feels better.) I never tried a trailing stop, but I’m sure my opinion would be about the same; “noise” is more likely to close a position than an actual reversal in trend, in my opinion.
+
+I appreciate the call for combating personal psychology, enforcing discipline, having an exit plan and a guard against unacceptably high losses. I’m aware that risk management is an important part of any trading system, and as I write this I am sure that there are better approaches than what I had learned (I hold out hope for VaR assessment, though I have yet to try it out). But I have little love for the approach to stop-losses as I learned it, which is partly why the strategies I’ve looked at so far have closed positions only when the indicators pointed to a change in regime.
+
+That being said, I’m still interested in modelling them. I could be wrong. And more intelligent approaches to risk management likely resemble a simple stop-loss.
+
+I also want to look at parameter optimization with quantstrat. We’ve been using 20-day and 50-day moving averages without questioning what makes those numbers special. quantstrat provides functions that allow for backtesting a strategy while trying out multiple parameters so one can hopefully find a more profitable combination. Now, that said, what I will likely have done is overfit my strategy; the optimal combination looks good in backtesting thanks to torturing the data, but when deployed it will likely perform miserably (or at least not nearly as well as the backtest would suggest). A correction for this should be applied. In the future I may write about how to handle overfitting, but for now, I’m just getting started with the tools.
+
+If you’ve been following along with my articles, the next few lines of code should look very familiar, so I won’t repeat the explanation. Let’s just say we’re going to pick up where the article on accounting for transaction costs left off. We’ll work with a \$100,000 trading portfolio that faces \$5 in total for transaction costs per trade. We’ll even tack on an additional 0.1% loss per trade to simulate slippage. We’ll be requiring that trades be done in batches of 100. All told, we end up with the following code (read earlier articles for better explanations):
+
+Now I add the stop-loss order. This is done by adding a new rule. First, note that I start by adding the same rules I had before. Then, I add a rule labeled (the name of the label has no special meaning; it’s useful to the programmer, not to blotter) with order type that
+
+Let’s now look at the results:
+
+Eesh. Not good. The fees were not helping, but they’re relatively small in this context, so the effect we see is likely thanks to the stop-loss orders. Positions are getting closed out before being given a chance to be profitable, locking in losses.
+
+As mentioned before, there may be a better way to pick the stop-loss than simply saying, “if the value drops below 1%, exit the position.” I won’t discuss this now.
+
+But let’s turn this awful rule off, and see what happens when we don’t use this stop-loss (you’ve now seen a new rule in the toolbox, ):
+
+What makes a 20-day moving average special? What about a 50-day moving average? These numbers were chosen arbitrarily, so there’s no reason to believe that they will produce the best results. So how about we try different combinations of windows for the moving averages used in the moving averace crossover strategy, and pick the combination that obtains the best results?
+
+quantstrat easily implements this behavior. We can keep the strategy we’ve already defined, but we will be varying the parameters used in the moving averages, ‘n’ in particular. This can be accomplished by adding a distribution to the parameters of interest in the strategy, via the function .
+
+We need to add a constraint to the parameter values since we do not want the window size of the fast moving average to exceed the window size of the slow moving average; this would not make sense. This constraint can be added via :
+
+Having given distributions, we now optimize. The function repeatedly applies the strategy with different combinations of the parameters in the parameter set. The parameter controls how many combinations to try, and the combinations actually chosen are random (and presumably don’t repeat). If this is zero, all combinations will be chosen. This is fine if there are few parameters to try, but otherwise, beware; the time spent trying out different combinations could explode.
+
+This step is naturally computationally intense. A single backtest can take some time, so just imagine how much time it would take to complete 40! One way to speed up the process is to parallellize it. quantstrat supports parallellization, and implementing it is as simple as loading the package doParallel and registering cores to be used in the parallelization; already uses and from the foreach package. I don’t show this here, just because there would be no advantage to it with the system I’m currently using.
+
+We will try 40 different combinations here.
+
+is a list containing some summary statistics for each backtest performed. Below I show its structure:
+
+There is an entry in called . This is a combined array of all trade statistics for all portfolios. I preview it below:
+
+Let’s see which combination did best. The last column of each data frame in the list is . It contains the total profit/loss for each stock tried in the portfolio. If we sum these we get the portfolio’s total profit/loss. Below I create a data frame containing the combination of parameters and their portfolio’s final profit.
+
+Profit appears to be maximized with the fast moving average’s window is 20 days (4 weeks) and the slow moving average’s window is 125 days (25 weeks), which can be nicely interpreted as a monthly and a biannual period, respectively. With these periods, we manage to double the profit we had.
+
+We have not searched the entire parameter space. One idea I’ve had to address this without actually trying every combination (a computationally intense task) is to fit a linear model to the profit, depending on the parameters of interest. I want to fit a model of the form:
+
+Why this model? Convenience; if both and are negative, there will be a unique global maximum and, thus, a combination of fast and slow moving averages that will maximize profit. This is the simplest model with that guarantee. It translates to a linear function of the form:
+
+We will compute the least-squares fit with :
+
+Take partial derivatives of the above fit with respect to both and and set it equal to zero to conclude that the critical point is at:
+
+Whether this is a minimum or maximum depends on and . If these both are positive, the critical point is a global minimum, and if both are negative, the critical point is a global maximum. Unfortunately, while we have a global maximum, it is around , which is nonsense, so we’ll replace -163 with the smallest possible value for the fast moving average considered: 5. This can be interpreted as a moving average computed over a week, and the slow moving average is 95 days, which roughly corresponds to a quarterly cycle.
+
+Here we try out the optimized strategy.
+
+The results look promising. Let’s compare to the performance of SPY:
+
+The strategy isn’t being beaten by SPY quite so badly as it was before, which is good news, and that’s after accounting for transaction costs (notice that we’ve kept those costs low; presumably we’ve found a very cheap brokerage service) and even a little slippage (that’s the 0.1% fee applied per transaction). So not bad. We can deploy this strategy and expect decent results.
+
+Not so fast. We optimized the strategy using a data set, then evaluated its performance on the same data set. Any expert in statistics or econometrics or machine learning will protest this. Our approach may be leadng to overfitting, a phenomenon where a model describes the data it was trained on very well but does not generalize well to other data. I believe that my tactic of looking at a model obtained by maximizing a quadratic function may help combat this, but that’s just a hunch; we need to check the performance of the strategy on out-of-sample data (that is, data the strategy has never seen) in order to get a sense of how it would actually perform if deployed.
+
+Notice that never did I look at stock data after October 2016, so why not see how the strategy would perform on more recent data?
+
+Our strategy’s performance does not at all rival that of SPY out of sample. Admittedly, SPY’s behavior over this period is spectacular even by its own standards, with an annualized rate of return of about 21% (~10% is about normal), but the strategy has an annualized rate of return of about 5%, far below SPY’s “typical” performance.
+
+If you were thinking about quitting your day job to day-trade full time, I hope I have curbed your expectations. Beating the market should be looking rather difficult by now.
+
+I recently read an article on Bloomberg about why financial products always seem to burn investors. The article pointed the finger at p-hacking, backtesting without sufficiently checking out-of-sample performance, and overall sloppiness. This paragraph in particular jumped out at me:
+
+quantstrat is a backtesting package. You need to backtest. Backtesting, though, is not nearly enough. You need to check out-of-sample performance, and even this must be done carefully lest you succumb to the same flaws of backtesting alone (that is, torturing the data until you get a confession).
+
+In other words, we will need to look at some machine-learning techniques such as cross-validation to figure out what choice of parameters would be best. Packages such as caret may facilitate this, and I may look into them in the future. With that said, I doubt that the simple moving average crossover strategy will be very profitable, but that’s okay; I’ve been using it for pedagogical reasons only. With it, we’ve been able to see basically all of quantstrat‘s major features. We’ll keep using it as long as it’s useful.|||
+
+In this post we look at stop-loss orders in quantstrat, and how to pick optimal parameters for a strategy.
