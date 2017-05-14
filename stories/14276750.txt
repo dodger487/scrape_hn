@@ -1,0 +1,47 @@
+In my last post, we discussed 3 useful tips for working effectively with Lambda and Kinesis. Now let’s take a look at how we can use Lambda as cost-effective solution to auto-scale Kinesis streams.
+
+Auto-scaling for DynamoDB and Kinesis are two of the most frequently requested features for AWS — and as I write this post, I’m sure the folks at AWS are working hard to make it happen. Until then, here’s how you can roll a cost effective solution yourself.
+
+From a high level, we want to:
+
+Reaction time is important for scaling up. Based on personal experience, I find polling CloudWatch metrics to be a poor solution. Here’s why:
+
+Instead, consider using a push-based approach using CloudWatch Alarms. Whilst CloudWatch Alarms is not available as trigger to Lambda functions, you can use SNS as a proxy:
+
+You can use a number of metrics for triggering the scaling action. Here are a few metrics to consider.
+
+The simplest way is to scale up as soon as you’re throttled. With a stream-level metric you only need to set up the alarm once per stream and wouldn’t need to adjust the threshold value after each scaling action. However, since you’re reusing the same CloudWatch alarm you must remember to set its status to OK after scaling up.
+
+You can scale up preemptively (before you’re actually throttled by the service) by calculating the provisioned throughput and then setting the alarm threshold to be, say 80% of the provisioned throughput.
+
+After all, this is exactly what we’d do for scaling EC2 clusters and the same principle applies here — why wait till you’re impacted by load when you can scale up just ahead of time? However, we need to manage some additional complexities that are included in the EC2 auto-scaling service:
+
+With shard level metrics you get the benefit of knowing the shard ID (in the SNS message) so you can be more precise when scaling up by splitting specific shard(s). The downside is that you have to add or remove CloudWatch alarms after each scaling action.
+
+To actually scale up a Kinesis stream, you’ll need to increase the number of active shards by splitting one of more of the existing shards. One thing to keep in mind is that once a shard is split into 2, it’s no longer  — but it will still be accessible for up to 7 days (depending on your retention policy setting) and you’ll still pay for it the whole time!
+
+Broadly speaking, you have two options available to you:
+
+Option 1 — UpdateShardCount — is far simpler but the approach comes with some heavy baggage:
+
+Option 2 — SplitShard — uses shard level metrics to split only the shards that have triggered the alarm(s). A simple strategy would be to sort the shards by their hash range and split the biggest shards first.
+
+To scale down a Kinesis stream, simply merge two adjacent shards. Just as splitting a shard leaves behind an inactive shard that you’ll still pay for, merging shards will leave behind two inactive shards!
+
+Since scaling down is primarily a cost saving exercise, I strongly recommend that you don’t scale down too often. You could easily end up increasing your cost instead if you have to scale up soon after scaling down — hence leaving behind lots inactive shards.
+
+Since we want to scale down infrequently, it makes more sense to do so with a cron job (i.e. CloudWatch Event + Lambda) versus using CloudWatch Alarms. After some trial and error we settled on scaling down once every 36 hours, which is 1.5x our retention policy of 24 hours.
+
+When the cron job runs, our Lambda function would iterate through all the Kinesis stream, For each stream, we would:
+
+The reason we went with 5 min metrics is because that’s the granularity the Kinesis dashboard uses and allows me to validate my calculations. Keep in mind that you don’t get and values from CloudWatch directly, but will need to calculate them yourself.
+
+Also, we require all data points over the last 24 hours to be below the 50% threshold. That helps us to be absolutely sure that utilization level is consistently below the threshold, rather than a temporary blip which could be a result of an outage.
+
+When considering the approach for scaling down Kinesis streams, you’ll have the same trade-offs as scaling up — between using UpdateShardCount and doing-it-yourself with MergeShards.
+
+To set up the initial CloudWatch Alarms for a stream, we used a repo which hosts the configurations for all of our Kinesis streams. The repo contained a script for creating any missing streams and associated CloudWatch Alarms using CloudFormation templates.
+
+I hope you enjoyed this post — if you are doing something similar to auto-scale your Kinesis streams, please share your experiences and let me know in the comments!|||
+
+In my last post, we discussed 3 useful tips for working effectively with Lambda and Kinesis. Now let’s take a look at how we can use Lambda as cost-effective solution to auto-scale Kinesis streams…

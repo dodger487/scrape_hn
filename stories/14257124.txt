@@ -1,0 +1,55 @@
+Message queues are a way of sending asynchronous messages across boundaries. Different message queue implementations offer varying features but the key features offered by pretty much all of them are…
+
+As you can probably guess from the name when you send a message you typically specify a queue to send it to, this could be either local or remote. If the queue is offline the message will stay in some sort of pending transactions store where it will be sent on when the queue comes back online. At this point there will be some sort of receiver service that processes messages in order from the queue and possibly send one back.
+
+*Not all implementations guarantee in order processing of messages, MSMQ for example could have messages stored out of order due to one traveling faster over the wire than another. This however is solved in Service Broker with use of conversation groups and message sequence numbers. Also MSMQ could process messages out of order if you are processing messages in multiple threads, again Service Broker solves this by locking conversation groups guaranteeing all messages sent in that group will be processed in order.
+
+It’s part of SQL Server so offers a lot of benefits other implementations struggle with. Some of these being….
+
+I’m going to walk you through implementing a solution to a typical scenario that benefits from the use of Service Broker, the complete project for this example can be downloaded from github at https://github.com/gavdraper/ServiceBrokerTicketMaster. I recommend you clone the example and have a look at the source code as I’m not going to cover everything here.
+
+The scenario for this example is we are building a ticket booking website that will have 1000’s of concurrent users and we need the flexibility to scale quickly.
+
+There are 2 components of this system that don’t need to happen in real time and could possible be deferred to periods of low activity, these are the payment processing and ticket printing.
+
+This is how it is going to work…
+
+With this example its very easy to add payment processing/printing servers as needed. We can also schedule them to start and stop as and when needed meaning we could defer either of them to process overnight if we were becoming limited on resources. This option would have been a lot harder to implement if you were synchronously doing these operations on your webserver/sqlserver.
+
+The first thing we need in this example are to define our message types, in this case we have 4 that we need to create Print Request/Response, and Payment Request/Response. You can create them by running the following TSQL…
+
+The only restrictions we are placing on these messages are that they must be well formed XML which is fine because our app is the only app sending messages. If we were communicating with third party apps we can set the messages to validate against an XML Schema to make sure the format is 100% correct.
+
+Next we need to define the queues the messages are going to be sent to/from, in this case we have a queue per message type so that’s 4 queues.
+
+As you can see in the diagram/workflow  at the start of the example the target queues are monitored by separate services but the initiator queues are monitored and processed by SQL Server. You can see in the queue code above for the initiator queues I specify with activation and pass in some extra parameters. The activation is a way of telling service broker to run a procedure/CLR method  when a new message appears on the queue. It will only do this  if the processing procedure isn’t already running or if it decides a second (third/fourth….) procedure would process the queue quicker.
+
+Just to clear things up target queues are where a message is first sent to and initiator queues are where the response is sent, from this point the conversation can go back and forth for as long as is needed until both parties end the conversation.
+
+Ok so we have our queues and message types now we need to create some contracts to define the messages allowed in a conversation…
+
+The last step is to create the actual services…
+
+We now have everything we need to begin sending messages back and forth.
+
+Lets imagine when a user creates a booking it calls the CreateBooking stored procedure, this procedure creates a booking record in the booking table then sends a message to the ProcesssPaymentTarget queue for a payment app to pick up and process the payment. Sending a message to the ProcessPaymentTarget queue can be done in TSQL like this…
+
+As you can see it’s pretty much a case of specifying the source and destination services with the contract you want to use and you can then send your message.
+
+If you look at the full example project on github you can see I then have a console app that picks up this message, there are a few ways you can achieve this.
+
+I’m not going to go through all the source of the payment console app as its on github and quite straight forward instead I’m going to show you the BrokerPrintMessageProcessed stored procedure that…
+
+One thing to note is that when a conversation is over both parties need to send an end conversation message or the conversation will stay alive forever!
+
+If you look back at the TSQL we used to create the queues you’ll see the above procedure is the one that automatically gets called by the use of activation when a message is received on the PrintInitiatorQueue queue.
+
+WHILE (1=1) : This procedure deliberately runs in an endless loop until a call to receive returns no messages. This is so the whole queued gets processed without having to keep calling this procedure from activation.
+
+The call to receive takes a timeout in this case 1 second, meaning it will wait at this point until a message appears on the queue or the timeout expires. If the timeout expires the @@Rowcount will be zero and we can return from the procedure as there is nothing else in the queue.
+
+The rest should be fairly straight forward as we are just parsing the received message to update our bookings table and then sending the end conversation message back to close the conversation. Once this is done we then open up a new conversation to the PrintTargetQueue for the print service to pick up and handle printing.
+
+The best way to see all this in action is to clone and build the source from github, then run both the print and payment console apps, once they are running run the webapp and make a booking. You will then be able to see the messages flow from the webapp to the payment console and then to the print console.|||
+
+What is Service Broker? Service Broker is a native SQL Server implementation of message queues.

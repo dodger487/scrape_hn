@@ -1,0 +1,84 @@
+This was no ordinary memory leak. No unbalanced malloc/free or new/delete was this. No circular references with reference counting pointers. No queues not being emptied. No file descriptors being dropped. When we program we assume certain things. We assume that we live in an orderly universe that obeys physical laws.
+
+This is the story of one of the worst bugs I've ever investigated in my entire career. This is the story of...
+
+About a week ago many users may have noticed instability on our hosted ZeroTier Central . Network controllers would flicker on and off, and eventually the whole service needed to be restarted across our cluster. 500 errors and timeouts were a thing.
+
+It was a bright cloudless day (we're in Southern California). We'd just pushed out a series of updates to ZeroTier Central to address one of our largest customers' performance concerns, not to mention dealing with the high load that comes with growth in general. I'm a believer in trying to fix performance issues before throwing more hardware at the problem, so we worked hard to factor out a fragile and CPU-intensive coupling between our controller microservice (written in C++) and our backend (written in NodeJS) in favor of a faster and simpler one.
+
+After uttering those famous last words of "it worked in dev and staging," we pushed it to live. Everything came back up and all remained calm. Load dropped a bit. Things seemed to be working well. We went home for the weekend. (We usually try to avoid shipping on Fridays, but this one was kind of critical.)
+
+Sometime after the witching hour, poltergeist activity began to afflict our mobile phones. Bzz, bzz, ... Something was wrong. Very wrong. Since customers were being impacted, we restarted stuff. (Please don't judge. If you've ever run anything at scale you've been there.) It happened again, and again, and finally our devops person put a shim in place to restart the service automatically via a cron job (stop judging us!) every few hours. This kept things stable enough while we could diagnose the problem.
+
+Nothing made any sense until we noticed the controller microservice's memory consumption. A service that should be using perhaps a few hundred megabytes at most was using gigabytes and growing... and growing... and growing... and growing...
+
+A leak. Le sigh. Time to look through the commit log. What did I do? Hmm... nothing looks like it could account for this. We're doing almost everything the RAII way using managed structures that are well tested, and any places with a new/delete are old code that hasn't changed in ages.
+
+Next step involved finding a way to duplicate it in dev. Eventually I was able to do so using siege, a command line utility for load testing web servers. Make tons and tons of network member changes and the leak appears, meaning it must be something in either the new coupling code or the (very simple) database inside the controller microservice.
+
+I worked until about three o'clock in the morning selectively commenting out regions of the code. Eventually I narrowed the problem down to a region of code inside the method that handles creating the actual serialized network configurations that are sent to ZeroTier network members. This gets called when members request updates and when members are changed to push them out.
+
+Unfortunately the region of code in question made absolutely no sense. Everything happening there involved simple non-cyclic structures built on a very well tested JSON library we'd been using for ages and C++ STL data structures that are used everywhere. What made even less sense was that the rate at which the leak occurred could be changed by changing the order of certain lines of code in ways that had no impact on actual logic.
+
+When it's long after midnight and you can't think of anything more to do other than obsessively eyeball the code, it's time to go to bed.
+
+In every haunted house flick there's always the rational one who dismisses everything. The wife, the husband, the memory debugger. We tried valgrind, dmalloc, the Microsoft Visual Studio memory profiler (yes we tried running it in Windows via an elaborate shim just to use this), and glibc's built-in memory tracing.
+
+"Leak? You don't have a leak! There's no such thing as leaks! Maybe you should see a doctor," said these tools.
+
+I knew I wasn't crazy. Memory use doesn't increment by itself. Then I remembered reading something long ago about the presence of optimizations inside certain C++ STL structures like std::string that are designed to reduce memory copying and re-allocation when sub-strings are extracted or certain other operations are performed. I started to suspect that maybe our JSON library with all its slinging around of strings and other STL containers could be triggering some kind of weird edge case, or maybe even creating what amounted to a hidden circular reference due to strings reusing their memory and passing it around to their kinfolk.
+
+At this point I was acting out another haunted house flick cliche: frantically digging up the basement floor in search of bones. Have you ever actually looked at C++ STL code? After giving up trying to fathom hyper-optimized C++ template origami, I tried to rule this possibility out by introducing code everywhere that forced strings to be re-created from plain C pointers and that stringified and then re-created JSON objects to ensure that they weren't holding onto any memory under the hood. This would use more CPU but if it made the leak go away it would validate this hypothesis.
+
+Nothing worked. It's leaking but it's not. It's leaking but the debugger says no memory was lost. It's leaking in ways that are dependent on irrelevant changes to the ordering of mundane operations. This can't be happening.
+
+I decided to background this task and let my subconscious work on it while I enjoyed the rest of my weekend. It worked. Sometime late Sunday night a novel thought arrived: "memory fragmentation."
+
+To achieve high throughput under heavy load, the controller microservice creates a number of worker threads and passes off requests to them. That way things like ECC certificate signatures can happen without blocking the main loop. Years ago while reading some forgotten lore I had read of memory fragmentation and of how this demon of chaos can be summoned by complex programs and multiple threads. I'd been working under the assumption that the wizards of operating systems and language runtimes had long ago banished this beast, like many other ancient demons from the time of creation, to the pit. Modern memory allocators use thread-local pools and object size bins and stuff, right?
+
+I searched a bit and read things that led me to believe that this might not entirely be the case. The default allocator in the standard C library is designed for an acceptable trade-off between memory use and performance under ordinary work loads, but it doesn't always perform ideally in aggressively multithreaded or very high throughput applications.
+
+Luckily there are very highly regarded drop-in replacements like jemalloc. Trembling with anticipation that maybe... just maybe... I'd found the answer... I dropped in jemalloc and ran the test.
+
+CPU usage dropped but otherwise this had no effect.
+
+Then I tried something stupid that for some reason had not yet occurred to me: only create one worker thread. This also had no effect.
+
+The jemalloc library has its own memory debugging features, so I decided to try those and see if they'd reveal something the other debuggers couldn't see. Like the others it stubbornly denied the existence of a leak, but I did notice something curious. This allocator like many other high performance allocators creates a series of memory pools of geometrically increasing size to rapidly service small allocation requests. C++ code that makes extensive use of containers should be creating a huge number of small objects, but instead I saw memory use creeping up in bins of larger size and in the un-binned "huge allocations" category. Some allocations were much larger than anything ZeroTier should need. That made no sense.
+
+My thoughts once again returned to the C++ STL and its rumored under-the-hood memory optimizations. I dug up the basement some more, then grabbed a sledgehammer and took to the walls. It has to be here! It has to be here!
+
+Nothing. Nothing but dirt and drywall and C++ templates.
+
+Defeated, broken, exhausted, curled in the floor in a fetal position, and... wait... I hadn't looked behind operator new! I picked up my hammer, marched purposefully up to the only remaining intact wall, and started whacking away.
+
+Most operators in C++, including its memory allocation and deletion operators, can be overloaded. Indeed this one was. In some C++ STL libraries the overloads for new and delete just hand the task off to malloc and free, but not this one. Behind the gaping hole I tore in the wall leered the hideous moldy corpse of another memory allocator. It had been there all along, probably since Victorian times, silently waiting, brooding, sealed behind the wall by a jealous maintainer...
+
+Since "malloc is slow," libstdc++ "helpfully" adds its own memory allocator layer between you and the C library. This one implements its own caching and pooling, and searching around the web yields many examples of people complaining about it.
+
+It turns out that there is a somewhat convoluted way to disable it globally: set the environment variable "GLIBCPP_FORCE_NEW". After doing this, CPU use increased slightly but memory use stabilized. Recalling jemalloc I now once again tried sticking it under the controller in place of glibc's malloc and both CPU load and memory use dropped to substantially less than either stock configuration. More importantly everything became stable once again.
+
+I don't know what we did in our most recent changes to anger the spirit of this forgotten allocator, but we'd given it a proper burial and our home was once again at peace.
+
+We now have code in production (in ZeroTier Central) that force disables libstdc++ allocation pools via the above environment variable and ensures that jemalloc is preloaded. This lets us use stock binaries while avoiding this problem. We're considering trying to find a way to do this for the precompiled versions we ship, or maybe building clang's libc++ and statically linking that instead.
+
+We use RethinkDB and it's also written in C++, so I decided to take a look and see if setting the same environment variable and preloading jemalloc might improve our database performance. Lo and behold, but it would appear that the binary RPMs for RethinkDB already do this and link against jemalloc. Looks like they discovered this problem too.
+
+From what I can find on the web issues with GNU libstdc++ allocation pools have been discussed for a while, but as far as we can tell the issue persists in the very latest versions. We can duplicate this readily on Debian "stretch," which is pretty much bleeding edge. This is pretty unforgiveable. How many other C++ developers on Linux are banging their heads on the table right now as they search in futility for memory leaks that do not exist?
+
+The right answer to "malloc is slow" is to make it faster. This way regular C programs and programs written in other languages can also benefit. Adding wheels to the wheel is sometimes forgiveable when dealing with closed systems that you can't fix but libstdc++ and glibc are both open source GNU projects. The jemalloc allocator works very well so why not ship that or something very much like it?
+
+If you're looking to duplicate this issue pull the latest ZeroTierOne repo, set up a simple network controller, and then bang heavily on the JSON API with POST requests using siege or another web stress testing tool. Just don't do it in production or your phone might tremble in the night.
+
+The plot thickens. I've received several messages from people claiming the likely problematic C++ allocator, known as mt_alloc, hasn't been the default for a very long time and isn't in CentOS 7. To investigate I tried doing a string search of all binaries in /lib, /usr/lib, /lib64, etc., for "GLIBCPP_FORCE_NEW" and "GLIBCXX_FORCE_NEW" and variations thereof and... came up empty.
+
+Yet setting this environment variable makes the problem go away. I repeated the test and confirmed. Then I tried stupid things like setting "GLIBCXX_FARCE_NOO" and no, the problem remains.
+
+I tried to create a simpler C++ program that used the same JSON library and did similar kinds of JSON schlepping stuff to see if I could create a test case and was unable to do so. Compiled with the same compiler, same options, etc.
+
+The next step is to use a fully instrumented debug build and trace and determine who or what is looking at that environment variable. I still think the problem is somewhere in the C++ stack, but why it's there is mysterious. Our software doesn't include very many things and is low-dependency in general. We're not running some kind of crazy turtles all the way down stack.
+
+Will update when time permits, but unfortunately we're too busy with other things (and we have a work-around) to deeply investigate this issue right now. Perhaps some mysteries are meant only for distribution and core library developers and should not be pondered by mere mortals.
+
+This post got way way way more hits than any of us thought it would. Programmers are craftspeople and every craftsperson loves a good from-the-trenches story and to praise and/or complain about their tools. On an amusing side note, we are apparently "Hipster-Bullshitbingo-Startup-Klitsche" according to a German language web site. LOL.|||
+

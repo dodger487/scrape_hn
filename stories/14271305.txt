@@ -1,0 +1,57 @@
+It was late October last year, and as we began preparations for Realmstravaganza — our annual all-hands gathering in Copenhagen — we started receiving bug reports with some serious native crashes. No one could have guessed just how deep of a rabbit hole we’d have to go down to find a fix. Before we were done, we’d be neck deep in compiler-level optimizations of fundamental C functions, looking for a smoking gun that wouldn’t even set off our unit tests.
+
+For a while, we weren’t even sure what devices were affected, and so we couldn’t even reproduce the crashes our users were sending us. But as early reports trickled in, it seemed that the crashes were limited to certain older Android devices — running Android 4.2 Jelly Bean and 4.4 Kitkat. By now, both versions are unsupported, but that doesn’t mean they’re unused. About 30% of all Android devices are still running a pre-Lollipop version. We couldn’t slack on fixing this.
+
+The popularity of older Android versions didn’t make finding a test device any easier. After a lot of searching and bartering, we dug up an end-of-life Samsung Galaxy Tab 3 Lite (SM-T111). If there was a smoking gun in here somewhere, our Tab 3 would let us find it.
+
+After all, the incoming comments on the original Github issue name this specific Samsung tablet as one of the devices which shows the mysterious native crashes. But even with the device, none of our unit tests failed. Only our example apps showed signs of this mysterious bug; combined with the stack traces reported by users, we thought it pointed to a bug in the way Realm Core stores strings.
+
+Still, that would have been strange. The method is used very widely, so we had no reason to believe it contained a bug — especially a bug limited to such a narrow range of devices and Android versions. The next alternative wasn’t an appealing one: we had to look at the possibility that we were dealing with a native bug.
+
+Really pesky native bugs tend to present themselves infrequently and only on certain hardware, and we were about to discover that we were facing one of the peskiest bugs around. Our challenge would be magnified because, until recently, the support for C++ and native debugging has been less than stellar. Simply put: on the Android platform, native crashes can be hard to debug even when you know what you’re looking for.
+
+It took us this long just to be able to reproduce the bug, but we weren’t anywhere close to uncovering its cause. We had to realize that the truth about this bug went much deeper than we’d hoped: we were looking at a bug on the device, not in our code.
+
+But one day, a lucky breakthrough came from one of our users, and we found that other developers had faced the same bug. The culprit was right under our noses all along.
+
+With our trust Tab 3 in hand, and a sample app designed to trigger the native crashes that continued to elude our understanding, we felt closer than ever to a solution.
+
+Our debugging app, introExample, is extremely simple. It initializes Realm, create a Realm file with a couple of classes and inserts some objects. By using a non-stripped version of the native code, the crash from this app produced a stack trace which gave us an indication of what was going on:
+
+The method is taking care of storing strings within Realm Core. It has its share of pointer arithmetic and it has a few calls to standard library functions like and . Disassembling the object file of shows that the crash happens when calling (at byte 176, the instruction after the call is found):
+
+Could it really be that — a core C function handled by virtually every operating system — is the source of our bug?
+
+Things got weirder. The function in the above stack trace is only called when the Realm file is created. That is, it is only called once and before any objects have been inserted. The function is pretty simple: it creates two tables, adds a few columns to them and add search indices. We swapped the order of creating the tables, which exercised a different code path of , and that magically solved the issue. In most cases, exercising a different code path doesn’t really fix a bug; it only masks it. So even though it was likely only a short term work-around, we were running out of options, and decided to release this fix in Realm Java 2.2.3 anyway.
+
+Likewise, changing linker flags exercises another code path. But in uncovering what the linker flags changed, and unearthing a long-closed compiler-level issue, we’d discover the real bug.
+
+The function - together with its cousins and - have been available to UNIX programmers since 1990 as part of 4.3BSD-Reno. The signature of the function is pretty simple:
+
+The function copies bytes in memory — even if the source and the destination memory areas overlap. The function is not able to cope with overlaps but is generally faster than .
+
+Virtually every operating system implements a version of and - either in the kernel or through the C standard library. The functions are often used as primitives to implement other functions. Examples from GNU C++ standard library are and — both of which call an implementation of . In order to have as good performance as possible, it is not uncommon to write optimized versions in assembler. Compilers often have builtin implementations too, and these builtins are inlined at some optimization levels.
+
+In sum: is a very fundamental method, and it can be changed in many different ways that are all hard to introspect.
+
+A major breakthrough in understanding the issue came from our user diegomontoya. He had systematically built Realm Core and Realm Java with different optimization flags. We typically use which is extremely similar to , but the space consuming optimizations are disabled. With optimization flag, the bug seems to vanish.
+
+By now, we’ve got a strong indication of an issue in or in older versions of Android. That led us to a few similar bugs that other developers had documented. In his blog, ChengYi He has published a thorough analysis of a similar crash. Unfortunately, he did not have a solution. Furthermore, Unity has experienced similar crashes but without indicating a solution.
+
+With the optimization flag fix in mind, we found a closed issue reported by a Qt developer. In the original Qt bug, they found that would swap the implementation of . By adding the flag, they could switch from calling ’s builtin version of to the standard library version, and it solved their issue.
+
+Unfortunately, trying does not seem to fix the issue for us. Maybe we are going through yet another different code path? The solution, it turns out, was close at hand.
+
+Taking a page from the Qt developer’s workaround, we decided to add our own version of and . You can simply wrap ’s builtin functions by adding the flags and . Supply your own versions of them, and the calls to these functions will then be changed at linker time. Our code wraps both functions, and we also added a simple test from the closed issue that the Qt developer filed with Android:
+
+We use that test to see if works correctly. If it does, it is likely much faster than any implementation we can come up with. In that case, we just call the version found in the standard library. If does not work, we use our version.
+
+Instead of rolling a brand new version of , we have reviewed existing implementations, which is an exercise in weighing both technical and legal considerations. A strict license can have dramatic consequences for our users, but an incorrect implementation means Realm becomes unusable. In the end, the D.R.Y. Project is our choice. The library has easy-to-read implementations of and , and the code is public domain.
+
+Developers like having flashy, new toys — so it’s pretty rare that you’ll have an end-of-life device in your pocket. That doesn’t mean your users don’t have them, and because Realm Java has been so broadly adopted, we’re likely to be used on all sort of devices. Even old ones, and even old ones with bugs. It is a great privilege to be able to serve so many devices, and the consequence is that we are likely to see extremely weird bugs — like specific devices with bugs in signal handling. We consider it part of our duty to not just serve our users by fixing these bugs, but to tell you about the process so that we all know what to look for in the future.
+
+Moreover, we’re reminded of how hard it is to build great software. Even Samsung didn’t pick up on this device-specific bug in . And testing was only added to CTS in Lollipop. Even if most bugs happen because of silly typos, it doesn’t mean that it’s impossible for there to be a failure point in compiler-level optimizations of fundamental C methods.
+
+At Realm, we are lucky. We have users who give us detailed bug reports, and sometimes from devices we have never heard about. We are lucky to have users who try out unreleased patches on these devices. And we’re lucky to be able to see all the diversity of the mobile ecosystem, and to know that happens because our software matters to so many people. It’s a big responsibility, and we appreciate your trust in our platform. It’s what drives us to find and fix bugs like these, and to tell you about the mystery of a weird little bug on an old Samsung tablet.|||
+
+The Realm Android Team investigates mysterious bug reports and finds memmove() to be the culprit!
