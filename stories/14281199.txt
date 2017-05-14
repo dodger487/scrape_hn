@@ -1,0 +1,191 @@
+This specification defines a method of increasing bitcoin transaction throughput without altering any existing consensus rules.
+
+The bitcoin network's transaction throughput is correlated with its consensus rules regarding retargetting and denial-of-service limits.
+
+Bitcoin retargetting ensures that the time in between mined blocks will be roughly 10 minutes. It is not possible to change this rule. There has been debate regarding other ways of greatly increasing transaction throughput, with no proposed consensus-layer solutions that have proven themselves to be particularly safe.
+
+Auxiliary blocks, as first proposed by Johnson Lau in 2013, outlined a way of having funds enter and exit an additional block by using special opcodes.
+
+Extension blocks were a later proposal, also from Lau in 2017, which revised many of the ideas of the original proposal.
+
+Extension blocks devise a second layer on top of canonical bitcoin blocks in which a miner will commit to the merkle root of an additional block of transactions.
+
+Extension blocks leverage several features of BIP141, BIP143, and BIP144 for transaction opt-in, serialization, verification, and network services. This specification should be considered an extension and modification to these BIPs. Extension blocks are not compatible with BIP141 in its current form, and will require a few minor additional rules.
+
+Extension blocks maintain their own UTXO set in order to avoid interference with the existing UTXO set of non-upgraded nodes. This is a tricky endeavor, requiring a transaction to be present at the end of every canonical block.
+
+This specification prescribes a way of fooling non-upgraded nodes into believing the existing UTXO set is still behaving as they would expect. Unfortunately, this requires a bit of extra book-keeping on the upgraded node's side.
+
+An upgraded miner willing to include extension block is to include an extra coinbase output of 0 value. The output script exists as such:
+
+The commitment serialization and discovery rules follows the same rules defined in BIP141.
+
+The merkle root is to be calculated as a merkle tree with all extension and canonical block txids and wtxids as the leaves.
+
+Any block containing an extension block MUST include an extension commitment output.
+
+Outputs can signal to enter the extension block by using witness program scripts (specified in BIP141). Outputs signal to exit the extension block if the contained script is either a minimally encoded P2PKH or P2SH script.
+
+Output script code aside from witness programs, p2pkh or p2sh is considered invalid in extension blocks.
+
+Resolution transactions are a book-keeping mechanism which exist to maintain the total value of the extension block UTXO set. They exist as a consecutively redeemed OP_TRUE output. They handle both entrance into and exits from the extension block UTXO set.
+
+Every block containing entering or exiting outputs MUST contain a final transaction. This resolution transaction spends all outputs that intend to enter the extension block. The resolution transaction MUST appear as the last transaction in the block (in order to properly sweep all of the newly created outputs). The funds are to be sent to a single anyone-can-spend (OP_TRUE) output. This output is forbidden by consensus rules to be spent by any transaction aside from another transaction.
+
+The resolution transaction MUST contain additional outputs for outputs that intend to exit the extension block.
+
+Coinbase outputs MUST NOT contain witness programs, as they cannot be sweeped by the resolution transaction due to previously existing consensus rules.
+
+The first input of a resolution transaction MUST reference the first output of the previous resolution transaction.
+
+Fees are to propagate up from the extension block into the resolution transaction. In other words, the resolution transaction's fee should should be equal to the amount of total fees collected in the extension block.
+
+In order to bootstrap the activation of extension blocks, a "genesis" resolution transaction MUST be mined in the first block to include an extension block commitment along with any entering outputs (the block). This is the only resolution transaction in existence that does not require a reference to a previous resolution transaction.
+
+The genesis resolution transaction MAY also include a 1-100 byte script in the first input, containing a single push-only opcode. This allows the miner of the genesis resolution to add a special message. The input script MUST execute without failure (no malformed pushdatas, no OP_RESERVED).
+
+The resolution transaction's first output MUST have a value equal to:
+
+The following output scripts and values must replicate the extension block's exiting outputs exactly (in the same order they appear in the ext. block).
+
+The resolution transaction's version MUST be set to the uint32 max ( ). After activation, this version is forbidden by consensus rules to be used with any other transaction on the canonical chain or extension chain. This is required for easy non-contextual identification of a resolution transaction.
+
+Any witness program output is considered an opt-in to fund a keyhash or scripthash within the extension block's UTXO set.
+
+The resolution transaction shall redeem any witness program outputs:
+
+In the case that a spender wants to redeem tx2/output0, the corresponding extension block may exist as such:
+
+In order to ensure a 1-to-1 value between the existing blockchain and the extension block, an exit must be provided for outputs that exist in the extension block.
+
+In a later transaction, the spender of Transaction #2's output may want an output to exit with some of their money.
+
+As described above, outputs exit from the extension block onto the main chain by way of the resolution transaction. The outpoint created in the extension block MUST not to be spent on either chain. Instead, exiting outputs must be spent from outpoints created on the resolution transaction.
+
+Similar to coinbase transactions, resolution transactions can also be permanently un-mined in the case of a reorganization. This potentially invalidates all spends from any exiting outputs it may have contained, rendering the spending transactions not relayable and no longer mineable on the best chain. An exit maturity requirement is required for this reason.
+
+Fees collected from inside the extension block propagate up to the corresponding resolution transaction. The resolution transaction's fee MUST be equal to the cumulative amount of fees collected inside the extension block.
+
+On the policy layer, transaction fees may be calculated by transaction cost as well as additional size/legacy-sigops added to the canonical block due to entering or exiting outputs.
+
+In the previous example, the spender of Transaction #2's output could have also added a fee.
+
+Verification of transactions within the extension block shall enforce all currently deployed softforks, along with an extra BIP141-like ruleset.
+
+Transactions within the extended transaction vector MAY include a witness vector using BIP141 transaction serialization.
+
+Verification shall be performed on extended transactions with rules.
+
+Extended transactions MUST NOT have any access to the canonical UTXO set.
+
+If an extension block fails any consensus check, the upgraded node MUST consider the entire block invalid.
+
+DoS limits shall be enforced by extension block size as well as the newly defined metrics of inputs and outputs cost. Be aware that exiting outputs inside the extension block affect DoS limits in the canonical block, as they add size and legacy sigops.
+
+The maximum extension size should be intentionally high. The average case block is truly limited by inputs (sigops) and outputs cost.
+
+Future size and computational scalability can be soft-forked in with the addition of new witness programs. On non-upgraded nodes, unknown witness programs count as 1 inputs/outputs cost. Lesser cost can be implemented for newer witness programs in order to allow future soft-forked dos limit changes.
+
+Extension blocks leverage BIP141's upgradeable script behavior to also allow for upgradeable DoS limits.
+
+Witness key hash v0 shall be worth 1 point, multiplied by a factor of 8.
+
+Witness script hash v0 shall be worth the number of accurately counted sigops in the redeem script, multiplied by a factor of 8.
+
+Unknown witness programs shall be worth 1 point, multiplied by a factor of 1.
+
+To reduce the chance of having redeem scripts which simply allow for garbage data in the witness vector, every 73 bytes in the serialized witness vector is worth 1 additional point.
+
+This leaves room for 7 future soft-fork upgrades to relax DoS limits.
+
+Currently defined witness programs (v0) are each worth 8 points. Unknown witness program outputs are worth 1 point. Any exiting output is always worth 8 points.
+
+This leaves room for 7 future soft-fork upgrades to relax DoS limits.
+
+A consensus dust threshold is now enforced within the extension block.
+
+Outputs containing less than 500 satoshis of value are invalid within an extension block. This includes entering outputs as well, but not exiting outputs.
+
+Lightning Network faces certain kinds of systemic attacks as defined in the Lightning Network whitepaper risks (mass-closeout of old states).
+
+If the second highest transaction version bit (30th bit) is set to to within an extension block transaction, an extra 700-bytes is reserved on the transaction space used up in the block. [NOTE: Transaction space and sigops cost not yet defined]
+
+This space per transaction is pre-allocated and can be consumed in the same block by two transactions (of a maximum size of 350 bytes each), which fulfill specific constraints as defined below.
+
+The first allocation may only be consumed by a transaction which directly spends from the first output of the transaction with the 30th bit set.
+
+The second allocation may only consume the first output of ANY transaction within the past 2016 blocks which have the 30th bit set.
+
+If the allocation is not used by other transactions, the transaction consumes that extra space, reducing the blocksize by up to 700 bytes in available space.
+
+This is a consensus rule within the extension block and does not apply to the main-chain block.
+
+The purpose of this is to ensure that without miner coordination, the costs will be unusually high for systemic attacks, since blockspace is preallocated for miners to include penalty Lightning Network transactions, and this is enforced since both parties must agree to the version bit in Commitment Transaction in Lightning. This is an opt-in feature in Lightning, and trades higher transaction fees for greater availability for penalties. The assumption is that in the majority of cases of an incorrect broadcast, the penalty will be included in the same block via the second allocation, and give room for other transactions in the first allocation.
+
+Most of the bitcoin ecosystem is currently well-equipped to handle an upgrade to BIP141.
+
+For wallets currently supporting BIP141, the migration should be trivial.
+
+For fullnode-based services, APIs may be altered to transparently serve extension block transactions to clients as if they appeared in the canonical block. This, of course, would not include any miner API.
+
+Wallets currently supporting BIP141 must be modified in a few key ways in order to achieve compatibility with extension blocks.
+
+The latter two points only apply to wallets with operate via direct blockchain monitoring. Monitoring wallets typically watch the blockchain and index their own transactions and outputs.
+
+Changes to mempool implementations are surprisingly minimal. Although details may differ across implementations, a conforming mempool must disallow cross-chain spends (mixed inputs on both chains), as well as track exiting output's outpoints. These outpoints may not be spent inside the mempool (they must be redeemed from the next resolution txid in reality).
+
+Nodes creating block templates internally will have to take into account entering and exiting outputs when reserving size for the canonical block. A transaction with entering outputs or exiting outputs adds size to the canonical block.
+
+Entering outputs add size in the form of inputs in the resolution transaction.
+
+Exiting outputs add both size and legacy sigops in the form of duplicated outputs on the resolution transaction.
+
+Transaction sorting and selection algorithms must take care to account for this.
+
+In addition to the array, conforming implementations MUST include an array. The array contains transactions as defined in BIP22 as well as the BIP145 extensions to .
+
+Conforming implementations MUST include the resolution transaction as part of the array. The resolution transaction must have an extra property called , which is a boolean value set to . Including the resolution TX in the array directly is done for backward compatibility with existing mining clients.
+
+has been renamed to and includes the extension block commitment script.
+
+An extra field is defined for . If is present in the mutable array, allows extension block mutation, provided the client is able to properly update the resolution transaction.
+
+Along with the mutable field, a field is also defined in order for the client to state that it is capable of updating the resolution transaction.
+
+For nodes dealing with out of date mining clients, storing the extension block locally in a map of may be required (along with some reserialization during a call).
+
+It is likely that implementations will need to include an extra bit on every stored UTXO in order to mark which chain they belong to. Depending on the implementation's UTXO serialization/compression format, this may require a database migration.
+
+Miners may vote on deactivation of the extension block via the 28th BIP9 softfork bit. The "deactivation" deployment's start time shall begin 3 years after the start time of extension blocks, with a miner activation threshold of 95%. The minimum locked-in period must be at least 26 retarget intervals (1 year).
+
+By this point, a future extension block ruleset will likely have been developed, which is superior in terms of feature-set and scalability (see also: Rootstock and/or Mimblewimble). This enables updates for long-term scalability solutions with minimal baggage of supporting deprecated chains.
+
+After deactivation, it is expected by the community that exits from the extension block will still still be possible and secure according to the terms of the yet-to-be-designed soft-fork, but entrance into and transfer of funds within the extension block could be no longer permitted.
+
+We propose two possible solutions for deactivation, one of which will be selected in the final version of this document.
+
+Upon activation of the 28th bit, the resolution output will return to being an output which anyone-can-spend as a consensus rule today. This 28th BIP9 bit (or another BIP9 bit in conjunction) can be overloaded to enable soft-fork activation to prevent this from actually being an anyone-can-spend in the future. This allows for enabling future extension block features without hard-forking the code.
+
+A social contract is understood whereby the funds in the extension block will be usable and redeemable in the general deactivation design below. If proper and safe withdrawals are not activated within the terms, users and exchanges can refuse to acknolwedge blocks with the bit set as a soft-fork.
+
+It is possible to do a direct upgrade of the extension block by using the same output set upon BIP9 activation of the 28th bit in conjunction with new rules on another bit (e.g. 27th bit activates the new chain conditionally upon the 28th bit also being activated, creating a direct migration into a new extension block without new transactions on the main-chain).
+
+It is understood that this soft-fork will be overloaded with enforcement of withdrawal/redemption of funds so that it requires the script terms to be parsed upon withdrawal.
+
+Upon activation of the 28th bit, no further transactions are permitted inside the extension block. Withdrawals to the main-chain only via merkle proofs are only permitted.
+
+This requires code and specification for merkle-proof withdrawals to be specified and available today.
+
+Redemption from the old extension block to the main-chain and new extension block can be migrated by way of merkle proofs to be designed in the future. Funds may be imported to the new extension block by hard-coding a UTXO merkle root into the implementation as a consensus rule, and verifying imported funds against a merkle path.
+
+To enable importing, nodes require only a copy of the current 32-byte merkle root of the deactivated extension block.
+
+This removes the necessity for full nodes to store a copy of the full UTXO set on disk, with a tradeoff of larger on-chain transactions when redeeming in the future. An alternative would be for all clients to maintain a record of the UTXO set and keep the full bitfield in memory.
+
+Since the TXO set is static (with only whether it is unspent or spent changing) as it is deactivated from new outputs, this is simpler than currently proposed designs for changing UTXOs: https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2015-October/011638.html
+
+While deactivation may be seen as a drawback, the primary benefit of this specification is not an extension block with a BIP141-ruleset. Instead, it is that the ecosystem will have laid the groundwork for handling extension blocks. The future of the bitcoin protocol may include several different extension blocks with many different rulesets.
+
+This document is hereby placed in the public domain.|||
+
+extension-blocks - Extension blocks soft-fork specification

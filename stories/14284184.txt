@@ -1,0 +1,119 @@
+In my previous post, we learned about the current and future state of reflection in C++. But I left a few questions unanswered. Indeed, you may still be wondering why I care so much about reflection and if it has any useful applications for the average programmer. In this post, I’ll try to answer that question with real code examples using the two reference implementations of C++ reflection. I’ll explore the strengths of the two implementations, as well as the major limitations. These examples make heavy use of metaprogramming and C++17 features, so if you find yourself in unfamiliar territory while reading the code, I suggest supplementing this article with other resources.
+
+When I refer to the implementation, I’m talking about Matúš Chochlík’s fork of Clang which implements P1094, by Chochlík, Axel Naumann, and David Sankel.
+
+When I refer to , I’m talking about Andrew Sutton’s fork of Clang which implements P0590R0, by Sutton and Herb Sutter.
+
+Disclaimer: these reference implementations do not represent the final state of the reflection proposals. They are simply prototypes and the API that may end up in the language is highly subject to change!
+
+Have you ever written a tedious equality operator that checked for the equality of every member of a regular type? Have you ever written a code generation tool for generator such a function? You’re not the only one. In fact, this is such a problem that someone wrote a standards proposal for adding default comparison operators for regular types to the language (N3950).
+
+It turns out that with reflection, you can write a generic equality operator for any type composed of equality-comparable members!
+
+This implementation uses the detection idiom to check if the type T has a valid equality operator. If it does, return the result of that equality comparison for the two input objects. Otherwise, we recursively call “equal” on each member of T. If the type is neither equality comparable or a record (something with members), then that means we can’t compare T for equality.
+
+Note that is simply my own namespace that provides some metaprogramming utilities.
+
+The trickiest part of this example is the use of and fold expressions. To get metainfo for each member of T, we call on , the metainfo for T. This returns what the proposal currently calls a meta-object sequence, which must be unpacked using . takes the meta-object sequence, which is represented as a type, and a struct which is templated on a parameter pack of types, and returns the instantiation of the templated struct with the object sequence as the parameter pack.
+
+This may seem weird to you, but it’s also the only way the authors of this proposal could see to transfer a compile-time sequence of types to variadic template arguments. Once we have the metainfo for each member, we can compute equality for each member elegantly using a fold expression on the boolean “and” operator. Within that fold expression, we access members by using the member pointer provided by that metainfo ( where ).
+
+One thing that’s a bit odd about this example is that we have to forward-declare the operator so that we can call it within the function which applies the fold expression, because also refers to . Another syntactic nitpick is that we have to call twice within the fold expression so that MetaMembers can be unpacked; if we stored the result in a value, the compiler would complain about an unexpanded parameter pack.
+
+The basic idea of this example is the same as the previous one.
+
+You may find it shorter and more elegant due to the use of value semantics instead of type semantics for accessing metainformation. The most important difference is the use of instead of . implements a for loop over heterogeneous types. It allows us to write the equality comparison as a lambda function. This has the advantage that it requires less syntactic overhead than defining a struct, but it requires us to capture our inputs into the lambda, which could be annoying if there’s a lot of state that needs to be shared. More importantly, it requires us to initialize the result and capture it. In this example, it’s trivially known what the initial state of the comparison should be, but there could be cases where the initial state is not known. allows us to directly access the result of the operation we wrote over the members.
+
+Also, the implementation also offers an implementation of with a similar interface: it accepts an object sequence like the result of as a type parameter and a function object and applies the function over the sequence. Thus you can achieve a very similar example as what I showed here with . I just wanted to show the two different styles of iterating over members.
+
+If you want to save data to hard disk or share data across different processes or machines, you need serialization and deserialization. Converting information between a structured representation that can be understood by a program and an unstructured storage format is a fundamentally important problem for practical applications.
+
+In the C++ world, libraries like Boost Serialization, Cereal, yaml-cpp, and Niels Lohmann’s JSON parser are indispensible for this problem. These libraries often include adaptors for standard library containers like and . However, they do not have true generic power: for your custom data types, you have to specify the data layout for serialization, e.g. which data fields in the serialization format go into which member fields of the type. Reflection makes it possible to infer that data layout automatically from the definition of the C++ struct.
+
+For certain data types, you might want more control over which fields are a part of the serialization format. In the case of the standard library containers, you probably don’t want to serialize members used for bookkeeping or metadata that exposes implementation details. But for the case of POD types which represent configuration maps or protocol messages, generic serialization saves us the pain of writing and maintaing a lot of repetitive boilerplate code.
+
+In this example we’ll write a simple JSON serializer. If you’re closely following reflection and metaprogramming, you may recall that Louis Dionne’s keynote at Meeting C++ 2016 showed an example of JSON serialization using reflection and value semantic metaprogramming. But he did not show JSON deserialization, which requires some extra thought. Since I’m not using Boost Spirit here, the task requires a lot of token parsing boilerplate that I’ll omit for the sake of brevity, but you can always see the full example on Github.
+
+The basic idea behind serialization is straightforward: like the equality operator example, we’ll apply a serialization operation over the members of a struct if they are serializable primitives (numeric types or strings) and recursively call the serialize function on the member if it is a Record.
+
+We’ll use and a mix of type traits and the detection idiom for the “base cases”. detects if the type has a operator. detects, roughly, if a type can be used in a range-based for loop, like a vector or array (although right now it’s not a bulletproof implementation). The if constexpr block conditioned on this type trait will map the type to a JSON array of its values.
+
+To handle the case where T is a POD type, we’ll recursively apply the serialize function over the members of T using reflection. gets the name of the member from the metainfo. We’ll use this as the key name in the JSON object.
+
+Deserialization is where it gets more interesting. I’ll skip the part of the code that deals with primitive types as well as the parser boilerplate, and show the parts related to reflection.
+
+First, we count the colons and commas in the outermost scope of the JSON object that we are mapping to our member, and return an error if the number of colons mismatched (since that represents a key-value mapping):
+
+For every key, value pair in the JSON object, we’ll find the string representing the key and the string representing the value. Then, we need to match the key string in the set of possible member names for the struct we are deserializing JSON into. Because the key string is not known at compile time, we will have to pay some runtime cost to do this lookup. For now, we’ll simply loop over the members of the struct and compare the runtime string key to the name of each member.
+
+As you can see here, if the key matches the name of the member, we’ll grab the type of the member from the metainfo, and retrieve the member pointer corresponding to that member.
+
+I’ve added a couple of utilities here to make this code more readable and brief.
+
+is a utility that maps the constexpr string name of a member to the member index, and then retrieves the member pointer corresponding to that member.
+
+The implementation of is also a bit funny. We compute a fold expression over each member of the struct again, comparing the constexpr string name to the name of the member. If the name matches, we add the index of that member to the result, otherwise we add zero.
+
+In this post, I’m following the “implement now, benchmark later” philosophy. If you’re obsessed with performance and the the rather naive runtime-determined member lookup presented here bothered you, don’t worry. You might be able to imagine how we can improve O(n) runtime string comparisons and O(n) compile-time string comparisons, where n is the number of members of the struct. We’ll analyze the performance and see how we can do better… in the next blog post in my reflection series!
+
+The version of the same code has a similar structure, but is overall cleaner and more terse–to reiterate the point Louis made in his aforementioned keynote. This is how we loop over members to serialize them:
+
+One notable issue with the current state of this implementation is that I couldn’t find a good “type trait” equivalent to the concept, which simply returns true if T is a type that contains members. I don’t think this is an intentional emission from the implementation, since this kind of introspectability is key for the kind of generic programming that reflection allows, and I have hope that Herb and Andrew understand that.
+
+Anyway, I went ahead and implemented a type trait using the detection idiom so that I could switch on this concept using . This is not a great implementation since it could easily be faked by another interface, but it gets the job done for this example:
+
+The deserialization code is much cleaner and requires fewer helper functions because of the value semantics of this API: we can simply access the member pointer directly from the metainfo. (We are still matching the runtime string to a member metainfo by looping over each member.)
+
+Let’s start with a common problem in C++: you want to map from an incredibly primitive C-style array to a set of program configuration options, which you’ve encapsulated as a struct that gets passed around to initialize your application. You could write an “if” statement for each flag you want to recognize and manually stuff the options struct with the parsed values. Or, you could write a generic parse function that changes its behavior based on the layout of the options struct and some compile-time configuration options.
+
+This example may remind you of a commonly used solution for this problem: Boost Program Options. Since this is just an example and not a fully-fledged library, it offers a much more limited interface, but my thought is that static reflection and metaprogramming can be used to implement a similar library with less runtime cost.
+
+Of course, we will need to add some annotations to our program configuration, such as which flags specify which options.
+
+Recall that C++11 added attributes to the language: annotations using syntax that may change how the compiler treats a function, a declaration, an expression, or pretty much anything. Ideally, we could simply add our own attributes and reflect on them (this is known as “user-defined attributes” in standard proposal-land).
+
+Unfortunately the reflection proposals and their implementations don’t have user-defined attributes baked in. However, I’m going to show an implemention of annotated members for program options using reflection, some Boost Hana utilities and–you guessed it–macros.
+
+The basic idea is that, within a struct, we call a macro REFLOPT_OPTION to define a member given its type, name, the flags which map to the member on the command line, and an optional help string describing what the option does.
+
+The macro defines a member with the given type and name. It also defines a member of templated type that holds constexpr strings with the option-related metadata.
+
+We’ll define a function that detects if the input struct contains members which specialize and generates parser code based on the option metadata.
+
+The function instantiates a helper OptionsMap type. At compile time, OptionsMap generates two runtime functions, and based on the layout of the struct which holds our program options. will check if a given argument flag is valid based on the Option metadata. will set the field in the program options struct corresponding to the given flag to the value specified on the command line. ’s return type is ; it returns the field program options struct if the given argument vector was valid or nullopt if it couldn’t figure out how to prase the arguments. (This should probably be an instead of an , but since the proposed interface of is simpler we’ll use that for the sake of demonstration).
+
+scans over all the members of . For every member which is a specialization of , we look at hte flags mapping to that option and collect a compile-time map which associates the flag strings with the reflection metainfo of the member representing the program option. In the implementation of , we’ll take the runtime string input and compare it against the compile-time string keys of this map for a match. In the implementation of , we’ll take the metainfo value associated with the compile-time key that matches the given flag, and retrieve the type of the member, so that we can convert the string value to the right type using , and the member pointer, so that we can set the value in the program options struct.
+
+One key helper function we need for this example is , which retrieves the metainfo for a member given a compile-time string representing its name. This requires some boilerplate since associative access of members based on the name of the identifier is not a part of the proposal, and because the constexpr string representation chosen by the proposal cannot be used as a key in a Hana compile-time map.
+
+In terms of syntactic overhead and code aesthetics, the one place where the raw API has an advantage over is when you want to directly grab a type and use it in a template (angle-bracket) context. You can see this in the implementation of :
+
+As we’ll see, the cpp3k implementation will require a little more to unwrap a type from a value to be used in the same way.
+
+The implementation of is slightly nicer than above, but not by much.
+
+Notice that after getting the index corresponding to the identifier we use a new utility from : , the constexpr free function that accesses the heterogenous sequence container which results from .
+
+In the implementation of , we need to retrieve the member type from the metainfo.
+
+Now, this may be another bug in the implementation, but I couldn’t find a way to gracefully retrieve the type of the member from the metainfo value. Ideally we could do something like this:
+
+But trying to retrieve the type like this didn’t compile, so I had to write an helper function to do this.
+
+The implementation of is not pretty, which makes me think the lack of type retrieval is an unintentional omission:
+
+And that’s about it! If you’re feeling a brave, you can check out the complete implementation on Github, clone one of the reference implementations and play around with these examples–have fun!
+
+Reading this blog post, you might feel as if there’s something missing. Maybe it was the code smell coming from the macro used for member annotations in the program options example. Or maybe you just aren’t impressed by the examples so far.
+
+The reflection proposals we’ve looked at do not extend the code generation features of the language. Unfortunately, while brainstorming what I could do with reflection, I had a lot of ideas for utilities that required the ability to add new type members based on the metainformation resulting from reflection, such as:
+
+Actually, I didn’t include any function reflection examples, even though it is implemented in the fork, because the most interesting and useful applications of function reflection require this missing feature! I didn’t see a compelling and immediately obvious application of function introspection for the “everyday programmer”.
+
+But if you’re still reading, you’re probably not an everyday programmer! Function reflection could make dealing with overload sets a lot simpler in generic libraries. The user of a library could add a custom callback by overloading a function, and the library could simply reflect over all overloads of a function to find the customization point rather than using tricky ADL rules. I haven’t made a demo of this idea, but I’m looking forward to the upcoming talk at C++ Now by Michał Dominiak about “Customization Points that Suck Less”.
+
+At this point, you might be saying “Jackie, if you have so many opinions about this feature, why don’t you write a proposal about it?” I’m just one person who has thought about the issue of type synthesis or identifier modification–and some of the others have many, many more years of C++ and software architecture development than I do! Herb Sutter’s upcoming proposal on metaclasses is a promising way forward to make reflection and more generic programming as powerful as it needs to be. Out of respect for Herb I’ll refrain from saying more until he’s officially released this work.
+
+In the third and final part of this series, we’ll take a look at the performance implications of reflection as it’s currently proposed–specifically, the metaprogramming techniques needed to make reflection useful.|||
+
+In my previous post, we learned about the current and future state of reflection in C++. But I left a few questions unanswered. Indeed, you may still be wond...

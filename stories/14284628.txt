@@ -1,0 +1,49 @@
+Recently I've been playing a lot with HTTP/2 and with ASP.NET Core but I didn't had chance to play with both at once. I've decided it's time to change that. Unfortunately the direct HTTP/2 support for Kestrel is still in backlog as it this blocked by missing ALPN support in SslStream. You can get some of the HTTP/2 features when using Kestrel (like header compression or multiplexing) if you run it behind a reverse proxy like IIS or NGINX but there is no API to play with. Luckily Kestrel is not the only HTTP server implementation for ASP.NET Core.
+
+The second official server implementation for ASP.NET Core is Microsoft.AspNetCore.Server.WebListener which has been renamed to Microsoft.AspNetCore.Server.HttpSys in January. It allows exposing ASP.NET Core applications directly (without a reverse proxy) to the Internet. Under the hood it's implemented on top of Windows Http Server API which on one side limits hosting options to Windows only but on the other allows for leveraging full power of Http.Sys (the same power that runs the IIS). The part of that power is support for HTTP/2 based on which I've decided to build a proof of concept API.
+
+I've started by creating a simple ASP.NET Core application, something that just runs.
+
+Then I've grabbed the source code and compiled it. Now I was able to switch the host to HttpSysServer.
+
+The two URLs above are kind of a trick from my side - they are the same as ones used by my development instance of IIS Express. The process of configuring SSL for HttpSysServer is a little bit problematic and by using those URLs I've saved myself from going through it as IIS Express has already configured them.
+
+After those steps I could run the application, navigate to over HTTPS and see that HTTP/2 has already kicked in (thanks to native support in Http.Sys).
+
+The ASP.NET Core has a concept of which represent server capabilities related to HTTP. Every request feature is represented by an interface sitting in namespace. There are features representing web sockets, HTTP upgrades, buffering etc. Representing HTTP/2 as a feature seems to be in line with this approach.
+
+Deep at the bottom of HttpSysServer there is a class which exposes the Http Server API. The information whether the request is being performed over HTTP/2 is available through Flags field on HTTP_REQUEST structure. Currently the field isn't being used so it's simple there as unsigned integer, I've decided to change it to flags enum. The second thing needed to be done is importing the HttpDeclarePush function which allows for Server Push.
+
+The property should be exposed as part of the request. In order to do that the information needs to be bubbled through two layers. First is class which servers as a bridge to the native implementation and contains pointer to .
+
+The second layer is the class which servers as an internal representation of the request. Here we need to grab the value of in constructors, because the last step of constructor is call to which releases the structure.
+
+The Server Push functionality fits better with response which is internally represented by class. This is where I'm going to put the method which will take care of transforming the parameters to form acceptable by . First step is transforming the HTTP method from string to . Also some additional validation is needed as only GET and HEAD methods can be used for Server Push.
+
+The path also needs to be processed as expects the path portion and query portion separately.
+
+The hardest part is putting headers into structure. The side effect of this process is a list of instances which will need to be released after the Server Push (the class already contains method capable of doing this).
+
+I'm not including the method here. If somebody is interested in my certainly not perfect and probably buggy implementation, it can be found here (in general it's based on already existing method which class is using for actual response).
+
+After all the preparations finally can be called.
+
+With and classes ready the feature itself can be implemented. The HttpSysServer aggregates most of the features implementations into class, so this is where the explicit interface implementation will be added.
+
+As you can see I've decided to swallow almost all exceptions coming from . This is in fact the same approach as in ASP.NET which makes Server Push a fire-and-forget operation (this is ok as application shouldn't rely on it).
+
+Last step is exposing the new feature as part of class. The class provides field which represents a delegate returning for current request.
+
+In order to consume a request feature it should be retrieved from collection. If given feature is not available the collection will return null. As is available on both and classes the feature can be exposed through some handy extensions.
+
+Now it is time to extend the demo application to see this stuff in action. I've created a css folder in wwwroot, dropped two simple CSS files in there and added the StaticFiles middleware. Next I've modified the code to return some simple HTML referencing the added resources.
+
+The delays have been added in order to avoid client side race between Server Push and parser (as the content is really small and response body has higher priority than Server Push the parser could trigger regular requests for resources instead of claiming pushed ones).
+
+Below is what can be seen in developer tools after running the application and navigating to /server-push over HTTPS.
+
+There it is! HTTP/2 with Server Push from ASP.NET Core application.
+
+This was a fun challenge. It gave me an opportunity to understand internals of HttpSysServer and work with native API which is not something I get to do every day. If somebody would like to roll out his own HttpSysServer with those changes (or have some suggestions and improvements) full code can be found on GitHub. As there is already an issue for enabling HTTP/2 and server push in HttpSysServer repository I'm going to ask the team if this approach is something they would consider a valuable pull request (the interface should be probably added to HttpAbstractions, possibly with and ).|||
+
+Yet Another Developer Blog
