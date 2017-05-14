@@ -1,0 +1,69 @@
+itch.io is a website for hosting indie games, its implementation is unique because it’s written entirely in Lua (MoonScript). It runs inside of an nginx distribution called OpenResty. It uses coroutines for all asynchronous operations like database queries and HTTP requests.
+
+I like Lua for many reasons1, it gets the design of many core components correct:
+
+Coroutines are a tool, but they probably aren’t a tool you're familiar with. When you first started programming you may have viewed regular expressions as some mystical thing that you didn’t really get, but let you do some powerful things. As you matured as a programmer you learned the syntax, and learned when and how to use them effectively. Coroutines are in the same category. The only problem is that most languages don’t expose coroutines like they do regular expressions, so you haven’t had the opportunity to use them effectively.
+
+This post is about coroutines. When coroutines are done right, they can be used as an implementation detail and not a syntax change. Examples of languages that do it right include Lisp and Lua. (I'm sure there are more, but I haven’t used them.)
+
+The best way to think of coroutines is to understand where they sit in the taxonomy of control transfer. Chances are you're already familiar with exceptions. I like to sort things like this:
+
+Exceptions can be thought of as a subclass of coroutines. You can implement an exception mechanism with coroutines. They are an abstract construct that let you control where your code is executing (see ). When there’s an error your program counter jumps to the block you've written further up in the execution stack. Jumps like this are called control transfer.
+
+When an exception happens you lose access to where the error happened. (Although exception implementations will capture information about where the error happened, like a backtrace, and return it in an exception object.) You can’t say try running that line again, which makes sense, because that line resulted in an error.
+
+With coroutines you can tell the code to jump back and start running exactly where it left off. We don’t use coroutines for unrecoverable errors, there are many scenarios where it makes sense to go back to where we were and keep on executing. This is called cooperative multithreading.
+
+Coroutines do not use or . In Lua, after creating a coroutine, you run it, just like a function, and it returns values, just like a function. Instead of using , a coroutine can yield to signal that it might want to return back to that spot. When a yield happens, control is transferred back to where the coroutine was initially executed. The original caller can decide to resume the coroutine if it makes sense.
+
+Continuations are like coroutines but with even more control. You can return to the same location multiple times. Additionally, when continuations are implemented as first-class objects, you can pass around a control transfer object. You might be starting to see the parallels to how first-class functions work.
+
+I mentioned above that coroutines work best when they're an implementation detail and not a syntax change. As the consumer of some interface/library/framework, you should be able to take advantage of coroutines, but it shouldn’t require you to change how you write code.
+
+JavaScript definitely popularized asynchronous code via callbacks. It also completely changed how many of us write code. For complicated applications, it changed it for the worse.
+
+Now that Node.js has brought server side JavaScript to the masses, a common task for a web developer is to run a few queries that are dependent on one another, then return the result. Queries should be executed asynchronous since they preform networks operations that should not block the main thread.
+
+The naïve approach looks something like this:
+
+As more queries are added the nesting becomes extreme. Additionally, the real disadvantage, it changes the interface to our function. It’s impossible to return the result because we don’t have the final query’s response. You must restructure your functions to no longer use return values, but instead take a callback.
+
+The code above doesn’t even handle errors. Do we add a second callback for errors? Do we pass a special argument that represents an error to the one callback? Assuming we decide on how we want to handle errors, how do we get everyone else to agree with it so we can have uniform syntax?
+
+This is an actual problem in the JavaScript community: There are still people building new libraries trying to figure out the best way to manage asynchronous control. A language that creates this kind of schism in the community is not a well designed language.
+
+This asynchronous interface contaminates your code. If you have any other function in your application that needs to work with this function, it then needs to be rewritten asynchronous-callback style to match the control transfer, even if this hypothetical function does nothing asynchronous. This is a massive overhead for developers.
+
+If someone writes a library that abstracts all this database logic away, you, as the consumer, must use their asynchronous interface. The asynchronous interface will permeate throughout your code base, even if you never write anything asynchronous. You can not hide asynchronous control transfer via callbacks within a procedural interface.
+
+Luckily the JavaScript community is coming to agreements on how to handle asynchronous interfaces. But the core problems still stands: We have two competing ways to do flow control in our code base.
+
+Here’s an how I would write the snippet above for itch.io with Lua running within OpenResty:
+
+Whoa, wait a second: that’s just procedural code. That’s exactly why coroutines are important. Coroutines do not require us to rewrite our code. OpenResty gives an environment to execute in where the implementation of my non-blocking functions, like , can yield when it’s time to give control back to the scheduler.
+
+As an application developer I change nothing about how I write code. Coroutines are an implementation detail of the function, not a requirement on how I must structure my business logic.
+
+What about errors? Easy: I use the same interface as any other function. In Lua errors are handled by returning a second value. And since I'm just writing procedural code, I can on error:
+
+The framework developers determine how the code executes, not me. This is perfect, since writing the asynchronous callback code in JavaScript is just busy work.
+
+It gets even better: In my test environment I don’t need non-blocking code, I don’t have a scheduler, I don’t even run my code inside of OpenResty. It doesn’t matter. I can provide my own implementation of which operates synchronously. My business logic runs exactly the same. If I'm upgrading from an old synchronous project to non-blocking IO, I don’t have to rewrite everything.
+
+Runtime errors are what you expect: Since each coroutine has its own stack, when a runtime exception happens (eg. I try to dereference ), my backtrace only contains the stack that my coroutine is running in. Error backtraces are short and easy to parse.
+
+Since there is only one function interface, non-blocking code already works fine with all existing code. There are no new interfaces to learn, and there is no confusion about the best way to call a function. The language gives us an interface we can all agree on.
+
+OpenResty is clever about their implementation for non-blocking IO. OpenResty re-implements the interface provided by . It directs all network activity to non-blocking IO managed by Nginx’s event loop. Every time Lua code triggers a network operation, control is yielded back to Nginx where it can resume any coroutines that have IO ready for reading. Although I'm using cooperative multithreading, I don’t have to think about yielding.
+
+Why is this important? I can use the same exact library, and have it run either synchronous on the command line or non-blocking inside of OpenResty. Not only have coroutines saved my sanity as an application developer, but also as a library developer. I've done exactly this with my Lua PostgreSQL driver: pgmoon.
+
+I hope this post encourages you to check out OpenResty. If you're looking for a full featured web framework to use with it then I suggest Lapis. itch.io has been running Lapis in production for over 3 years. I've written over 100 thousand lines of MoonScript for itch.io without a single asynchronous callback.
+
+The slowest asynchronous APIs that itch.io has to communicate with are payment gateways. I remember speaking to another marketplace about how they needed to build new queueing infrastructure to handle all the asynchronous communication with their payment gateways. Since they were using a blocking web framework, Rails, their throughput would be destroyed had they tried wait for PayPal to respond in their web app.
+
+In itch.io I just write and read the return value. Throughput is unaffected. Imagine saving hundreds of thousands of dollars and months of headaches because you decided to learn about coroutines. 😉
+
+1 These are just some of my favorites, check out the Lua reference manual for more.|||
+
+itch.io is a website for hosting indie games, its implementation is unique because it’s written entirely in Lua ( MoonScript ). It runs inside of an nginx distribution called OpenResty . It uses coroutines for all asynchronous operations like d...

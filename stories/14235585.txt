@@ -1,0 +1,94 @@
+This post was originally posted on LinuxDevices.com
+
+When it come to our gadgets, we are all hungry for immediate satisfaction, and it is the challenge of embedded developers to meet those needs. There are many tricks one can employ to to achieve boot-time nirvana, but as Knuth taught us, premature optimization is the root of all evil. Therefore, the first step is to measure the boot latency and find out what parts of the boot sequence contribute to it. Otherwise, one can end up wasting time optimizing the wrong code.
+
+Generally speaking, on a 32- or 64-bit x86 platform, the boot process of a Linux system is comprised of the following phases and milestones:
+
+ Power up — when the power is set to on
+
+BIOS — including POST (Power On Self Test), device initialization, running of option ROMs, and loading the bootloader from the MBR (Master Boot Record)
+
+Bootloader — loading an operating system (OS) kernel and ancillary data (such as Linux initrd or initramfs) into RAM
+
+Kernel initialization — including CPU, peripherals, and kernel data structures, as well as bring-up of the non-boot cores in the case of multi-core machines
+
+First user application, first line of code — when the first line of user application source code is executed
+
+ Unfortunately, measuring the contribution of each of these phases to the overall boot latency is not an easy task. At each phase, different kind of code is executing, including 16 bit-BIOS code, which is part of the machine firmware; 16- or 32-bit bootloader code; 32-bit kernel code; and, user applications. Each is executing in a completely different software environment, and it is hard to find a common ground to compare the time each phase takes.
+
+Luckily, the x86 architecture provides a useful tool: the TSC (Time Stamp Clock) register. Introduced in the original Intel Pentium, the TSC register counts the number of clock ticks from the last processor reset. Reading the current value of the TSC register is done using the RDTSC instruction.
+
+The TSC register provides an accurate hi-res timer, assuming that there are no processor frequency changes (for example via SpeedStep technology), and that one always samples the register of the same core in a multi-core environment. Fortunately, both of these steps are easy to guarantee during the boot phase.
+
+As of Linux kernel version 2.6.11, the kernel supports a build-time configuration option called CONFIG_PRINTK_TIMES. This adds a time stamp based on the TSC value to each kernel log message, including during the boot process. Turning on this option is the first step towards a boot latency benchmark, as it provides a breakdown of the latency of the various points within the kernel initialization phase. In addition, turning off CPU frequency scaling OS support is required during configuration of the kernel. Otherwise, the TSC register can be rendered useless.
+
+The PRINTK_TIMES feature can be used to get an understanding of how various kernel subsystems contribute to overall kernel initialization latency, but it only goes so far. Because the printk timestamp counts from the kernel boot and includes only kernel log messages, it does not take into account the latency induced by the BIOS, bootloader code, or the time to the first application source code line being executed. In order to measure these elements, one must add code that queries and prints the TSC value during bootloader execution, as well as during execution of the first user space program.
+
+Code to query and print the TSC is rather simple. Here is an example taken from Wikipedia’s article on RDTSC:
+
+A call to the rdtsc() function above can be used to measure the boot-time latency contribution of the various phases other than kernel initialization. The function can be called by the bootloader, or by a user program that will run at boot. Here is the user program, which is the easier of the two:
+
+The rdtsc function is the same function provided earlier in this article. Note that an infinite loop has been added at the end of the program. This hack is meant to keep the program from exiting when it has finished, thus making it easier to run it as an “init” program without having the kernel panic when the program exits.
+
+Yet another issue to bear in mind is that on a multi-core board, it is prudent to pin the program to run on the boot CPU using the sched_setaffinity() system call (see this article for the details), as the value of the TSC register of different cores is not consistent, a fact not handled in the code example above.”
+
+To build the program, the following one-liner can be used:
+
+After building the program, it is necessary to copy the timestamp program binary onto the root file system of the target board, and instruct the kernel to run the program during boot using the kernel command line parameter “init=/sbin/timestamp”. If using syslinux, this can be done by specifying append=”init=/sbin/timestamp” in your boot loader configuration file. Doing so instructs the kernel to run the specified program, rather then the default of “/sbin/init”, at boot.
+
+Alternatively, one can use the initramfs mechanism of the Linux kernel to include the small user-space program as part of the kernel binary image itself. Either way, it is fairly easy to write a user space program to print the value of the TSC register, and have it run as the first program during boot.
+
+A similar effect can be produced with the boot loader, but it is not nearly as easy. There are quite a few bootloaders that can be used to load Linux on the x86 architecture (e.g. GRUB, LILO, syslinux), and x86 bootloader code can be notoriously complex. It is usually written in 16-bit assembly, and part of it runs under less than ideal conditions.
+
+Luckily, the syslinux bootloader offers an easy way to integrate 32-bit C code that can be run as part of the boot process. It does this via its support for the Comboot API, which enables one to write a small 32-bit C program and integrate it as part of the bootloader phase.
+
+Below is the timestamp program again, this time presented as a Comboot 32 module. It is derived from the hello.c example program supplied as part of the syslinux source code:
+
+The rdstc function is the same one presented earlier in this article. Also, the little comboot32 program is concluded by invoking the syslinux_run_command() comboot 32 API call, which causes the Linux kernel image with the name of “linux” to be executed when the timestamp program ends.
+
+To build the comboot32 program, it is a good idea to look inside the com32/samples/ directory that is part of the syslinux source code and follow the Makefile example provided there.
+
+Having completed the Comboot32 program, named timestamp.c32, the next step is to instruct the syslinux bootloader to run the program at boot-time. The program will then print the value of the TSC register and proceed to load the Linux kernel.
+
+The syslinux bootloader reads a configuration file, called syslinux.cfg, located in same partition into which it is installed, and then executes the command in the file. In this case, the file content will be:
+
+This is a good time to recap the different stages of the boot process and determine a benchmark plan for each:
+
+ When the power is turned on, the board firmware runs the BIOS, which initializes the hardware and loads and runs the syslinux bootloader.
+
+Syslinux reads the syslinux.cfg file, and according to the commands in it, executes the timestamp.c32 Comboot32 program. Comboot32 prints the current value of the TSC register to the VGA screen and proceeds to instruct syslinux to load the Linux kernel.
+
+As the kernel boots, every printk log message sent by it to the kernel log buffer is timestamped, relative to the kernel start time, which is based on the TSC register.
+
+Finally, after the kernel initialization has completed, the kernel runs the first user space program. In this case, this is the user program version of the timestamp program, which once again prints the current value of the TSC register and halts.
+
+ At the end of this process, the following values should be present:
+
+ The value of the TSC register when the bootloader runs — By dividing this value by the number of cycles per second (Hertz) of the machine, one can convert this cycle count to the the number of seconds since the CPU reset up to this point.
+
+The time it takes the kernel to finish initialization — Reflecting the PRINTK_TIMES timestamps in the log messages, this value is already represented in seconds, so no conversion is needed.
+
+The final TSC register value when the first user code program runs — Here, too, one should divide the raw cycle count as reported by the TSC register by the number of cycles per second the machine is running at to obtain the number of seconds.
+
+ From these measurements one can easily construct a somewhat crude, but useful, table of the contribution each of the stages has to the overall machine boot latency. These stages are as follows:
+
+ The latency of the BIOS phase is measured by reading the TSC register at the start of the bootloader code, as recorded by the timestamp.c32 program.
+
+The latency of the bootloader actions, including reading the kernel image to RAM and uncompressing the image, can be computed. This is done by subtracting the number of seconds it took the kernel to initialize, as reported by the PRINTK_TIMES feature, from the number of seconds reported by the user-space version of the timestamp program, and the number of seconds recorded at the bootloader launch. In addition, the various timestamps in the log messages throughout the kernel initialization process provide further insight as to the contribution of the various kernel subsystems and device drivers to the overall latency.
+
+Finally, the full boot latency — which is the overall time needed to get the first user program’s first line of code running — is the number of seconds computed from the value of the TSC reported by the user-program version of the timestamp program.
+
+ As an example, here are the values from one type of Intel Core-Duo-based board, running at 1.5Ghz:
+
+ The value reported from the timestamp.c32 program was 90933051222 cycles. Dividing the number of cycles by the number of cycles per second (1,500,000,000 on this board) gives a BIOS latency of 60.6 seconds. (The BIOS on this particular run wasted a long time scanning the IDE bus.)
+
+The timestamp provided by the PRINTK_TIMES feature in the kernel log messages indicated it took the kernel 0.44 seconds to initialize.
+
+The user program timestamp reported the first line of code ran at 93907247022 cycles, or 62.6 seconds after CPU reset, which is 2.0 seconds since the bootloader started.
+
+ If one subtracts the 0.44 seconds it took the kernel to initialize from the over two seconds of latency between bootloader and first user-program line of code, one can conclude that it took the bootloader roughly 1.66 seconds to read the kernel binary into memory from CompactFlash, including decompression time. So, it is clear that a faster storage medium can shave up to 1.66 seconds from the boot process, simply because it will take less time for the bootloader to load the kernel image into memory.
+
+Note that these numbers are not 100 percent accurate. They neglect to attribute some kernel initialization time before the first printk to the kernel initialization phase. In addition, the numbers do not reflect the latency caused by the bootloader code initialization, instead wrongly attributing them to the BIOS phase. However, the numbers are accurate enough to be used as the basis of evaluating the effect of various changes on overall boot-time, as well as to provide a clue as to where optimization efforts need to be focused.
+
+For further information about reducing and measuring boot latency, the embedded Linux wiki entry on BootTime is highly recommended.|||
+

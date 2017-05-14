@@ -1,0 +1,93 @@
+Git is known (among other things) for its very simple object model – and for good reason. When learning I discovered that the local object database is just a bunch of plain files in the directory. With the exception of the index ( ) and pack files (which are kind of optional), the layout and format of these files is very straight-forward.
+
+Somewhat inspired by Mary Rose Cook’s similar effort, I wanted to see if I could implement enough of to create a repo, perform a commit, and push to a real server (GitHub in this case).
+
+Mary’s program has a bit more of an educational focus; mine pushed itself to GitHub and so (in my humble opinion) has more hack value. In some areas she implemented more of Git (including basic merging), but in other ways less. For example, she used a simpler, text-based index format instead of the binary format that uses. Also, while her does support pushing, it only pushes to another repository that exists locally, not on a remote server.
+
+For this exercise, I wanted to write a version that could do all the steps including pushing to a real Git server. I also wanted to use the same binary index format that used so I could check my work using commands at each step of the way.
+
+My version, called , is written in Python (3.5+) and uses only standard library modules. It’s just over 500 lines of code, including blank lines and comments. At a minimum I needed the , , , and commands, but pygit also implements , , , , and . The latter commands are useful in their own right, but they were also very helpful when debugging pygit.
+
+So let’s dive into the code! You can view all of pygit.py on GitHub, or follow along as I look at various parts of it below.
+
+Initializing a local Git repo simply involves creating the directory and a few files and directories under it. After defining and helper functions, we can write :
+
+You’ll note that there’s not a whole lot of graceful error handling. This is a 500-line subset, after all. If the repo directory already exists, it’ll fail hard with a traceback.
+
+The function hashes and writes a single object to the “database”. There are three types of objects in the Git model: blobs (ordinary files), commits, and trees (these represent the state of a single directory).
+
+Each object has a small header including the type and size in bytes. This is followed by a NUL byte and then the file’s data bytes. This whole thing is zlib-compressed and written to , where are the first two characters of the 40-character SHA-1 hash and is the rest.
+
+Notice the theme of using Python’s standard library for everything we can ( and ). Python comes with “batteries included”.
+
+Then there’s , which finds an object by hash (or hash prefix), and , which reads an object and its type – essentially the inverse of . Finally, is a function which implements the pygit equivalent of : it pretty-prints an object’s contents (or its size or type) to stdout.
+
+The next thing we want to be able to do is add files to the index, or staging area. The index is a list of file entries, ordered by path, each of which contains path name, modificiation time, SHA-1 hash, etc. Note that the index lists all files in the current tree, not just the files being staged for commit right now.
+
+The index, which is a single file at , is stored in a custom binary format. It’s not exactly complicated, but it does involve a bit of usage, plus a bit of a dance to get to the next index entry after the variable-length path field.
+
+The first 12 bytes are the header, the last 20 a SHA-1 hash of the index, and the bytes in between are index entries, each 62 bytes plus the length of the path and some padding. Here’s our namedtuple and function:
+
+This function is followed by , , and , all of which are essentially different ways to print the status of the index:
+
+I’m 100% sure ’s usage of the index and implementation of these commands is much more efficient than mine, taking into account file modification time and all of that. I’m just doing a full directory listing via to get the file paths, and using some set operations and then comparing the hashes. For example, here’s the set comprehension I’m using to determine the list of changed paths:
+
+Finally there is a function to write the index back, and to add one or more paths to the index – the latter simply reads the whole index, adds the paths, re-sorts it, and writes it out again.
+
+At this point we can add files to our index, and we’re ready to do a commit.
+
+First, a tree object, which is a snapshot of the current directory (or really the index) at the time of the commit. A tree just lists the hashes of the files (blobs) and sub-trees in a directory – it’s recursive.
+
+So each commit is a snapshot of the entire directory tree. But the neat thing about this way of storing things by hash is that if any file in the tree changes, the hash of the entire tree changes too. Conversely, if a file or sub-tree hasn’t changed, it’ll just be referred to by the same hash. So you can store changes in directory trees efficiently.
+
+Here’s an example of a tree object as printed by (each line shows file mode, object type, hash, and filename):
+
+The function , strangely enough, is used to write tree objects. One of the odd things about some of the Git file formats is the fact that they’re kind of mixed binary and text – for example, each “line” in a tree object is “mode space path” as text, then a NUL byte, then the binary SHA-1 hash. Here’s our :
+
+Second, a commit object. This records the tree hash, parent commit, author and timestamp, and the commit message. Merging is of course one of the fine things about Git, but pygit only supports a single linear branch, so there’s only ever one parent (or no parents in the case of the first commit!).
+
+Here’s an example of a commit object, again printed using :
+
+And here’s our function – again, thanks to Git’s object model, almost pedestrian:
+
+Next comes the slightly harder part, wherein we make pygit talk to a real, live Git server (I pushed pygit to GitHub, but it works against Bitbucket and other servers too).
+
+The basic idea is to query the server’s master branch for what commit it’s on, then determine which set of objects it needs to catch up to the current local commit. And finally, update the remote’s commit hash and send a “pack file” of all the missing objects.
+
+This is called the “smart protocol” – as of 2011, GitHub stopped support for the “dumb” transfer protocol, which just tranfers files straight and would have been somewhat easier to implement. So we have to use the “smart” protocol and pack objects into a pack file.
+
+Unfortunately I made a dumb mistake when I implemented the smart protocol – I didn’t find the main technical documentation on the HTTP protocol and pack protocol until after I’d finished it. I was going on the fairly hand-wavey Transfer Protocols section of the Git Book as well as the Git codebase for the packfile format.
+
+In the final stages of getting it working, I also implemented a tiny HTTP server using Python’s module so I could run the regular client against it and see some real requests. A bit of reverse engineering is worth a thousand lines of code.
+
+One of the key parts of the transfer protocol is what’s called the “pkt-line” format, which is a length-prefixed packet format for sending metadata like commit hashes. Each “line” has a 4-digit hex length (plus 4 to include the length of the length) and then length less 4 bytes of data. Each line also generally has an byte at the end. The special length is used as a section marker and at the end of the data.
+
+For example, here’s the response GitHub gives to a GET request. Note that the additional line breaks and indentation are not part of the real data:
+
+So we need two functions, one to convert pkt-line data to a list of lines, and one to convert a list of lines to pkt-line format:
+
+The next trick – because I wanted to only use standard libraries – is making an authenticated HTTPS request without the library. Here’s the code for that:
+
+The above is an example of exactly why exists. You can do everything with the standard library’s module, but it’s sometimes painful. Most of the Python stdlib is great, other parts, not so much. The equivalent code using wouldn’t really even require a helper function:
+
+We can use the above to ask the server what commit its master branch is up to, like so (this function is rather brittle, but could be generalized fairly easily):
+
+Next we need to determine what objects the server needs that it doesn’t already have. pygit assumes it has everything locally (it doesn’t support “pulling”), so I have a function (the opposite of ) and then the following two functions to recursively find the set of object hashes in a given tree and a given commit:
+
+Then all we need to do is get the set of objects referenced by the local commit and subtract the set of objects referenced in the remote commit. This set difference is the objects missing at the remote end. I’m sure there are more efficient ways to generate this set, but this is plenty good enough for pygit:
+
+To do the push, we need to send a pkt-line request to say “update the master branch to this commit hash”, followed by a pack file containing the concatenated content of all the missing objects found above.
+
+The pack file has a 12-byte header (starting with ), then each object encoded with a variable-length size and compressed using zlib, and finally the 20-byte hash of the entire pack file. We’re using the “undeltified” representation of objects to keep things simple – there are more complex ways to shrink the pack file based on deltas between objects, but that’s overkill for us:
+
+And then, the final step in all of this, the itself – with a little bit of peripheral code removed for brevity:
+
+pygit is also a pretty decent example of using the standard library module, including sub-commands ( , , etc). I won’t copy the code here, but take a look at the argparse code in the source.
+
+In most places I tried to make command line syntax be identical to or pretty similar to syntax. Here’s what committing pygit to GitHub looked like:
+
+That’s it! If you got to here, you just walked through about 500 lines of Python with no value – oh wait, apart from educational and artisan hack value. :-) And hopefully you learned something about the internals of Git too.
+
+Please write your comments on Hacker News or programming reddit.|||
+
+Ben Hoyt is an experienced software engineer at TripAdvisor in New York City. He and his wife and three daughters live just across the Hudson River in New Jersey.

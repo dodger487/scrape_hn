@@ -1,0 +1,72 @@
+Django has added support for Postgres's built-in full-text searching as of version 1.10. This is a great alternative to a heavier search system such as elasticsearch or SOLR, when we want decent search capabilities without having to setup and maintain another service. Postgres's full-text search is Good Enough for a lot of use cases.
+
+With this quick guide, I'll show how to add full-text searching to a Django application. Simple use-cases are covered pretty well in the Django documentation, so I will focus on a slightly more advanced example that allows searching through multiple fields, including data through relationships, weighting fields differently, adding an index for speed, and methods to keep the search data up-to-date.
+
+It should go without saying that this is focused on Django with a PostgreSQL database back-end. This will not work with SQLite or MySQL. I also assume familiarity with Django and a basic understanding of Postgres.
+
+An example project is available on github that follows this guide.
+
+We will use these models as an example. It's simple data for a Blog-like application consisting of Posts with data both directly included and referenced through relationships. But most importantly, we have data we want to search through that exists as ManyToOne (author) and ManyToMany (tags)relationships.
+
+We will use this sample data:
+
+The first step is going to be building Documents for our posts. Each Document will be a logical representation of a single post, including:
+
+Here is an example Django query:
+
+This includes all of our data for each post, separated by spaces.
+
+So now that we have our documents, we need to convert them into a format that Postgres can index and search through. Postgres calls these Vectors. Django has a class to encapsulate this functionality called SearchVector. A can also take a weight, so we'll rewrite our query to create vectors.
+
+Each document has been normalized down to a common set of word stems. This includes dropping case, dropping common prefixes and suffixes (like 's', and 'es'), and removing common words like 'a', 'an' and 'the'. The numbers are where in the document it found that stem, and the letter is the weight. If we want to override the configuration setting for how Postgres processes the words, for example to specify a different language, then we can pass an optional parameter to SearchVector. If not given, then it will use whatever the database is configured to use by default, most likely based on the configured locale.
+
+So now that we have our documents, we can perform a search. The easiest way to do this is to filter on our documents.
+
+By default, django will use the function in Postgres to parse the query. The short of this is that it will search for documents that match all of the words. However, instead of a string we can pass a SearchQuery() instance, which can be combined with several boolean operators.
+
+If we use a custom with SearchVector(), then we should use that same with SearchQuery().
+
+Results are most useful if we can rank them, taking into consideration the different weights we've assigned to each part of the document. Django provides the SearchRank class for this purpose.
+
+This gives us the functionality we want, but this isn't the best way to go about it if we care about performance. Every time we run this query the database has to build all the documents, for all rows in the table before it can search and rank them. It's fine for a few rows, but after more than a couple hundred it's going to start slowing down to unacceptable speeds. If our documents only contained data from a single table, we could just build a GIN index, but that won't work in this case since we pull extra data from other tables. So what we really want to do is to pre-calculate all of the documents and store them in the database.
+
+Django provides a special field that allows us to store pre-calculated vectors in a field called . We'll add that field to our Post model:
+
+Then we'll migrate this to add the field.
+
+Let's update this field manually for now.
+
+Note: This will issue an UPDATE for each row in the table, which will take forever if our table has a lot of rows. If we are only including fields from a single model in our document, then something like this would be much more efficient:
+
+Django doesn't allow us to use aggregate functions with an update clause, but Postgres does, so if we really wanted, we could issue a query like this to refresh all of the documents at once:
+
+Now that we have our documents stored, we can easily search on them
+
+Now that the documents are stored in a field, we can create a GIN index to speed up searching. With Django 1.11, this is as easy as adding an Meta option to our model, then create and apply a migration.
+
+For Django 1.10, we'd need to create an empty migration then add a operation:
+
+This is great and all, but as soon as any of the data changes, the documents will be out of date, and the search results will be incorrect. The first way we could address this is with a cron or scheduled task that updates the whole table (like we did above) at regular intervals. This would be a good option for an application that processes a lot of updates, or does its updates in large batches. This way we don't add overhead to every update, and instead can more efficiently update all rows at once.
+
+For other applications that have a slow steady stream of updates, it would be more appropriate to update every time the data changed. The upside is that the search data will always be up to date. The downside is that every update will incur extra overhead as the search_vector is calculated.
+
+A compromise would be to queue up the update to the search_vector as an asynchronous process, so that it's updated fairly quickly, but the updates can still be done as a batch. This is outside the scope of this article, but it shouldn't be too difficult depending on the application architecture.
+
+The best method is going to depend on the particular application. Here are a couple simple ways to update on every save.
+
+One method to update the document is to override the save() method on Post. With this method, every time the data that search relies on is updated, then the search_vector is also updated alongside it. So search results reflect data changes immediately. This does incur an overhead on every update to the database, though.
+
+First we'll create a custom manager that adds documents to the queryset when we request it, so we can keep things DRY, and only have our SearchVectors defined in one place.
+
+Now we'll update our Post model and add our custom manager and a custom save function. The idea here is to save the data to the database, then do a SELECT query that joins all the data together and then save the new search_vector. So each save will result in an UPDATE, SELECT, then another UPDATE.
+
+Also, updates to authors and tags won't trigger the , so we'll also add signals for those that force a on the Post as well to update the search_vector.
+
+Now any changes to a Post, Author or if tags are added, removed or cleared will cause the search data to be updated. If a tag is renamed, then we won't pick up on that without creating another signal handler.
+
+It's also possible to install a few triggers in the database that will automatically update the search_vector whenever the data is changed. I won't go into too much detail, but they will look something like this. We can easily add these to a migration that uses a RunSQL operation to install them into our database. The idea is exactly the same as above, but since the database can do it all locally and not have to send data back and forth to Django, it will perform better.
+
+Now we have a working application using Postgres full-text search, and once set up, it can be mostly forgotten about. Compared to setting up elasticsearch or SOLR (even with Haystack), this is a breeze, and results are going to be good enough for most applications.
+
+For more information and more features, such as language support, custom stemming, trigrams, accents, etc, please see the following sources:|||
+

@@ -1,0 +1,54 @@
+I ran across Pierre Terdiman's article on Radix Sort for floating point numbers, and I became interested in seeing how far I could push the performance.
+
+I figured out what I think are a few unusual optimizations, and while I'm not really sure that any of them are new, the combination makes my code run pretty fast.
+
+First, I use histogramming to make the radix work fast -- this is very standard stuff. The standard approach is to take all the bits in a certain radix and build the histogram for them, then summing across the histogram to determine where to copy each element, and then making a final pass to copy all the bits in-order. This is two read-passes per radix, but we can certainly do better.
+
+In particular, histograms don't change when you change the order, so I just do all the histogramming in one pass through the data. One read builds several histograms.
+
+So if you histogram a floating point number in four 8-bit passes, you can build four histograms from one pass through the data, rather than four.
+
+This would mean 5 passes through the data, rather than the usual 8.
+
+Pierre (above) has a nice approach to floating point sorting, a good way to find the sign bit and switch the order of the values. But I wanted to do it directly, without a need for a final pass.
+
+If you look at them in binary, single precision floating point numbers have two problems that keeps them from being directly sortable.
+
+[sign] [exponent] [mantissa]
+
+ First, the sign bit is set when the value is negative, which means that all negative numbers are bigger than positive ones. You could just flip it, of course (I thought this was all I had to do at first), but there's still another problem.
+
+But the second problem is that the values are signed-magnitude, so "more negative" floating point numbers actually look bigger to a normal bitwise comparison.
+
+To fix this, we have to do some bit-twiddling in integer. It turns out that flipping the exponent inverts the order of the exponents (flips them low to high), and flipping the mantissa does the same. Basically, the exponent is a "range" of numbers, and we flip the orders of these ranges. And then the mantissa is the numbers in each range, and we flip these as well.
+
+We're supposed to call this a "bijective mapping" from 32-bit integers to themselves, which means, for every 32-bit number, there's another unique one that we map to, and we can invert the mapping to get back exactly where we started.
+
+It turns out that when you say "flip" you can also say, "xor with 1's" -- for instance, if you had an 8-bit number "x", to compute "255-x" you could simply use (255 ^ x) instead -- without any of the evils of carrying like addition has. (In case it wasn't clear, 255 is eight "1s" in a row.)
+
+So, to fix our floating point numbers, we define the following rules:
+
+To get back, we flip the sign bit always, and if the sign bit wasset, we flip the other bits too.
+
+If we write this as a single xor, what we want is:
+
+
+
+This leads to two routines to convert floating point values to sortable numbers and back again. I call them FloatFlip and IFloatFlip:This shifts the sign bit down 31 places (to make the entire number "0" or "1"), and then either inverts it or subtracts one. In particular, this always makes "0" or "0xFFFFFFFF" which becomes "0x80000000" or "0xFFFFFFFF" after or'ing in a 1.
+
+The third optimization notices that 11-bit histograms fit in L1, so we use 3 11-bit histograms, rather than the more standard 4 8-bit ones.
+
+An initial implementation used 8-bit histograms, and this 11-bit optimization improves performance by about 40%.
+
+The final optimization uses prefetch instructions (from the SSE instruction set) to optimize read access to memory. This gives an additional 25% speedup.
+
+If done well, this code should be memory-bound. In this case, I think I fall a little bit short, though the fact that prefetch gave such a reasonable speedup means that I'm close to memory bandwidth.
+
+My mergesort (from my class library) achieves about 12 sorts/sec on this test, approximately equivalent to the std::sort routine in Microsoft's implementation of the STL, distributed with Visual C++ (a quicksort, I believe.) Both of these implementations are considered incredibly well optimized.
+
+After all the above optimizations, the radix achieves 97 sorts/sec on this test, a quite amazing improvement.
+
+I hope the code is quite readable, so I'm just posting it here for everybody to try. You'd have to do some modifications to make it useful, but this is nice as a raw speed test.
+
+And for trying this at home, a zipfile for you: radix.zip|||
+

@@ -1,0 +1,123 @@
+HackerEarth prides itself in its scalable & automated evaluation system. What was initially designed keeping standard programming problems in mind (check this post out), gradually evolved to accommodate a plethora of problem types across various tech domains.
+
+Note: Not all of the problem types are accessible by end users publicly. Some are reserved for HackerEarth’s Recruit product.
+
+While most of them have their own evaluation stack and are automated in the complete sense of the word, evaluating submissions for some of these problem types requires partial manual intervention. Evaluation of Android submissions for instance, is not automated.
+
+An android submission is basically an apk. Given a requirement, the user has the freedom of designing and implementing an app in whatever way he/she deems fit. Given the nature of such submissions, it would be ill conceived to design an evaluation system in a one-size-fits-all manner. Hence the need for manual intervention.
+
+Each submission is rated based on the following parameters:
+
+For a given hiring challenge, a dashboard containing all the submissions along with the candidate details is provided to the recruiter. The recruiter then follows each of these steps:
+
+Straight off, you can identify serious cons to this approach.
+
+This was tedious and not scalable.
+
+We set out to solve these problems and defined the following objectives:
+
+Note: The technique we apply for streaming applications is not tailor made for the emulator, it applies to any kind of GUI application.
+
+Before I present to you a system-level overview, lets run through the core components. We will introduce each component and it’s functionality via usecases.
+
+Any GUI application requires a graphical system that provides a basic framework, or primitives, for building GUI environments. Basic primitives like:
+
+All *nix based systems provide the X Window System for the same. Every GUI application that runs on a Linux machine interacts with what is called an X Server.
+
+As depicted above, the X Server relies on input and output devices like the Monitor, Keyboard and Mouse.
+
+Note: DISPLAY is an environment variable that instructs an X client(read GUI application) which X server it is to connect to by default.
+
+A Headless Server, does not have a screen, keyboard or mouse attached. Most servers are configured to be headless so as to reduce operational cost. Since the server has no associated display, there is no X Server running on such machines.
+
+Which is why, you get something like this when you try running a GUI app on a headless server.
+
+Note: glxgears is just a GUI app that we’ll utilise for the purpose of this demo.
+
+So how does one go about running GUI apps on a headless server? Enter Xvfb.
+
+Xvfb or X virtual framebuffer is a display server that performs all graphical operations in memory without showing any screen output. This virtual server does not require the computer it is running on to have a screen or any input device. Only a network layer is necessary.
+
+Here’s how you’d run glxgears, with Xvfb set up.
+
+This time, the app was able to successfuly run. But you won’t see anything, because this machine is by definition headless(i.e without a display). In order to actually interact with it, we need to setup a VNC server.
+
+RFB (remote framebuffer) is an open simple protocol for remote access to graphical user interfaces. It enables one to transmit GUI frames and input events across a server and a client, over the network.
+
+VNC (Virtual Network Computing) is a graphical desktop sharing system that uses the Remote Frame Buffer protocol (RFB) to remotely control another computer.
+
+Various implementations for VNC Servers and clients exist. Most VNC Servers create their own virtual X Display. But we already had that covered by using Xvfb. We simply needed to export an existing X Server, which is why we opted for the x11vnc server.
+
+Here’s how you’d start an x11vnc server pointing to a DISPLAY at :1.
+
+Note: Make note of the port 5900, which is the port that the server is listening on
+
+Connecting to this VNC session can be done using a VNC viewer(read client) or via SSH X11 forwarding.
+
+Here we connect to a VNC server running on localhost at port 5900 using a vncviewer.
+
+which then allows us to interact with the DISPLAY :1, which is what the VNC Server was connected to.
+
+In order to interact with a VNC Server, one would need to install a VNC viewer. This is a no go, if we wish to eliminate dependencies at the recruiter’s end. Ideally, we want to establish a VNC session from within the browser. Basically we needed a VNC client built for the browser.
+
+NoVNC is a VNC client using HTML5 (Web Sockets, Canvas). The project is available on GitHub. Particularly check out the Integration section.
+
+Connecting to a VNC server from javascript is as simple as:
+
+With the VNC Server process running, if you try establishing a connection from the noVNC client, it will fail with the following error.
+
+The reason this happens is because the noVNC client communicates using WebSockets, which is different from the raw TCP protocol that the VNC server uses. To bride this gap, the folks at noVNC built a websocket proxy called websockify, that translates low-level TCP traffic into WebSocket traffic and vice-versa.
+
+The following command listens for WebSocket traffic at port 6080, translates and forwards the same onto port 5900(which is where the VNC server is listening). Communication is bi-directional.
+
+Consequently, we update our noVNC client to instead connect to the websocket port.
+
+The noVNC client should now be able to establish a connection.
+
+The Android Emulator supports several hardware acceleration features to improve performance, sometimes drastically. An Android Developer usually concerns himself/herself with these details only once. One can find a comprehensive guide in the Android Docs.
+
+The emulator runs inside a Virtual Machine. In order to configure the VM for acceleration, the underlying hardware needs to expose what is called a hypervisor. On a Linux machine this comes in the form of Kernel-based Virtual Machine(KVM).
+
+In order to get access to the hypervisor, we needed to spin a bare metal machine(as opposed to running the emulator on a machine provisioned by a cloud provider, which are VMs themselves).
+
+You can refer to the docs for how to go about exposing the hypervisor.
+
+An Android Virtual Device (AVD) definition lets you define the characteristics of an Android phone, tablet, Android Wear, or Android TV device that you want to simulate in the Android Emulator.
+
+We pretty much stuck to the procedure defined in the docs and defined a bunch of AVDs, one for each emulator that we were planning to run. Few things worth a mention here are:
+
+In order to start an emulator, you need to first define at least one AVD. While there are multiple parameters that can be specified, we will concern ourselves with only 2 of them.
+
+Note: As we saw in the Running GUI apps on Headless Server section, we need to point the DISPLAY to the running Xvfb process first.
+
+Let’s break down the requirements for running a single emulator:
+
+Note: In software renderers, graphical computations are performed on the CPU itself. One would opt for a software renderer if there is no GPU available, since it introduces quite a bit of computational overhead.
+
+Factoring in these requirements. We came up with the following machine specifications to parallely run 6 emulators:
+
+We purchased a dedicated server meeting these specifications from this vendor called Hetzner. Their pricing is surprisingly reasonable and their servers have consistently performed well.
+
+While there was now a way to facilitate live interaction with an emulator, we needed certain primitives to be exposed on the emulator so that we may run them programmatically.
+
+For this, we leveraged the ADB (Android Debug Bridge), which let us send commands, among other things, into a running emulator by exposing a port(ADB PORT) on the host machine.
+
+Note: When running more than one emulator on a machine, one needs to explicitly specify the ADB PORT for the consecutive emulators to avoid port clashes.
+
+We were now able to perform operations like:
+
+And here’s a simple bash script that incorporates all of the components, to finally expose a websocket that a noVNC client can connect to.
+
+Note:This is a grossly oversimplified version. Because there are so many moving parts, we need to ensure each of these processes have been initialised and are in running state before starting the next one.
+
+The entire setup can be considered as one unit, which we will refer to as an endpoint hereon. We built a Thrift service that provisions such endpoints, along with exposing certain other primitives like - Installing/uninstalling of apks, Flushing of the Activity Stack, etc.
+
+And here’s the thrift definition for Droid Service.
+
+In Sizing up the machine we saw that we could run at most 6 emulators on a machine with those specs. We had to be able to accommodate more endpoints by horizontally scaling up.
+
+We employed the Apache Zookeeper project to this effect. One of it’s usecases lies in centrallized configuration management, which provides recipes for designing distributed systems.
+
+And here’s the thrift definition for the Master Droid Service|||
+
+Comprehensive guide to setting up remote emulators and interacting with them from the browser

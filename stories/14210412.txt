@@ -1,0 +1,40 @@
+This is a fascinating post about building a time series database from scratch. The author explicitly warns that they have no background in databases, but given that this is my day job, I decided I might throw in my 2 cents about the way they do things.
+
+Note: Large protion of the original post talk about their existing system (which they are replacing), and most of my criticisms are about that system. Where I'm talking about the new system (toward the end of this post) , I'm noting that explicitly.
+
+I started writing this post about halfway through reading  the post, mostly because I got all sort of comments and wanted to keep a record of things as I’m reading it. It is possible that some of the things that I’m concerned about would be answered later in the post. Without further ado, my comments. It will probably won’t make sense without reading the original post.
+
+They are storing their time series data using keys similar to:
+
+And then they allow to do queries on both the keys and time (all GET requests on /status in the past week). I would have thought about this, but it it a very interesting way to handle queries on such an environment. They also seem to need to do queries that are both in the same series and across series, they call it vertical and horizontal queries.
+
+Yes, that is pretty much the key for good performance.
+
+Yes, being able both write efficiently and query efficiently are two very different problems that you need to handle, and often you need to select which one you’ll prefer.
+
+What?! No, you can’t do that. At least, you can’t do that and get reasonable behavior. To start with, even though you are doing batch, you are actually guaranteeing that your write pattern would be random. Why is that?
+
+Because if you are writing every KB (which is what they do) per file, you are basically ensuring that the OS will have to write to different sectors / pages on the physical drive. So if you have writes to 100 series, you are going to be writing to 100 different on disk locations. To make things worse, you aren’t writing in 4KB increments, which basically means that you are doing buffered writes. That information isn’t in the post, but it is a safe assumption, since if they weren’t doing buffered writes, there is no way that the operating system will be able to catch up with the kind of load. That in turn means that you don’t have any durability whatsoever.
+
+In fact, this is mentioned explicitly, but only in the case of losing the writes made in the application buffer. I’m assuming that they either don’t care or have a different manner for avoiding / dealing with data loss / corruption in the case of machine failure. More to the point, given that they do compression, they need to be able to recover from partially written data to the files, and from the post, I don’t think that they are doing that.
+
+But those issues are only just the start. On Windows, you don’t typically worry about the number of open files you have, but on Linux, there is a typical a limit on the number of open files you can have. It is common to have that around 64K max open files. Using a file per series means that you are very likely going to run into issues with the number of open files you have, in fact, it would be very easy to construct a query that would hit that limit, and that would have a global impact on the server.
+
+Other issues with such large number of files is that file systems don’t really like it when you have so many files, this is discussed in the post as running out of inodes, but we have noticed performance degradation on directories with large number of files on a wide variety of file systems.
+
+When you implement expiration of data, it also means that you have to move data from the middle of the file to the beginning, and then truncate it, that leads to a huge amount of additional I/O, likely blocking and is probably something that an operations guy is looking at.
+
+Another issue is that because they have a file per series, they need to cache it aggressively, leading to competition between the database cache and the operation system page cache. It also means that the application is sensitive to allocation patterns, and on Linux, that is a really bad thing to do, because the silly OOM killer.
+
+Yep, that was my first thought when I started reading this. I follow the reasoning on why OOM is there, but I still think it is a very silly choice.
+
+The actual solution that they present is to have all the data for a particular time frame (2 hours, in their case) in a block directory. I’m not sure why they have a separate directory from block (with multiple chunks per block), and mmaping the whole thing. That is a far better solution, but they also implement compaction, which get you right back to write amplification, and I don’t quite get why. The example they give is that if you have a week long query, you don’t want to merge results across 80 blocks, but I would assume that this is surely better than having to write the same data over and over again.
+
+This just screams at me that it is wrong. Oh, not the actual content, but look at the list, it should be [9, 10, 29], because working with the sorted data is going to enable so many more interesting scenarios. Oh, it seems like that is what they are doing in the new version, so that is good.
+
+I think that I found the right location for the code, and this line scares me, basically, it means that this will issue an fsync once every 10 seconds. That means that there is a 10 seconds period of potential data loss. Given the data that is kept, that is probably not an issue, and losing 10 seconds of samples is likely not going to be an issue.
+
+That means that you can basically do all writes to memory all the time, and that gives you a major performance boost all around, at the expense of safety.
+
+This is an interesting enough topic that I’ll do another post, discussing how I’ll implement the same scenario with Voron.|||
+

@@ -1,0 +1,47 @@
+The rate limit service is a Go/gRPC service designed to enable generic rate limit scenarios from different types of applications. Applications request a rate limit decision based on a domain and a set of descriptors. The service reads the configuration from disk via runtime, composes a cache key, and talks to the redis cache. A decision is then returned to the caller.
+
+The rate limit configuration file format is YAML (mainly so that comments are supported).
+
+Each configuration contains a top level descriptor list and potentially multiple nested lists beneath that. The format is:
+
+Each descriptor in a descriptor list must have a key. It can also optionally have a value to enable a more specific match. The "rate_limit" block is optional and if present sets up an actual rate limit rule. See below for how the rule is defined. The reason a rule might not be present is typically if a descriptor is a container for a 2nd level descriptor list. Each descriptor can optionally contain a nested descriptor list that allows for more complex matches and rate limit scenarios.
+
+The rate limit block specifies the actual rate limit that will be used when there is a match. Currently the service supports per second, minute, hour, and day limits. More types of limits may be added in the future based on customer demand.
+
+In the configuration above the domain is "mongo_cps" and we setup 2 different rate limits in the top level descriptor list. Each of the limits have the same key ("database"). They have a different value ("users", and "default"), and each of them setup a 500 request per second rate limit.
+
+In the preceding example, the domain is "messaging" and we setup two different scenarios that illustrate more complex functionality. First, we want to limit on marketing messages to a specific number. To enable this, we make use of nested descriptor lists. The top level descriptor is ("message_type", "marketing"). However this descriptor does not have a limit assigned so it's just a placeholder. Contained within this entry we have another descriptor list that includes an entry with key "to_number". However, notice that no value is provided. This means that the service will match against any value supplied for "to_number" and generate a unique limit. Thus, ("message_type", "marketing"), ("to_number", "2061111111") and ("message_type", "marketing"),("to_number", "2062222222") will each get 5 requests per day.
+
+The configuration also sets up another rule without a value. This one creates an overall limit for messages sent to any particular number during a 1 day period. Thus, ("to_number", "2061111111") and ("to_number", "2062222222") both get 100 requests per day.
+
+When calling the rate limit service, the client can specify multiple descriptors to limit on in a single call. This limits round trips and allows limiting on aggregate rule definitions. For example, using the preceding configuration, the client could send this complete request (in pseudo IDL):
+
+And the service will rate limit against all matching rules and return an aggregate result; a logical OR of all the individual rate limit decisions.
+
+An example to illustrate matching order.
+
+In the preceding example, we setup a generic rate limit for individual IP addresses. The architecture's edge proxy can be configured to make a rate limit service call with the descriptor ("ip_address", "50.0.0.1") for example. This IP would get 10 requests per second as would any other IP. However, the configuration also contains a second configuration that explicitly defines a value along with the same key. If the descriptor ("ip_address", "50.0.0.5") is received, the service will attempt the most specific match possible. This means the most specific descriptor at the same level as your request. Thus, key/value is always attempted as a match before just key.
+
+The Ratelimit service matches requests to configuration entries with the same level, i.e same number of tuples in the request's descriptor as nested levels of descriptors in the configuration file. For instance, the following request:
+
+Would not match the following configuration. Even though the first descriptor in the request matches the 1st level descriptor in the configuration, the request has two tuples in the descriptor.
+
+However, it would match the following configuration:
+
+The Ratelimit service uses a library written by Lyft called goruntime to do configuration loading. Goruntime monitors a designated path, and watches for symlink swaps to files in the directory tree to reload configuration files.
+
+The path to watch can be configured via the settings package with the following environment variables:
+
+For more information on how runtime works you can read its README.
+
+For information on the fields of a Ratelimit gRPC request please read the information on the RateLimitRequest message type in the Ratelimit proto file.
+
+The rate limit service generates various statistics for each configured rate limit rule that will be useful for end users both for visibility and for setting alarms.
+
+These are examples of generated stats for some configured rate limit rules from the above examples:
+
+The debug port can be used to interact with the running process.
+
+You can specify the debug port with the environment variable. It defaults to .|||
+
+ratelimit - Go/gRPC service designed to enable generic rate limit scenarios from different types of applications.

@@ -1,0 +1,129 @@
+Nedoka is a platform which facilitates the rapid prototyping of containers and containerised environments. It allows you to merge complete or partial containers and stacks, create relationships and more, while handling DNS, reverse proxy rules, backups, restores, secrets etc.
+
+It's a very malleable and powerful sandpit which isn't locked down and trades security for convenience in a few places, don't expose it to the internet unless you understand and mitigate the risks.
+
+If you like Nedoka, please consider backing its development on Patreon
+
+Clone this repo or download and extract the zip wherever you want it to live on your system. Data and backups will be stored in subdirectories of that folder, so put it somewhere sensible.
+
+Nedoka comes with a bootstrap/kickstart script which will configure pretty much everything on mac os and Ubuntu (16.0.4 tested only) If you're using one of these operating systems, just cd into the folder you extracted, and bring the Nedoka VM up using
+
+After it finishes installing and configuring pre-requisites and building the VM, you can use with arguments to do the necessary.
+
+Finally, edit your network settings and add the DNS server and search domain and you'll be good to go.
+
+If you're able to use the bootstrap/kickstart script you can skip ahead to adding the CA, otherwise...
+
+Other Linux distros and Windows don't have a bootstrap/control script yet, but it's not difficult to set up manually. Here's a rough guide to what you need to know, best of luck!
+
+Install Vagrant, VirtualBox, dnsmasq and whatever the equivalent of nfs-kernel-server is for your distro.
+
+Add to dnsmasq.conf (wherever it lives)
+
+Add to dnsmasq.d/test (probably in /etc)
+
+Optionally, create profile aliases to control the VM - something like this should do the trick:
+
+Install Vagrant (not 1.9.3), VirtualBox and Acrylic DNS Proxy. If you don't have any of these already you can use chocolatey to do it by running this in an Administrator cmd window.
+
+Change the IP in the line to whatever your primary DNS server normally is (or just leave it as google's 8.8.8.8)
+
+Scroll down to the SecondaryServer section and set the server address and affinity mask like this:
+
+Edit your windows network settings and add 127.0.0.1 as your primary DNS server, and .test as a suffix.
+
+Then you should be able to just hop into the directory and run vagrant up followed by vagrant ssh to get connected to the VM.
+
+Note: Malwarebytes does something screwy which prevents local resolvers from working correctly. I've just been lazily disabling MBAM when testing Nedoka on Windows to get it ready for release (I'm normally on Mac) you might want to dig into a better solution if you use Windows + MBAM
+
+During build, nedoka creates a certificate authority which it uses to sign certificates as required. You'll find this in the data/ folder once the VM has been provisioned. Add it to your OS keychain and/or browser keystores and trust it to get those delicious green padlocks.
+
+Once everything has downloaded and built, our DNS settings are configured and we've trusted the CA, we can connect to the VM.
+
+From the directory the Vagrantfile lives in, type
+
+Assuming you've followed along to this point and haven't hit any weird problems, your vagrant box will be up, DNS is configured and you're ready to start creating containers. We'll build out a little PHP stack over the rest of this guide (with a detour here and there). A database dump and frontend files already exist, so don't worry, we're just running through the Nedoka end of things, we won't be writing a bunch of code neither of us care about.
+
+Start by creating config/tutorial/tutorial.yml in your text editor of choice. We could spread the containers we'll be describing in this guide out into other files in the config/ directory tree (any containers in config/ can reference each other) but we'll just put everything in tutorial.yml for now.
+
+To add a simple container we can run, we just need to give it a name and tell it which image to use - we're going to build a little PHP stack, so we'll call the first container just that, and point it at the php:7-apache image on docker hub.
+
+Bring it up with ( is shorthand for - either works)
+
+The image will be pulled, built as a new container and run. We haven't done any port forwarding or reverse proxying though, so we won't be able to do much with it yet.
+
+Add an http service endpoint as below - services can be called anything and can specify ports, forwarded ports and paths. In this case we've called our service 'http' which means nedoka will handle the reverse proxying automatically (similarly, when a https service is defined it'll create and sign a certificate before doing the reverse proxying)
+
+Run it again with
+
+When it finishes building this time, you'll see a .nedoka URL, if you visit that you'll see the apache server running, but by default the php:7-apache image doesn't have anything in its web root, and that "Forbidden" page doesn't look very nice, so Let's throw a quick build script in there to add an index which just displays phpinfo.
+
+You can run it again and see your new index now or take my word for it that you'll see a phpinfo page, it's thrilling, but I won't hold it against you if you just keep reading instead.
+
+The web piece of this config comes in handy elsewhere though, so it's already provided as a standalone snippet we can merge into any container. It looks like this:
+
+So to use it instead, we can change the php-stack definition to this:
+
+By declaring the php-stack using , we've created the resulting container by merging both definitions, if you run again now you'll see it looks exactly the same. In fact it won't even need to rebuild because the dockerfile nedoka creates behind the scenes won't change.
+
+Merging stacks this way is very handy, but bear in mind you'll need to have a bit of logic in there if you're merging with different distros.
+
+We'll add a database next, modify the php-stack section as below:
+
+Try another and you'll see the supporting containers are built, vault and consul will come up for secrets storage, mysql will come up, a database and user will be created, and all the details necessary to use it will be baked into our demo container as environment variables.
+
+If you take a look at the environment variables in the php-stack container now with (x is shorthand for ) you should see something like this:
+
+The names look a little weird, but that's because Nedoka is generating the database names by merging the container's ancestry and name with the database name. You don't need to worry about what the databases are called though, that's provided as an env var too (bolded).
+
+Let's add a phpmyadmin container as a requirement now. We could keep it seperate and run it manually with - or run both with , but we'll require it in the php-stack stack so nedoka will handle bringing it up for us if it's offline when we need it.
+
+again and you'll see it'll bring up our phpmyadmin container. You can now hit http://phpmyadmin-mysql and take a look at the database.
+
+Looking at the database now will show you various tables exist. These were imported from config/tutorial/php-stack/mysql/tutorial.sql - let's break down why it looked in there subdirectory by subdirectory
+
+This happens automatically, so if you create a file config/my-project/testing/test.yml and in it, define a container called mycontainer with a postgres database called backend, nedoka will automatically try to import a database dump from config/my-project/testing/mycontainer/pgsql/backend.sql when you baseline it (or a container derived from it)
+
+Anyway, getting back on track, we've just been working on a single container so far, but we called it 'php-stack' for a reason. In this hypothetical scenario we're working on something we intend to be compatible with php5 and php7, so we're going to build our php-stack container out into a proper stack hosting php5 and 7 containers now, we'll also mount our frontend code.
+
+First thing to do is destroy php-stack - we won't be using it again, we also don't care about backing it up so we'll use --nobackup (-nb) and we want to get rid of the database, so we'll also use --remove-databases (-rmdb) the complete command is (d is shorthand for )
+
+Next, we'll remove the line specifying the image in php-stack, and instead add 2 children.
+
+Fire off a , php7 and php5 will be built, they'll also both get their own databases and db users. Go ahead and visit the sites, our index.php will show what php version they're running.
+
+Now let's toss in a mountpoint to the frontend, and change our build script so it installs the pdo bits we need to wire it all up.
+
+Ru it again the same way and you'll see we've got working frontends talking to their own databases.
+
+Now spin off a new stack called php-stack-pgsql which hosts its postgres equivalents, by adding the following at the end of the file:
+
+Run it again and it'll bring up/create what it needs and make the sites available on the same URLs. Speaking of URLs, if you type you'll see a list of defined endpoints for running containers.
+
+We did a couple of new things when we created the pgsql stack. We've merged one stack into another (with 'as') and we've subtracted any existing settings from the requirements, databases, and onbuild using a single hyphen at the start, followed by a newline in the string (onbuild) and surrounded by quotes in the lists (requires/databases - the quotes are there because it's yml, and if you write - - it's not treated as a list with a hyphen in it, it's treated as a list within a list)
+
+Note that if we'd changed the name of php-stack, we'd have had to rename the directory structure our database dump lives in - it's worth bearing that in mind. Renaming containers also involves renaming their backup directory, which I don't really like and will fix somehow at a later date.
+
+Anyway, by adding a hyphen at the start, followed by a newline in strings or surrounded by quotes in lists, it's possible to destroy inherited settings. You can do this with dictionaries too just by providing them as empty. e.g. to completely remote the requirements, we could have written:
+
+As well as the minus symbol, we can also use plus - this controls where info gets merged, e.g:
+
+When running cat3, the onrun script will create a file with the lines in correct order, because each inherited setting is being put where the plus symbol is.
+
+It's time for a detour within a detour though I'm afraid...
+
+So far when we've been running containers, it's been single containers or entire stacks, but it's also possible to bring up individual containers within stacks by providing their path. To bring up just php7 in the php-stack-pgsql stack now, type
+
+the container which is acted upon is the first one encountered when scanning the directory tree and files within - if no container by that name is running
+
+For instance if you run and have containers called "foo/php7" and "bar/php7" defined in that order within a file, foo/php7 will be used. Nedoka is good but it's not a mind reader, so if you feed it an ambiguous container name with no context, it'll use the first one it finds... However:
+
+when given an ambiguous name, nedoka will always treat active containers as the assumed context
+
+Given that same example, even if foo/php7 occurs first when the containers are indexed, if bar/php7 is running, will rebuild it, rather than replacing it with foo/php7.
+
+We've really only scratched the surface of what's possible, but sadly this is where the quickstart ends. For more info, you can read the reference in the docs/ directory, or look at the builtin containers in config/ to see how I've approached the creation of the builtin containers. Tutorials are also being posted for all backers on Patreon as time allows.
+
+So for now, have fun, and make cool stuff!|||
+
+nedoka - Rapid creation and management of complex containerised dev/lab environments.
