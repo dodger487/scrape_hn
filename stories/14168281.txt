@@ -1,0 +1,79 @@
+I'm just going to dump all my discoveries here, and hopefully they would be useful to the Nintendo Switch community.
+
+If you think something is wrong, have some observations that I might have missed, stuff you want to contribute, or just general questions please feel free to post here or contact me by email:
+
+If you want to use the information here somewhere else, feel free to do so, but do please credit me (dekuNukem).
+
+Full-size PDF of Joycon pinouts, both left and right.
+
+The "JC" is for the 10-pin Joycon connector, see below for details.
+
+There are 2 SPI devices on the bus, one 4Mb MX25U4033E flash memory and one LSM6DS3 6-axis MEMS accelerometer and gyroscope.
+
+Here is a capture of SPI lines when the Joycon battery is connected, and then attached to the console.
+
+It looks like SCK runs at 12.5MHz when accessing the flash memory, but switches to 6.25MHz when accessing the MEMS chip.
+
+Upon connection the microcontroller initializes a software reset of the MEMS chip, then set up the accelerometer and gyroscope as follows:
+
+The accelerometer also has AA filter at 100Hz bandwidth, low-pass filter enabled, slope filter enabled with cut-off frequency at 416Hz.
+
+The Joycon then polls LSM6DS3 every 1.35ms(740Hz) for both accelerometer and gyroscope data in all axises, totaling 12 bytes(6 axises, each axis 2 bytes).
+
+Since the Joycon polls MEMS data every 1.35ms but only send out controller update every 15ms, there might be some internal averaging to smooth out the data, needs to go through the numbers to find out.
+
+Well there's a capture of the SPI lines when the Joycon is powered up (battery connected), which contains all the address and data Joycon reads from the flash memory. I don't have time to go through it right now but of course you can if you want.
+
+The SPI flash can be dumped post-pairing over UART using where XX XX XX XX is a 32-bit little-endian address and YY is the amount to dump up to 0x1c bytes. The resulting data will be at +0x20 in the Joy-Con response.
+
+Joy-Con color, serial and calibration settings are all stored on the SPI flash and are accessed through the above query.
+
+When attached to the console, the Joycon talks to it through a physical connection instead of Bluetooth. There are 10 pins on the connector, I'm just going to arbitrarily name it like this:
+
+Looking at the pins on both Joycon facing towards you, the left most one is Pin 1, and the right most one is Pin 10. I simply removed the rumble motor, burned a hole on the back cover, and routed all the wires out through that.
+
+Capture of the docking of the left and right Joycon.
+
+I took apart 2 left Joycons, one grey one red. Below you can see the difference in the response between two Joycons.
+
+Pin 5 (Serial data, console to Joycon) is normally pulled high on the console side when nothing is connected. Since this line is inverted on the Joycon side, it will be pulled down when a Joycon is attached to the console, thus initializing a handshake. It seems Pin 5 needs to be pulled down for a while for the handshake to take place, 500ms works for me. Handshake starts at 1000000bps, and the console will send a 4-byte start sequence of , followed by 12 byte command of . It will send those commands repeatedly every 100ms (10Hz) for 3 seconds. Joycon respond with . If no response is received it gives up and wait for another event on the line. The console then sends , to which Joycon respond with a 20-byte MAC response used to pair the Joy-Con to the console. After the response is received the little Joycon insertion animation starts on the screen. The color for this animation is cached on the console after a Joy-Con has been connected for the first time and the color has been retrieved from SPI flash. They console sends , a command that switches baud rate from 1000000 to 3125000. Joycon respond with . Note that the faster baud rate takes effect from the next command. This command is not required for pairing to complete. Now serial comm is at 3125000bps. Console sends , Joycon responds with . Now the pairing is seemingly done, the console will now send every 15ms to ask for a controller status update. See "Protocol" section below for details.
+
+It turns out the last byte of each command seems to be a checksum of some sort, and without figuring it out it would be rather difficult testing what each command does because the console will not accept commands with the wrong checksum.
+
+Luckily here are some examples of the checksum, seeing it changes drastically with the difference of a single bit it's probably not some simple xor or modular checksum. If you can figure it out it would be really helpful.
+
+Thanks to ewalt1's effort and contribution, we seems to have a solution to the checksum problem:
+
+The first 4 bytes are a header, with the 4th byte being the length of the remaining packet (not counting the checksum). The next 7 bytes are some type of data, with the 8th byte being the CRC of that data. The CRC used is CRC-8 with a polynomial of 0x8D and an initial value of 0x00.
+
+There's some example code for calculating this CRC using a lookup table in packet_parse/joycon_crc.py.
+
+In normal operation the console asks Joycon for an update every 15ms (66.6fps), the command for requesting update is:
+
+Around 4ms later, Joycon respond with a 61 bytes long answer.
+
+Here is what I figured out:
+
+Each accelerometer and gyroscope axis data is 2 bytes long and forms a int16_t, last byte is the higher byte.
+
+The 16th and 17th byte (on line 5, before ) are the button status, when a button is pressed the corresponding bit is set to 1.
+
+Byte 19 and 20 ( between 5th and 6th line) are the Joystick values, most likely the raw 8-bit ADC data. Byte 19 is X while byte 20 is Y. Again, bizarrely, the X nibble is reversed, as in the should actually be (127 at neutral position). The Y value is correct though ( is 129).
+
+Still working on decoding those... It has to contain battery level, button status, joystick position, accelerometer and gyroscope data, and maybe more.
+
+I did a capture of the command sent from console to initiate a rumble on the Joycon. It was captured by pressing L to set off a bomb in BotW, which results in a fairly short rumble. Here is the capture.
+
+You can see the console sends longer commands (17 bytes vs 8 bytes) during the rumble period. I'm yet to look into this, but of course you can.
+
+The console itself uses a FT9CJ capacitive touchscreen controller. And according to techinsights it's a custom part by STMicroelectronics for the Nintendo Switch. After looking at the communication it appears to use I2C, which is in line with other touchscreen controller chips. Here is a capture of the I2C bus on power-up.
+
+The 7-bit I2C address of the chip is 0x49 (0x92 write, 0x93 read), and it's polled around every 4ms for update.
+
+The docking station uses a STM32F048 microcontroller. It's actually labeled as STM32P048 because it uses the FASTROM option where ST pre-programs the flash memory inside the factory. It has 32KB flash memory and 6KB RAM, runs at 48MHz.
+
+It uses SWD debugging and programming interface, and interestingly the programming testpoints are on the PCB and clearly labeled. After connecting a ST-Link programmer to it reveals that the chip is not read-protected at all, so a firmware dump was easily made. I'm not going to post it in the repo, but if you want it just ask.
+
+I'll update this from time to time when I have new discoveries. Please share if you find this useful.|||
+
+Nintendo_Switch_Reverse_Engineering - A look at inner workings of Joycon and Nintendo Switch

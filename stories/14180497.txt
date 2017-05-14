@@ -1,0 +1,94 @@
+This blog post started last August when I was integrating the Spectator PercentileTimer concept into the metrics library in Rend so we could get better cross-fleet latency percentiles.
+
+As a part of doing this, I had to port the code that selects which bucket (counter) to increment inside the distribution. A is implemented as a large array of counters, each of which represent a bucket. They are incremented whenever the observation lands in that bucket. The Atlas backend can then use these (properly tagged) counters as a group to derive cross-fleet percentiles within a couple percent error. The bucketing scheme divides the range of into powers of 4, which are then subdivided linearly by 3 for the set of final buckets. This code is farly quick to run and compact, if a bit obtuse at first.
+
+When I saw a divide by 3, I shuddered a little bit because I assumed it would be less efficient to do the division as a instruction instead of as a shift operation like a divide by 4 or 2 would be. Little did I know that people had solved this problem before. It’s a common compiler optimization to apply Montgomery Division when the division is by an integer constant. In this case, a divide by 3 is equivalent to multiplying by and then taking the top half of the output. Thanks, StackOverflow
+
+At this point I was also looking for an excuse to program something in assembly with Go. I actually already had a couple of other files in Rend that had assembly in them, but they were borrowed from other places and not my own original work. I wanted to translate this bucket selection code into assembly to see how fast I could make it.
+
+The first step was to translate it into Go code so I had something to compare my assembly code against. This was easy as it was pretty straightforward to change the Java code into Go. The only hangup was recreating the indexes array that is part of the static initialization in the Java code.
+
+From there, it was time to create the function and just get it set up to be called. This is where the trickery begins. From here on this post is mostly a list of things that I ran into that I had to do some research to solve.
+
+This is the entire Go version of the code below for reference. This is the original code that I am working off of throughout this process. In this code, lzcnt is another assembly function stolen from Rend that just returns the number of leading zeros of a uint64.
+
+Declaring an assembly function is more complex than a standard function. There is the equivalent of a C function declaration in Go code and then the actual assembly implementation in another file.
+
+There’s a few things that are sticky when making a new function:
+
+This is something I had a little difficulty with because the method was not entirely clear at first.
+
+In order to be able to compile the program, you need to create a Go version of the function declaration in a file alongside the file that contains the assembly implementation:
+
+The way to think about this, at least in my mind, is that this is your interface definition in Go and the implementation is in assembly in another file. Go code uses the interface.
+
+Function names in Go assembly files start with a middot character ( ). The function declaration starts like this:
+
+means that the following is meant for the text section of the binary (runnable code). Next comes the middot then the name of the function. Immediately after the name the extra is required. This means “static base” and is an artifact of the Plan9 assembly format. The real reason, from the Plan9 ASM documentation, is that functions and static data are located at offsets relative to the beginning of the start address of the program.
+
+I literally copy-paste the middot every time. Who has a middot key?
+
+The asm doc says this about :
+
+In this function’s case, we can add because the function doesn’t use any stack space at all beyond the arguments it receives. The annotation was probably not strictly necessary, but it’s fine to use in this case. At this point I’m still not sure how the “spare space” at the top of the stack works and I haven’t found a good bit of documentation to tell me.
+
+If your function requires more space than you have registers, you may need to spill on to the stack temporarily. In this case, you need to tell the compiler how much extra space you need in bytes. This function doesn’t need that many temporary variables, so it doesn’t spill out of the registers. That means we can use as our stack space. The stack space is the last thing we need on the declaration line.
+
+At this point we have one line done!
+
+I have written instead of because I wasn’t quite doing things right. I’ll get to that in the next section.
+
+In order to make the algorithm work, I needed to declare a static array of numbers that represent offsets into the array of counters. First, I derived a declaration from the standard library AES GCM code:
+
+This didn’t work, however, because the and symbols were undefined. I tried each on their own:
+
+Again, same result. To be expected, because they weren’t defined before. I didn’t know this at the time, though, because I was flailing about in the dark. I tried it without the annotation at all:
+
+Again, no dice. It needs something there to tell the compiler how to treat the data.
+
+It took me a while to find, but the asm documentation on the official Go website was actually the most helpful here. For “some unknown reason,” my code was unable to compile with the mnemonics so I just replaced and with the numbers that represent them:
+
+Aha! These two symbols tell the compiler to treat the “array” as a constant and not having any pointers.
+
+Of course hindsight is 20⁄ , meaning that after this entire exercise was over I found the proper header file to include to get these symbols. I didn’t figure out how to actually compile my code with this header file in place for this post, but the assembly files in the Go codebase all include it right at the top:
+
+It’s also important to note how the data is laid out. Each line is declaring a value for a given 8 byte chunk of the static data. The name of the “array” is first, followed by the offset (the type of which is defined in this picture from Plan9) and the size, then finally the value. After all of the lines are complete, the symbol is declared along with some flags and its total size.
+
+Now the Go array
+
+has become this block of assembly declarations:
+
+If you properly import then you could just change the declaration to be like it was originally:
+
+As for most of my struggles, careful reading of the Go ASM doc would have explained this to me.
+
+This is what I was faced with. Not much information there. I did manage to isolate the error to the most recent bit of code I had added, which had both a and a , which shift a quadword (64 bits) right and left, respectively. These can shift by a fixed amount or by a dynamic amount. I needed to use the dynamic amount in this case. The same mnemonic actually produces two different encodings at the binary level because the instructions for dynamic and static shift amounts are different.
+
+I had written the code to use some arbitrary register because I hadn’t thought anything of it at the time. It so turns out that the assembler was smart enough to recognize that the instruction was not actually encodeable, which is what the error message meant in the first place.
+
+I dug around a little bit, not really knowing exactly where to start. Eventually, I looked at the SSA code in the Go compiler to see what kind of logic they had around the instruction. Jackpot.
+
+The SSA code showed me only CX can be used as a variable shift amount:
+
+After this I had a bit of an epiphany: I could have just looked at the Intel manuals the whole time. In the manual (page 4-582 Volume 2B) it shows only the CL register being usable as the shift amount for the dynamic versions of and .
+
+I’ve reproduced the entire assembly version of the code here without comments for brevity. If you want to see the entire thing, you can take a look at the source files below. This code depends on the data declaration above.
+
+So what did all this struggle get me?
+
+I wrote up some benchmarks to compare three versions of the code:
+
+If it took me 4 hours to write this code, it would have to run 3.13043478 × 1012 times to be worthwhile. Luckily, this code would be run that many times in about a day or so in production at Netflix.
+
+However, I didn’t use it.
+
+For those of you wondering, I did actually benchmark the ported Go code before starting this whole process.
+
+I know this may sound rather disappointing, doing all this work without putting it into production, but it was a fantastic exercise in learning Go assembly idiosyncrasies. Hopefully this chronicle of my struggles helps you overcome some small hurdle in your assembly ventures.
+
+Please let me know what you think about this article in the comments or @sgmansfield on twitter.
+
+If you would like to peruse the files that made up this work in their entirety, you can find them here:
+
+You can also see them at the GitHub repository for this blog.|||
+
