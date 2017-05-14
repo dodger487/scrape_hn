@@ -1,0 +1,94 @@
+TLDR: If you have a lot of data to compress, it’s worth evaluating different compression programs and settings on a subset of your data. This article describes a process and a tool I wrote to automate it, based on some (basic) ideas from multi-objective optimization. In my experience, new compression programs, and particularly Facebook’s Zstandard, have often won over widely used incumbents.
+
+I recently found myself with a large dataset that I needed to compress. Ordinarily, I’d just it and carry on with my day, but in this case it was large enough to make me think twice about the cost of storage and transfer and the cost of machine time for compression and decompression. I decided to spend an hour or two trying out some different compression programs and… three weeks later, I have written a bunch of code and this article. Why spend two hours doing when you can spend three weeks automating, I always say!
+
+It turns out there many compression programs to choose from, and each one typically has at least one parameter to tune, a ‘compression level’ that trades off time and memory against space saved. For example, the Squash compression benchmark includes 46 programs with a total of 235 possible levels, at the time of writing. While such benchmarks are useful in general (and also interesting), they don’t tell you what program and level will work best on your particular dataset. To find that out, you need to run some experiments.
+
+This article describes the process and supporting tooling that I used for these experiments. We’ll see some nice applications of multi-objective optimization theory and Pareto optimality, why Docker is very useful for this type of task, and lots of plots from . My original application was proprietary, so instead I’ll use a made up (and more fun!) example:
+
+Let’s go through the process with this example.
+
+Here we’re assuming that the dataset is very large and/or isn’t all available yet, so we need to choose a subset of our data to experiment on. Ideally, it should be a random subset so we get an unbiased estimate of the performance on the dataset as a whole. If the dataset comprises many files, picking a random subset of the files would be a good choice.
+
+For our genomics example, we can (quite remarkably) just download the sequence from the human genome project. In uncompressed 2-bit binary format, it weighs in at 835,393,456 bytes, or 0.778GiB, where 1GiB = 10243 bytes. At the risk of dating myself, that’s a bit more than a CD-ROM, but much less than a DVD.
+
+Once we have a sample, we are ready to run some programs on it. The programs I chose, based on some Googling and availability of packages in Ubuntu, were brotli, bzip2, gzip, 7z, xz and zstd. Each program provides a varying number of compression levels, which are documented to varying degrees in the man pages or options.
+
+I wrote a small utility in ruby to run the programs and collect the results. For each program and level, we are mainly interested in measuring
+
+For the results to be accurate, we need to run the experiments on hardware that is representative of what we’ll use for the full dataset — CPU, memory and I/O speed are all important factors. It’s therefore important that the utility that runs the programs is portable. That can be challenging, however, particularly for the newer compression programs, which are often unavailable as packages or have different package names (and sometimes program names) on different platforms. And I have yet to find any portable way of measuring peak memory use.
+
+To address these portability challenges, I packaged the utility and its many dependencies as a Docker image. Docker lets us build one image that can run on a wide variety of Linux-based systems, and it causes no noticeable performance degradation, so the results remain representative of what you’d see if you were running the programs natively.
+
+It’s also possible to run the utility in Docker on Mac and Windows, but ongoing issues with the I/O performance of docker volumes on those platforms mean that the results are not very representative of what you would see if you ran the programs natively. That situation is improving rapidly, however, so hopefully soon this approach will also extend to non-Linux platforms.
+
+For the genomics dataset, I ran the experiments on an m3.medium virtual machine instance on Amazon EC2. Here’s the results table as a CSV (view on figshare). Now we’re ready to see what the data look like.
+
+Let’s start with just two variables: compression time and compressed size, which are usually the most important. The plots are generated using the utility and , as described in the appendix. In our first plot, each point represents a compression program, which is indicated by its symbol, and a corresponding compression level:
+
+For both axes, smaller is better: we want smaller compressed size and less time taken for compression. The main things that stand out on this first plot are:
+
+To narrow the field, we can focus our attention on the Pareto frontier, which is defined as follows: a point on this graph is on its Pareto frontier if there is no other point that is better according to both compressed size and compression time. Or, turning that definition around, if a point is not on the Pareto frontier, that means that there’s some other point that’s better on both axes, so we should always prefer said other point. Removing points not on the Pareto frontier gives us a much clearer plot:
+
+The outlier is gone, and we can see that of the six programs tested, only three, namely , and , have made it onto the Pareto frontier. The graph also nicely shows that, for our genome file, won for fast, light compression (top left), and and won for slower, heavier compression (bottom right).
+
+Now let’s annotate each point with the corresponding compression level:
+
+As we might expect, increasing compression levels generally lead to smaller compressed size and also longer compression times, as the programs work harder. We can now see that if our goal is to minimize compressed size, at compression level 9 (the maximum) is our winner for the genome file, at 659,486,454B, or ~629MiB. That will fit nicely on a standard CD-ROM. Fortunately (?) my laptop is sufficiently old that I could test this, hence the cover image for this article!
+
+While these plots are informative, they are not enough to solve more complicated problems, such as the genomics problem, in which we want to trade off compressed size with compression and decompression time. To do so, we can bring these variables together onto a common scale: cost.
+
+Choosing a compression program and level is basically an optimization problem: each compression program and corresponding level is a candidate solution, and we want to find the solution with minimal cost. A ‘cost’ is just a single number for each solution that describes how expensive it is in dollars and cents, or some equivalent scale.
+
+For the genomics problem (and for a surprising variety of other problems), it’s enough to use a linear cost function with three cost coefficients:
+
+We measured these three variables for each solution in step 2, so we can compute a solution’s cost just by multiplying them by the corresponding cost coefficients and adding up. Having separate cost coefficients for compression and decompression is useful if, for example, we need to decompress data more times than we need to compress it, which is often the case.
+
+While peak memory use may also be a factor, we usually care about it only insofar as we don’t want to run out of memory if we are using an embedded system or small-memory cloud server, so we can usually treat compression and decompression memory use as constraints, rather than quantities to be optimized.
+
+How we set the cost coefficients depends on what we plan to do with the data and on the basic hardware costs. For example, let’s assume that we’re working on Amazon EC2 with an m3.medium instance, which is where I ran the experiments, and that we’ll store the data on Amazon S3. Looking at the AWS pricing tables, we can work out that, at the time of writing, compute time (for either compression or decompression) will cost $0.073/hour, and storage will cost $0.023/GiB for each month that we store the data.
+
+For the genomics problem, let’s make a spreadsheet (XLSX) to calculate the cost coefficients from these basic costs. Let’s assume that:
+
+Here’s an extract from the spreadsheet that implements these assumptions:
+
+The last three rows give, for each month, the discounted storage costs per GiB per genome and discounted compression and decompression costs per hour per genome. Adding these up across all the months gives their total present values, shown in bold, which are our cost coefficients.
+
+For example, if through compression we can achieve 0.6513 GiB per genome, the storage cost coefficient of $56,052.75 / (GiB / genome) implies that the present value of our discounted monthly storage costs would be:
+
+As it happens, that is indeed the storage cost for the lowest-cost solution. Applying the above cost coefficients to each solution, we find that the one with lowest total cost is at level 12. Here is a summary of its key metrics, in which the costs are reported in thousands of present value dollars.
+
+It is interesting that even though the total cost ($37,540) is dominated by storage costs ($36,510), compressing the data further with a higher level of or another program, such as , does not provide enough additional compression to offset the additional compute cost for compression and decompression.
+
+Technically, we’re done: we don’t need any plots when optimizing with a cost function. However, it’s still helpful to be able to visualize the results. Given that there is a lot of uncertainty both in the extrapolation from one genome to many and in the business model that generates the cost coefficients, we should be thinking about the sensitivity of our conclusion to this uncertainty. One way to get a feel for it is to again look at the Pareto frontier of a plot of size costs and time costs. To stay in the world of two dimensional plots, we can simply add the compression and decompression time costs together, as follows:
+
+The diagonal lines are cost contours: total cost is constant along these lines. The optimal solution, at level 12, lies on a parallel contour line (not shown) closer to the origin with lower cost, namely $37,540. If storage costs were to increase relative to compute costs, the cost contours would be less steep, and we might be better off choosing a slightly higher compression level; however, the storage costs would have to increase by quite a lot for us to prefer the points in the bottom right. If storage costs were to decrease relative to compute costs, the cost contours would be steeper, and we might find that a lower compression level would have been better, but again they would have decrease a lot before we decided to use no compression at all. To know for sure, we’d have to try different cost coefficients, but at least this plot gives us some intuition about how to approach that sensitivity analysis.
+
+Finally, the plot above only shows the Pareto frontier, which does not include any or points. However, looking at the full cost summary, we can see that if we’d used at its default level (9), the total cost would have been $46,540, and if we’d used at its default level (6), the total cost would have been $39,700. So, in this case using instead of is saving us $2,160 in today’s dollars (since these costs are present values). Is that enough to warrant switching to a newer, less proven technology? I guess it depends on your appetite for risk. As the saying goes, nobody ever got fired for using !
+
+I think the genome dataset is actually quite a tough one to compress; in my own practice, I’ve seen much larger cost differences between et al. and that do make the newer programs more appealing. And of course, there’s only one way to find out whether it will be worth it in your context — go through a process like this one.
+
+Thanks to Hope Thomas for reviewing drafts of this article.
+
+If you’ve read this far, perhaps you should follow me on twitter, or even apply to work at Overleaf.
+
+To install via docker, you just need to run
+
+Alternatively, you can install the utility via ruby gems, but then you have to make sure that all of the dependencies are installed; the best place to find the list of dependencies is the Dockerfile.
+
+To check that it’s working, you can run the command:
+
+To rerun the data collection step, download the genome in 2-bit format and put it at . Then run
+
+Alternatively, note that you can just download the results I generated (view on figshare) and put them in for analysis.
+
+The last plot in ‘Step 2a’ above comes from the utility’s command. There is no need for a mount, but the utility still needs to be able to read the original data files, just to find their original (uncompressed) sizes. The command is:
+
+The preceding two plots in ‘Step 2a’ were generated by adding the and flags.
+
+The plot in ‘Step 2b’ comes from the utility’s command, which takes the three cost coefficients, as follows.
+
+Finally, the textual summary was generated by the command, as follows.
+
+The utility also contains some other commands, such as for a plot of compressed size, compression time and decompression time, and many other options I have found it useful to add. See the README on GitHub for more information.|||
+

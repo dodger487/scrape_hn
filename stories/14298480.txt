@@ -1,0 +1,53 @@
+In this article, we’ll look at different ways to solve a common task. Let’s assume that we have a list containing user IDs and a method to query a user by ID. The method works by blocking the calling thread until the requested user is loaded and throws a if necessary. Our goal now is to implement a method that tries to load all users corresponding to the given IDs. It should return the users that were loaded successfully and the IDs of any users that can’t be loaded.
+
+Our first approach is to load all users sequentially. To keep track of the users that were successfully loaded, as well as of the IDs of any users that can’t be loaded, we’ll use the class provided by the Javaslang library. This class has exactly two subtypes: and . In general, the subtype is used to wrap the expected result and the subtype is used to signal a failure.
+
+This implementation works fine — but it loads the users sequentially. This means if it takes 200 milliseconds to load one user, the method will take approximately 20 seconds to load 100 users. So we’d like to call concurrently instead.
+
+The easiest way to call concurrently is to use a parallel stream. Instead of transforming the list into a sequential stream by calling , we now call . This means the method that is used to map the elements of the stream will be executed on a .
+
+If we use this implementation to load 100 users and it takes 200 milliseconds to load each one as before, this method will need approximately 2.9 seconds to complete on an average machine. This is still a long time compared to the time needed to load a single user.
+
+The reason for this behaviour is the following: by calling the terminal method on a parallel stream, the operations given as parameters to methods like will be evaluated as s. These tasks are by default executed in the pool , and its default level of parallelism is equal to the number of available processor cores minus one. That means: if there are eight cores available, only seven users can be fetched concurrently.
+
+The level of parallelism of the common can be configured by setting a system property. However, there’s another reason why we shouldn’t rely on .
+
+If we are developing a web application and the processing of incoming requests involves parallel streams, the whole application can become unresponsive by executing a blocking task in the common . So it’s better to specify a dedicated thread pool for invoking blocking operations. This will help to isolate unresponsive resources and erroneous functions from the overall system. Protecting systems by isolating certain parts is also known as the Bulkhead Pattern.
+
+The question now is: how we can configure the thread pool on which the operations of a parallel stream will be executed?
+
+To answer this question, let’s look at the implementation of the method in the class:
+
+This method checks if the current thread is managed by a . If so, the execution of the will be scheduled on the same thread pool. Consequently, if we submit the processing of a parallel stream to a custom , this pool will also be used to execute the operations of the stream:
+
+We can use this approach to configure the thread pool used by the parallel stream. Submitting a task to a returns a , which implements the interface, so we need to block the execution of the calling thread by invoking .
+
+So far we figured out how to call the method concurrently and supply a customised thread pool. But we still need a way to control the execution of the individual tasks, for example by setting a timeout.
+
+Instead of using a parallel stream with a custom , we’ll work with a sequential stream again. But this time, we’ll combine it with an .
+
+We divided the loading of all users into two steps. First, we map the given IDs to tuples consisting of an ID and a wrapping the corresponding invocation of . The class is provided by the Javaslang library we used earlier. As a second step, we block the calling thread to collect the loaded users. Every time throws an exception, we return the ID of the user that could not be loaded. This is why we used tuples in the first step: we needed to pass on the IDs.
+
+Now we can control the execution of the individual tasks. In this example, we set a timeout of two seconds by calling with appropriate parameters.
+
+But our solution has a flaw — we need to iterate twice. In the first iteration we map IDs to s and in the second iteration we block and wait for the results. This is necessary because a stream is lazy. If we would just chain the task submission and blocking in two consecutive map operations, the method would not be parallel at all. It would submit one task and immediately block and wait for its result before submitting the second task.
+
+Luckily, we can eliminate this flaw by working with s instead of plain s.
+
+This time we only need one iteration that is completely non-blocking. First, we map each ID to a by using the static factory method . The outcome is a stream consisting of s. But what we really want is a wrapping our result list. To achieve this, we can use the method with two custom combiners: and .
+
+As before, we can control the execution of the individual tasks. Here we use the non-blocking methods , and . We wrap the users that were successfully loaded with the type, and those that couldn’t be loaded with . We also set a timeout of two seconds for each task.
+
+Sadly, I had to cheat a bit — the examples are intended to run with Java 8, but the method will only be available in Java 9. Luckily, Tomasz Nurkiewicz explains in his blog how to use asynchronous timeouts with Java 8.
+
+The examples presented so far were rather involved and perhaps hard to understand. This is a pity because the original problem is not complex at all. So let’s consider another way to solve it: by using the reactive library Reactor.
+
+We start by converting the given list of IDs into a using the factory method . Then we use the method to control the asynchronous execution of . We wrap the execution as a Mono and define a timeout as well as the error handling. We can use the method to provide a that loads the users in parallel. As soon as we subscribe to , the operator will take care of subscribing to each using the provided .
+
+There are some differences between and . One difference is that a is lazy by default. If no one subscribes to it, it will not load any users at all. Conversely, the existence of a denotes that the execution of a task has already began. Here we start loading the users by calling the method.
+
+In this article, we looked at different ways to load users concurrently. We started with code that was hardly understandable and managed to turn it into something readable using Reactive Programming techniques. But reactive libraries like Reactor not only help to write concurrent code in a declarative fashion, they also bring along specialised s that help to optimise the use of multiple cores by improving the cache locality of processed data.
+
+In closing, I’d like to point out two problems with the way we used thread pools, which would need to be addressed in an actual implementation. First of all, we never took care to shut them down and clean up the resources. Secondly, you should pay attention when using the convenient factory method . It returns an that uses an unbounded as a work queue. This can be dangerous if you are not in control of the number of tasks to be scheduled.|||
+
+In this article, we’ll look at different ways to load users concurrently using Reactive Programming techniques, working toward code that is understandable and readable.
