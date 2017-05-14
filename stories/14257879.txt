@@ -1,0 +1,59 @@
+I have been consulting a large website (+200M unique monthly visitors). This level of exposure comes with a great risk of various attacks, the most common of which is DDoS. The unnamed organisation has implemented a broad range of practices to prevent such attacks from effecting the service health.
+
+The aforementioned preventative measures are nothing out of ordinary. The key is: content construction on the edge nodes (CDN, ESI) and many layers of passive cache.
+
+This setup is great for ensuring system scalability. However, developing applications for passive cache is a big burden on the development teams (see Developing services that use passive cache).
+
+While working on this project, I have come up with a solution which gives all the same benefits of the passive cache without dictating the underlying service design.
+
+A service is said to be using passive cache if the service can read only from the cache backend. This service is not aware of the data store for the source of truth.
+
+In contrast, a service is said to be using active cache if the service first attempts to read from the cache backend and falls back to reading from the source of truth.
+
+In this setup, a cache backend is a key-value store (e.g. Redis) and the source of truth is an RDBMS (e.g. Oracle Database).
+
+Using passive cache architecture ensures that the backend serving the source of truth never gets hit by unexpected volume of traffic. Regardless of how many queries or what queries are made against the service, the source of truth is used only by the messaging queue service to populate the cache data store.
+
+http://gajus.com/blog/ is a blog service. The blog service lists articles; the client can access individual articles using the PK of the article, e.g.
+
+In the above example, “1”, “2”, “8” and “9” are the resource identifiers are used to identify the data in the data store.
+
+The above service is using active cache — when client requests an article with PK “1”, the service looks into the cache store and returns the result, or (if cache does not have the record about the requested resource) it queries the database and stores the result to the cache store for X amount of time.
+
+If a malicious user constructs an attack thats designed to make HTTP request to retrieve resource with PK “1”, all of these requests will be served from the cache backend. Requesting a record from a key-value table is a low resource intensity operation. It would be expensive to carry out an attack at a scale where a lookup in a key-value cache store becomes the bottleneck.
+
+The situation is very different if the attack is using arbitrary values to construct the resource identifier, e.g. ID values in a range from 1–1M. Now every request will result in a database query. Unlike the key-value lookups, queries against RDBMS are expensive. Chances are that the request/ response packets will need to travel many more hops, that the response needs to be processed using application logic, results stored in the cache store, etc.
+
+Scaling key-value storage is simple and cheap. Scaling RDBMS can be very expensive.
+
+If the service is using passive cache, then our scaling problems (concerning this subject) stop here. Using passive cache service architecture is great for scaling. However, it comes at a development cost.
+
+A service that is utilising a passive cache must:
+
+During the development, the iteration cycle (the time between actioning a change and seeing the result) is prolonged due to the messaging queue process, the developer needs to be aware of the bugs that might arise because of the stale cache and every CRUD operation needs to be implemented respecting the above constraints.
+
+In contrast, during the development of an application that utilises active cache — the developer can simply disable the cache and construct ad-hoc queries to get data from the source of truth.
+
+However, if you are reading this, you probably care about security above the cost. The good news is that there is a simple way to mitigate the above attack — make the resource identifier pattern unpredictable.
+
+The reason active cache pattern is susceptible to this attack is because the resource identifier pattern is predictable. Regardless of whether the ID is a numeric ID (such as in the earlier example), a base64 encoded GUID such as used in GraphQL APIs or UUIDs such as in most of the document-orientated databases, the problem is that when the server receives a request, it has no way of knowing whether the resource exists — it needs to make a roundtrip, either to the cache store or to the source of truth. There is a simple way to solve this — sign the resource identifier.
+
+Signing the resource identifier allows us to assert that the request is plausible. When the resource identifier is signed, the attacker is no longer able to fabricate a request that is outside of a finite number of publicly known identifiers.
+
+The service receives a request, attempts to decrypt the resource identifier and uses the decrypted value to lookup the record; if the resource identifier cannot be decrypted — it terminates the request.
+
+I am using this pattern when designing GraphQL resource IDs. Specifically, the proxy that routes the request to GraphQL asserts that resource ID is valid.
+
+I have abstracted generation and validation of the signed IDs using a Node.js package called sguid (Signed GUID). Signing IDs is done using  ; validating and opening SGUIDs is done using  :
+
+In addition to the signing of the IDs, Sguid enforces use of a namespace and resource type identification. This pattern ensures that the IDs are truly globally unique.
+
+The downside of this approach is non-user friendly IDs, e.g.
+
+The upside — scalable protection from layer 7 DoS attacks without sacrificing the developer experience.
+
+This will do absolutely nothing for the types of attacks such as the volume based attacks. Furthermore, this is effective only if your cache is capable of storing data for all valid requests. Nevertheless, it is an interesting approach to protect from cache-miss attacks.
+
+Often it matters that the attack is made to look ineffective, not that it isn’t ineffective. Attacker will stop the effort if there is no visible incentive to continue.|||
+
+I have been consulting a large website (+200M unique monthly visitors). This level of exposure comes with a great risk of various attacks, the most common of which is DDoS. The unnamed organisation…

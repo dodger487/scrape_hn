@@ -1,0 +1,21 @@
+A lot of the time here at Cloud 66 we run into race conditions where multiple threads/processes want to act on external resources. The nature of our business means we have a dearth of external resources who states we can not accurately predict at all times meaning we have to code with that in mind (ie. defensively).
+
+But in general, it is pretty common for large or complex applications to require some form of synchronisation when you can not get away with non-blocking algorithms(which is most of us most of the time)
+
+Additional to the above we have many servers (each with many processes) that are responsible for acting on these external resources. This means that we need some form of synchronisation that can run across process/server boundaries (ie. Ruby’s own mutex/file mutex) wouldn’t cut it!
+
+We, therefore, created a RedisMutex class that we could invoke and use our application to ensure that we have consistent synchronisation (where we need it) available everywhere.
+
+In this post, I’ll talk through the way that we implemented the code – and feel free to use it or reach out if you have any feedback or comments. Please note that you should understand the code you’re running and using it is at your own risk; Cloud 66 can not be held liable.
+
+It goes without saying that you’ll need a Redis Server to use this Mutex – but I still said it just in case!
+
+Without further ado; See below an implementation of our RedisMutex
+
+# cross-process/cross-server mutex class RedisMutex attr_accessor :global_scope, :max_lock_time, :recheck_frequency LOCK_ACQUIRER = "return redis.call('setnx', KEYS[1], 1) == 1 and redis.call('expire', KEYS[1], KEYS[2]) and 1 or 0" def initialize(global_scope, max_lock_time, recheck_frequency: 1) # the global scope of this mutex (i.e "resource") @global_scope = global_scope # max time in seconds to hold the mutex # (in case of greedy deadlock) @max_lock_time = max_lock_time # recheck frequency how often to check if the mutex is # released when blocked @recheck_frequency = recheck_frequency end def synchronise(local_scope = :global, &block) # get the lock acquire(local_scope) begin # execute the actions return block.call ensure # release the lock release(local_scope) end end private # attempt to acquire the lock def acquire(local_scope = :global) # construct the mutex key; the local scope # of this mutex (i.e "resource_id") mutex_key = "#{@global_scope}.#{local_scope}" # while statement will either get the lock and # set the expiry on the lock or do neither and return 0 while $redis.eval(LOCK_ACQUIRER, [mutex_key, @max_lock_time]) != 1 do # wait and try again (until we can get in) sleep(@recheck_frequency) end end # release the lock def release(local_scope = :global) # return value indicating whether the lock was currently held mutex_key = "#{@global_scope}.#{local_scope}" return $redis.del(mutex_key) == 1 end end "return redis.call('setnx', KEYS[1], 1) == 1 and redis.call('expire', KEYS[1], KEYS[2]) and 1 or 0" # the global scope of this mutex (i.e "resource") # max time in seconds to hold the mutex # recheck frequency how often to check if the mutex is # while statement will either get the lock and # set the expiry on the lock or do neither and return 0 # wait and try again (until we can get in) # return value indicating whether the lock was currently held
+
+Now, see the simple usage sample below.
+
+In this blog post we dipped our toes into a multithreading/cross process or server synchronization solution. In a forthcoming blog I’ll look at some other Ruby/Rails multithreading tricks we have use ourselves.|||
+
+We, therefore, created a RedisMutex class that we could invoke and use our application to ensure that we have consistent synchronisation (where we need it)

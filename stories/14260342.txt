@@ -1,0 +1,119 @@
+Truly Seamless Reloads with HAProxy – No More Hacks!
+
+HAProxy Technologies’ R&D has released a patchset to enable seamless reloads of HAProxy without dropping packets in the process. The patchset has already been merged into the HAProxy 1.8 development branch and will soon be backported to HAProxy Enterprise Edition 1.7r1 and possibly 1.6r2.
+
+This work was done as part of a larger roadmap initiative at HAProxy Technologies to support more microservices use cases as we see those becoming more and more frequent. This particular fix should address large environments very well, where multiple services all share the same HAProxy servers, or where microservice orchestration systems add/remove services more frequently than in traditional load-balancing setups, or where a number of other use cases require frequent HAProxy reloads.
+
+Let me walk you through the history of the issue and how we arrived to the final solution.
+
+What users often call a “seamless” or “hitless” reload is a configuration update or a service upgrade performed with no impact on user experience.
+
+Configuration updates may require a stop/start sequence of certain services, causing temporary outages and making the admins worry a lot before performing them or trying to postpone them for as long as possible. With today’s microservices and very frequent reloads, it is not acceptable that any single connection is lost during a configuration update or a service upgrade.
+
+Service upgrades are even more important because, while some products are designed from the ground to support config updates without having to be reloaded, they cannot be upgraded at all without a stop/start sequence. Consequently, admins leave bogus versions of those software components running in production because it is never the right time to do it.
+
+HAProxy makes no distinction between a configuration update and a service upgrade. In each case the new executable is used with the new configuration, so service upgrades are as transparent as configuration updates.
+
+The situation has evolved over time, especially on the Linux platform. In 2006, HAProxy version 1.2.11 implemented a soft reload mechanism. By then, the principle was quite simple and efficient:
+
+One should note that there was a small “black hole” between steps 2 and 3 where the ports were not bound by any process. In 2006, the loads we were seeing in the field were in the order of a few hundred connections per second, and the risk of any connections landing exactly during the reload period (shorter than a millisecond) was sufficiently low that it could be ignored.
+
+Later the same year, we had the opportunity to improve the situation on OpenBSD. This operating system used to support SO_REUSEPORT, a socket option allowing a new socket to be bound to the same port as the previous socket. The benefit was that on OpenBSD it allowed us to skip steps 2 and 3 and there was no “black hole”.
+
+This was implemented in HAProxy version 1.2.14 the same year and used to be the very first, truly seamless reload available in HAProxy.
+
+Then I discovered that older Linux kernels used to support SO_REUSEPORT too, but this feature had been lost during kernel 2.4 development. I was able to re-enable it by using a very small patch and I made it work. This provided the exact same behavior as on BSD and there was absolutely no black-out period during a reload – no connections were lost. Unfortunately, it was not accepted in the mainline Linux kernel:
+
+But we used to keep this patch in our ALOHA appliances till version 6.0 (based on Linux kernel version 2.6.32).
+
+In the mean time, a new and much better SO_REUSEPORT implementation was brought to Linux kernel 3.9, allowing the load to be intelligently spread over multiple sockets. HAProxy could immediately benefit from this new improvement.
+
+But it came with a problem, in part derived from its scalability. The socket queues were independent and people have progressively started reporting occasional RSTs being observed under load during an HAProxy reload.
+
+We managed to reproduce this in our lab under very high loads. The rate of RSTs emitted during a reload was around 2-3 per million connections per reload. At first it looked very low, but microservices and cloud environments have completely changed the perspective. Some services are reloading every few seconds. On an haproxy service running under Linux 4.9 at 55,000 connections per second and being reloaded 10 times a second, it is possible to reach 155 connection failures for one million connections after after 180 reloads:
+
+It is worth mentioning that, by then, browsers already often delegated the connection setup to a connection pool which was also in charge of the pre-connect, and generally they didn’t have any problem with a failed connection. But our users dealing with the highest loads were also dealing with web services (not only browsers), and we had to help them.
+
+Around 2010 when users started reporting this problem, I suggested to block SYN packets during the reload operation (which is supposed to be very quick). It ended up preventing new connections from being established during the reload, causing a few clients to retransmit their dropped SYN packets and saving them from experiencing a reset:
+
+Most users were fine with this method, although in certain low-latency environments it was not acceptable to cause an occasional extra 200ms-3s delay during a reload. But, as mentioned, most of the time it was OK, and this was the method used in OpenShift for example:
+
+In early 2011, after HAProxy version 1.5-dev4 was issued, Simon Hormans tried to address the issue in a completely different way, by implementing a master-worker model with a socket server:
+
+The idea was that instead of having HAProxy reload itself, one process would remain active and it would take care of all the sockets and would pass them to each new process upon reload. Unfortunately, this work unveiled a lot of internal limitations in HAProxy at the time, and there was no way to get it to work reliably without performing a massive redesign of HAProxy’s signal handling, memory management, and process management. Consequently, this patchset was never merged, but it was certainly interesting, and our focus has shifted to improving HAProxy internals in order to make such an architecture possible at a later time.
+
+In 2015, Joe Lynch of Yelp was still not satisfied with the extra latency caused by the “Blocking SYNs” method and he found a nice way to significantly improve it. Instead of dropping SYN packets, he would delay them using Linux queuing disciplines (qdisc). Once the qdisc was removed, the queued packets were automatically released and the extra delay only lasted while HAProxy was reloading the new configuration file. The script became a bit more complex in the end, but once it was written there was no need to touch it anymore, and this method was considered optimal by most users:
+
+With Joe Lynch and his coworker Josh Snyder, we contemplated various other options, such as removing the SO_REUSEPORT option during shutdown and making such sockets score less, setting the socket backlog to zero, shutting down the sockets before a close and have a drain mode, and other similar mechanisms. It just happened that at the same time, Tolga Ceylan proposed a similar design to address the same problem affecting Nginx as well, but it was rejected since it would have had some undesirable side effects:
+
+We participated in the discussion proposing our ideas as well, but they were rejected (and fortunately so, since one of them could have had an undetected side effect). Instead, we were advised to try eBPF:
+
+Trying to implement eBPF resulted in a failure. Long story short, the principle would have been to assign a different queue to the incoming packets so that none of them would land in the quitting process’ queue. One of the problems with this approach was that there was no way to know the queue numbers of the remaining processes, and these numbers could also change during the lifetime of the old process if reloads were more frequent than the old processes’ average lifetime (quite a common issue in microservices). So all we were basically able to do was to accept or reject traffic:
+
+In 2016, GitHub (who also uses HAProxy) proposed something very similar to the socket server in the master-worker model, but it was much less intrusive and it used HAProxy’s ability to reuse an already bound socket as the listening socket. Their server was called “multibinder” and the design was described here:
+
+Various other ideas were discussed, such as changing the listening socket’s binding to a wrong interface, or unbinding it if it was already bound in order to lower its score in the compute_score() function (which decided what queue to send the incoming connection to). All of these ideas came with unacceptable drawbacks (such as temporarily exposing a sensitive socket to an insecure interface) and none of them were implemented.
+
+After the failed attempt at implementing something based on eBPF, I thought there was little hope we could get a nice solution in the kernel in the short term. Additionally, all our users who were being affected by this problem on a daily basis (and who were running enterprise Linux distributions) would have had little chance of getting the necessary kernel updates backported to their production systems. So I thought the only remaining acceptable short term solution was to go back to the “socket server” approach (the file descriptor transfer between the old and new processes) so that the socket would never be closed. But instead of relying on a complex master-worker model, however, we tried using the HAProxy CLI socket which often is a UNIX socket and on top of which it is possible to transfer file descriptors using SCM_RIGHTS. SCM_RIGHTS is one of the little known features of UNIX sockets which allows one process to transfer one or several of its file descriptors to another process. The other process receives them in the same state they were in (generally with a different FD number) just as if they had been duplicated using dup():
+
+I discussed this with one of our engineers, Olivier Houchard, who was very interested in working on this, and he immediately started looking into what would have to be changed in HAProxy to support it. In the meantime, I got back to my thorough analysis.
+
+It sounded a bit amusing that in over 7 years nobody came up with a good solution to this problem, which in fact was a race imposed by the BSD socket API since by default it is not possible to drain incoming connections from a socket in the same way we can drain the last bits of incoming data from a shut down socket.
+
+I also started wondering why this problem, which was non-existent/ignored in HAProxy for many years, suddenly started affecting a lot of people. Did we change something in the recent versions of HAProxy that made it exhibit more often?
+
+I tried older HAProxy versions and figured the problem was hard to provoke. I tried again with recent versions and found it hard to provoke as well. I realized that I was running on my laptop (a dual-core system) and that I had not bound the load generator nor HAProxy to their respective CPUs while the occurrences were possibly dependent on time. So I tried again by pinning the load generator to its own CPU and HAProxy to its own CPU, and reloading HAProxy 10 times per second. The problem became fairly visible on all versions – see column “errs” in the inject window where there is roughly 1 error every 40,000 connections:
+
+The numbers looked huge, but keep in mind we were reloading 10 times per second and running at 80,000 connections per second!
+
+With the load generator attached to the same CPU as haproxy, there wasn’t any single error for more than an hour and 150 million connections:
+
+I was a bit puzzled by the results and wanted to find out if this was due to one process slowing down the other, or something else. I ran the same test over the network and found that there wasn’t a single error when HAProxy was bound to the same CPU as the network interrupts, and that errors only happened when the HAProxy process was on a different CPU.
+
+Suddenly, that explained why the situation changed over the years. For many years, most of us were running on inexpensive single-CPU machines thanks to HAProxy’s very limited resource usage, and the problem couldn’t happen there by default. Then, when haproxy started being deployed on SMP machines, the problem evaded us once more – many of these SMP systems were equipped with single-queue NICs and the kernel’s scheduler by default tended to automatically move the receiving process to the same CPU as the one receiving the interrupts. This was something we generally disabled by hand for higher performance, but since the vast majority of users didn’t change the default settings, they were still not affected. Those who cared a lot about performance and used large machines combined with applying some fine tuning were the first to start revealing the problem!
+
+But what was the actual cause?
+
+Due to a simple error I once started my load generator with parameters “-F” and “-c”. The first one does exactly the same that HAProxy’s “tcp-smart-connect” option does – it fuses the HTTP request with the connection’s ACK to save one packet. The second one closes with an RST to save another packet. I generally use these options a lot during my tests when I want to stress HAProxy (by putting less stress on the system and hence more on HAProxy). My fingers tend to add these options without me thinking about them:
+
+I noticed that there was no single error during this test at 150k connections per second on a single process. I thought it had something to do with “-c”, but no. It was “-F” which got rid of the problem:
+
+The difference between the tests with and without “-F” was that by removing the initial ACK, when the connection was accepted the request was immediately available. I started to think that it was a scheduling problem in HAProxy, maybe not processing some accepted connections. We thought we could replicate the same behavior by adding “defer-accept” on bind lines. But “defer-accept” still experienced the problem:
+
+Running strace over the process showed us that there was no single difference and that, in fact, after the last accept() returning “-1 EAGAIN”, it was obvious that a few connections were still pending.
+
+This, combined with the CPU binding observed above, suddenly rang a bell: it looked like an SMP memory barrier was missing somewhere in the accept() code in the kernel. Memory barriers are a synchronization mechanism used to ensure that modified data is visible to other CPUs: these consist of flushing pending cache writes. Without it, other CPUs only see what they have in their cache and are not necessarily aware of recent changes performed in the memory area. The likely situation in our case was that a pointer was being advanced as new connections got accepted, but other CPUs only saw a snapshot of this pointer once in a while, as illustrated below:
+
+And, consequently, it was very likely that when data arrived, the memory barrier on data-less ACKs was not applied, resulting in other CPUs not seeing the whole list of incoming connections. It resulted in leaving a few of them in the queue, which got reset when the listening socket was closed. It seemed possible that there was no way to be more accurate than this and to keep a high performance level at the same time (I didn’t know for sure). But at least I confirmed that blocking empty ACKs got rid of the problem:
+
+Interestingly, this could have possibly been achieved within haproxy using eBPF!
+
+Thanks to the discovery above, at least we had two short term workarounds for our users:
+
+The iptables rule I showed above cannot be used as-is in production because it relies on TCP timestamps and would block other packets without them. The following one presented below is intended for production. It blocks all pure ACK packets as well as those carrying less than 3 bytes of payload without a PUSH flag. It is not possible to match a single byte here because U32 references 32-bit payloads only, but at the same time, 3-byte packets without a PUSH flag do not make sense:
+
+NOTE: never apply this rule on a port designed for banner protocol (FTP, SSH, SMTP, POP, IMAP) as it would prevent connections from properly establishing. It only works with HTTP and HTTPS because the client sends data directly after the empty ACK. Maybe the mechanism demonstrated above could additionally be combined with Yelp’s method of delaying packets, except that we would delay empty ACKs instead of SYNs for an improved solution and less impact on banner protocols.
+
+In terms of a coming up with a proper, long-term solution, the first idea was to see if the kernel could be adjusted to avoid the problem in the first place. But that could result in undesired side-effects and it looks tricky as the problem could re-appear later.
+
+A safer, and proper, long term solution turned out to be what we already discussed in our step #4 – to pass the listening file descriptors to the new process so that the connection is never closed.
+
+Fortunately, by the time I was finishing running my tests and taking notes, Olivier has already gotten that code working pretty well. The implementation is limited to passing 253 listeners at the most, but this is a limitation of the SCM_RIGHTS API combined with the fact that we don’t want to poll at this moment, and it is more than enough to support even multi-process reloads.
+
+The patches were sent for review and testing to the mailing list:
+
+And they immediately received very positive feedback from Pavlos Parissis and Conrad Hoffmann, allowing us to fix a few minor glitches and merge the patchsets into the HAProxy 1.8 development branch, scheduled for a stable release in November 2017.
+
+In the mean time we are validating the remaining corner cases and are already considering integrating this patchset into HAPEE 1.7r1 and maybe even 1.6r2. Olivier took care of being as unintrusive as possible with his code in order to ease backporting. So stay tuned for the backports!
+
+We can run a script to test the results, going from restarts, to reloads, to reloads with transferring sockets between the HAProxy instances:
+
+It was fun to see that people sometimes accused HAProxy of being responsible for “breaking connections” (which was never true) or “sending RST” during reloads (which was in fact more likely a race condition in the Linux network stack). The kernel can’t be blamed either, though, as there are some trade-offs to apply to maintain a high performance level. Also, the fact that people less often report this problem with other software components simply means that they don’t push those components to the traffic levels where the problem starts to appear.
+
+But, at least the HAProxy Technologies’ R&D managed to identify the problem and get rid of it for the benefit of the whole community:
+
+As I mentioned before, this effort is part of our larger roadmap initiative to build more microservices-oriented features into HAProxy, as we currently power many microservice architectures and orchestration systems being used by companies like Yelp and GitHub mentioned in this article.. Stay tuned for more features and news for microservices use cases!
+
+Special thanks to Chad Lavoie, Nenad Merdanovic and Tim Hinds for their respective contributions to this article.|||
+
+HAProxy Technologies' R&D has released a patchset to enable seamless reloads of HAProxy without dropping packets in the process.
