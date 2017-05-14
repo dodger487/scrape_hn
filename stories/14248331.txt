@@ -1,0 +1,87 @@
+Bootstrapping a microservices system is often a very difficult process for many small teams because there is a diverse ecosystem of tools that span a number of technical disciplines from operations to application development. This repository is intended for a single developer on a small team that meets the following criteria:
+
+If the above criteria match then this project is for you and you should keep reading because this tutorial will help you get set up with a production-quality Kubernetes cluster on AWS in about 10 to 15 minutes!
+
+The concept of simplicity is subjective, but for the purpose of this architecture "simple" means that the application conforms to two constraints:
+
+Similarly, the term "modern" is ambiguous, but for the purpose of this architecture "modern" means that the application has a very narrow downtime constraint. We will be targeting an application that is designed for at least "four nines" of availability. Practically speaking, this means the app can be updated or modified without downtime.
+
+Infrastructure fabric is the term we use to describe the composite of a dedicated networking environment (VPC, more below), container cluster (Kubernetes), and any strongly associated resources that are used by services in the container cluster (e.g. RDS, Elasticache, Elasticsearch).
+
+To keep this infrastructure fabric simple, but also robust, we are going to make some opinionated design decisions.
+
+The GitHub repository is set up so that each fabric is defined in an independent Git branch. This allows for multiple fabrics to exist in parallel and for concurrent modification of the fabrics. Why might you want multiple fabrics? It allows multiple environments, e.g., develop, test, staging, prod. It also enables other types of useful separation, for example, Alice and Bob can each have their own cloud-deployed fabrics for whatever purpose they need. For simplicity, fabrics are named with DNS-compatible names.
+
+A single new Virtual Private Cloud ("VPC") will be created in a single AWS region (us-east-2 "Ohio") that holds the Kubernetes cluster along with all long-lived systems (e.g., databases). A VPC is a namespace for networking. It provides strong network-level isolation from unrelated stuff running in an AWS account. It's a good idea to create a separate VPC rather than relying on the default AWS VPC. Over time, the default VPC becomes cluttered and hard to maintain or keep configured properly with other systems. Also, VPCs are a cost-free abstraction in AWS. The base network will be IPv4 because Kubernetes does not run on IPv6 networks yet.
+
+The VPC will be segmented into several subnets that are assigned to at least three availability zones ("AZ") within the region. An availability zone in AWS is a physically-isolated datacenter within an AWS region that has high-performance networking links with the other AZ's in the same region. The individual subnets will be used to ensure that both the Kubernetes cluster as well as any other systems, such as an RDS database, can be run simultaneously in at least two availability zones to ensure there is some robustness in the infrastructure fabric in case one AZ fails.
+
+The deployed network fabric will not have an external vs. internal subnet distinction to avoid NAT gateways.
+
+Before the Kubernetes cluster can be provisioned, a public DNS record in AWS Route 53 needs to exist. For example, at Datawire, we own the mysterious . It is strongly recommended that you buy a domain name for this part of your infrastructure and do not use an existing one.
+
+A Kubernetes cluster is created in the new VPC and set up with a master node per availability zone and then the worker nodes (sometimes called "kubelets" or "minions" on the internet for historical reasons) are created across the availability zones as well. This design provides a high availability ("HA") cluster.
+
+You'll need all of the following to get through the tutorial. We'll go into more detail on how to set everything up in later sections.
+
+NOTE: You really need all of these tools. A future tutorial will simplify the requirements to get set up.
+
+Follow the links below for information on installing each tool.
+
+Before we begin a couple things need to be done on the AWS account.
+
+Clone this repository into your own account or organization. The cloned repository contains two branches: and . The branch contains documentation and some specialized scripts for bootstrapping AWS and additional fabrics. The branch is an example repository that is nearly ready for use.
+
+The repository is setup as a monorepo that uses branches to keep environment definitions independent. Run the following commands to get where you want to be:
+
+After running those commands you should be in the branch and the tools from the bin/ directory on the branch will be available for use.
+
+Every AWS account is allocated a different set of availability zones that can be used within a region. For example, in the region, Datawire does not have access to the zone while other AWS accounts might. In order to ensure consistent deterministic runs of Terraform, it is important to set the zones in the configuration explicitly.
+
+For this tutorial, we're going to assume is your preferred deployment region.
+
+A useful script bin/configure_availability_zones.py is provided that will automatically update with appropriate values. Run the script as follows.
+
+After a moment you should see the following message:
+
+You can confirm the operation was successful by comparing the above with the values in :
+
+Two other variables must be configured in before the fabric can be provisioned. The first is the name of the fabric and the second is the DNS name under which the fabric will be created.
+
+Open and then update the field with a DNS-compatible name. The name will be normalized to lowercase alphanumeric characters only so it is strongly recommended that you pick a name that makes sense once that is done.
+
+Also, find and update the field with a valid domain name that is owned and available in Amazon Route 53.
+
+Terraform operates like a thermostat, which means that it reconciles the desired world ( templates) with the provisioned world by computing a difference between a state file and the provisioned infrastructure. The provisioned resources are tracked in the system state file that maps actual system identifiers to resources described in the configuration templates users define (e.g., ). When Terraform detects a difference from the state file then it creates or updates the resource where possible (some things are immutable and cannot just be changed on-demand).
+
+Terraform does not care where the state file is located so, in theory, it can be left on your local workstation, but a better option that encourages sharing and reuse is to push the file into Amazon S3, which Terraform natively knows how to handle.
+
+If the operation is successful it will return the name of the S3 bucket, which is the value of with appended and all nonalphanumeric characters replaced with (dash) characters. For example:
+
+The high-level steps to get the networking set up are:
+
+Below are the detailed steps:
+
+The high-level steps to get the Kubernetes cluster setup are:
+
+It is extremely unlikely you will need to SSH into the Kubernetes nodes, however, it is a good best practice to use a known or freshly-generated SSH key rather than relying on any tool or service to generate one. To generate a new key pair run the following command:
+
+A 4096-bit RSA public and private key pair without a passphrase will be placed into the directory. Move the private key out of this directory immediately after creation with the following command:
+
+Ensure you the private key is read/write only by your user as well:
+
+Kops takes in a bunch of parameters and generates a Terraform template that can be used to create a new cluster. The next command only generates the Terraform template; it does not affect your existing infrastructure.
+
+Below are the detailed steps:
+
+The Kubernetes cluster provisions asynchronously so even though Terraform exited almost immediately it's not likely that the cluster itself is running. To determine if the cluster is up you need to poll the API server. You can do this by running , which will eventually return the API server address.
+
+Here are two straightforward strategies:
+
+Other options exist such as EC2 spot instances or refactoring your application to be less resource intensive, but those topics are outside the scope of this tutorial.
+
+If this tutorial seems like a lot of work, we wrote Loom to solve this problem at Datawire and open-sourced it. Loom is designed to run as a private isolated service within an AWS account. The design and usage theory is that an ops engineer would start up Loom on an EC2 instance, assign a DNS name for Loom and then tell their developers how to access the API. Its designed to be that simple. Check it out at loom.run or get started in just a few minutes.
+
+We’re happy to help! Look for answers in the rest of the Microservices Architecture Guide, join our Gitter chat, send us an email at hello@datawire.io, or contact our sales team.|||
+
+Microservices Architecture Guide

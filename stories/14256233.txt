@@ -1,0 +1,66 @@
+It’s been a while since the original articles about vulnerabilities in Signal that were published together with @veorq on this blog. Following this we were honored to present this research as well as new findings at great conferences all over the world such as TROOPERS17, INFILTRATE, and HITBSECCONF2017.
+
+We had some new things to present that sparked some discussion. An example is the lack of key validation done on public keys in Signal. This is discussed in-depth by @veorq in his blogpost.
+
+Here I would like to talk about another really interesting finding that relates to the Signal protocol itself: Message replay in a compromised server scenario.
+
+Signal uses a variant of the Diffie–Hellman key exchange called the X3DH key agreement protocol also called “Extended Triple Diffie-Hellman”. It is especially suited for use in asynchronous communication scenarios where one party may be offline during key exchange.
+
+We will not cover the full X3DH protocol here, but focus on the parts that are interesting for a message replay instead:
+
+Alice and Bob keep track of their sessions in a session store. Signal allows to have more than one session in parallel.
+
+Obviously this process could be replayed since Bob already published his ephemeral key as a pre-key. It is fixed and since Bob is offline he cannot change it when Alice wants to talk to him.
+
+This problem is somewhat known to the Signal vendor and discussed in the X3DH specification:
+
+4.2. PROTOCOL REPLAY If Alice’s initial message doesn’t use a one-time prekey, it may be replayed to Bob and he will accept it. This could cause Bob to think Alice had sent him the same message (or messages) repeatedly. To mitigate this, a post-X3DH protocol may wish to quickly negotiate a new encryption key for Alice based on fresh random input from Bob. This is the typical behavior of Diffie-Hellman based ratcheting protocols [5]. Bob could attempt other mitigations, such as maintaining a blacklist of observed messages, or replacing old signed prekeys more rapidly. Analyzing these mitigations is beyond the scope of this document. 4.3. REPLAY AND KEY REUSE Another consequence of the replays discussed in the previous section is that a successfully replayed initial message would cause Bob to derive the same SK in different protocol runs. For this reason, any post-X3DH protocol MUST randomize the encryption key before Bob sends encrypted data. For example, Bob could use a DH-based ratcheting protocol to combine SK with a freshly generated DH output to get a randomized encryption key [5]. Failure to randomize Bob’s encryption key may cause catastrophic key reuse.
+
+It basically says replay is possible in X3DH if no one-time prekey is used in the initial message or no other mitigations are in place. This has also been researched by Nadim Kobeissi, Karthikeyan Bhargavan, and Bruno Blanchet in their paper.
+
+Signal tries to do things right:
+
+Problem solved right? Not quite:
+
+Looking into a reference implementation of Signal (libsignal-protocol-java) there is some interesting code in file java/src/main/java/org/whispersystems/libsignal/SessionBuilder.java to be found:
+
+The method SessionBuilder::processV3 returns the id of the prekey that was used, except if it is the last resort prekey.
+
+The return value of method SessionBuilder::processV3 is used to determine the prekey to be removed in method SessionCipher::decrypt (calls processV3 internally) defined in file java/src/main/java/org/whispersystems/libsignal/SessionCipher.java:
+
+So if the id of the “one-time” prekey is MAX_VALUE (0xFFFFFF), the key is never removed from the prekey store and can be reused.
+
+Let’s put theory aside and create a practical demo of this replay attack.
+
+So what is the actual scenario here? The juice of Signal is that it should provide end-to-end security by employing cryptography. This means you don’t have to trust the Signal backend (in case you trust it, TLS should be enough for you).
+
+So we will assume just that: Mallory stole the TLS certificate for textsecure-service.whispersystems.org (WHOIS says it’s running on Amazon EC2!).
+
+She can now happily MITM any traffic from Alice to Bob even when they are using unmodified Signal clients. It does not matter if they also checked their “Safety Numbers” (remember kids, safety first!).
+
+In order to conduct a message replay we have to defeat the mitigations of Signal mentioned above. We also use the limitations of the protocol to our advantage. Let’s look at that in more details:
+
+As seen above there is one key that is never removed from the prekey-store. As a MITM Mallory can force Alice to use this key over and over again. When Alice request the prekeys for Bob, Mallory will just delete all the other prekeys and only give the last resort key with id 0xFFFFFF to Alice. Alice has to believe this is the only key and will happily use it for all sessions with Bob.
+
+We mentioned that not all parts of a Signal message are integrity checked. Let’s have a look on how such an initial PreKeyMessage looks like:
+
+As you can see the message includes an encrypted part “message” as well as key exchange values, ids of the prekeys used, Alice’s public identity, and the registration id of the corresponding Signal user.
+
+Interestingly integrity checking via HMAC is only done on the encrypted part:
+
+What does this mean for Mallory? Being a MITM she can change the baseKey value. This will result in a key exchange being conducted that results in a fake session. Mallory cannot really use this session since she does not have the private identity key and therefore does not know the shared secret. But the ability to create “fake sessions” alone comes in handy in the next steps.
+
+Only if a key exchange (PreKeyMessage) is accompanied by an encrypted message that can be decrypted (and especially has a valid HMAC) successfully, a new session is persisted. As stated above, the encrypted message can belong to any other session, there is no requirement that it actually belongs to the newly created session.
+
+So Mallory being a MITM just does the following: After the initial message she adds a her own fake key exchange to all encrypted messages sent from Alice to Bob. With each message a new session is created because the encrypted message is valid, and there is no integrity checking on the base keys and id values.
+
+As mentioned, Signal will not create a new session if it already knows the base-key. Therefore we have to purge a session before it can be replayed. Combining the two previous steps, Mallory can force a certain session to be purged from the session store if:
+
+After conducting the above steps, Mallory has now forced the target session to be purged on Bob’s side. Alice and Bob may communicate happily and will not see any warnings.
+
+It is now time for Mallory to replay the initial message sent from Alice to Bob (Mallory saved this of course after forcing the usage of the last-resort key). Since the last-resort prekey was used session-creation succeeds, the same shared secret will be created, and the initial message will be decrypted successfully. This applies not just to the first message but also the following messages sent by Alice up to the next Diffie-Hellman ratchet step. Most probably individual messages can be omitted (but we did not test that).
+
+The following video shows a replay attack conducted against a current Signal app (as of 2017-04-14) running on Android (sorry for the bad quality, I will probably create a better one if there is demand):
+
+To conduct the attack and create a MITM condition, a single modification was done to add a CA certificate into the APK file. I did not have access to the Signal servers and did not expect Moxie to give us the keys to conduct our research. To determine how difficult it is to get a certificate from an Amazon EC2 instance is left as an exercise to the reader. Messages were sent from a third-party command-line client for ease of use. This has no impact on the attack carried out against the original Signal app. The message modification is conducted by a dedicated MITM tool written in Python. It will be released publicly so others can also do research on the Signal protocol.|||
+

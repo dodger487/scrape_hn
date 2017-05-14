@@ -1,0 +1,91 @@
+Over the last few months, I’ve seen a password strength meter on almost every signup form I’ve encountered. Password strength meters are on fire.
+
+Here’s a question: does a meter actually help people secure their accounts? It’s less important than other areas of web security, a short sample of which include:
+
+With that disclaimer — yes. I’m convinced these meters have the potential to help. According to Mark Burnett’s 2006 book, Perfect Passwords: Selection, Protection, Authentication, which counted frequencies from a few million passwords over a variety of leaks, one in nine people had a password in this top 500 list. These passwords include some real stumpers: , , , , . Burnett ran a more recent study last year, looking at 6 million passwords, and found an insane 99.8% occur in the top 10,000 list, with 91% in the top 1,000. The methodology and bias is an important qualifier — for example, since these passwords mostly come from cracked hashes, the list is biased towards crackable passwords to begin with.
+
+These are only the really easy-to-guess passwords. For the rest, I’d wager a large percentage are still predictable enough to be susceptible to a modest online attack. So I do think these meters could help, by encouraging stronger password decisions through direct feedback. But right now, with a few closed-source exceptions, I believe they mostly hurt. Here’s why.
+
+Strength is best measured as entropy, in bits: it’s the number of times a space of possible passwords can be cut in half. A naive strength estimation goes like this:
+
+This brute-force analysis is accurate for people who choose random sequences of letters, numbers and symbols. But with few exceptions (shoutout to 1Password / KeePass), people of course choose patterns — dictionary words, spatial patterns like , or , repeats like , sequences like or , or some combination of the above. For passwords with uppercase letters, odds are it’s the first letter that’s uppercase. Numbers and symbols are often predictable as well: l33t speak (3 for e, 0 for o, @ or 4 for a), years, dates, zip codes, and so on.
+
+As a result, simplistic strength estimation gives bad advice. Without checking for common patterns, the practice of encouraging numbers and symbols means encouraging passwords that might only be slightly harder for a computer to crack, and yet frustratingly harder for a human to remember. xkcd nailed it:
+
+As an independent Dropbox hackweek project, I thought it’d be fun to build an open source estimator that catches common patterns, and as a corollary, doesn’t penalize sufficiently complex passphrases like . It’s now live on dropbox.com/register and available for use on github. Try the demo to experiment and see several example estimations.
+
+The table below compares zxcvbn to other meters. The point isn’t to dismiss the others — password policy is highly subjective — rather, it’s to give a better picture of how zxcvbn is different.
+
+zxcvbn has no dependencies and works on ie7+/opera/ff/safari/chrome. The best way to add it to your registration page is:
+
+is a measly 350 bytes. On , after your page loads and renders, it’ll load , a fat 680k (320k gzipped), most of which is a dictionary. I haven’t found the script size to be an issue; since a password is usually not the first thing a user enters on a signup form, there’s plenty of time to load. Here’s a comprehensive rundown of crossbrowser asynchronous script loading.
+
+It takes one required argument, a password, and returns a result object. The result includes a few properties:
+
+The optional argument is an array of strings that zxcvbn will add to its internal dictionary. This can be whatever list of strings you like, but it’s meant for user inputs from other fields of the form, like name and email. That way a password that includes the user’s personal info can be heavily penalized. This list is also good for site-specific vocabulary. For example, ours includes .
+
+zxcvbn is written in CoffeeScript. and are unreadably closure-compiled, but if you’d like to extend zxcvbn and send me a pull request, the README has development setup info.
+
+The rest of this post details zxcvbn’s design.
+
+zxcvbn consists of three stages: match, score, then search.
+
+Search is the crux of the model. I’ll start there and work backwards.
+
+zxcvbn calculates a password’s entropy to be the sum of its constituent patterns. Any gaps between matched patterns are treated as brute-force “patterns” that also contribute to the total entropy. For example:
+
+That a password’s entropy is the sum of its parts is a big assumption. However, it’s a conservative assumption. By disregarding the “configuration entropy” — the entropy from the number and arrangement of the pieces — zxcvbn is purposely underestimating, by giving a password’s structure away for free: It assumes attackers already know the structure (for example, surname-bruteforce-keypad), and from there, it calculates how many guesses they’d need to iterate through. This is a significant underestimation for complex structures. Considering , word-word-word-word, an attacker running a program like L0phtCrack or John the Ripper would typically try many simpler structures first, such as word, word-number, or word-word, before reaching word-word-word-word. I’m OK with this for three reasons:
+
+With this assumption out of the way, here’s an efficient dynamic programming algorithm in CoffeeScript for finding the minimum non-overlapping match sequence. It runs in O(n·m) time for a length-n password with m (possibly overlapping) candidate matches.
+
+holds the match in this sequence that ends at password position , or null if the sequence doesn’t include such a match. Typical of dynamic programming, constructing the optimal sequence requires starting at the end and working backwards.
+
+Especially because this is running browser-side as the user types, efficiency does matter. To get something up and running I started with the simpler O(2m) approach of calculating the sum for every possible non-overlapping subset, and it slowed down quickly. Currently all together, zxcvbn takes no more than a few milliseconds for most passwords. To give a rough ballpark: running Chrome on a 2.4 GHz Intel Xeon, took about 3ms on average. took about 12ms on average.
+
+Entropy isn’t intuitive: How do I know if 28 bits is strong or weak? In other words, how should I go from entropy to actual estimated crack time? This requires more assumptions in the form of a threat model. Let’s assume:
+
+I added a .5 term because we’re measuring the average crack time, not the time to try the full space.
+
+This math is perhaps overly safe. Large-scale hash theft is a rare catastrophe, and unless you’re being specifically targeted, it’s unlikely an attacker would dedicate 100 cores to your single password. Normally an attacker has to guess online and deal with network latency, throttling, and CAPTCHAs.
+
+Up next is how zxcvbn calculates the entropy of each constituent pattern. is the entry point. It’s a simple dispatch:
+
+I gave an outline earlier for how works. You can see the full scoring code on github, but I’ll describe two other scoring functions here to give a taste: and .
+
+Consider the spatial pattern . It starts at , its length is 9, and it has 3 turns: the initial turn moving right, then down-right, then right. To parameterize:
+
+The space of total possibilities is then all possible spatial patterns of length L or less with t turns or less:
+
+(i – 1) choose (j – 1) counts the possible configurations of turn points for a length-i spatial pattern with j turns. The -1 is added to both terms because the first turn always occurs on the first letter. At each of j turns, there’s d possible directions to go, for a total of dj possibilities per configuration. An attacker would need to try each starting character too, hence the s. This math is only a rough approximation. For example, many of the alternatives counted in the equation aren’t actually possible on a keyboard: for a length-5 pattern with 1 turn, “start at q moving left” gets counted, but isn’t actually possible.
+
+CoffeeScript allows natural expression of the above:
+
+The first line is the most important: The match has an associated frequency rank, where words like the and good have low rank, and words like photojournalist and maelstrom have high rank. This lets zxcvbn scale the calculation to an appropriate dictionary size on the fly, because if a password contains only common words, a cracker can succeed with a smaller dictionary. This is one reason why xkcd and zxcvbn slightly disagree on entropy for (45.2 bits vs 44). The xkcd example used a fixed dictionary size of 211 (about 2k words), whereas zxcvbn is adaptive. Adaptive sizing is also the reason includes entire dictionaries instead of a space-efficient Bloom filter — rank is needed in addition to a membership test.
+
+I’ll explain how frequency ranks are derived in the data section at the end. Uppercasing entropy looks like this:
+
+So, 1 extra bit for first-letter-uppercase and other common capitalizations. If the uppercasing doesn’t fit these common molds, it adds:
+
+The math for l33t substitution is similar, but with variables that count substituted and unsubstituted characters instead of uppers and lowers.
+
+So far I covered pattern entropy, but not how zxcvbn finds patterns in the first place. Dictionary match is straightforward: check every substring of the password to see if it’s in the dictionary:
+
+maps from a word to its frequency rank. It’s like an array of words, ordered by high-frequency-first, but with index and value flipped. l33t substitutions are detected in a separate matcher that uses as a primitive. Spatial patterns like are matched with an adjacency graph approach that counts turns and shifts along the way. Dates and years are matched with regexes. Hit matching.coffee on github to read more.
+
+As mentioned earlier, the 10k password list is from Burnett, released in 2011.
+
+Frequency-ranked names and surnames come from the freely available 2000 US Census. To help zxcvbn not crash ie7, I cut off the surname dictionary, which has a long tail, at the 80th percentile (meaning 80% of Americans have one of the surnames in the list). Common first names include the 90th percentile.
+
+The 40k frequency list of English words comes from a project on Wiktionary, which counted about 29M words across US television and movies. My hunch is that of all the lists I could find online, television and movie scripts will capture popular usage (and hence likely words used in passwords) better than other sources of English, but this is an untested hypothesis. The list is a bit dated; for example, Frasier is the 824th most common word.
+
+At first glance, building a good estimator looks about as hard as building a good cracker. This is true in a tautological sort of way if the goal is accuracy, because “ideal entropy” — entropy according to a perfect model — would measure exactly how many guesses a given cracker (with a smart operator behind it) would need to take. The goal isn’t accuracy, though. The goal is to give sound password advice. And this actually makes the job a bit easier: I can take the liberty of underestimating entropy, for example, with the only downside of encouraging passwords that are stronger than they need to be, which is frustrating but not dangerous.
+
+Good estimation is still difficult, and the main reason is there’s so many different patterns a person might use. zxcvbn doesn’t catch words without their first letter, words without vowels, misspelled words, n-grams, zipcodes from populous areas, disconnected spatial patterns like , and many more. Obscure patterns (like Catalan numbers) aren’t important to catch, but for each common pattern that zxcvbn misses and a cracker might know about, zxcvbn overestimates entropy, and that’s the worst kind of bug. Possible improvements:
+
+Even with these shortcomings, I believe zxcvbn succeeds in giving better password advice in a world where bad password decisions are widespread. I hope you find it useful. Please fork on github and have fun!
+
+Big thanks to Chris Varenhorst, Gautam Jayaraman, Ben Darnell, Alicia Chen, Todd Eisenberger, Kannan Goundan, Chris Beckmann, Rian Hunter, Brian Smith, Martin Baker, Ivan Kirigin, Julie Tung, Tido the Great, Ramsey Homsany, Bart Volkmer and Sarah Niyogi for helping review this post.
+
+|||
+
+Over the last few months, I've seen a password strength meter on almost every signup form I've encountered. Password strength meters are on fire. Here's a question: does a meter actually help people secure their accounts? It's less important than other areas of web security, a short sample of...

@@ -1,0 +1,102 @@
+Setting up a Docker Swarm (“docker swarm mode” if you want to be more accurate), is pretty much a trivial process. You need 3 nodes, create a swarm on one of them and join the other two nodes to the swarm. Simple. What if you wanted a 100 swarm nodes? How fast can you provision new nodes to scale up your Docker Swarm?
+
+Maybe you’re well funded, have lots of income and can afford running auto-scaling groups on AWS into tens, hundreds or even thousands of instances. If you are, maybe you should look into something more reliable and battle tested, like Amazon Auto Scaling groups or their Google Compute counterpart.
+
+Maybe you’re bootstrapping on a very limited budget, but still need to be ready to scale up when you get a traffic spike. Adding a few servers by hand still takes quite some time to provision, even if you’re starting off with a basic template.
+
+You can consider provisioning new nodes on DigitalOcean. If you haven’t signed up yet, you can use this affiliate link to give you $10 in credit. This gives you a node for a month, or when you’re dealing with elastic loads it can give you about 30 instances for an hour. Sounds good? It is.
+
+DigitalOcean provides a CLI interface, which allows you to perform operations like provisioning droplets, listing running instances and ultimately destroying them. Creating a Docker Swarm is a basic iteration of the following steps:
+
+Did you think that scaling a Docker Swarm will be so simple? It really is.
+
+When it comes to Amazon, they provide something they call “AMI” or “Amazon Machine Images”. This is similar to what Docker images are, and DigitalOcean also provides images of common deployments. To save time configuring our own images, we can use an existing image:
+
+As we want the latest and greatest, we can use the image currently available. We will use this image to spin up new droplets (DigitalOcean version of a VM instance).
+
+Provisioning a new DigitalOcean instance is very simple:
+
+With the command we can create any size of Droplet supported by DigitalOcean. We can set size, enable private networking, spin droplets up in different regions and provide a script to be executed by cloud-init when the instance will spin up.
+
+We can provision a Docker Swarm with cloud-init and automate this process.
+
+When it comes to automating the provisioning of Docker Swarm, we have three operations that are important for us. These operations are:
+
+I created a set of scripts available on the 12FA book GitHub repository. Consider checking it out to follow along with this article. I’ll be explaining parts of what the scripts do as we go along.
+
+Manager nodes handle the main orchestration part of the swarm cluster. You can have as many manager nodes, but you need a majority to function correctly. So, out of 3 nodes, one can fail without impacting the swarm. Out of 5 nodes, two can fail without impacting the swarm. You should keep an odd number of manager nodes to keep your swarm highly available.
+
+There are a few things being done here to set up a manager node. First, a tag is created with . This will allow us to tag our manager nodes with the tag . The script uses another command, to get the IP of a live manager node.
+
+Depending on the output of this command - we can determine if any manager droplets are already running. If none are running, we create a new swarm. If at least one manager is running, we join that swarm. Creating a swarm is done by using the capability when creating a droplet:
+
+In comparison to the previous example, there are a few subtle differences of how we’re creating a new droplet in the swarm:
+
+We’re using the option to wait until the droplet is fully created. As we’re creating the first manager node, it will take some time before it comes online. During this time, we can’t get a token to join the swarm, so we can’t run any manager or worker nodes. This takes about a minute.
+
+We tag the image with , so we know by looking at tags exactly how many running managers or workers we will have at any given time.
+
+We enable the private networking with . This means that the instances within the same region (ams3) will be reachable over a private LAN. This LAN is available on the interface . We will however be using the public IP of the droplets for communication. This allows us to run nodes in different regions, and still being the part of the same Docker Swarm.
+
+The is the most important part of setting up a Docker Swarm. To create a swarm a number of commands should run immediately after the machine comes online. The script runs the following commands:
+
+This script is passed to cloud-init. It will run on the server after it is done spinning up and setting up any software included in the image.
+
+What this script does is pretty straighforward: The script will open up the firewall with ufw to allow traffic on port . This is the port that’s used for communication between swarm nodes. The script uses and the DigitalOcean Metadata service to get the public IP of the instance. Using this information, a Docker Swarm is created.
+
+The process take about 2 minutes until the first manager node is created. After that you can add additional managers or worker nodes at a higher speed / concurrently. The join token is being passed to the instance over a cloud-init script and doesn’t change between runs, so you can literally spin up tens of instances in the span of a few minutes.
+
+Adding additional manager nodes is pretty much the same, apart from one small detail. The script that’s passed with changes so that the new node will join the existing cluster, and not create a new one:
+
+The difference is subtle - we are issuing a command, with two additional pieces of information. One piece of information is the . This token is generated by connecting to a live master node and requesting a join-token:
+
+If for some reason this token can’t be retrieved (for example, because your swarm is not yet created and you still need to wait a bit), then adding a new manager will fail. You should retry this, usually the first node needs only a few minutes.
+
+The second part of the information is the . This is the $IPADDR of the manager that produced a join token for our swarm. Docker will try to join the swarm existing on the same IP address.
+
+Worker nodes don’t get a management interface to the swarm, but just an execution. This means that you can’t perform any swarm actions from the workers, but the managers schedule containers for execution on them. They work, not manage.
+
+If no workers exist, you’ll end up with a descriptive error:
+
+You can have as many workers as you like, you can even have none if you don’t. The join token is being passed to the instance over a cloud-init script, just like it is with adding new managers. The only difference is that the type of token is specifically created for workers:
+
+While technically, you could scale your swarm by having a large number of masters, this will add strain to the system. Manager nodes should be used to provide redundancy, while worker nodes should be added to provide capacity.
+
+Removing a manager first demotes the manager to a worker, and then the worker node is removed from the swarm, after which, the DigitalOcean droplet is purged.
+
+I’m trying to make this process as expected to the system as possible. By setting the availability to drain, we’re already telling Docker Swarm that this node shouldn’t be used for containers anymore. New containers will start to spawn on other nodes.
+
+We will demote the manager to worker, so we may safely destroy the node. This is a managed way how to reduce the number of managers without causing an outage. When demoting managers, the process should never result in the failure of the swarm.
+
+When we purge the droplet, we basically shut down the instance and any data it may have had. It’s effectively reducing the capacity of your instance pool. Any containers will continue to be scheduled on the remaining instances.
+
+Finally, we should remove the worker node from the swarm. The worker node can’t remove itself and this is why we already purged the instance. We connect to one of the managers and use to purge it from the swarm.
+
+All this can be done by running:
+
+As the node is removed gracefully, the constraints about fault tolerance do not apply any more. The swarm size goes down, and with it, availability guarantees and constraints.
+
+Removing a worker is just as simple as removing a manager:
+
+You can remove any number of workers without causing an outage, as long as your managers have enough capacity to run the containers you were running on the workers until the point of removing a worker.
+
+Just run and it will wipe all your swarm manager and worker instances from existence.
+
+There are a few utility scripts to facilitate the functionality presented above:
+
+For example, if you want to run on all manager nodes, you can do:
+
+After spinning up the managers, you can create a service on them:
+
+As you can see, the service created 10 containers, distributed between the available nodes.
+
+I added the option to filter container based on their desired state, listing only running containers. Here we see that the containers have re-scheduled on the available managers without issue. As long as there is one manager left, we can remove managers without failure of the swarm.
+
+With the set of these scripts it’s possible to provide swarm elasticity. If your load is elastic, you can use the provided scripts to add and remove worker and manager nodes as needed to faster process your workloads. Depending on any monitoring rules you set up, you can create your own system to grow and scale your Docker Swarm based on a number of inputs that you monitor. This may be anything from CPU usage, to the number of items in your worker queue.
+
+Just as an interesting fact: to test out the above (with a lot of trial and error), I used about $1.75. It’s the average price for a cup of coffee in Slovenia.
+
+I'm the author of API Foundations in Go and my latest book, 12 Factor Apps with Docker and Go. You should read both books if you want to learn more about Docker and Go. I write about technology, Docker, Go, Node, PHP and databases most of the time. I am always interested in implementing best practices in whatever I do. You can reach out to me on Twitter.
+
+I'm available for consulting / development jobs. Fixing bottlenecks and scaling services to cope with high traffic is my thing. I specialize in back-end development with a focus on providing APIs for consumption in Angular, React, Vue.js and other front-end technology stacks.|||
+

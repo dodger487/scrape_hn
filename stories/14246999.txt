@@ -1,0 +1,128 @@
+Learn how to deploy an application to Kubernetes with Google Container Engine, and how to set up continuous deployment for it using Semaphore.
+
+This tutorial will show you how to deploy a sample microservices application to Kubernetes and set up continuous deployment using SemaphoreCI. It includes a crash introduction to Kubernetes, Google Container Engine, and building an automated deploy process.
+
+Kubernetes, or "k8s" for short, is an orchestration tool for container native applications. Note that Kubernetes is about containers, and not only Docker containers. This tutorial uses Docker because it's the current industry standard.
+
+Kubernetes is a complex distributed system. This tutorial only requires access to a running Kubernetes cluster, and it shows you how to create a hosted cluster using Google Container Engine (or GKE). The tutorial assumes you have experience with Docker and the idea behind orchestration tools. All set? Let's begin.
+
+Kubernetes is an open-source container orchestration tool for cloud native applications. Kubernetes is based on Google's internal Borg orchestration tool. It's a distributed system following the master/slave architecture. Kubernetes clusters may have multiple masters for high availability requirements. Master nodes manage containers on minion nodes. Minions run the "kublet" which handles communication with masters and coordinating the container runtime (e.g. Docker, Rocket).
+
+Applications are modeled as "pods". Pods contain one or more containers. A modern web application may have separate frontend and backend containers. These two containers form one pod. All containers in a pod run on the same node. Kubernetes handles all the networking and service discovery so containers may communicate to pod-local containers or to other containers in the cluster.
+
+Pods are exposed to other pods via "services". Kubernetes has a few different types of services, namely an external load balancer and a private proxy for internal access. Kubernetes can automatically create load balancers on supported cloud providers, e.g GCP or AWS.
+
+Pods are the building blocks for higher level concepts. Kubernetes uses "deployments" to manage changing configuration (e.g. environment variables, container images, and more) for running pods. Deployments are connected to "Replica Controllers" for horizontal scaling. Deployments also use built-in liveness and readiness probes to monitor deployment rollouts.
+
+You can interact with Kubernetes via the web dashboard or the CLI. uses YAML or JSON input to manage resources, e.g. create a pod/deployment/service. This tutorial uses exclusively.
+
+There is so much more to Kubernetes. The project is extremely well documented with low level API documentation and high level user guides. Here are the main takeaways:
+
+These points should give you enough information to deploy the sample application.
+
+The sample application has three containers. The "server" container is a simple Node.js application. It accepts a POST request to increment a counter and a GET request to retrieve the counter. The counter is stored in redis. The "poller" container continually makes the GET request to the "server" to print the counter's value. The "counter" container starts a loop and makes a POST request to the server to increment the counter with random values.
+
+We'll play with setting up the application ourselves using before building the deployment pipeline.
+
+Here's a rundown of everything you'll need to complete the tutorial:
+
+First, create a new project in your GCP account. You can do this via the web console or the CLI. The CLI version is available via the alpha release track. Here's the CLI version. Replace the with the name of your choosing:
+
+Next, navigate to the GKE Dashboard with your project selected. You'll see a message saying that GKE is not enabled yet because the project is not linked to a billing account. Click the button to select a billing account. This will take some time to kick in. You can refresh the web dashboard to check the status. You'll see a blue "create container cluster" button once you're good to go.
+
+Time to create the GKE cluster. You may include the option to change geographical region. United States is the default zone. Remember the zone you used. You'll need this later.
+
+The sets the ID for the previously created project. The cluster is named . You can name it whatever you like. It will take some time to create the cluster. You'll see something like this when it completes:
+
+The next step is to get login credentials to use with .
+
+This command creates the configuration "context" for this cluster. You may have configured multiple contexts for easy switching between multiple clusters. Run:
+
+You'll see something similar to the output below. You will have more output if you've configured multiple contexts.
+
+Note the column. You'll need this value shortly. You can see that has also set this to the current context, denoted with . You can override this value by passing to every command. Let's test the cluster by asking for all the pods in the cluster.
+
+There should be no output because we've not created any pods.
+
+Congratulations! You've just created your first Kubernetes cluster using Google Container Engine. Now it's time to build and run the sample application.
+
+Let's familiarize ourselves with the sample application. First clone (or fork) the source repo. Next, run:
+
+This will build all the images and start the containers. Once the build process completes, you'll see a lot of output streaming to your screen. Here's a sample:
+
+You can see the is printing the counter. The is sending requests to increment by a random number.
+
+Let's get the application running on Kubernetes. First, we need to push our Docker images to a registry accessible to our cluster. GKE clusers are automatically authenticated to an associated Docker registry (Google Container Registry or GCR). This is the easiest way to manage private Docker images for GKE.
+
+Open up in your source checkout. You'll see some items. Replace the zone subdomain and project ID to match your cluster. Refer to the GCR push docs for the list of regions to subdomain mappings.
+
+Time to push images. We need access to the project's GCR. This process is similar to the command used earlier. Run:
+
+This command generates a temporary entry for the registry. Now, use to push images.
+
+The Docker images are now accessible to our cluster. Time to create our first pod.
+
+Open up in your source checkout. You'll see items. Knock those out. This file is effectively equivalent to . There are some Kubernetes specifics at the top (the , , and ). Then, there is a list of containers. The expected parts are configured:
+
+These are common parts you'll see for most pods. Note that is not specified. This is because each Docker image (check each in the source) sets the . The images use environment variables for everything (thus the and value).
+
+Time to create our first pod. Set the default context to avoid passing to all future commands.
+
+Next, we'll create a namespace. A namespace isolates resources. Separating environments is a common use case. You may create a namespace for , , , and . Using namespace is a best practice you should follow. Let's create a namespace now:
+
+The command deals with files specified by the option. You may use YAML, JSON, or stdin. Next, create the pod:
+
+Next, check the pods in the namespace.
+
+You'll see a list of pods and their status. Here's an example:
+
+Great! Our pod is running. If you see something that looks like an error, the is probably incorrect. You can delete the pod, and try again with .
+
+Let's get some detailed information on this pod:
+
+The command is an important debugging tool. The information is not immediately useful for this tutorial. However, it's a good inclusion because you may need it to diagnose problems.
+
+We should be able to find out the current counter. Let's check the 's logs:
+
+Congratulations — you've just created your first microservices application on Kubernetes. There are a few drawbacks though. First, this setup is not scaleable. Remember that all containers in a pod are scaled horizontally? Our pod has 4 containers: the redis server, API server, counter, and poller. Trying to scale this setup wouldn't work. There would be N separate data stores creating N different counters. We can solve this problem by splitting the large pod into smaller pods and connecting them with Kubernetes services.
+
+Let's delete the pod we created before moving on:
+
+Let's break up the application into fewer components. We'll create one pod with the redis container. We'll have one deployment for the server container, for horizontal scaling. Then, we'll have one optional deployment for the poller and counter containers. These files are in the folder and annotated with comments. Here's the rundown:
+
+This setup is deployed by:
+
+The contains all the commands to do so. The script takes the target namespace as an argument. Let's deploy everything to the namespace:
+
+Note that the various YAML files may set the in their metadata. It's preferable not to do that, so the same resources may be reused in multiple namespaces, like we've done here.
+
+You'll see that they have been created:
+
+Note that there are three server and support pods. Kubernetes has scaled our application without a problem. Let's check the logs for the container in one of the support pods. Pick one of the support pods from the previous output:
+
+If everything is working, you should see some counter lines. Now, let's scale up our deployment. Open up and increase the value. We'll tell Kubernetes to apply the changes. Kubernetes will take care of the rest:
+
+The command is similar to , except that it can create resources and update them with changes. You may use like if the resource does not exist.
+
+Notice the number of support pods has changed, depending on whether you scaled up or down. We can use this approach to set up continuous deployment.
+
+We walked through the initial process and modifying a running system manually. Now we need to automate it. The high level process looks like this:
+
+Start by signing up on Semaphore if you don't already have an account, and creating a GCP service account for Semaphore CI. Open up IAM in the GCP console. Then click "Service Accounts". Make sure the correct project is selected. Create a new service account with the "Owner" role and check "Furnish a new private key". Press "create" and the authentication file will download to your machine. Refer to the GCP service account docs for more info.
+
+Next, create a new project in Semaphore CI. Configure the Docker platform. Then, download service account authentication to create a new configuration file. The tutorial assumes the name is . Note that the UI shows the absolute path for this file. Use that value to set the environment variable. Do not use the form. Use the full path. Here's an example: . Replace with the name of your file.
+
+Now, create a script to configure the build environment. Refer to for the complete example. Complete the items. Add this step to your SemaphoreCI project.
+
+Next, write a deploy script. The deploy script handles the last two points in the process. Refer to for the complete example. It is almost the same as the earlier bootstrap script. is used because it will create or update resources accordingly. Thus, we can change the configuration by committing changes to the files in and deploying. Add the command to your project.
+
+Finally, push a build. You should see it go all the way through the pipeline and deploy everything to your Kubernetes cluster. Congratulations! Let's check the production pods:
+
+You can now try making changes the configuration files to scale out the application, commit, and redeploy.
+
+We've covered a lot of ground — a Kubernetes crash course, the different types of resources, and how to model a microservices application. We created a production-ready Kubernetes cluster via Google Container Engine, and hooked up Semaphore CI for continuous deployment. There is still room for improvement. Here's what you can investigate next:
+
+Good luck out there, and happy shipping!
+
+If you’d like to simplify delivering your apps using Google Container Registry, you can learn more about our Google Container Registry Integration, or register on Semaphore and get started now.|||
+

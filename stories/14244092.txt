@@ -1,0 +1,53 @@
+PostgreSQL 10 is getting close to its first beta release and it will include the initial support for logical replication, which is was written primarily by me and committed by my colleague Peter Eisentraut, and is internally based on the work 2ndQuadrant did on pglogical (even though the user interface is somewhat different).
+
+I’d like to share some overview of basics in this blog post.
+
+Let me start with briefly mentioning what logical replication is and what’s it good for. I expect that most people know the PostgreSQL streaming master-standby replication that has been part of PostgreSQL for years and is commonly used both for high availability and read scaling.
+
+So why add another replication mechanism and why call it logical? Well, the traditional replication works by shipping the write ahead log (binary transaction log) to the standby server which applies the changes. And the changes described there are very low-level and, in simplified terms, it just says what bytes to add or change in what file. The result of this is that the standby server is bit for bit copy of the master server. That’s fine if you want to just have a copy of all your data (and databases) but not if you need some flexibility of what should be sent and where. It also means that you can’t write anything on the standby since then it would no longer be an exact copy. And as for example using temporary tables requires writes, it’s not possible to use them on a standby.
+
+Logical replication uses the same information in the binary file, but translates it back into logical changes. For example, we know that a row with some data was inserted into a specific table, instead of just knowing we should append bytes to a file. This allows us to do some interesting things. First, since we know what table changed, we can filter based on that, so that we can now replicate just some tables from a database as opposed to data of a whole instance. The other big difference which this implies is that the downstream no longer applies just binary changes to files but actual changes to tables and so the downstream is no longer an exact binary copy of the master. So now we can do writes on the downstream, we can use temporary tables, we can add additional indexes (very handy, for example, when the additional server is used for analytics) and we can even have multiple upstream servers replicate to single downstream and combine the data.
+
+Okay, “that’s all cool” I hear you say, “but how do I use it then?”.
+
+Logical replication uses a publish/subscribe model and so we create publications on the upstream (or publisher) and subscriptions on downstream (or subscriber). Before we can really do that though we need to change the configuration of PostgreSQL a bit. The PostgreSQL 10 comes with new defaults that allow replication slots, walsenders and replication connections (all prerequisites for replication) out of the box, so the changes aren’t big. For a start it’s enough to change the configuration parameter to so that the write ahead log contains information needed for the translation of binary changes back to logical ones.
+
+Once the basic configuration is done we can start creating publications. The command for that looks something like this:
+
+The above will create a new publication and adds the tables and to it. There is also shorthand to publish all user tables in the database:
+
+See the CREATE PUBLICATION documentation for more details.
+
+After publications are created, the other servers can subscribe to them. That’s accomplished by creating subscription like this:
+
+This creates a new subscription which will start replicating tables that are part of the publication. And that’s all that’s needed to get basic replication working! By default, the new subscription will also copy any preexisting data in those tables. This can be optionally disabled (using the clause). See the CREATE SUBSCRIPTION documentation for more details. Note that the definition of the table is not copied at this time, so we need to create the tables ourselves, as the replication worker will error if it can’t find the table locally.
+
+When new tables are added to the publication, the subscription will not learn about them automatically, and so they will not be replicated. To replicate them we need to run a command which updates the subscription’s idea about what tables are published:
+
+This again will copy any existing data for new tables and supports the clause.
+
+Now that we have logical replication setup, it would also be nice to see what’s happening and if it’s even working. For that there are two monitoring views. One is an already familiar one called which shows all the replication connections to the current server. The logical replication subscribers will be shown there along with the standbys, providing same information. The other view is which which shows status information about the subscription on the downstream server. It contains one entry per subscription plus another entry for every table that’s currently being synchronized (the existing data are being copied).
+
+That’s enough for basic overview, now let’s see example captured output from psql.
+
+Let’s setup some table and publication on a publisher:
+
+We can see that it also synchronized the table information and creates a replication slot on the publisher.
+
+Let’s check the status of the subscription now.
+
+And also verify that the existing row was replicated.
+
+Everything works as expected. Back on the provider we can also check the replication status, just like we would for a normal standby.
+
+Note that the shown here is the same as the name of the subscription we created.
+
+Okay, let’s insert one more row and check if it gets replicated:
+
+And once more on the subscriber we can see that the data is there:
+
+Getting logical replication into PostgreSQL was large undertaking and I am happy that we managed to get something into PostgreSQL 10 which is already quite useful. It does not have all features of pglogical, but it’s still an important step to providing the basic version of this powerful functionality out of the box. It also opens other possible uses for the underlying technology for other features inside of PostgreSQL.
+
+We’ll look into some aspects of logical replication more deeply in future blog posts – so be sure to follow our social channels to not miss the update!|||
+
+PostgreSQL 10 is getting close to first beta release and it will include the initial support for logical replication.

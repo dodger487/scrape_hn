@@ -1,0 +1,47 @@
+This project is a minimal benchmark of applicability of several implementations of machine learning algorithms to training on big data. Our main focus is Spark.ML and how it compares to commonly used single-node machine learning tools Vowpal Wabbit and XGBoost in terms of scaling to terabyte (billions of lines) train data. Quick web search shows that many people tested Spark but not on tasks requiring a cluster so they are mostly single-node tests.
+
+This project is inspired by https://github.com/szilard/benchm-ml but is focused on training models on billions of lines of train data, including Spark.ML in multinode cluster environment.
+
+Our target application is prediction of click-through ratio (CTR) of banners in online advertising. Criteo released an industry-standard open dataset which represents banner impressions in online advertising during the timespan of 24 days. It is more than 1 terabyte in size and consists of more than 4 billion lines of data. Each line represents a banner impression and contains 40 columns separated by tabulation:
+
+This is how it looks like:
+
+All the data except the last day was concatenated and sampled into training sets of 10ⁿ and 3×10ⁿ lines with (i.e. train samples' sizes are 10k, 30k, 100k, ..., 1kkk, 3kkk lines). The last day was used for testing - a sample of one million lines was taken from it. All samples were converted to
+
+Data for Spark.ML models was processed on-the-fly from LibSVM format:
+
+Historically, we make use of Vowpal Wabbit and XGBoost exploiting "Local train + Distributed apply" scenario. Our task was to run a performance test of our currently used approach and Spark.ML library algorithms.
+
+We used the following non-distributed algorithms:
+
+Our preliminary research shows that four of the algorithms are not well-suited for our task of CTR prediction:
+
+Thus we use only LogisticRegression and RandomForestClassifier for our testing purposes.
+
+Local models were trained on a 12-core (24-thread) machine with 128 GiB of memory. Distributed training was performed on our production cluster (total capacity is approximately 2000 cores and 10 TiB of memory); for the experiment a small part of resources has been allocated - 256 cores and 1 TiB of memory for training on datasets upto 300 million of lines and 512 cores and 2 TiB of memory for training on one billion and 3 billion lines of train data. 4 cores and 16 TiB of memory per Spark executor was used.
+
+For the experiment we used Vowpal Wabbit 8.3.0, XGBoost 0.4 and Spark 2.1.0 running on a Hadoop 2.6 cluster (using YARN as a cluster manager).
+
+Our first idea was to skip models' hyperparameters optimization completely, but unfortunately XGBoost's default hyperparameters are not good enough for training even on million lines of data - the default number of trees is only 10, and it hits the ceiling quite soon:
+
+These figures reminded us that production usage of any machine learning model is associated with optimization of its hyperparameters, and in our experiment we should do the same. For optimization of models' hyperparameters (including Spark.ML ones) we used the million-line sample of train data and 5-fold cross validation for metric (log loss) averaging.
+
+We tried to use one-hot-encoding of categorical features, but due to very large number of unique values it turned out to be very time and memory consuming, so for Spark.ML we decided to try the hashing trick. Spark.ML LogisticRegression was trained using this approach. We sticked to hashing space of 10⁵ hashes as it turned out to give about the same quality as VW on large samples. Taking less hashes usually leads to better quality on smaller data (because of less overfitting) and worse quality on bigger data (because some patterns in data are consumed by collisions in hashing space):
+
+RandomForestClassifier was very slow to train even with a thousand hashes, so we used "as-is" format for it:
+
+All work was performed in Jupyter notebooks in Python. Notebooks:
+
+We made the following conclusions:
+
+To check how model training scales to multi-core setup we made a quick test where we increased the number of cores and measured training time for every step. To make it fast we used a 10⁷ sample of train data and checked training time for a number of cores from 5 to 50 in steps of 5. In order to eliminate the uncertainty brought forth by running the test in parallel with production tasks, for this test we created a standalone Spark cluster running on three machines with a total of ≈50 cores and ≈200 GiB of memory.
+
+Training time dropped quite fast when we went from 5 to 15 cores but slowed down afterwards and completely ceased to improve by the mark of 40 cores (even growing a little on transition from 40 to 45 cores). The main idea we have extracted from this figure is that one should not increase amount of resources beyond minimum required, so that work distribution and aggregation overhead would be cheaper than potential improvement of speed by parallelization.
+
+We can see that:
+
+The best quality measured by logarithmic loss (which is a metric of choice for CTR prediction) was achived using XGBoost - no matter in-memory or out-of-core, as they both seem to be equal in quality - on a sample smaller in size than other models required for the same level of quality. However XGBoost is very slow on big samples in out-of-core setup thus it was not rational to test it on a 300kk sample and above (training the in-memory setup on large samples was also not possible due to memory restrictions). The highest ROC AUC was reached by Vowpal Wabbit on one-billion-line train sample, strangely decreasing in quality by three-billion-line sample. Spark.ML LogisticRegression is quite close in quality to Vowpal Wabbit, and maybe it can be made even better by increasing the feature space size (which is 100k hashes in current setup). Spark.ML LogisticRegression appeared to be considerably faster than VW on billion-line samples and maybe it can be made even faster by optimizing the allocated resources. Spark.ML RandomForestClassifier stopped increasing in quality quite early and it is also quite slow.
+
+Results in table format can be found here. Scala scripts used for faster conversion and sampling can be found here - these scripts can be used from spark-shell using command. Scripts for running VW & XGBoost and plotting outside of the Jupyter notebooks can be found here.|||
+
+criteo-1tb-benchmark - Benchmark of different ML algorithms on Criteo 1TB dataset

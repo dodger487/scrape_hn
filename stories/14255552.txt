@@ -1,0 +1,106 @@
+I'VE GOT THE BYTE ON MY SIDE 57005 or alive
+
+Much of Scala’s power comes from its flexibility and generality as a language. You can mold it quite extensively to suit your particular problem domain or coding style.
+
+The downside of this is that Scala can sometimes be permissive and accommodating to a fault. You often hear Haskell or F# users attest to a sense of “if it compiles, it works” – in my experience this is not generally the case with Scala.
+
+To illustrate this point, let’s walk through a few examples, all of which are distilled from honest-to-goodness I-swear-I’m-not-making-this-up bugs my team or I have encountered.
+
+The following nonsensical code compiles with no warnings, no errors:
+
+This will crash with a at runtime. Always. It’s super broken. Why does the compiler let it through?
+
+Because when an expression has multiple return branches, Scala tries to be helpful, by picking the first common ancestor type of all the branches as the type of the whole expression.
+
+In this case, one branch has type and the other has type , so the compiler decides that what the developer really wants is for the whole expression to have type , since that’s the most specific type to claim both and as descendants.
+
+And guess what, is also , so as far as the compiler is concerned, the assignment of the whole mess to can’t be proven invalid. So it gets through with nary a warning, destined to fail at runtime.
+
+I had dashed off some tests that more or less boiled down to something like this, which compiled with no errors or warnings:
+
+This comparison was, surprisingly, returning , and I couldn’t figure out why. Can you?
+
+With syntax highlighting, the problem is clearer:
+
+You see the character in the list? There is a typo – I meant to type but I missed a quotation mark and typed .
+
+As it turns out, the syntax is actually valid in Scala, and represents a symbol literal.
+
+Now recall the “helpful” compiler behavior mentioned in Example 1. Instead of yelling at me for putting a in the middle of my list, the compiler generalizes and assumes what I really wanted from the start was a , as is the first common ancestor of and .
+
+And comparing a with a also raises no objections, because in theory it’s not impossible for it to work.
+
+Somebody makes a small change - adds a log line at the start of the method.
+
+Jolly good, doesn’t get much simpler than that. I think most code reviewers would glaze over it in the middle of a big PR. The compiler (the best code reviewer) is also 100% happy with this change and raises no objections.
+
+Three of Scala’s features come into play:
+
+So the resulting code really acts like this:
+
+What was previously the body of the method has been silently bumped into the body of the primary constructor. Oops!
+
+Here’s another example of “I’ll just add one thing” gone awry.
+
+Quick background: Scala has a shorthand syntax to represent an anonymous argument in a lambda function. A number of languages (Perl, Mathematica, Powershell to name a few) have a similar capability.
+
+This allows one to use the following shorthand, which is actually quite nice:
+
+So let’s say you come across some code like this, and you want to add one little thing: a counter in the loop.
+
+Compiler is happy, looks good right?
+
+Not so fast. This code will print the following:
+
+Why is the counter only incremented once if we are looping over a 3-element list?
+
+Because is not a lambda, it is an expression that increments then yields a lambda, one which does nothing but invoke . So the function argument passed to is just the lambda that invokes , the part is only executed once along the way to obtaining this argument.
+
+In very explicit pseudo-code, this is the equivalent of
+
+Note that everything would have worked fine if the shortcut syntax was avoided, because the “full-fledged” lambda syntax does capture the whole of the bracketed code into the lambda.
+
+This one’s a twofer. Consider the following two test cases, executed with ScalaTest.
+
+For those not familiar with ScalaTest, using matchers just means “LHS should be equal to RHS, fail if not.” So given the code above I would think test 1 would pass and test 2 would fail.
+
+If you compile and run this, you will find that exactly the opposite happens: test 1 fails while test 2 passes.
+
+The cause of both unexpected results is the same – stray expressions in statement position.
+
+In test 1, actually returns , not as you might assume from quick inspection. When you declare a Scala method without a (i.e. like in the example, as opposed to ) that indicates to the compiler that the method has return type (i.e. it’s a “void” method). So the string is simply ignored, is returned, and the LHS string of the test is in fact . Test fails.
+
+In test 2, we see another manifestation of the same problem. Due to the implementation details of ScalaTest and its matchers DSL, the code actually represents a complete expression, whose type is some kind of curried lambda function that expects a RHS value. Nonetheless, it’s a complete expression in statement position, so its value just gets thrown away. Similarly, is a complete, valid string expression, which also gets ignored. Thus this “test” is really just two expressions that do nothing, and that’s considered a “pass.” (Also worth noting that sometimes Scala expressions can flow across line breaks, so it’s not too unreasonable to see this during a review and assume it works)
+
+To be fair – in this example, both the method and the first line of test 2 trigger warnings from the compiler. It’s certainly good that warnings are issued, but I’ll explain why that’s not enough in the next section.
+
+I see 3 basic themes in these examples, each representing an aspect of Scala I don’t personally care for.
+
+Due to the kind of automatic generalization demonstrated above, I never feel fully confident that the compiler has my back. I’m always wondering what I screwed up, type-wise, that the compiler isn’t telling me about. Call me old-fashioned, but isn’t type safety supposed to be one of a compiler’s strong suits?
+
+I readily acknowledge that some of the more powerful type system capabilities Scala offers hinge on this behavior, and that some devs fully rely on it for more advanced usages. I just personally prefer the safety of something stricter.
+
+On the one hand, Scala’s syntax is “dynamic” and “flexible.” Scala is great for crafting DSLs, and it accommodates a wide range of coding styles.
+
+That sounds nice in theory, but I’ve found that in practice it leads to headaches. In a team setting, everybody ends up writing their own personal brand of Scala code, and it takes constant policing to maintain a uniform style. With so much variation in syntax, code reviews become more difficult since the visual patterns you are accustomed to from your own syntactic style don’t neccessarily carry over to what you’re reviewing. And the rules are such that mistakes don’t always result in errors - they might just shift you into another supported form.
+
+Example 3 would have been prevented if methods were simply required to have , or if primary constructor content was required to come before method definitions.
+
+Example 4 would have been prevented if there was a single syntax for lambda functions, or if the rules for , , and weren’t so subtle and overloaded.
+
+The first part of Example 5 would have been easier to catch if return type annotations and/or the in method definitions were required.
+
+The second part of Example 5 would have been prevented if methods required around their arguments, or if ScalaTest wasn’t inviting people to use a magical DSL that nobody can actually reason about.
+
+Like most languages, Scala has a “fatal warnings” flag which will promote warnings into errors. But it doesn’t have any way to suppress individual warnings.
+
+The result is an “abstinence only” kind of situation – you either have to commit to never introducing a single warning of any kind, or else you can’t benefit from fatal warnings at all.
+
+Here in the real world, it’s to be expected that a big project will pick up a warning here, a deprecation there. These useful warnings that indeed should be fixed, but for whatever reason the team decides they can’t or won’t be fixed yet.
+
+Ideally one could suppress those particular issues while maintaining the protection that fatal warnings provide against new problems. Instead, we are left with a situation where the build log is already sullied with a bunch of (known) warnings, and nobody notices when new ones (e.g. Example 5) are introduced.
+
+There are a number of comments along the lines of “just don’t rely on type inference,” “just use a linter,” “nobody uses that syntax anyway,” etc. I fully agree! We are indeed looking to implement these kind of things in our CI system and style guide, and I expect those efforts to help.
+
+These comments are making my broader point for me, though – you get a remarkably flexible and powerful language in return, but using Scala safely and confidently means avoiding flagship language features, opting in to experimental compilation flags, and maintaining a small constellation of 3rd-party plugins.|||
+

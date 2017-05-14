@@ -1,0 +1,118 @@
+If you're looking to get a distributed Erlang cluster up and running on Kubernetes you'll need take a few things into account. This post will create a basic application and provide scripts to automate the creation and deployment of a distributed Erlang application in Kubernetes.
+
+We will be using Google's hosted Kubernetes since this is the simplest method. Not to mention that right now (2017-03-31) they will give you $300 credit and 12 months to use it all in.
+
+I will assume you have already set up your kubectl and gcloud tooling as information to do that is elsewhere.
+
+Maybe you're reading this and thinking, why would I want to do this? I'm already running distributed Erlang on some other cloud provider. I've already got my automation set up to achieve a persistent (as possible) mesh network. Why do I want to use kubernetes?
+
+For one, kuebrnetes is a very slick set of tools. Compared to other tooling available for the bigger cloud providers kubernetes is much simpler to configure, contains a lot of quality of life utilities and overall has a much tigher interface.
+
+Secondly, containers. Kubernetes provides methods to run Dockerfiles easily. Compared to Amazon ECS and getting distributed Erlang running on ECS -- kubernetes is vastly more simple. With ECS there are some annoying hoops to jump through (requiring static ports, host networking) on the ECS instances to even begin to get distributed Erlang working. This eats into the possibilities for deployment. You would need to ensure that epmd runs on a separate port for each deployment or forgo using epmd altogether.
+
+We will be using Erlang, rebar3, Terraform, make and some shell scripts to automate the creation of the cluster. I also provide some simple libraries which ease the discovery of containers running inside your kubernetes cluster (entirely optional).
+
+The main issue when creating a distributed Erlang cluster is discovery of the Erlang nodes themselves. There are many ways to do this. The simplest is hardcoding which nodes to connect to:
+
+This assumes everything will always live on the same host. It assumes that it will never change and if you just use this kind of code that things will never disconnect.
+
+You may also use the file, with contents such as:
+
+Which will connect to all Erlang nodes running on each hostname in that file. This also has issues because you need to populate that file initially and then update this file when the list of Erlang hosts changes. In one legacy deployment we in fact do this. It does genuinely work and I have never had issues with it but it doesn't feel like an elegant solution.
+
+The issue is that either, if the hostnames change, for example running in cloud providors where you are replacing servers running the Erlang nodes or that or you don't want/can't create a periodic task to update this file then you cannot use this method.
+
+The most robust solution that I have found with kubernetes is to use DNS records. We can ensure our pods are created and registered under a kubernetes Service and then it's very easy to query a well-known DNS entry such that we can retrieve each individual pod.
+
+How to do this will be explained later, as it first requires that our pods even exist.
+
+Let's get on with creating our running application.
+
+The first step is to create the basic application skeleton:
+
+Which should give you this basic structure:
+
+And create a basic terraform description of what we need in gcloud, for ease of use create it in a subdirectory inside the directory.
+
+This assumes that your credentials are symlinked to . I find that gcloud service account credentials are the easiest to work with. For simplicity, grant the service account credentials. Symlink that file to /gcloud/credentials.
+
+The symlink isn't necessary but it makes sharing terraform files easier.
+
+Our directory structure should look something like this:
+
+So far this just creates a deployment that likely will not work. For one the field makes no sense since that docker tag won't exist. We'll fix that later. We also don't expose any ports between containers, surely that won't help to cluster our application.
+
+Our directory structure should look like this:
+
+Next, lets create a dockerfile that will package up our Erlang application:
+
+Our directory structure should look like this:
+
+Right. So far we've done seemingly nothing but all of this means we have the basic files and configuration together so we can start running our distributed Erlang cluster in Kubernetes.
+
+What we can do now is simply build and run our Erlang release on kubernetes. It won't be clustered, it won't do anything and all we will learn is that our initial application template is valid.
+
+You will need to know the project ID of the gcloud project you have created. I've created a script for this purpose:
+
+Once that's done, lets check if everything is running:
+
+What this shows is that the three pods we requested are up and running in our cluster. Let's look at how we can cluster our three Erlang nodes.
+
+Great. Now we have a shell running on our Erlang pod. Remember the kubernetes DNS queries I mentioned before? Let's take a look at how that works.
+
+When you create a deployment definition kubernetes groups the pods together and assigns them a stable DNS name where kubernetes will automatically add the A records to. The name will always be:
+
+I have no qualms with these IPs being listed here as they are not publicly accessible since the deployment we created did not have any LoadBalancer directive set.
+
+As you can see there are three A records corresponding to the three Erlang nodes we have running. Now it's just a simple case of writing some Erlang code to query those A records and use them to discover our Erlang network.
+
+Erlang has built-in libraries for querying DNS records and also for extracting specific fields from them. Add that module to your Erlang release and re-run with the correct arguments.
+
+Let's get back onto one of the running Erlang pods and attach to the release:
+
+And bingo. All our cluster is connected. Let's prove that when removing and recreating pods that our cluster is automatically meshed:
+
+Great. We've deleted a pod and kubernetes has automatically created another as per the service description (3 pods required).
+
+Let's see if Erlang had any trouble with that:
+
+As we can see here is now missing, this was the pod that we deleted and in its place is . We've automatically discovered and connected to the remote Erlang node.
+
+So far a lot of details have been glossed over, a lot of the configuration files here if simply copy and pasted will mean that some subtle but important configuration details will missed.
+
+There's a few configuration files that I neglected to mention before because they would cloud the main points in getting clustering working.
+
+In order to easily configure the vm.args such that Erlang is started with the proper value and we can nicely into the running Erlang release we need to set a couple of properties:
+
+When runs will replace any directives in any files it templates with the value found in the environment. Using this feature we can tell Erlang to start on the correct hostname that matches what will be found in the A name records that kubernetes sets.
+
+Additionally, we also need to set the environment variable per-pod in kubernetes. We do this by adding the IP of the pod to the pod's environment:
+
+This means that whenever the pod is created will have the pod's IP set.
+
+Distributed Erlang uses specific ports to communicate over. Erlang uses two different methods to achieve the distributed communication.
+
+The first is which is the Erlang Port Mapper Daemon. This is a small program that runs on each machine where one or more Erlang beam instances is running and maintains which specific ports those individual beam instances are communicating on and what kind of communication they are exporting ( versus ). The easiest way to expose is to leave the default settings and tell kubernetes to expose the default port.
+
+Here, the kubernetes service description exposes port 4369 which is the default epmd port.
+
+The next configuration item is what's labelled by Erlang as:
+
+These two configuration items (explained how to set them shortly) control which port range the Erlang beam instances themselves will communicate along. will know which ports individual beam instances communicate on and other Erlang beam instances will contact remote nodes using these ports.
+
+In sys.config we can control these two settings by adding:
+
+This will set the minimum port for the distributed protocol to 10000 and set the maximum to 10005. This is an example configuration. To simplify the configuration and prevent unnecessary duplication in the kubernetes service description we just set them both to port 10000.
+
+Then, we need to tell kubernetes to expose those ports from the pods:
+
+We can see here that port 10000 has been opened.
+
+Using the information provided here, I hope that you should learn all the things you would need to know in order to create distributed clusters using Erlang and kubernetes.
+
+The example repository which contains all of the code and configuration for this exists at: https://github.com/AeroNotix/disterltest
+
+I also have wrapped up several methods of discovering Erlang nodes in a library: https://github.com/AeroNotix/werld
+
+Using that library, configured properly, the majority of use cases and methods for discovering remote nodes are covered, including the Kubernetes DNS method discussed in this post.|||
+
