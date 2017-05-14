@@ -1,0 +1,105 @@
+For quite some time, I’ve been keenly following developments in the world of compression, reading blog posts and lurking in forums. It’s always been something I’ve found interesting, but I haven’t really had much practical experience implementing general purpose compressors (most of the things I’ve done have been quite special purpose). I had a few weeks off over the Christmas break, so I decided to have a play with some fairly traditional LZ77/LZSS compressors, just to familiarize myself a bit with details of the implementation.
+
+The work done over the break was fairly simplistic and well trodden ground. Sometimes it’s good just to instrument code like this, using simple histograms that you can read in the debugger/dump to the console and get a feel for what’s going on. Experimenting a little, trying a few things and building up more of an understanding.
+
+About two weeks ago a few ideas clicked together and I decided to start a new experiment, building an SSE/x64 oriented LZSS format, with a decoder that can branchlessly decode up-to 32 matches per iteration, with a fair bit of the upfront logic done in parallel using SIMD. This is what I’ll be sharing in this blog post, along with associated code for three variants (LZSSE2, LZSSE4 and LZSSE8).
+
+Note, this is an experiment mainly focused on the decompression, the compressors I’ve implemented aren’t great in terms of speed yet, because I haven’t really put any focus on optimizing them (not being the goal of the experiment). The LZSSE4 and LZSSE8 of the compressors aren’t too slow, but the LZSSE2 compressor is. It uses an optimal parse to test the compression levels achievable with the format, but the binary tree based matching it uses has some terrible pathological cases.
+
+The ideas that clicked together were the threshold based encoding talked about by Charles Bloom here, the way Yann Collet’s LZ4 block format uses the highest value in fields to do variable length encoding and the way parallel SSE pop count implementations split apart the high and low nibbles of bytes and then use them to look-up values inside a register using the PSHUFB instruction (note, only LZSSE8 actually uses the PSHUFB to implement the logic I was originally thinking about, the other variants use binary logic).
+
+The three formats implemented have a lot in common. They all use 32 nibble control words packed continuously in the stream, followed by either the offsets or literals for each word. Each nibble either flags a sequence of literals, or a match, based on a threshold. The length for the sequence of literals is encoded if below the threshold, the length of the match is encoded if above. When the nibble is set to 15, that indicates that the following nibble extends the match (and can’t encode literals). I’ve also used a small 64k window, with fixed 16 bit offsets. Each stream also must end with 16 literals (which are not encoded with controls).
+
+One of the goals is that each control word maps to at most one SSE register width worth of data to copy, so that we don’t need an inner loop (or rep movsb) to copy data. The corresponding challenge, and the reason there are three variants, is trying to get each step in the decoding loop to shift as many bytes as possible on average to keep performance high (which goes hand in hand with compression ratios, as it reduces the relative overhead of the control nibbles).
+
+In LZSSE2, the control values 0 and 1 represent a sequence of 1 and 2 literals respectively, while the control values 2 through to 15 represent a match length of 3 to 16. If the value of the match control is 15, the next nibble represents an additional 0 to 15 bytes that will be appended to the match (and the same with the next nibble after that and so on). This means that each literal has an overhead of either 2 or 4 bits, but that we can represent shorter matches (3 to 15 bytes) in 20 bits. These kind of matches tend to be quite common in a lot of data, especially text. The overhead for longer matches means we limit the maximal achievable compression ratio to a limit approaching 30x. Because there are only a couple of literals per control, this format isn’t great for data that doesn’t have a lot of matches, or that has long strings of literals between matches.
+
+In LZSSE4, the control values 0 through to 3 represent sequences of 1 to 4 literals and the control values 4 through 15 represent matches of 4 to 15 bytes, but otherwise the format is the same. This format does better with longer strings of literals and is also more suitable to be paired up with a faster/lower ratio compressor. The longer minimum match length works better with less exhaustive hash based matching.
+
+LZSSE8 is aimed at lower compression scenarios with more literals again, the control values 0 to 7 represent runs of 1 to 8 literals and the control values 8 to 15 represent matches of 4 to 11 bytes. Also, LZSSE8 needs match offsets greater than 8 bytes from the current cursor (LZSSE8 still beats LZSSE4 on some files in compression ratio, despite the extra restrictions). Again, other than that, the format is the same.
+
+Offsets and literals use an xor encoding, where offsets are xor’d against the previously read offset and literals are xor’d against the data at the previous match offset in the decompressed stream. This allows us to do some optimizations that we’ll talk about later on.
+
+We also restrict the kind of overlapping matches allowed. Matches are only allowed to overlap if the offset is greater than one SSE register width away from the current output cursor.
+
+The compressor for LZSSE2 uses a variant of the Storer-Szymanski optimal parse algorithm and a binary search tree for finding matches. The implementation is quite naive, but apart from quirks with short offsets, it should always find the longest match. It does have some pathological binary tree problems when you have long runs of the same character, a well known problem, so some files compress very slowly. At it’s maximum level, it should achieve the best possible compression for this format (although, there are some caveats with very small offsets). Note that this slow performance is not indicative of anything inherent in LZSSE2, a better matching algorithm would allow the codec to be competitive for compression speed.
+
+The LZSSE4 and LZSSE8 compressors uses a single entry hash and a greedy parse, they’re designed to be sloppy and fast. That said, there are some files where matches are rare enough that the sloppy matching/parses of LZSSE8 actually beat the LZSSE2 optimal parse on compression ratio.
+
+Neither is particularly optimized for speed at the moment (although, SSE is used for testing matches). These are basically built for testing out the performance of the format and the decompression implementations.
+
+This is where things get interesting. Firstly, a comment on this code; it uses macros and gotos, which are things that I wouldn’t usually recommend. It also has largish unrolled loops, which aren’t always wise (but work well in this case). Finally, it’s quite tricky to follow and beaten to make the compiler (in this case, Visual Studio 2015; note, this code has not been tested yet with any other compiler and is definitely not ready for them yet) do what I want, which is no register spills and some quite specific instructions being generated (with an eye on the assembly listings). It’s also some of the code I’ve had the most fun writing in a long time, because it was a good puzzle.
+
+It’s also important to note, this code is targeted at 64bit/SSE 4.1 and it eats pretty much all of the registers (and narrowly avoids spills). You’d probably want to do the implementation differently for targeting 32bit x86. I’m sure there are some wins to be had in the implementation. You could definitely trim the implementations back to only require SSSE3 (needed for the 8 bit variable shuffle) though, if you were keen (extracts and blends are fairly simple to emulate with SSE2 instructions).
+
+One of the first things you might notice is that the main loop is implemented 3 times. The first loop has buffer checks for under-flowing the output buffer based on matches before the data. The second loop doesn’t have buffer checks and the third loop has both the underflow checks and overflow checks for the input and output buffers. The loops themselves have conditions on them that mean it’s impossible to overflow/underflow in the particular loop innards, because they are a “safe” distance away.
+
+We’ll focus on the LZSSE2 implementation, because it’s a little bit simpler to explain. LZSSE4 and 8 are well commented though, so it should be possible to grok what’s going on.
+
+Each iteration of the loop deals with 32 control nibbles, which is exactly what fits in one SSE register. We load that at the start of the loop, then split it into high and low nibbles:
+
+Then we threshold the control values to work out which is a literal or match (note, later this will possibly be ignored in the event of an extended match):
+
+We also work out if the controls will cause the next control to be an extended match. We call this the “carry”, because it essentially shifts up to the next control.
+
+Now, the low carry will be used with the high controls and the high carry will be used with the low controls, but we’ll need to shift the high carry along one to be used with the low controls after the high ones. Because this would leave a gap of one, we also need a memory to remember the previous set of high carries.
+
+Next, we’ll calculate the number of bytes that we’ll be outputting per control. To do this, we take the control and add one to it if the carry is not set. We actually use a subtraction of negative one, because SSE masks are the same as negative one. Note, in LZSSE8 the bytes out and bytes read stages are done via a lookup using the PSHUFB, where the values are stored in the high and low values of a register.
+
+Now we’ll calculate how many extra bytes we’re going to read from the input stream for each control. That will either be two for matches (the size of the offset), one or two for literals and zero for extended matches (when the carry is set). Note that the “literalsPerControl” value here is two, so we’re re-using it.
+
+This is followed by simple masks for whether we’re going to update the offset value (we will for initial matches, we won’t for literals or the extended match) and whether we are writing out literal data or match data:
+
+After this point, we’re going to need some of these values in general purpose registers instead of SSE registers, so we read read out the bottom 64 bits (we’ll read out the top 64 bits in a second version of this later). In fact, when we do the step for handling each individual control, we’ll read the bottom 8 bits of these registers, then shift them 8 bits along (we’ll avoid angering the partial register stall demon by getting the compiler to generate sign and zero extension instructions).
+
+Speaking of which, this is implemented with macros (because we do it 32 times in a loop), but now we’ll get on to the step for an individual control decoding (we’ll not include the buffer checks used in some loops). Here we show the step for low controls, high is very similar. Low and high steps are interleaved.
+
+Part of the goal here is to provide enough interleaved chains of instructions that the compiler always has something to chew on, especially when we have to eat some latency on reads and writes.
+
+First we read from the input stream (we’re doing this unconditionally to avoid a branch). We treat it as a 16 bit integer and then zero-extend it to size_t and load it into an SSE register. Note, there will be some latency between the two in the time the value takes to come from the (hopefully) L1 cache. We also load the value into an SSE register to be used as literals:
+
+Next, there is this beauty/monstrosity, which takes the bottom 8 bits of the “readOffsetLo” mask that we’ve copied into a GPR, sign extends it, converts it back to an unsigned integer, uses it to mask the inputWord, which could potentially be the offset, which is then xor’d with the previous offset. This will select the previous offset or update to the new offset, without a branch, and ends up being quicker than a mask and a cmov instruction, because it’s a shorter dependency chain from the load on the input word. This is why we require the offset to be pre-xor’d with the previous offset in the compression stage.
+
+Here we broadcast the low byte of the from literal register (which we’re also shifting right by one byte each step) to get a mask across the entire width of a register:
+
+Mask out the literals if we are doing a match and xor them against the potential match data. Note, the literals have been xor’d previously against the match data, so this is essentially an operation choosing between the literals and the match data. Then we’ll store the data to the output, note we’re always storing 16 bytes, regardless of the length of the actual output.
+
+Finally, we bump along the input and output streams:
+
+To compare this to other similar codecs, I needed some benchmarks. To do this, I quickly ported lzbench to Visual Studio, dropping any codec I couldn’t easily get to compile. The changes required to get lzbench working with Visual Studio were fairly minor. The benchmarks here will be enwik8, because there are lots of publicly available results in the Large Text Compression Benchmark and the Silesia corpus (both as a tarball and the individual components). Note that we’ll mainly focus on decompression speed vs compression ratio here, because that’s the main target of this experiment at the moment. There is also a smaller benchmark done on enwik9, with competing codecs other than LZ4 variants dropped because enwik9 is a much larger file and ran out of benchmarking time. The specific machine used was a Haswell i7 4790 at stock clocks, running Windows 10 64 bit.
+
+Here’s the results for enwik8, along with all the other compressors that would work with the Visual Studio lzbench build. LZSSE does very well on relatively compressible text like this, which will be one of the common themes in the results. LZSSE2 with the optimal parse provides particularly fast decompression relative to decompression ratio on these kind of files.
+
+For some more mixed results, the silesia corpus as a tar shows that on quite varied data the decompression speed vs compression ratio is still pretty good. We’ll break these down into the individual components for a little analysis.
+
+The Dickens file in the corpus is the collective work of Charles Dickens. This kind of fairly compressible text works well with LZSSE2, where relatively long matches mean a lot of copied bytes per step, for relatively good performance. Also, LZSSE2 works well in terms of the probability for control words too, because there are relatively short literal runs per number of matches.
+
+Mozilla is the tarred binaries of the Mozilla 1.0 distribution. Things here aren’t as rosy as we have shorter matches and lots of literal runs, although there are some long runs of the same character. The LZSSE2 compressor hits the pathological case for it’s binary tree based matcher, slowing to an absolute crawl on compression. We’re still competitive with LZ4 HC for compression ratio vs decompression performance.
+
+Silesia’s mr is a magnetic resonance image. Again, we have pathological compression performance for LZSEE2. LZSSE8 does well here because of the longer literal runs, but LZSEE2’s stronger matching puts it ahead.
+
+Silesia’s nci is a database of chemical structures and is highly compressible. LZSSE loves this file, especially LZSSE2, where we get over 60% of memcpy speed for relatively competitive compression ratios (yes, that is over 7GB/s). The main thing here is that we get a lot of bytes copied per step, which increases the relative efficiency of the decompression.
+
+Ooffice is a dll from open office. Again with this kind of binary LZSSE does not do as well, although LZSSE8 does a lot better here. Performance is much closer to LZ4.
+
+The next cab off the rank is osdb, which is a MySQL database. Here we do better than we did on the binaries, with LZSSE8 doing particularly well.
+
+Reymont is a Polish literature work in pdf, this time LZSSE2 does well again.
+
+The samba source code, similar performance characteristics to other text:
+
+The SAO star catalogue is less compressible and suits LZSSE8 very well, but LZSSE2 fairs quite poorly, even with the optimal parse advantage.
+
+The 1913 Webster dictionary works well with LZSSE2. There is a definite trend towards LZSSE2 for the more compressible text.
+
+Collected xml files, the optimal parse and the focus on matches instead of literals means LZSSE2 again performs very well, copying a lot of bytes per step and the control word probabilities suiting it well:
+
+The last file of Silesia, an x-ray medical image, is less compressible and suits LZSSE8.
+
+Here’s enwik9 from the Large Text Compression Benchmark, mainly for completeness, as there is a quite large number of published results for this benchmark elsewhere. Note, I used 128MiB blocksize for this test, instead of the default as used on the other tests. Curiously here, we actually beat memcpy, probably due to some OS related memory management shenanigans:
+
+Currently, this experiment is pretty young and I’m sure there are plenty of potential improvements and optimizations I haven’t yet thought of.
+
+Here are a few I have:|||
+
+A fun exercise in building something for a particular platform.
