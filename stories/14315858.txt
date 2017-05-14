@@ -1,0 +1,104 @@
+Unit 42 researchers have uncovered a backdoor Trojan used in an espionage campaign. The developers refer to this tool by the name Kazuar, which is a Trojan written using the Microsoft .NET Framework that offers actors complete access to compromised systems targeted by its operator. Kazuar includes a highly functional command set, which includes the ability to remotely load additional plugins to increase the Trojan’s capabilities. During our analysis of this malware we uncovered interesting code paths and other artifacts that may indicate a Mac or Unix variant of this same tool also exists. Also, we discovered a unique feature within Kazuar: it exposes its capabilities through an Application Programming Interface (API)  to a built-in webserver.
+
+We suspect the Kazuar tool may be linked to the Turla threat actor group (also known as Uroburos and Snake), who have been reported to have compromised embassies, defense contractors, educational institutions, and research organizations across the globe. A hallmark of Turla operations is iterations of their tools and code lineage in Kazuar can be traced back to at least 2005. If the hypothesis is correct and the Turla threat group is using Kazuar, we believe they may be using it as a replacement for Carbon and its derivatives. Of the myriad of tools observed in use by Turla Carbon and its variants were typically deployed as a second stage backdoor within targeted environments and we believe Kazuar may now hold a similar role for Turla operations.
+
+Kazuar is a fully featured backdoor written using the .NET Framework and obfuscated using the open source packer called ConfuserEx.  We used a combination of tools such as NoFuserEx, ConfuserEx Fixer, ConfuserEx Switch Killer, and de4d0t in order to deobfuscate the code for in depth analysis.  We then used dnSpy to export the code to a Microsoft Visual Studio project, so that we could rename the random method names to better understand the flow of the code. We will describe how Kazuar works and what capabilities it offers threat actors.
+
+The malware initializes by gathering system and malware filename information and creates a mutex to make sure only one instance of the Trojan executes on the system at a time. Kazuar generates its mutex by using a process that begins with obtaining the MD5 hash of a string “[username]=>singleton-instance-mutex”. The Trojan then encrypts this MD5 hash using an XOR algorithm and the serial number of the storage volume. Kazuar uses the resulting ciphertext to generate a GUID that it appends to the string “Global\\” to create the mutex.
+
+An interesting artifact that we found within the mutex creation process is that if the code cannot obtain the system’s storage serial number, it will use a static integer of 16456730 as a key to encrypt the MD5 hash. The hexadecimal representation of 16456730 is 0xFB1C1A, which appears to be included by the malware author as a potential reference to the United States’ FBI and CIA organizations.
+
+The Trojan then creates a set of folders on the system to store various files created during its execution. Kazuar creates its folders using group names, which logically organize the files contained within the folder. Table 1 shows the folder layout:
+
+Table 1 Kazuar’s folder group names and the files stored within
+
+The Trojan uses a similar process to create these folder and file names as it uses to generate its mutex, generating an MD5 hash of the name, using XOR on each byte using the volume serial number as a key and generating a GUID based on the ciphertext. The resulting GUIDs are used as file and folder names, which are combined with the local system path to the %LOCALAPPDATA% folder to create Kazuar’s folders.
+
+Throughout its code, Kazuar verbosely logs its activities by writing debug messages to log files stored within the “log” folder. Kazuar encrypts the debug messages saved in these log files using the Rijndael cipher. We decrypted the initial entry that was added to the log files during the execution of the Trojan. This entry reveals the following information:
+
+The log message above shows that the malware author refers to the Trojan as “Kazuar”. Interestingly, the word “Kazuar” appears in several languages, such as Polish, Hungarian and Slovenian, and is the ASCII form of the Russian word “казуар”. The word “Kazuar” and казуар translates to Cassowary, which is a large flightless bird native to New Guinea and Australia as shown in Figure 1.
+
+After initial setup, the method at the main entry point of the malware, as seen in Figure 2 may follow one of four main paths of execution. The main entry point contains a relatively simple set of if statements that determine the execution path of the malware. Interestingly, one of the paths appears to be for execution on a Mac or Unix host.
+
+Figure 2. Main entry point shows if statements that control the flow of execution
+
+The four possible paths of execution taken by Kazuar’s main entry point are as follows:
+
+The flow of execution is carefully guided by its operating environment, which is determined using the .NET Framework Environment.OSVersion.Platform.PlatformID enumeration, as seen in the function in Figure 3 that is responsible for gathering system specific information. Interestingly, we see a specific boolean variable for a PlatformID value of Unix that suggests that Kazuar might be used against Mac or Unix targets that return True for that API.
+
+Figure 3. The getsysinfo() function provides various environment enumeration capabilities for Kazuar.
+
+After enumerating the operating environment, Kazuar will attempt to establish persistent access to the system. Kazuar uses the method displayed in Figure 4 within its Autorun class to set up persistence on Windows systems, which has multiple options including:
+
+Figure 4. Kazuar’s Autorun class is a Windows specific method that contains multiple options for persistence using the startup folder and registry.
+
+The Kazuar Trojan initially relies on its command and control channel to allow actors to interact with the compromised system and to exfiltrate data. Kazuar has the capabilities to use multiple protocols, such as HTTP, HTTPS, FTP or FTPS, determined by the prefixes of the hardcoded C2 URLs. So far, we have only observed HTTP used as the C2 protocol in our sample set. All of the known Kazuar C2 servers appear to be compromised WordPress blogs, suggesting that the threat group using Kazuar in attacks also locates and exploits vulnerable WordPress sites as part of their playbook.
+
+To interact with its C2 server, Kazuar begins its communication by creating an HTTP GET request to use as a beacon. The beacon, generated by the code seen in Figure 5 contains a cookie that has an “AuthToken” value that is a base64 encoded GUID used to uniquely identify the compromised system. Kazuar refers to this GUID as an “agent” identifier.
+
+Figure 5. The createGET and getWebRequest classes define the construction of the HTTP request used for command and control communication.
+
+During our analysis, we observed the beacon seen in Figure 6 sent via HTTP from a Kazuar sample to its C2 server. The initial HTTP beacon shows the base64 encoded AuthToken value within the Cookie field that we believe the C2 server uses to uniquely identify and track individual compromised hosts.
+
+Figure 6.  Wireshark snippet of a fully constructed HTTP GET request which shows the base64 encoded GUID within the Cookie header.
+
+Kazuar will read the response from the C2 server and attempt to parse the response as XML formatted data. The XML formatted data will contain what Kazuar refers to as a “task”, which is comprised of an action identifier and specific arguments for each action. Figure 7 below shows the code responsible for receiving the response to the HTTP request and using a long integer stored in the “num” variable as the action identifier.
+
+Figure 7.  The response parser listens for new tasks to be received from the command and control server.
+
+The action identifier is directly related to the command which the actor wishes to run on the compromised system. Surprisingly, Kazuar also contains methods for each command to equate the action identifier to a string that describes the command, which makes determining the purpose of each command much easier. Table 2 shows a list of available commands within Kazuar, specifically each action identifier, command string and a description.
+
+As can be seen from the Table 2 above, Kazuar has an extensive command set, many of which are similar in functionality as other backdoor Trojans. However, a few commands specific to Kazuar appear to be unique and are worth further discussion.
+
+First, several of these commands contain checks to determine the environment in order to use appropriate paths or commands. The ‘tasklist’ command will use a WMI query or the “ps” command, which allows Kazuar to obtain running processes from both Windows and Unix systems. Also, Kazuar’s ‘cmd’ command will run commands using “cmd.exe” for Windows systems and “/bin/bash” for Unix systems. These two commands provide evidence that the authors of Kazuar intended to use this malware as a cross-platform tool to target both Windows and Unix systems.
+
+Kazuar contains three commands related to plugins: plugin, plugout and pluglist. These three commands allow an actor to administer a framework that allows Kazuar to use additional plugins. This plugin framework provides Kazuar potentially endless functionality, as its operators can provide additional .NET applications that Kazuar can load and execute.
+
+While many backdoor Trojans have extensive command handlers and plugin frameworks, Kazuar’s ‘remote’ command provides a functionality that is rarely seen in backdoors used in espionage campaigns. This command instructs the Trojan to start a thread to listen for inbound HTTP requests, which effectively turns Kazuar into a webserver. This functionality provides an API for the Trojan to run commands on the compromised system. Figure 8 shows the code within Kazuar that provides this functionality.
+
+Figure 8 HTTP method handler used by Kazuar to provide threat actors with API access
+
+To initiate this functionality, the actor will issue the ‘remote’ command and provide a list of URI prefixes that Kazuar’s HTTP listener will process and respond to. The URI prefix supplied by the actor would be added to the “Prefixes” property of the HttpListener class, which requires a schema, a host, an optional port and optional path. The actor would then issue HTTP requests to URLs that match these URI prefixes using specific methods, specifically OPTIONS, POST, GET and PUT methods to interact with the compromised system using Kazuar’s command set seen in Table 3.
+
+This functionality flips the communication flow between the Trojan and the C2 server. Instead of the Trojan initiating communications with its C2 server, the C2 server sends requests directly to the Trojan. This communications flow is important if the compromised system is a remotely accessible server that may raise flags when initiating outbound requests. Also, by creating this type of API access, the threat actors could use one accessible server as a single point to dump data to and exfiltrate data from.
+
+Table 3 HTTP methods and the functionality they provide in Kazuar’s API
+
+This functionality flips the communication flow between the Trojan and the C2 server. Instead of the Trojan initiating communications with its C2 server, the C2 server sends requests directly to the Trojan. This communications flow is important if the compromised system is a remotely accessible server that may raise flags when initiating outbound requests. Also, by creating this type of API access, the threat actors could use one accessible server as a single point to dump data to and exfiltrate data from.
+
+While yet another fully featured backdoor alone is not particularly novel, the existence of a code path for Unix, combined with the portability of .NET Framework code makes the Kazuar Trojan an interesting tool to keep an eye on. Another interesting portion of this malware is its remote API that allows actors to issue commands to the compromised system via inbound HTTP requests. Based on our analysis, we believe that threat actors may compile Windows and Unix based payloads using the same code to deploy Kazuar against both platforms. Palo Alto Networks AutoFocus subscribers can explore additional samples using the Kazuar AutoFocus tag.
+
+Action with identifier {0} is not implemented.
+
+Going to sleep for {0}…
+
+Got new task #{0} from {1}.
+
+Max interval value is less than min value!
+
+Max interval value is more than supported!
+
+Min interval value is less than supported!
+
+No servers available now.
+
+Proc kill command requires name or pid to be set!
+
+Request was sent to {0}.
+
+Result #{0} was sent to {1}.
+
+Result #{0} was taken by {1}.
+
+Server command requires at least one server!
+
+Transport command requires at least one process name!
+
+Unable to get last contact time due to {0}
+
+Unable to get task from {0} due to {1}
+
+Unable to send result #{0} to {1} due to {2}
+
+Ignite ’17 Security Conference is a live, four-day conference designed for today’s security professionals. Hear from innovators and experts, gain real-world skills through hands-on sessions and interactive workshops, and find out how breach prevention is changing the security industry. Visit the Ignite website for more information on tracks, workshops and marquee sessions.|||
+
