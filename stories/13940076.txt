@@ -1,0 +1,67 @@
+At Xeneta we operate the world’s largest container freight rate database and provide powerful analytics on top of that.
+
+One of the most basic use cases is finding out the average price to ship a container of a certain type from one port to another. To enable that we have to give users the ability to search for ports. As with all geographical objects, port names may not necessarily be easy to remember or spell correctly, so the search tool has to be robust against typos.
+
+This article presents a reasonably simple and flexible solution to this problem which will be especially useful if you are running MongoDB, as it does not require external search tools.
+
+The collection that keeps ports in MongoDB looks somewhat like this:
+
+Ålesund contains an accented latin character, which is not even present on an ISO keyboard. We want to be able to search for it as aalesund, alesund or ålesund.
+
+St. Petersburg (ex Leningrad) has to be searchable with both lenin and peter.
+
+Search query alex has to be able to find El Iskandariya (Alexandria).
+
+Even though MongoDB supports text search functionality in more recent versions, it is not a particularly good fit for this task, mostly because it works by matching whole words. Stemming could be the answer, but it is hard to find stemming dictionaries for geographical names.
+
+In order to solve our problem, additionally we use an n-gram technique.
+
+In our case, an n-gram is a sequence of characters taken from a string. n-grams are commonly used in statistical text analysis problems: like measuring text similarity (think plagiarism check) or even speech recognition.
+
+It is pretty clear that unigram (single character) is not going to be of much use, because there are a few letters are very common among different words and therefore search would give way too many false positives to be useful.
+
+Here is a Python function that we use to extract n-grams out of a port name:
+
+This is how ålesund would look like after we split it into n-grams:
+
+Now, if we take an input search term, coming from the user, something like alesu, and split it into n-grams:
+
+We can compare these two lists, and consider overlap to be a search hit — and this is something that MongoDB text search can do really well.
+
+We are introducing additional collection in MongoDB for storing space-separated n-grams of port names as text.
+
+This is a function that we have to run every time someone modifies or adds a new port:
+
+It extracts n-grams from port name, puts them into a text field, and stores it alongside with code and name in sub-collection.
+
+Collection would look something like this in MongoDB:
+
+In this particular case we are not using n-grams that are shorter than 3 characters. We found this lower limit empirically: bigrams gave too many false hits to be useful.
+
+Now we need to tell MongoDB to build text search index on this collection:
+
+We turn the incoming search query into space-separated list of n-grams so that MongoDB could do whole-word match in documents we indexed for text search:
+
+We tell MongoDB to use text search on our collection using n-grams from search query and sort results by text match score.
+
+This is already a functional solution, but there is one obvious edge case we want to look at.
+
+Many port names have common n-grams in different positions, for example Guam and La Guaira. If the user is searching for gua, both port names will get the same search score, but we want to show port that matches at the beginning higher up in search results — people rarely type search query from the end.
+
+This is where we exploit MongoDB index weights to our benefit.
+
+This version of our n-gram extraction function can optionally return n-grams only from the beginning of the word:
+
+And now we have to add one more field to the documents in search sub-collection:
+
+And here we change the index to incorporate this new field:
+
+Note that we give a higher weight to the field containing prefix n-grams. The ability to adjust field weight in the index gives us a way to adjust which kind of results search prefers.
+
+Usage would be the same:
+
+Now we can play a bit with field weights in index and make search behave as we want it to.
+
+The solution we employ in production is a bit more complicated than what was presented:|||
+
+At Xeneta we operate the world’s largest container freight rate database and provide powerful analytics on top of that. One of the most basic use cases is finding out the average price to ship a…

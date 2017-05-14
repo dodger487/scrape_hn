@@ -1,0 +1,46 @@
+Row Level Security is one of the lesser known great addition to PostgreSQL 9.5. The documentation about it is of PostgreSQL documentation quality of course, but there is a lack of online examples and usages without relying on distinct PostgreSQL users for multi-tenant websites. I recently built a proof of concept using RLS to secure access to a specific table in a multi-site Django application, and I will explain here how to do it. It is a very simple trick, but it can improve your security a lot, especially in bigger applications when auditing the whole source code can become tedious.
+
+Row Level Security, aka RLS, is a great PostgreSQL feature that allows you, for each (user, table, action) combination, to specify additional rules that restrict access to the rows. The PostgreSQL documentation, and most online documentations, show that feature with SQL users. A table with an “owner” column would be automatically filtered on the criteria owner = current_user(). It’s very efficient (the criteria is not applied after the query but pushed in the query and thus can use more indexes if needed), and for a very low maintenance cost you can have security pushed down to the lowest level of your stack.
+
+With RLS, suddendly customer A can no longer steal from customer B, even if there is a SQL injection in your server. It would also require a security issue or misconfiguration on PostgreSQL side. Of course, you should keep checks in your code, better safe than sorry, but it’s the extra security belt that could save you from the next “data leaks” headlines 🙂
+
+Usually, most RLS demo will apply restrictions per SQL user. It’s, by far, the easiest and safest way to do it, because it will be very hard to alter the data used to apply the rules. But it’s not going to work very well for most, if not all, web applications. Web applications seldomly use different SQL users per authenticated web user. Sometimes one SQL user is used per “site” (we will see that a bit later), but even that is not the most common deployment strategy. Web applications, with their very short connection lives, rely on poolers like pgbouncer to keep connections to the SQL server alives and save a lot of time for each HTTP request. Doing that for tens or hundreds of different SQL users would be complicated and likely to be expensive.
+
+But there is absolutely nothing in PostgreSQL preventing you from using any function. We could even have a policy applying restrictions based on the time or the day in the week (a “no work can be done outside work hours” policy). The real “complexity” will be the forwarding of the needed informations from your application to the policy. And PostgreSQL has a solution for that too (new motto of the day ?) : SET SESSION…
+
+So let’s build a small django application and combine all that together to have our security belt against code mistakes.
+
+First, let’s see how to create a simple RLS policy, based on my previous business hours idea.
+
+We are superuser here (notice the # in prompt) and we put a new task in our work_queue. And our employee can read the queue. But he could do that even out of business hours, and we don’t want that. So let’s write a policy and enable it :
+
+Policies are quite readable : on table work_queue, for all operations (SELECT, INSERT, UPDATE, DELETE) to user employee, filter rows using the time of day. Note that policies, of course, don’t apply to super users…
+
+And now, if our employee selects in the table:
+
+And if he comes back tomorrow :
+
+We wrote our first security policy, congrats! Now, let’s start working with Django.
+
+In the Django world, a single server, a single process can handle several “sites”. Let’s say you, tinycorp, are selling a SaaS software to your customers megacorp1 and megacorp2. The both want their logo to appear on the login page. So you won’t be able to have a simple app.tinycorp.com domain, otherwise you would have no way to customize the look. You will instead use one vhost per customer, megacorp1.tinycorp.com and megacorp2.tinycorp.com. That’s what Django calls a site.
+
+So here we will work on preventing a leaking page used by an attacker against megacorp2 to leak datas from megacorp1 too.
+
+Django store in memory, for each request, the current site. It’s done in the first steps after a browser connects to the server. This is a simple integer, referencing the django_site table. So we have to do the following SQL call for each request:
+
+How can we do that without altering every view in the application? It’s easy, most Python/web developers will know the answer: we must write a middleware.
+
+In the Python world, a middleware is a function (or a class that defines what is needed to behave like a function) that is called for each request. The request and the “next” middleware are given as parameters, the response must be returned. For instance, you could have an AuthMiddleware, a CSRFProtectionMiddleware, a WafMiddleware and then your application. This is a very nice mechanism, efficient and simple.
+
+Since this post starts being quite long, I will just post here a working Django Middleware. The code should be obvious to most Python developers.
+
+And now, we only have to enable RLS on the tables and restrict the Django SQL user.
+
+And… that’s all folks! Nothing else is needed, you only have to apply such a security for each table.
+
+The main drawback with that solution against restrictions based on the SQL user is that you trust your SQL user to honestly request the proper site. It’s a far lower security than distinct SQL users, but like any security, you must do a threat analysis. The threat here is poorly coded views forgetting a check, and some partial SQL injections. Full SQL injections, allowing any SQL query, could still hurt you badly since they could change the django.site variable. But, considering the low cost of that extra-security… Why not?
+
+Another drawback is that you must have a separate SQL user for your console Django commands, or celery tasks or whatever you do in your Django application with no user interaction. But that’s almost always better to do that, so it’s more like pushing a good practice down your throat 🙂
+
+If you want, you can dig deeper. Much, much deeper. You could set a django.user variable that contains the current user id, and push down most access rules in the database. Again, you are protecting yourself against some programming or logic errors, a full SQL injection would work around that easily…Thank you all for reading that long explanation, and I hope it will be of use to someone… Especially if I have an account on your website, I don’t want to be in a pwned list please !|||
+

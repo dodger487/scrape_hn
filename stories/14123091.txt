@@ -1,0 +1,84 @@
+I finally got around to playing around with the ESP8266 breakout boards (ESP8266-01) I had sitting on the bench. The community support for these has improved a lot recently although there is still some signal to noise problems between old and new information when googling.
+
+The AT firmware preloaded on the ESP module should work out of the box, but if you’re planning on reflashing it you’ll need to be able to trigger it’s reset pin while pulling GPIO2 pin low to trigger the bootloader.
+
+Here’s a quick diagram of the setup I used for the ESP8266-01 breakouts I had.
+
+I initially had some issue uploading firmware to the ESP. The AT commands were working fine and I was able to read the device’s mac address with , but I was unable to upload new firmware programs. It turns out the Bus Pirate I was using as a serial bridge wasn’t reliable enough for the firmware transfers at speed. So I would suggest you use an FTDI cable or other well known and widely used serial/USB converter when you’re first setting up. Once I switch to the FTDI cable everything worked smoothly.
+
+By default when you boot your devices (without holding GPIO2 low) you’ll get the AT firmware which lets you control the chip over UART as a peripheral WIFI device. There’s a couple different sets of documentation for the AT commands. Depending on your device and current firmware you may not have all the commands available to you, but the basics should always be the same. Here’s a copy of the latest espressif AT command documentation.
+
+You’ll need to a serial terminal. If you’re on a mac like me the simplest option is , but you might also want to try something like CoolTerm for some handy advanced options like enter key emulation.
+
+Apparently not all the AT firmware versions run the same baud rate. The modules I had defaulted to 9600 baud but you’ll just have to cycle through different speeds until you figure it out.
+
+Note that the AT firmware requires you to terminate your lines with , e.g. ASCII . If you’re using CoolTerm you can go configure this under . If you’re using the enter key only send the character so you’ll have to enter to send the character afterwards. Supposedly it’s also possibly to configure the enter key behaviour for by calling once is running but I haven’t tested this.
+
+I fired up by running , obviously you’ll need to subsitute the correct tty/COM device and/or baud rate.
+
+You can hello world your ESP like so:
+
+You should get a response like:
+
+We can try something a little fancier like sending a request. Here’s a couple lines that will connect to WIFI and make a request to pushover a programatic notification service.
+
+First we connect to the network (JAP = Join Access Point)
+
+And initiate sending some data. Note that 209 here is the number of characters in my subsequent request
+
+Now we send our simple HTTP POST request over the TCP connection. The is simply the number of characters in the message body:
+
+So putting that all together we get:
+
+If we want to go beyond the default AT firmware, the which I was mentioning earlier is is available on GitHub. It seems to be the go-to tool for uploading binaries and talking to the ESP in bootloader mode from the command line.
+
+If you reboot your ESP while pulling the GPIO2 pin low, you can then test the by reading the mac address of your module (the bootloader seems to run at 115200 baud). Again you’ll need to subsitute the correct tty/COM device and/or baud rate in the examples here.
+
+You should get a response like this (but with a different mac address);
+
+As an exercise, I wanted to make sure I could reflash/restore the stock AT firmware. It turns out that it can be tricky to find the correct version of the most recent version of the espressif AT firmware. In general you can find the original firmware within the espressif SDK which is (currently) available on the espressif forum. The ES8266.com forum seems to also be working on some “improved variants” of the AT firmware.
+
+If you’re working from the espressif SDK, which is what I’m doing, you’ll need to look in in the SDK folder. In the latest version they have a fairly useful file exlaining which files you need to use and where they should be uploaded into memory. This is the caveat of using the official SDK, you have to upload a number of different binary firmware blobs to different memory regions.
+
+This led to my next confusion with the flash memory sizing. This matters because the more recent AT firmware have some options for OTA (over the air) updates that require larger flash memory sizes to function. This is basic stuff, but it’s easy to get confused with the conversion between Mbit and Mbyte and it can be a little obtuse to figure out which flash chip is on your ESP board.
+
+First let’s figure out what flash chip we have by running:
+
+You should get a crytpic response like this:
+
+Then confusingly you can refer to this header file to figure out what actual part number that and number refers to. In this case we have and which is associated with the flash chip. We’re actually missing some information so I had to look at physical part on the board to establish that it’s the chip. Now we can look up this part number and determine the size of the flash chip which will be important for choosing the AT firmware (and also for configuring you toolchain or Arduino IDE later). Keep in mind distinction between Mb(it) and MB(yte), 1 MB(yte) is 8 M(bit). Different forums and documentation may use one of the other. In my case the is 4 Mb(it) or 512 KB(yte).
+
+I also have some more recent ESP12e boards. These have and which is associated with the chip. It has 32 Mb(it) or 4 MB(yte) of SPI flash memory.
+
+Once you’ve got that sorted out you can look at the in the ESP SDK and try flashing your AT firmware. You will need to adjust the exact command based on which firmware version and chip size you’re using.
+
+Here’s an example where I flash a 4 Mb(it) or 512 KB(yte) chip. This means we’ll the default AT firmware without OTA updates (the only option for such a small flash chip).
+
+Notice how this matches up with the section for an 512 KB(yte) flash size:
+
+Note that the files referenced by the are spread around various folders ( , etc) in the espressif SDK so you might need to poke around to located them.
+
+In order to quickly start my project I decide to try the ESP8266 Arduino plugin which works surprisingly well. Installing it is pretty straight forward via the Arduino board manager and well documented on the GitHub page. You’ll probably want to glance over it’s documentation, specifically the libraries since some of them don’t work exactly like their Arduino counterparts due to the differences in hardware.
+
+There are quite a large number of options when configuring the upload for the ESP8266 in the Arduino IDE, but I had success with the default setttings. You may eventually want to configure the “Flash Size” option to match your device.
+
+The project I had in mind was to hook up the ESP to an IMU and stream the data to SuperCollider, a sound synthesis programming language.
+
+I wired the ESP up to an MPU-6050 IMU breakout from sparkfun. You can see the wiring and the protoboard below. I also hooked up a linear 3.3V regulator with a LiPo battery. I used an LM1117, which is really not an ideal choice since it struggles to provides 3.3V from the LiPo. Even fully charged I was only getting 3.1V - 3.2V from the regulator. But it was the only regulator I had on hand so I made due.
+
+Here’s the source for my ESP/Arduino firmware which uses the Arduino OSC library from CNMAT. You can see me setting up the WIFI and UDP data. Currently I’m just hardcoding the (statically allocated) IP address and port of the target computer, something more intelligent with multicasting would probably make the project more flexible.
+
+A cautionary note about the CNMAT OSC library, it uses dynamic memory allocation (e.g. it calls malloc) which may not be desirable for an embedded application like this where limited memory can make memory fragmentation and memory leaks a big problem. I’ve subsequently been using tinyosc instead which leaves the memory allocation to you.
+
+In addition here’s a short python script to debug the incomming OSC data. This script uses pyOSC.
+
+For those familiar with super collider here’s a quick GUI interface that will plot the incomming sensor data
+
+When you program your ESP you can configure the WiFi mode. For the ESP this mean you’re choosing between station mode ( ), access point mode ( ) or a hybrid of both ( ). In station mode the ESP connects to an existing WiFi networks as a client, much like any other wireless device. In access point mode, the ESP creates a network others can join, essentially acting as router to which other devices can connect. Finally in hybrid mode, the ESP does both simultaneously; it can join an existing network while also hosting second network of it’s own.
+
+With the Arduino IDE the command is used to set this mode. However by default Arduino configures the ESP in the hybrid . This will cause a noticable lag on boot while the ESP sets up the access point. You may also see other intermittent performance issues as it tends to this access point.
+
+So if you’re planning to the ESP in station mode, I strongly encourage you to change the WiFi to station mode by calling in your setup.
+
+The big letdown with ESP8266-01 is that it only has two pins available for GPIO use. In addition you may not get much flash memory if you bought a cheap one. Luckily there are some really interesting breakouts for the ESP now. The sparkfun breakout, for instance, conveniently includes both a LiPo charger and an auto reset mechanism so you don’t have to hold the reset button when programming it. There is also a new more powerful iteration of the platform, the ESP32 with BLE, more pins and other goodies. It’s also available as a breakout from sparkfun among others.|||
+

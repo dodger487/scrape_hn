@@ -1,0 +1,85 @@
+Docker has been touted as the holy grail of on-premises software container solutions. Docker Swarm is the orchestration upgrade that allows you to scale your containers from a single host to many hosts, and from tens of containers into thousands of them.
+
+But does it deliver on that promise? Let’s run 1,000 containers to find out.
+
+I’m starting with a three-node cluster, running the latest version of Docker.
+
+We will need to set up a multihost network. This network is the common communication channel between the containers, or any other containers. For example, if you would run a webserver and a database, you would put them on the same network, so they can talk to each other.
+
+In order for containers to be discoverable between hosts in a Docker swarm, we will need to create an network on one of the manager nodes.
+
+Since we can use a higher number of containers, we can declare a larger number of IPs available, using the CIDR notation. A bit mask with 20 bits leaves 12 bits available for IPs — 4,096 of them can be run on this network.
+
+The switch creates this network in a way that may be used by non-swarm containers. This provides access to the network from the classic way of running your containers.
+
+Due to the very large number of containers, which means an even larger number of system processes on your Docker host, we will need to tune some settings in order to avoid instability when running our service at such a scale.
+
+Various Linux subsystems, especially in regards to networking, have many exposed configuration flags that are managed by sysctl. The defaults of these flags are more suited for laptops than servers that would run thousands of processes.
+
+When I first tried to run 1,000 containers in a service, I hit a limitation that resulted in the Docker swarm becoming unresponsive, with occasional connectivity interruptions. When inspecting this, I found many messages like the following one in output of .
+
+The ARP cache is a look-up table that connects IP addresses (OSI Layer 3) to MAC addresses (OSI Layer 2). When we’re running 1,000 containers and assigning them IPs, we will inevitably declare a large number of IP/MAC address pairs. The issue with connectivity interruptions was caused by hitting the ARP cache limits, where garbage collection is performed.
+
+Keep in mind, when we start a service, the service will attach to three networks:
+
+Some of these networks will contain multiple IP addresses in each container. On my count, it means about 5,000 network addresses allocated for a 1,000 containers.
+
+A bit of digging around led me to some sysctl tunable settings which can be used to work around the problem, basically by increasing the thresholds where ARP cache collection occurs.
+
+Issue this on every Docker swarm host:
+
+And this is what the values do:
+
+The operative value is , as garbage collection there happens five seconds after the ARP cache crosses this many entries. The default value was 512, which caused very frequent garbage collection runs and related system instability.
+
+The reason why I chose this value is that I needed a sane default that would not be hit. Generally the recommendation is that you should multiply all the values by 2 until your system will behave nicely. As is the case most of the time, the sysctl tunable settings are very poorly documented, so figuring out what kind of impact they have in terms of memory use or other pitfalls is possible only in the rarest occasions.
+
+There are other sysctl tunable settings which might be useful for you:
+
+These sysctl settings deal mainly with how many connections can be open at a given time, which ports are used for the connections, how fast connections are recycled… I can’t imagine a high-traffic, load-balancer host running without at least some of these.
+
+For our purposes, my Swarm cluster has three nodes, which each have six CPU cores and 8GB of RAM. I have a bit more than 100GB of disk space available, but if you’re following along, 10GB of available disk space will be enough to run 1,000 containers.
+
+In order to calculate the theoretical capacity of your system for a single Docker container, we can look at the image size. A Docker image is created as a composite of many layers.
+
+For example, the image I’m using uses as a base (4MB) and adds a compiled application which is about 6MB in size. The application is an ID generator written in Go (source code available on titpetric/sonyflake GitHub).
+
+Using this simple calculation, we can estimate that we can run about 1,000 containers on a single host with 10GB of available disk space.
+
+Memory use is a bit harder to calculate, because it can vary from the state when your application just starts (cold) or after the state when your application is serving real traffic for a while. The basic calculation is pretty much the same, but I do caution that you keep some buffer when doing calculations with more fluid resources.
+
+I want to reserve about 20 percent of memory for other uses, so I assume that I only have 6GB of available resources. I round up the memory usage of the container as well.
+
+It just so happens that we can comfortably run 1,000 containers on a single host because of the low memory footprint of the sonyflake app.
+
+You don’t. You should use a monitoring system that will monitor CPU usage of your hosts and containers. There are some free and cool tools you can use. For example, ctop gives you a real-time view of your Docker containers on a single host. Netdata provides an overview of real-time data as well as limited historical data and alerting.
+
+You can also resort to benchmarks, with software like wrk or siege, to estimate what kind of capacity you can expect with your setup.
+
+After we get all the configuration and tuning out of the way, we’re at a point where we can run our service and create 1,000 instances. For this example, I’ve chosen the sony/sonyflake ID generator and prepared an HTTP server following 12-factor app guidelines. The source code for the HTTP server is on titpetric/sonyflake GitHub.
+
+It takes about ten minutes to start up all the containers. You can inspect the service as it’s starting up containers:
+
+The service is already usable as soon as one container is online.
+
+After all the containers have started, there will be a nice 1000/1000 replicas column in the output of .
+
+Let’s give it a kick with a benchmark tool just to see that it works. As wrk is also available as a Docker container, I’ll be running it to attach to the custom network which we created and to benchmark the service.
+
+I’m feeling pretty nervous, so I’ll also scale down the service to 30 containers, wait about ten minutes until it completes that, and rerun the benchmark.
+
+You can inspect the state of your containers by issuing something like this:
+
+When “Removal in Progress” drops to 0 on all hosts, it should be okay to rerun the benchmark.
+
+Here we can see the effect that process scheduling on Linux has on containers. When we run 1,000 containers, it means that the operating system has to divide all available time between them. Figuring out which process needs CPU time is a completely different problem when you’re running 1,000 containers or when you’re running only 30.
+
+This is why the benchmark for fewer containers is faster. But consider that increasing containers from 30 to 1,000 containers is a 30x increase, and the penalty is still just 30 percent of your total capacity. Amazing.
+
+Running a service in Docker Swarm feels very natural and simple. Scaling to 1,000 containers was a fun challenge, with honestly not very many obstacles.
+
+Of course, it very much depends on what kind of application you are scaling. If you follow the 12-factor application guidelines, it makes it very easy to go from 1 to 1,000 containers, but as soon as you’re thinking of adding on another thousand containers, some systems settings should be revisited.
+
+If you need some settings inside your container — for example, if you have a high-traffic reverse proxy or Redis recommends some settings for you — it seems that you need to stick with for a while longer.|||
+
+Docker Swarm supposedly allows you to scale from a single host to many, from ten containers to thousands. But does it deliver?

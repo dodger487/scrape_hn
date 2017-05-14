@@ -1,0 +1,56 @@
+Suppose there is an alternate reality in which you own an apartment building and your biggest worries are the security of your apartments and the well-being of goldfish, respectively.
+
+In this reality, that of apartment building ownership without profit motive, there exists a startup, “GLDFSH,®” that allows tenants to summon others to feed their goldfish. Sometimes folks will set up a trust with GLDFSH to take care of their goldfish after they pass away.
+
+As you care about security (even more than goldfish), if a tenant no longer inhabits one of your apartments, you change the locks as a matter of course—regardless of circumstance. There have been times (dark times) when a goldfish being cared for in trust has missed a meal because you didn’t get GLDFSH an updated copy of a key in a timely manner.
+
+So what if you made a special GLDFSH-only key that opened all the apartments where there were goldfish?  You could keep that key under the watchful eye of a security minion 24/7/365.  That minion wouldn’t allow anyone to use the key, but would allow anyone with an active and valid GLDFSH employee ID (very secure) to enter an goldfish-containing apartment by using that single special key.
+
+Keyholder, a newly open-sourced project from the Wikimedia Foundation, is a bit like that ever-watchful security minion. For us, it allows authorized developers to access remote servers using an ssh key, to which it is the only user that has access. More specifically, Keyholder is an ssh-agent proxy that allows a group of trusted users to share an SSH identity without exposing the contents of that identity’s private key.
+
+We have been using Keyholder for several years, and we’re now releasing it as a standalone project.
+
+Secure Shell (SSH) is a cryptographic network protocol and client-server architecture that is used to provide a secure communication tunnel over an insecure network. The SSH protocol is defined across a series of requests for comments, an Internet standards-setting publication, and its OpenSSH implementation is broadly used wherever you find Linux on a server.
+
+Over here at Wikimedia, we use SSH everywhere! If you interact with a shell account, chances are you authenticate yourself (and the server to which you’re connecting) via SSH.
+
+SSH is also the tool we turn to for deployments of MediaWiki and other software. Our deployment software, stripped to its nuts and bolts, sends a command over SSH to all of our application servers to tell them that new code is available and that they should fetch it.
+
+SSH is not a perfect technology; there are various means by which malicious actors may exploit SSH, and we do our best to mitigate the ability of those malicious actors to do harm to our infrastructure.
+
+For instance, there are several ways in which SSH may authenticate a client – passwords and public keys being the most common. Using password-based authentication is insecure for all the normal reasons that passwords may be compromised – everything from using easy-to-guess passwords to rubber-hose cryptanalysis.
+
+Alternatively, public key cryptography is a technology that is indistinguishable from magic (a.k.a, “math”) that enables a server to authenticate you by validating that you have some secret (a private key) based on a public piece of information (a public key).
+
+Public key cryptography is awesome; however, there are ways in which you can be bad at public key authentication.
+
+ssh-agent is a program that allows a user to hold unencrypted private keys in memory for use in public key authentication. ssh-agent is neat – it means you only need to enter the password for your private keys once per login session. ssh-agent is also a way you can be bad at public key authentication.
+
+A common use of the ssh-agent is to “forward” your agent to a remote machine (using the -A flag in the OpenSSH client). After you’ve forwarded your ssh-agent, you can use the socket that that agent creates to access any of your many (now unencrypted) keys, and login to any other machines for which you may have keys in your ssh-agent. So, too, potentially, can all the other folks that have root access to the machine to which you’ve forwarded your ssh-agent.
+
+While some folks may pick-and-choose keys to keep in one of many ssh-agents, it’s entirely possible to keep your Wikimedia production SSH key in the same ssh-agent that you forward to your second-cousin’s friend-of-a-friend’s shared-hosting provider. For this reason, forwarding your ssh-agent is Considered Harmful™.
+
+And even though we know no one would ever be reckless enough to try to forward SSH keys, we discourage bad practice by not allowing anyone to forward their ssh-agent to production.
+
+Keeping track of the two deployed versions of MediaWiki, the nearly 2000 files in the MediaWiki configuration repository, and the correct version of the other 169 extensions we branch every week is a heavy burden.
+
+To lighten the load on our deployers, we use a handful of deployment hosts from which we are able to easily script deployments.
+
+This means you can login to a deployment host, pull in the latest updates, and get new code running on the Wikimedia sites in under a minute (if you’re a quick-draw with git).
+
+But how do we grant deployers SSH access from the deployment host without using passwords, without allowing agent forwarding, without having to manage SSH keys for every. single. deployer, and without creating the administrative mess of every deployer sharing a single deployment key?
+
+Several years ago there were some folks around here who pondered this exact problem and came up with a pretty novel solution that we’ve finally made into a standalone project!
+
+Keyholder began life as a gleam in the eye of principal operations engineer Faidon Liambotis, who conceived of its core requirements and gave a basic operational sketch. From there, Ori Livneh did the hard work of reading the source and RFCs that make ssh-agent work and turned that into the initial version of Keyholder. Tyler Cipriani added support for multiple keys and separate user groups. Riccardo Coccioli added support for OpenSSH SHA256 fingerprints. And, finally, Mukunda Modell liberated Keyholder from the depths of our Puppet repository where it was previously languishing in obscurity.
+
+Keyholder makes it possible for deployers to share a key without complicated administrative overhead. When a user needs to use SSH to connect to an application server from our deployment host they point ssh-agent requests to a UNIX domain socket created by Keyholder. If a user’s group membership allows them to use a particular key protected by Keyholder, then Keyholder will sign an application server’s authentication request, otherwise authentication will fail and they will not be able to login to the remote machine.
+
+The actual SSH private keys are encrypted on disk and only readable by root users. When a user’s shell account is removed from the deployment host there is no need to rotate the SSH public/private keypair because the user has never had direct access to it, rather they’ve simply been using the mystical magic of Keyholder.
+
+The magic of Keyholder is in its ability to proxy the ssh-agent socket as a privileged user. Keyholder creates a UNIX domain socket that is a readable and writable by anyone with shell access; however, Keyholder will only respond to requests to list identities and sign requests – users cannot add new keys or accidentally remove keys from the agent. Keyholder will only sign requests after verifying that the requesting user is authorized to make a signing request using a particular key.
+
+We’ve been using Keyholder for several years at this point, and it’s a solution that works well for us. Still, it’s not a perfect approach. The increase in security comes at a price of increased complexity both for users and administrators. When the need to add new keys arises, the means by which those keys are generated and stored can be opaque for end-users. Further, utilizing and troubleshooting Keyholder as an end-user is not obvious. Many of our uses of Keyholder are scripted, so that Keyholder’s use on our servers is largely (hopefully) transparent. On the administrative side, storing separate keys and passwords for every group using Keyholder has its own difficulties.  Also, the need to add keys to the ssh-agent being proxied by keyholder means that the servers on which Keyholder are running require some kind of manual intervention on reboot to ensure that Keyholder is, in fact, holding all the necessary keys.
+
+Despite the added complexity, we’ve found that Keyholder is a very useful tool. We’re excited to unlock its potential on the world! We hope that it will be useful to other organizations faced with similar challenges, of managing many servers that a large number of users are accessing via ssh. It’s a small step towards improving the security of our shared online infrastructure.|||
+

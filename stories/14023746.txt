@@ -1,0 +1,91 @@
+Monitoring is essential to know the state of our running applications. When you are running your applications in a scalable environment like Docker Swarm, you need a scalable monitoring solution as well. In this article, we will setup just that.
+
+We will install cAdvisor agents in each nodes to collect host and container metrics. We will save these time-series metrics in InfluxDB. We will use Grafana to setup dashboards for this metrics. All these tools are open-source and can be deployed as a container.
+
+We will use the Docker Swarm Mode to build the cluster and deploy these services as a stack. This allows for a dynamic setup for monitoring. Once we deploy this stack in a swarm, any new nodes joining the swarm will be automatically monitored. All the files used for this project can be found here.
+
+There are plenty of options for monitoring solutions. We are using open-source and container friendly services to build our stack. Our stack comprises of the following services.
+
+cAdvisor collects the metric from the host and docker containers. It is deployed as a docker image with shared volumes to docker socket and root file system of the host. cAdvisor pushed these metrics to a bunch of time-series database including InfluxDB, Prometheus, etc. It even has a web UI that shows graphs of the metrics collected.
+
+InfluxDB is open source time series database. You can save numeric value metrics with tags. It supports a SQL like query language to query for data. The tags let us filter data for a specific host and even a spefic container.
+
+Grafana is a popular graphing tool that lets you build dashboards with data from Graphite, Elasticsearch, OpenTSDB, Prometheus and, of course, InfluxDB. From version 4 of grafana, you can also setup alerts based on query conditions. We will setup dashboard that can be drilled down to specific host and service.
+
+Docker introduced from version 1.12.0. This allows us to easily create and manage swarm of multiple hosts. The swarm mode has the key-value store for service discovery and orchestration capability in-built. You can join hosts into a swarm as a manager or a worker. Generally, manager handles the orchestration part and workers are used to run the containers. Since this is for demostration, we will run InfluxDB and Grafana in the manager itself.
+
+Swarm Mode has an interesting feature called . This acts as virtual load balancer. Let’s say that we have 10 containers running across 5 nodes and they listen to the port 80. Now, if you access the port 80 of any of the hosts. You will directed to any one of the 10 running instance, even the instances that are not even in that particular host. So you can publish the IP of any of the nodes and the requests will be automatically load balanced between all the 10 containers.
+
+To follow along with the demonstration, you need to have the following prerequisites:
+
+We will be creating 3 local VMs to form the swarm using the plugin of . For this, you need to have Virtualbox installed in the system. You may also deploy the nodes in cloud services using different plugins. The steps after creating in the VMs are same for all the plugins. You can read more about docker-machine here.
+
+We will using the default options to create the VMs. To know more about the options available, check here. We will create a host named that acts as the manager for the swarm and two hosts and to act as the workers. You may create as many nodes as you want. Just repeat the commands with the host names changed. To create the VMs, execute the follwing commands.
+
+These commands may take some time. After creating the VMS, the output for the command should look something like this.
+
+Now you have to switch context to use the docker engine in the . We will be doing the rest of the demostration in the docker engine of the and NOT in our local system. To do this, run the following command.
+
+We have now switched over to the docker engine in . We will initialize the swarm with acting as its manager. We have to mention the IP which will be published for other nodes to join the swarm. We will use the IP of for this. The command, will get you this. So, to create the swarm, run the following command.
+
+Now, we need to add the two workers to this swarm. To do this, we need to pass a and the IP published when the swarm was created. To get the token for joining the swarm as a worker, you can run the command . As before, will get the IP for joining and the default port for this is . We could join the swarm by changing the context to each of the workers, but it is easier to run the commands as via SSH. To join workers to the swarm, run the following commands.
+
+You can see the nodes in the swarm with the command . Once the workers are added the output of the command must look something like this.
+
+With the version 3 of file, we can define the entire stack with the deployment strategy with one file and deploy it with one command. The main difference between version 2 and 3 of docker-compose file is the introduction of the parameter for each service. This parameter will define where and how you want the containers to be deployed. The file for the monitoring file is given below.
+
+We will start by saying that we are using the version 3 of file. We have following 3 services in the stack.
+
+This uses the image and for persistent storage, we are creating a volume named that is mounted to the folder in the container. In the deploy key, we are saying that we need one copy of InfluxDB which we will place in the . Since we are using docker engine in the , we can execute commands to this container from here itself. As both the other services needs influxDB to run, we will add a key to other services with in it.
+
+We will use the image and expose the port of the container to port of the host. The feature will then let us access grafana from port 80 of any host in the swarm. We have another volume named mounted to in the container for persistent data. As before, we also deploy one copy of grafana in the .
+
+cAdvisor service has much more configuration required than the other services. To know more, check this out. The hostname key is a tricky one. We intend to put one agent in each node of the swarm and this container will collect all metrics from the node and the containers running in it. When cAdvisor send metrics to InfluxDB, it send it with a tag that contains the hostname of cAdvisor container. We need to match it with the ID of the node running it. Docker stacks allows templating in naming. You can find more information about this here. We have named the containers with the ID of the node running it so that we know where the metric is coming from. The is done by the value .
+
+We also add some command line parameters to cadvisor. More about this can be found here. The redirects the logs generated by cadvsior to , which makes it easy to debug. The flag says that we are only interested in docker based containers. The next three parameters defines where you want metrics to be pushed for storage. We are asking cAdvisor to push the metrics to database in InfluxDB server listening at . This will send the metrics to the influx service in the stack. In a stack, all ports are exposed and you don’t have to specifically mention them.
+
+cAdvisor need the volumes mentioned in the file to collect the metrics from the host and docker system. We use the mode for deploy in cadvisor service. This will ensure that exactly one instance of cadvisor service will be run in each node of the swarm.
+
+Finally, at the end of the file, we have the key with the and volumes. As we are using the driver for both the volumes, the volumes will be stored in the .
+
+To deploy this stack, save the above file as and run the following command.
+
+This will start the services in the stack which is named . This might take some time the first time as the nodes have to download the images. Also, you need to create the database named in InfluxDB to store the metrics.
+
+This command might fail saying that the container doesn’t exist. This is beacuse the container is not yet ready. Wait for some time and run it again. We are able to run the commands in the service beacuse it is running in and we are using its docker engine. To find the ID of InfluxDB container, you can use the command and we are executing the command to create the new database names .
+
+To see the services in the stack, you can use the command , the output of the command will look like this.
+
+You can see the running containers in the stack with the command . Its output will look like this.
+
+Once the services are deployed, you can open up grafana with the IP of any node in the swarm. We will open the IP of manager with the following command.
+
+By default, use the username and password to login to grafana. The first thing to do in grafana is to add InfluxDB as the datasource. In the home page, there must be a link, click that. If the link is not visible, you can select from menu and choosing from there. This will give you the form to add a new Data Source.
+
+You can give any name for the source. Check the default box, so that you won’t have to mention the data source everywhere. Choose the type as . Now, the URL is and Access is . This will point to the port listened by the InfluxDb container. Finally give the Database as and click the button. This should give the message .
+
+In the github repository, I have added the file , that can be imported to Grafana. This will provide a dashboard that monitors the systems and the containers running in the swarm. We will import the dashboard now and talk about it in the next section. From the menu, hover over and select . Click the button and choose the file. Select the data source and click the button to import this dashboard.
+
+The dashboard imported to Grafana will monitor the host and containers in the swarm. You can drill down to host level and even to the container level in each host. To be able to do this, we are using two variables. To add variables to Grafana dashboard, we use the templating feature. To know more about templating with InfluxDB, check here. There are two varibles, to select the node and to select the container. To see the variables, select Settings from dashboard page and choose .
+
+The first variable is and this provide the option to select the node and drill down to its metrics. When cAdvisor sends metrics to InfluxDB, it also includes some tags, which we will use to filter the metrics. There is a tag named that shows the hostname of the cAdvisor instance. In this case, it will match the ID of the hosts in swarm. To get the values in the tag, we use as the query.
+
+The second variable is and this is to further drill down to the container level metrics. There is a tag named that contains the container name. We also need to only get the values based on the value of variables. So, the query is . This will fetch the containers which is running in the node selected by the variable.
+
+The container name will look something like this, . However, we are only interested in part of it, till the first period. If there are multiple instance of the same service, we need seperate lines. To filter the portion until first period, we use as the regex.
+
+Now that we have set up the varibles, we can use it in the graphs. We will discuss about graph and the rest are similar. The memory values is present in the series in InfluxDB, so the query starts with .
+
+Now we add the filters with the keyword. The first condition is that is equal to variable. That is given by . The second condition is that starts with the variable. We use the operator here because we have filtered the variable until first period. This is given by . The final condition is to match the time interval selected in grafana dashboard, . The query is now SELECT "value" FROM "memory_usage" WHERE "container_name" =~ /^$container$*/ AND "machine" =~ /^$host$/ AND $timeFilter .
+
+As we need seperate lines for different hosts and container, you need to group the data based on the and tags. So now the entire query becomes, SELECT "value" FROM "memory_usage" WHERE "container_name" =~ /^$container$*/ AND "machine" =~ /^$host$/ AND $timeFilter GROUP BY "machine", "container_name" .
+
+We have also applied the alias for this query as . Here, will be replaced by the value in tag and will be replaced by the value in tag. The rest of the graphs are similar. Only the series name changes. You can also create alerts for these metrics from inside Grafana. For more about Alerting, check here.
+
+In this article, we were able to set up scalable monitoring solution for Docker Swarm, that automatically monitors all hosts and containers running in the swarm. While doing this, we became familiar with popular open-source tools like Grafana, InfluxDB and cAdvisor.
+
+Once you are done with the demonstration, you can remove the stack with command,
+
+If you are done with the VMs created for the demo, you can stop and remove then with the following commands,|||
+
+Monitoring is essential to know the state of our running applications. When you are running your applications in a scalable environment like Docker Swarm, yo...

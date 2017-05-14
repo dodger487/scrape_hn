@@ -1,0 +1,114 @@
+Anyone who knows me knows that I've been spending a lot of time working on the Rust compiler, to the detriment of all my other projects. I'm glad to say I'm done.
+
+The 2000-foot version: Rust structs, enums, and tuples are now automatically smaller in some cases. It's possible for the compiler to work with types whose in-memory field order doesn't match that of your source code. And a minimal debugging framework for future optimizations is in place. This work has already had some real-world impact on Servo. In the rest of this post, I'm going to lay out the problem and detail what I did. This sounds like a very insignificant feature, but it actually took a lot.
+
+If you'd prefer to just look at pull request threads, see: #36151, #36904, #37429, #38483, #38523, #39595, and #40377. There's also a related discussion thread of some note here, from which the initial design of optimization fuel emerged.
+
+This is my first completed Rust project, and I certainly intend to do more. The community was amazing, the Rust compiler itself is some of the best open source code I've ever worked with (and they think it actively needs to be cleaned up--well, let's talk about open source DSP sometime), and all tooling is accessible. In fact, the accessibility point deserves special emphasis: everything is command line, and I've been drawn into more than one discussion because I'm possibly the only blind Rust developer. In particular, a deciding factor for this RFC is that it's unfriendly to blind devs.
+
+Before we begin, a brief moment of self promotion. I'm looking for part time remote work, preferably in the open source space and extra preferably with Rust because I like Rust. I'll probably be able to do full time and/or in-person in the next 6 months, but i'm still sorting out some personal stuff that takes time and makes me hesitant to move. My resume is here. I'm also trying to fund development on an audio synthesis library with a ton of applications that I started 3 years ago and have been developing continuously since, so if you like this maybe check out Libaudioverse's GoFundMe and donate $5.
+
+Types have both a size and alignment. Your processor can do unaligned loads at a performance cost, but it really likes it when data is at preferred addresses. We therefore try to put types in memory at addresses that are a multiple of their alignment. The alignment of primitive types is usually the same as their size. If you want more info, see What Every Programmer Should Know About Memory. While lengthy and dated, it will teach you more than you ever wanted to know and is still accurate to my knowledge.
+
+So, here is how C lays out a struct. For each field in the order you defined them in the source:
+
+And, when you're done with that, make the following two adjustments:
+
+here's a pair of demonstrative examples which show the optimization I implemented.
+
+First, using Rust struct syntax, noting that a is size and alignment 1 and is size and alignment 2:
+
+First, we give offset 0, noting that is of size 1.
+
+Then, is a , with alignment 2. We would like to give it offset 1, but it's aligned to the 2-byte boundary, so we bump it up to offset 2.
+
+Finally, is a with alignment 1. We don't have to do anything special, so we give it offset 4.
+
+The total size of this struct is 5, but the most-aligned field is with alignment 2, so we round up to 6 and give the struct an alignment of 2 bytes. Notice that there is a hole at offset 1 and a wasted byte at the end.
+
+here is the same struct, but with the fields reordered:
+
+We give offset 0. It's size and alignment are 2. gets offset 2. Since it has an alignment of 1 byte, we needn't make further adjustments and just leave it alone. gets offset 3 and also needs no further adjustment for the same reasons as . The struct is aligned to 2 bytes, but the size is 4, so we leave that alone as well.
+
+These are the same struct in terms of everything but the order of the fields in the source. On the one hand, it's only a 2-byte gain. On the other, the second struct is 2/3 the size of the first one. If we were putting them in arrays, the second is clearly better.
+
+A reasonable question to ask here is why our compilers don't reorder structs to be smaller in this case.
+
+There's a simple answer for C. C has a defined ABI. People rely on the C ABI to do all sorts of evil pointer tricks, and it's how two or more non-C libraries in different languages can talk to each other and to C libraries, even across compilers. Changing it is therefore impractical.
+
+On the other hand, Rust doesn't make it so easy to observe field order and has intentionally left the ABI of Rust types mostly undefined. In Rust, you have to explicitly indicate that a struct follows C layout by adding to it. Though there are difficulties in practice, we are in theory free to modify the layout of Rust types.
+
+I've known about this peculiarity of C and C++ for a while. I've always been slightly annoyed by it. Compilers are supposed to be smart. So one day I asked if Rust was already optimizing it on IRC and was told that it could but no one had done so yet. Upon expressing interest in implementing it, Eduard-Mihai Burtescu offered to help, and frankly this wouldn't have been possible without them and their willingness to answer all my questions over the last 6 months.
+
+Relevant pull requests: refactor to remove trans::adt and make rustc::ty::layout authoritative and Refactor layout to store offsets of fields, not offsets after fields.
+
+Rustc used to leave the layout of types to a submodule called trans. They were represented with the following type, which i'm posting because the one we moved to isn't very different:
+
+This seems pretty straightforward and reasonable, but trans is responsible for the translation of MIR (a representation of Rust used by the compiler) to LLVM IR. As a consequence, it runs well after Rustc should still be giving errors.
+
+Someone else eventually needed type layouts at a higher level, spawning the module , with a type very similar to the above enum. The reason I was originally given is that this came into being because the size of types needs to be known to check usage. But whatever the original reason, this nevertheless lead to duplicate code.
+
+The first task I had to complete was to replace the code in trans that did type layouts. This occurred in two phases. First, I removed the code which computed type layouts in trans and forwarded it to the code which computes types in layout, converting the return value from the latter to the former. Then, I went through the rest of trans and replaced everything that used the type posted above to call into layout and use the type it gives you, mostly the same in spirit but with some fun edge cases here and there. Once I was done, I killed the old code in trans.
+
+Though certainly not the most complicated, this is possibly my biggest pull request. The diff weighs in at around 120KB.
+
+The next, much smaller pull request was #36904 . In order to save some space, layout used to store the offsets after fields as opposed to the offsets of fields. This worked because the offset of a field is the offset after the previous field with the alignment adjustments described earlier in this post. Since we're reordering them and don't know which field is the "first", however, I had to change this to store the offsets of fields instead.
+
+At this point, nothing of substance to a user of Rust has changed, but I've killed a huge chunk of duplicate code. This makes other projects easier, for example the in-progress implementation of repr(align="n") and the eventual implementation of custom struct packing. Together, these will make it possible for the bindings to the Windows API to be extended by providing alternatives to layout-controlling pragmas in VC++.
+
+Relevant PRs: struct field reordering and optimization and small fix to closure debuginfo.
+
+I did this across two pull requests because it turned out that Rust's CI infrastructure wasn't running the debuginfo tests. The second just fixes the first. Rust's CI now runs the debuginfo tests, though I only get credit for being the one who caused others to find the problem.
+
+The algorithm we want to use for ordering struct fields is very simple:
+
+Rustc represents enum variants, tuples, and structs internally with the same thing, so the reordering algorithm applies to all three. We do enum variants differently because discriminants (an integer that says which variant) are often small, so it can potentially save us a bit more space. Since enums are the size of their largest variant, The enum case is not nearly as helpful as the struct/tuple ones.
+
+The best I can give you as to proving that this algorithm works is that everyone on IRC was reasonably convinced. No one managed to formally prove it.
+
+There isn't much interesting I can say about how I implemented it, save that Rustc really does assume that fields are in increasing order by offset in lots and lots of places. I'd find a broken test and fix it, asking for help with difficult ones. There were lots of really difficult ones, though no specific examples come immediately to mind.
+
+(Also, there's obviously a lot of blog post left. Spoiler: this broke production software at a really bad time).
+
+What is worth discussing is the impact. I have a benchmark program. This is a bit fiddly to run (and, honestly, I don't remember how. It's been months). I posted the conclusions from running it to GitHub, and I'll paraphrase them here:
+
+The biggest gain of the optimization is for types such as . My benchmark can't detect these, but the real point here is arrays of optimized types, not optimized types themselves. We're also potentially missing all the people who did care about layout being maximally efficient and consequently hand-reordered types themselves, but there's no way we can know how many people may have.
+
+Relevant PR and discussion: Disable Field Reordering and Rolling out (or unrolling) struct field reorderings.
+
+Here comes the catch. My PR landed right as Servo decided to upgrade to a nightly with field reordering and started failing tests. Since Servo is Rust's flagship project, we had to roll it back.
+
+In the past, Rust copied what C did even though it was technically undefined, so it was possible for things to work fine without . I honestly don't remember which crates were missing on structs. You can check the discussion threads if it's important to you; they have since been fixed. This lead to important discussions about debugging it and rolling it out without disrupting everything.
+
+Relevant PR: Make reprs use a structured representation instead of a slice.
+
+This one is actually really simple. The compiler used to work with reprs as an array of , and admittedly still does in some cases. You'd get info out of it by iterating over a slice wherever you needed to know if a repr was present. What we have now is this:
+
+And is exactly what the comment says.
+
+It's possible we did (or didn't) reorder a struct when we compiled another crate, so Rustc has to know after the fact. By making it part of the repr, it gets put into crate metadata, and gives us a way to internally turn it off. The reason I had to do this now is that we needed a place to put the internal field, and is to do with parsing, so it's awkward-to-impossible to do it there. This was due to be refactored anyway and is yet another piece that makes a lot of other stuff easier to implement.
+
+Relevant PR: Implement optimization fuel and re-enable struct field reordering. I should also link this again, as it's where the design came from.
+
+Here is a really simple but profound idea that I sadly cannot take any credit for. Let there be a value called the fuel. Every time we optimize something in the compiler, subtract from the fuel. If the fuel is 0, stop optimizing.
+
+By setting the fuel to specific values and internally passing a message to a should-we-optimize decider function, we can now binary search Rustc optimizations to find broken ones down to the granularity of a single optimizer decision. Rustc currently uses this only for struct field reordering, but all future optimizations can just share the same fuel. If Rust ends up with enough of them that it stops being a scalable method, we've done very well indeed.
+
+To make this work, I added two new options to the compiler. gets the compiler to print the fuel for a crate and sets the fuel for the crate. Someone will probably write a driver program that searches automatically, but at the moment you have to run the search by hand.
+
+Field reordering will probably break people's already-broken code. It's not introducing bugs; it's showing bugs that were already there. But we can to turn it off and find out if it's us or them, and we can search their code and see exactly which type.
+
+This work has already had a positive, real-world impact on Servo. I was expecting it to impact someone in a noticeable way at some point, but not necessarily this quickly.
+
+Modern compilers look nothing like what the tutorials and textbooks would generally have you believe. There's an explanation that everyone uses: it goes from parser to AST to SSA or whatever to machine code. But in reality Rustc goes through a ton more phases than that, and I don't even know what they all are. I think there's around 20.
+
+This was the first time I've worked with code that's an order of magnitude bigger than I can understand, and what ended up happening is I colonized. I might be able to fix trans bugs with help, and this was after working with Rustc for a very long time. But this is a major win since people on the official teams do the same. More than one of my questions got an answer of "I don't know. Ask so-and-so when they're around."
+
+Modern compilers are also way more tested than anything I've ever seen, or at least Rustc is. Every PR goes into a multi-day queue and then gets run through a multi-hour CI process before it can merge. Waiting days for CI to fail frustrates me, but it's also exactly what should happen for software this critical.
+
+I'd love to do this as my job, if I could work out how to get paid for it. It's hard for me to find projects that remain challenging; the usual progression for me is that I achieve full understanding and lose interest after a while. This pattern isn't happening here, probably because Rustc is big and complicated enough that one person can never fully understand it. As a bonus, all the challenge here was about programming, not inaccessible tooling. I didn't have to work around anything. You don't run up against major problems because of blindness, and any blind dev reading this is going to know how amazingly rare that is.
+
+I want to follow this work up with a smaller RFC against the standard library, including an implementation. Whatever I do, though, I don't have the time for another volunteer project of this magnitude. I did this because I had a lot of free time, but I am now forced to begin focusing on employment instead.
+
+Libaudioverse is flashy and cool, and the people who know about it give me way too much credit with respect to how much digital signal processing I know. To anyone who knows about my work on both, the Rust compiler makes Libaudioverse look like hello world.|||
+

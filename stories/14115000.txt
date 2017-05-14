@@ -1,0 +1,109 @@
+How do you export water from your country? Well, you first go to your reservoir, pump out all the water, and fill it into bottles. You then go to the streams of clear mountain water flowing into the reservoir, and tap into them, filling the fresh water into bottles as it arrives. Then you ship those bottles all around the world.
+
+How do you export data from your database? Well, you first take a consistent snapshot of your entire database, and encode it in a language-independent format. You then look at the stream of transactions writing to your database, and parse the transaction log, encoding the inserts/updates/deletes into the same language-independent format as they happen. Then you take that data and ship it to your other systems: build search indexes, update caches, load it into a data warehouse, calculate analytics, monitor it for fraud, and so on.
+
+Bottled Water uses the logical decoding feature (introduced in PostgreSQL 9.4) to extract a consistent snapshot and a continuous stream of change events from a database. The data is extracted at a row level, and encoded using Avro. A client program connects to your database, extracts this data, and relays it to Kafka (you could also integrate it with other systems if you wish, but Kafka is pretty awesome).
+
+There are several possible ways of installing and trying Bottled Water:
+
+The easiest way to try Bottled Water is to use the Docker images we have prepared. You need at least 2GB of memory to run this demo, so if you're running inside a virtual machine (such as Boot2docker on a Mac), please check that it is big enough.
+
+After the prerequisite applications are installed, you need to build the Docker containers for Bottled Water and Postgres:
+
+Once the build process finishes, set up some required environment variables, then start up Postgres, Kafka and the Confluent schema registry by running as follows:
+
+The image extends the official Postgres docker image and adds Bottled Water support. However, before Bottled Water can be used, it first needs to be enabled. To do this, start a shell for the Postgres database:
+
+When the prompt appears, enable the extension, and create a database with some test data, for example:
+
+You can keep the psql terminal open, and run the following in a new terminal.
+
+The next step is to start the Bottled Water client, which relays data from Postgres to Kafka. You start it like this:
+
+You can run to see what it's doing. Now Bottled Water has taken the snapshot, and continues to watch Postgres for any data changes. You can see the data that has been extracted from Postgres by consuming from Kafka (the topic name must match up with the name of the table you created earlier):
+
+This should print out the contents of the table in JSON format (key/value separated by tab). Now go back to the terminal, and change some data — insert, update or delete some rows in the table. You should see the changes swiftly appear in the Kafka consumer terminal.
+
+When you're done testing, you can destroy the cluster and it's associated data volumes with:
+
+To compile Bottled Water is just a matter of:
+
+For that to work, you need the following dependencies installed:
+
+You can see the Dockerfile for building the quickstart images as an example of building Bottled Water and its dependencies on Debian.
+
+If you get errors about Package libsnappy was not found in the pkg-config search path, and you have Snappy installed, you may need to create with contents something like the following (be sure to check which version of libsnappy is installed in your system):
+
+The command above installs an extension into the Postgres installation on your machine, which does all the work of encoding change data into Avro. There's then a separate client program which connects to Postgres, fetches the data, and pushes it to Kafka.
+
+To configure Bottled Water, you need to set the following in : (If you're using Homebrew, you can probably find it in . On Linux, it's probably in .)
+
+You'll also need to give yourself the replication privileges for the database. You can do this by adding the following to (in the same directory, replacing with your login username):
+
+Restart Postgres for the changes to take effect. Next, enable the Postgres extension that installed previously. Start and run:
+
+That should be all the setup on the Postgres side. Next, make sure you're running Kafka and the Confluent schema registry, for example by following the quickstart.
+
+Assuming that everything is running on the default ports on localhost, you can start Bottled Water as follows:
+
+The first time this runs, it will create a replication slot called , take a consistent snapshot of your database, and send it to Kafka. (You can change the name of the replication slot with the command line flag.) When the snapshot is complete, it switches to consuming the replication stream.
+
+If the slot already exists, the tool assumes that no snapshot is needed, and simply resumes the replication stream where it last left off.
+
+In some scenarios, if you only care about streaming ongoing changes (and not replicating the existing database contents into Kafka), you may want to skip the snapshot - e.g. to avoid the performance overhead of taking the snapshot, or because you are repointing Bottled Water at a newly promoted replica. In that case, you can pass at the command line. (This option is ignored if the replication slot already exists.)
+
+When you no longer want to run Bottled Water, you have to drop its replication slot (otherwise you'll eventually run out of disk space, as the open replication slot prevents the WAL from getting garbage-collected). You can do this by opening again and running:
+
+If Bottled Water encounters an error - such as failure to communicate with Kafka or the Schema Registry - its default behaviour is for the client to exit, halting the flow of data into Kafka. This may seem like an odd default, but since Postgres will retain and replay the logical replication stream until Bottled Water acknowledges it, it ensures that:
+
+However, in some scenarios, exiting on the first error may not be desirable:
+
+To support these scenarios, Bottled Water supports an alternative error handling policy where it will simply log that the error occurred and drop the update it was attempting to process, acknowledging the update so that Postgres can stop retaining WAL. This policy can be enabled via the command-line switch. N.B. that in this mode Bottled Water can no longer guarantee to never miss an update.
+
+Bottled Water creates one Kafka topic per database table, with the same name as the table. The messages in the topic use the table's primary key (or replica identity index, if set) as key, and the entire table row as value. With inserts and updates, the message value is the new contents of the row. With deletes, the message value is null, which allows Kafka's log compaction to garbage-collect deleted values.
+
+If a table doesn't have a primary key or replica identity index, Bottled Water will complain and refuse to start. You can override this with the option. Any inserts and updates to tables without primary key or replica identity will be sent to Kafka as messages without a key. Deletes to such tables are not sent to Kafka.
+
+Messages are written to Kafka by default in a binary Avro encoding, which is efficient, but not human-readable. To view the contents of a Kafka topic, you can use the Avro console consumer:
+
+Bottled Water currently supports writing messages to Kafka in one of two output formats: Avro, or JSON. The output format is configured via the command-line switch.
+
+Avro is recommended for large scale use, since it uses a much more efficient binary encoding for messages, defines rules for schema evolution, and is able to faithfully represent a wide range of column types. Avro output requires an instance of the Confluent Schema Registry to be running, and consumers will need to query the schema registry in order to decode messages.
+
+JSON is ideal for evaluation and prototyping, or integration with languages without good Avro library support. JSON is human readable, and widely supported among programming languages. JSON output does not require a schema registry.
+
+For each table being streamed, Bottled Water publishes messages to a corresponding Kafka topic. The naming convention for topics is [topic_prefix].[postgres_schema_name].table_name:
+
+It is recommended to compile Bottled Water against the versions of librdkafka and avro-c specified above. However, Bottled Water may work with older versions, with degraded functionality.
+
+At time of writing, the librdkafka-dev packages in the official Ubuntu repositories (for all releases up to 15.10) contain a release prior to 0.8.6. This means if you are building on Ubuntu, building librdkafka from source is recommended, until an updated librdkafka package is available.
+
+As noted above, Bottled Water sends a null message to represent a row deletion. librdkafka only added support for null messages in release 0.8.6. If Bottled Water is compiled against a version of librdkafka prior to 0.8.6, deletes will instead be represented by empty messages, i.e. a message whose payload is an empty byte sequence. This means that Kafka will not garbage-collect deleted values on log compaction, and also may confuse consumers that expect all non-null message payloads to begin with a header.
+
+librdkafka 0.9.0+ provides a "consistent partitioner", which assigns messages to partitions based on the hash of the key. Bottled Water takes advantage of this to ensure that all inserts, updates and deletes for a given key get sent to the same partition.
+
+If Bottled Water is compiled against a version of librdkafka prior to 0.9.0, messages will instead be assigned randomly to partitions. If the topic corresponding to a given table has more than one partition, this will lead to incorrect log compaction behaviour (e.g. if the initial insert for row 42 goes to partition 0, then a subsequent delete for row 42 goes to partition 1, then log compaction will be unable to garbage-collect the insert). It will also break any consumer relying on seeing all updates relating to a given key (e.g. for a stream-table join).
+
+Bottled Water encodes the Postgres schema to which tables belong in the Avro schema namespace. Support for accessing the schema namespace was added to the Avro C library in version 0.8.0, so prior releases do not have access to this information.
+
+If Bottled Water is compiled against a version of avro-c prior to 0.8.0, the schema will be omitted from the Kafka topic name. This means that tables with the same names in different schemas will have changes streamed to the same topic.
+
+This serves as a reference for the various command-line options accepted by the Bottled Water client, annotated with links to the relevant areas of documentation. If this disagrees with the output of , then is correct (and please file a pull request to update this reference!).
+
+If you want to work on the Bottled Water codebase, the Docker setup is a good place to start.
+
+Bottled Water ships with a test suite that verifies basic functionality, documents supported Postgres types and tests message publishing semantics. The test suite also relies on Docker and Docker Compose. To run it:
+
+If submitting a pull request, particularly one that adds new functionality, it is highly encouraged to include tests that exercise the changed code!
+
+Bottled Water has been tested on a variety of use cases and Postgres schemas, and is believed to be fairly stable. In particular, because of its design, it is unlikely to corrupt the data in Postgres. However, it has not yet been run on large production databases, or for long periods of time, so proceed with caution if you intend to use it in production. See this discussion about production readiness, and Github issues for a list of known issues.
+
+Note that Bottled Water has nothing to do with Sparkling Water, a machine learning engine for Spark.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this software except in compliance with the License in the enclosed file called .
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+
+See for a list of contributors.|||
+
+bottledwater-pg - Change data capture from PostgreSQL into Kafka

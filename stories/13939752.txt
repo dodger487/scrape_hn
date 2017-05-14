@@ -1,0 +1,42 @@
+Recently I spent some time reading Dragonfly BSD code. While doing so I spotted a vulnerability in the sysvsem subsystem that let user to point to any piece of memory and write data through it (including the kernel space). This can be turned into execution of arbitrary code in the kernel context and by exploiting this, we're gonna make Dragonfly BSD great again!
+
+If you accidentally know Polish, I gave a talk about this particular bug and it's exploitation at SecurityBSides Warsaw 2016 [1]
+
+Dragonfly BSD is a BSD system which originally comes from the FreeBSD project. In 2003 Matthew Dillon forked code from the 4.x branch of the FreeBSD and started a new flavour. Some people thought, at that time, that it's just a hoax [2], but it wasn't. I thought of Dragonfly BSD as just another fork, but during EuroBSDCon 2015 I accidentally saw the talk about graphical stack in the Dragonfly BSD. I confused rooms, but it was too late to escape as I was sitting in the middle of a row, and the exit seemed light years away from me. :-) Anyway, this talk was a sign to me that it's not just a niche of a niche of a niche of a niche operating system. I recommend spending a few minutes of your precious time to check out the HAMMER file system, Dragonfly's approach to MP, process snapshots and other cool features that it offers. Wikipedia article is a good starter [3]
+
+The Bug itself is located in the semctl(2) system call implementation, which looks as follows:
+
+bcopy(3) in line 385 copies semid_ds structure to memory pointed by arg->buf, this pointer is fully controlled by the user, as it's one of the syscall's arguments. So the bad thing here is that we can copy things to arbitrary address, but we have not idea what we copy yet. This code was introduced by wrongly merging code from the FreeBSD project, *bah*, bug happens. Happily thanks to Linus's Law things like that can be spotted easily, sometimes it just takes a few years to do so.
+
+For now, let's try to trigger the bug, just to be sure that we know what we're doing and our prophecies are correct. We're going to stick with amd64 architecture (the only one currently supported by the Dragonfly BSD).
+
+We're gonna copy data to 0xdeaddead which is likely unmapped, so kernel should panic. Here we are using syscall(3) in order to bypass libc's wrapper for sysctl which brings additional complexity by wrapping things (it provides his own buffer which points to the correct memory, so there's no way to crash the kernel).
+
+Great, we can crash it. Let's see if we can control any piece of copied data.
+
+As we see, we can easily control at least 4 bytes (the key value). Luckily it's surrounded by 0x00000000, so the idea is that we can pass somewhere a pointer in following form: 0x00000000AABBCCDD, where AABBCCDD is controlled by us. You may ask why? Well, we can overwrite some function pointer and force CPU to jump into pages that are controlled by the user.
+
+Dragonfly BSD lacks of SMEP and SMAP implementation, which means that we can execute code placed in the user's pages directly from the kernel space, sweet. Now, we're going to make a dumb decision: let's overwrite open function pointer under the /dev/kpmap device dev_ops struct, which is defined here:
+
+Well, that was one of my first ideas which worked well enough. Of course it's not so clever, as we may get preempted and other process may crash the whole Universe by opening mentioned device. No risk, no fun. Easier and more elegant way would be to overwrite syscall table - but that's so easy and yesterday. Let's try to reach user page execution in the privileged mode.
+
+0x18 offset combined with MEM_OPS_ADDR is used to shift our data to overwrite open(2) function pointer with chosen value. We overwrite pointer in semctl(2) call and then open the /dev/kpmap device to jump into our code.
+
+Our system seems to be frozen - that's a good sign, we are stuck in the for-loop.
+
+Since we can execute arbitrary code in the kernel mode, we're one step away from making Dragonfly BSD great again. We want to change the OS name, which is stored under ostype variable, exposed via sysctl(8).
+
+We should also remember to fix the overwritten mem_ops structure before a potential catastrophe caused by another process.
+
+OK, now we can finish him!
+
+Previous paragraph could be the last, but I bet you think that the joke with changing OS name is not funny at all. Fortunately we can execute arbitrary code in kernel mode, therefore getting root privileges shouldn't be hard. mmopen function takes dev_open_args which has a pointer to cred structure, holding credentials of the calling process. We can simply use that reference to change uid, gid and friends to 0.
+
+Let's try if it works:
+
+The bug was fixed in uber fast manner (within few hours!) by Matthew Dillon, version 4.6.1 released shortly after that seems to be safe. In case you care, you know what to do!
+
+If you liked this article and want to be notified about other trash from me, the easiest way to do it is to follow me on twitter: @akat1_pl, thanks.
+
+Thanks go to s1m0n and n1x0n for helping me to make it happen!|||
+
