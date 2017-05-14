@@ -1,0 +1,55 @@
+This week I raised my first pull-request to the CPython core project, which was declined :-( but as to not completely waste my time I’m writing my findings on how CPython works and show you how easy it is to modify the Python syntax.
+
+I’m going to show you how to add a new feature to the Python syntax. That syntax is the increment/decrement operator, a common operator in most languages. Just to prove, open up the REPL and try it.
+
+Before the Python syntax is changed, a proposal needs to be made with a set of reasons, design and behaviours. All language changes are discussed by the core Python team and approved by the BDFL. Increment operators are not approved (and probably never will be), which gives us a good test.
+
+The Grammar file is simple text file describing all the elements of the Python language. This is used by not just CPython, but other implementations like PyPy to keep consistency and agree on the types of language semantics.
+
+Internally, these keys form the tokens, which are parsed by the lexer. When you a command converts these into a set of enums and constants in the C headers. This allows us to reference them later on.
+
+So, a is a simple statement, it can optionally have a semicolon, like when you put and ends in a new line . A is the word pass, a is the work break. Simple, right?
+
+Let’s add an increment and decrement expression, something which does not exist in the language. It would be another option in an expression statement, along with yields, augmented assignment and regular assignment, i.e. .
+
+We add it to the possible list of small statements (this will become obvious in the AST). The will be our increment method and will be a decrement. Both follow a (a variable name) and form a small standalone statement. When we build the Python project it will generate the components for us (not yet).
+
+If you start Python with -d and try it you should get:
+
+What is a token? Let’s find out..
+
+There are four steps that Python takes when you hit return: lexing, parsing, compiling, and interpreting. Lexing is breaking the line of code you just typed into tokens. The CPython lexer is called . It has the functions that read from a file (like , a string (like the REPL). It also handles the special encoding comment at the top of files and parses your file as UTF-8, etc. It handles nesting, async and yield keywords, detects sets and tuple assignment, but only the grammar. It doesn’t know what those things are or what to do with them. It just cares about the text.
+
+For example, the code that allows you to use the notation for octal values is in the tokenizer. The code to actually create octal values is in the compiler.
+
+Let’s add 2 things to Parser/tokenizer.c, the new and tokens, these are the keys that get returned by the tokenizer for each part of the code.
+
+Then, we add check to return a or token, whenever we see ++ or — . There is already a function for 2 character operators, so we extend this to suit our case.
+
+Those are defined in
+
+Now, when we run Python with -d and try our statement we see:
+
+The parser takes those tokens and generates a structure that shows their relationship to each other. For Python and many other langauges, this is the Abstract Syntax Tree (or AST). The compiler then takes the AST and turns it into one (or more) code objects. Finally, the interpreter takes each code object executes the code it represents. Think of your code as a tree. The top level is the root, a function might be a branch, a class is a branch and the class methods branch off that. The statements are leaves within a branch.
+
+The AST is defined in both ast.py and ast.c. ast.c is the file we need to change. The AST code is broken into methods that handle the types of tokens, handles statements, handles expressions. We put the and as possible expression statements. They are almost identical to Augmented Expressions, e.g. but there is no right-hand expression (1), it is implicit.
+
+This is the code for us to add to handle increment and decrement.
+
+This returns an Augmented Assignment — instead of a new Expression type with a constant value of 1. The operator is either Add or Sub(tract) depending on the token type or . Going back into the Python REPL after compiling — we can see our new statement!
+
+At the REPL, you can try this : and you’ll see the type returned. The AST has just converted the statement into a statement expression which can then be handled by the compiler. The function sets the field which is used by the compiler.
+
+The compiler then takes the syntax tree and ‘visits’ each branch, the CPython compiler has a method for visiting a statement, called which is just a big switch statement looking at the statement kind. Our’s was a type, so it calls out to to handle the details. This function then converts our statement into a set of Byte-codes. These are an intermediary language between machine code (01010101) and the syntax tree. The Byte-code sequence is the thing cached in .pyc files.
+
+The output would be VISIT (load value — which is 1 for us), ADDOP (add operation of a binary op, depending on the operator (subtract, add), and STORE_NAME (store the result of ADDOP to the Name). Those methods respond with more specific byte-codes.
+
+If you load the module you can see the byte-code for yourself
+
+The final level is the interpreter. That takes the byte-code sequence and converts it into machine-specific operations. This is why Python.exe and Python for mac and Linux are all seperate binaries. Some byte codes need OS specific handling and checks. The threading API for example needs to work with GNU/Linux’s thread API which is very different to Windows threading.
+
+If you’re interested in interpreters, I’ve given a talk on Pyjion, a plugin architecture for CPython which became PEP523
+
+If you still want to play, I pushed the code up to GitHub, along with my changes to the tokenizer.|||
+
+This week I raised my first pull-request to the CPython core project, which was declined :-( but as to not completely waste my time I’m writing my findings on how CPython works and show you how easy…

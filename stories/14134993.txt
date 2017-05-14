@@ -1,0 +1,105 @@
+The purpose of this library is to support server-side rendering of your Angular 4+ applications with minimal code changes and mimimal difficulty. It supports both Angular CLI projects and projects that use custom webpack configurations. It works out of the box with with no hot-fixes or workarounds! It also generally requires zero changes to your existing application code: you won't have to create separate s, one for the server-side rendered application and one for the regular client application (unless you want to). You can just take your Angular code as-is and follow the steps below to get server-side rendering working.
+
+There are two ways you can use :
+
+If it makes sense for you to render your application at build time as a performance optimization (ie., your application does not contain lots of dynamic content that is not available at build time, or which is subject to change after the build), then the CLI tool is probably what you want. You simply run or as normal, and then invoke (after of course). This will render your application routes into static files. It is worth emphasizing that this use case is the easiest, but also the least flexible. If you need on-demand rendering, or if you have custom webpack configurations, then you should skip down to the examples below as they will cover your use-case better than this section.
+
+To give a shot, just do:
+
+It should spit out some messages like:
+
+You can then do and run:
+
+Then when you load the application by hitting , you should see the pre-rendered document in the initial HTTP response (for each route in your application). To see what the prerendered document looks like, open Chrome Developer Tools and click the option. This way you can see the server-rendered document and prevent the client app from booting.
+
+An example application like the one I have just described is available in the directory. It also uses to prove that Material works with .
+
+Additional examples are available in the Examples section.
+
+I think this is likely to be the most common usage of :
+
+Your actual HTTP server code will look something like the following:
+
+If you wish to do prerendering (rendering of all routes that do not take parameters), which is appropriate for applications that are mostly static controls and so forth, then you can write a bit more code like this:
+
+The caching implementations in are completely optional and are not integral to the product in any way. The library provides two caching implementations: one that is variant-aware ( ) and one that is not ( ). They are both fixed-size LRU caches that default to 65k items but can accept different sizes in their constructors. But they are very simple abstractions that just sit atop and there is absolutely no requirement that you use them. They all share the same basic implementation:
+
+These cache implementations are being considered for removal or deprecation because they are not appropriate for most applications.
+
+If you want to roll your own caching solution, or just not cache anything, you are absolutely free to do so. Just call and you will get a freshly rendered document each time. After that, you can cache it or not cache it or do whatever you want with it. Caching is not an integral part of the library; and are provided mostly as examples of how to implement basic caching.
+
+If your application does not fall into the categories described above (i.e., you do not need on-demand server-side rendering of all URLs), then perhaps your application falls into another category: single-use server-side rendering as part of the application build process.
+
+In this case, your code will look similar to the HTTP server code above, but instead of integrating with express, you will simply use to pre-render all application routes and write them to static files, which you can then serve with the HTTP server of your choosing. Again: this case only makes sense if you do not need on-demand rendering of all application routes.
+
+In this case, your code will look something like this:
+
+Now we arrive at the most complex use case. Here we wish to do prerendering and demand rendering inside a NodeJS HTTP server, but we also wish to render variants of each page. For example, our application may support multiple languages. supports this using a concept called a variant. A variant is essentially a key, a set of unique values, and a transition function which can place the application in the specified state.
+
+To illustrate, let's again use the example of locales / languages. Your application has multiple languages and you want to support server-side rendering for each of them. The first time someone loads your application, we set the current language selection to the value of (eg, "en-US"). We set an application cookie using so that subsequent loads of the application will include as part of the request the language that the user wishes to view the application in. Assume we have some simple code like this somewhere in the application:
+
+Essentially what this code is doing is setting a cookie in two events:
+
+The code above means that our HTTP requests will match one of two cases:
+
+We can handle this by rendering different variants of our application. Let's assume that our application supports , and locales. This is how we would configure the server:
+
+Voila! Now whenever the user reloads our application or comes back to it in a few days, we are going to hand them a pre-rendered document that is in the language of their choosing! Simple.
+
+The example in has working code that implements what was just described. Give it a shot!
+
+The main contract that you use to define the behaviour of your application in a server context is called . It has thorough comments and explains all the ways that you can configure your application when doing server-side rendering. is an implementation of the Builder pattern. You use it to configure your application and then once you are finished configuring, you call the method to get an instance of (where is an object describing the variants your application understands, or if you are not using variants).
+
+is an interface. It has three concrete implementations that you can instantiate, depending on which suits your needs:
+
+The typical usage of looks something like:
+
+The entire purpose of is to produce an object. The interface that you get from is the primary API that you will use to render your application. It contains several methods:
+
+Note that because extends the interface, you should call when you are finished with it. Failing to call is likely to result in memory leaks, temporary files not being deleted, and other undesirable behaviour.
+
+Many applications may wish to transfer some state from the server to the client as part of application bootstrap. makes this easy. Simply tell your object about your state reader class or function, and any state returned from it will be made available in a service called .
+
+On the server, we tell our about our state reader class:
+
+Your class implementation might look like this:
+
+Note that you can inject any service you wish into your state reader. will query the constructor arguments using the ng dependency injector the same way it works in application code. Alternatively, you can supply a function which just accepts a bare and you can query the DI yourself:
+
+Both are equivalent, but the class-based solution is probably cleaner and easier to understand.
+
+Note that your state reader will not be called until your application zone becomes stable. That is to say, when all macro and microtasks have finished. For example, if your application has some pending HTTP requests, will wait for those to finish before asking your state reader for its state. This ensures that your application has finished initializing itself by the time the state reader is invoked.
+
+Another interesting one is . This is the data structure you get back from the server-side rendering process. It takes a type argument that represents the variants your application is aware of, or if you are not using variants.
+
+One thing to note about is that it contains far more information than just the final rendered document. It has:
+
+The library provides two extremely simple caching implementations. Both are LRU caches that default to a maximum size of 65k items. They are unlikely to be useful to you if your application contains a lot of dynamic content, but they illustrate how you can implement caching inside of your server application:
+
+Alternatively, you can provide your own caching mechanism and just call when there is a miss. This is the solution that is going to be the most flexible and allows you to customize your caching needs to suit your application (for example, you may wish to integrate with an external caching service built with Redis or some such).
+
+The problems you are most likely to run into revolve around zone stability.
+
+If you are familiar with Angular 4, you know that all application code executes inside of a zone. The same is true of applications running in . Each render operation causes a new zone to be forked from the zone. All operations (synchronous or asynchronous) then execute inside of that zone. also uses zones to map global objects like and to the correct values even if multiple render operations are executing concurrently. Lastly, the library uses zone.js determine whether your application is stable. Stable means that all macrotasks and microtasks have completed. The library will wait for your zone to become stable before it attempts to do any of the following:
+
+This is fairly easy to understand. There are lots of resources online that can provide additional information and guidance on zone:
+
+Many issues can surface if your application zone fails to become stable quickly:
+
+Timed out while waiting for NgZone to become stable after 5000ms! This is a serious performance problem! This likely means that your application is stuck in an endless loop of change detection or some other pattern of misbehaviour In a normal application, a zone becomes stable very quickly
+
+At this point, the SSR library will just assume that the application will never stabilize and will go ahead with the render anyway. This is very dangerous because your application may be in the middle of some kind of state transition or waiting for a network response. So it is very important to ensure that your application becomes stable quickly when running on the server, otherwise you risk poor performance and mangled responses.
+
+If your application requests large amounts of data on startup and it takes a while, one potential solution is to pre-request the data it needs and store it in some sort of cache. Presumably you would update this cache periodically with new data. Then instead of requesting data directly from the running application on the server, you can inject it using a bootstrapper:
+
+This means that we will not have to wait for HTTP requests to finish before we render the application, increasing performance and reducing the risk of sending a bad document in the HTTP response.
+
+The folder contains a project that was generated with , and which also integrates with , and uses the command to render itself as part of the build process. This is the simplest possible usage of angular-ssr and covers very basic applications.
+
+A project using express and lives in the directory.
+
+A project using koa and lives in the directory.
+
+Direct your vitriol to chris.bond@rangle.io or post an issue on this GitHub repo!|||
+
+Angular server-side rendering implementation

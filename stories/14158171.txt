@@ -1,0 +1,36 @@
+One of the really great things about Tensorflow is how easy it makes it to offload computations to the GPU. Tensorflow can do this more or less automatically if you have an Nvidia GPU and the CUDA tools and libraries installed. But just because Tensorflow offloads computations to the GPU doesn’t mean you’ll get good performance. In fact, it’s not uncommon to get significantly worse performance when using a GPU than you would if you ran your compute graphs on the CPU.
+
+There are two main reasons that using a GPU can be slower than the CPU:
+
+Writing big, expensive network models is easy, so usually the first point isn’t the problem. It’s much more common to run into problems where data is unnecessarily being copied back and forth between main memory and GPU memory. This is the same problem that OpenGL programmers have faced for years: copying vertex data between main memory and the GPU is expensive, so a big part of writing high performance OpenGL code is figuring out how to keep vertex data on the GPU.
+
+There are two ways to copy NumPy arrays from main memory into GPU memory:
+
+Most of the models and tutorials you’ll find online use the first approach, copying the data using a . This always copies the data from main memory to the GPU. For huge datasets that can’t entirely fit onto the GPU, this is often fine. For instance, if you have hundreds of gigabytes of image or video data, your dataset will vastly exceed the available space in the GPU, so it’s easy to fill the GPU with each mini-batch. Furthermore, contemporary CNNs are quite deep and are fairly expensive to run, so the memory transfer overhead is low compared to how long the compute graph take to run. However, if you’re dealing with smaller datasets that can fit entirely in GPU memory (e.g. with text or numeric datasets), you can get much better performance using to pin your dataset into GPU memory. The problem with doing this is that neural networks tend to overfit training data unless the training data is split up into mini-batches, so reusing the same for each training epoch will lead to poor generalization.
+
+After a lot of internet sleuthing, I found a cryptic StackOverflow answer suggesting a clever solution to this problem: load the entire dataset using , and then use to grab mini-batches from the constant. For instance, let’s say you have an Nvidia GPU with 8 GB of memory, and your dataset is smaller than 8 GB. During training, you want to split the dataset into 100 mini-batches. The idea is that in each training epoch you would pass the slice indexes into the session via a , and then the compute graph you’ve written would use to generate the mini-batch. Using this approach requires only sending the slice indexes via a , which will be small scalar values. The idea is really elegant, but I found actually figuring out how to implement this to be kind of tricky.
+
+I’m going to demonstrate this technique with a small Python 3 program that generates mini-batches from a using the operator. I’ve also created a GitHub repo with the full code for this example, if you want something you can download and actually run locally.
+
+To keep the code simple, we’re going to write a Tensorflow compute graph that applies a simple numeric operation to a small 10⨯3 matrix:
+
+The code above will create a NumPy array called that looks like this:
+
+For this demo our mini-batches will have size 2, meaning that they will be 2⨯3 matrices. The first mini-batch would be equivalent to , the second mini-batch would be equivalent to , and so on. Of course, we won’t actually be using NumPy slicing; instead we’ll be using Tensorflow operators.
+
+The next step is to copy into Tensorflow’s data graph. Tensorflow will automatically use a GPU if available, but you can also use a context to force the location.
+
+Generating a mini-batch is done by supplying a batch index via a placeholder called , and then a mini-batch is generating using with the batch index:
+
+I found the documentation for to be pretty confusing, so I’ll explain here in plain English how it works. The argument, which is in the code above, is the index of the upper-left corner of the slice we’re creating. The index is multiplied by because the values are in the range 0 to 4, so they need to be scaled to get the true offset into the matrix. The argument, which is in the code above, says how many rows to go down and how many columns to go right. The special value -1 means “all columns”; I could have also used 3 here, since that’s the width of the matrix.
+
+The value we’re going to calculate with our compute graph is the sum of the squares of the values in our mini-batch:
+
+For this demonstration, we’ll run the compute graph 100 times. We’ll also shuffle the batch order. In this example I’ve initialized the dataset with random data, so shuffling isn’t necessary. However, in a real neural network shuffling the mini-batch order is helpful since it helps fight any locality patterns in the input data (e.g. if earlier batches tend to have small numeric values, and later batches tend to have larger numeric values). Shuffling the data this way can help combat overfitting:
+
+The training loop is very simple. All it does is pass the batch index (a single 32-bit integer) into a Tensorflow session:
+
+There are a lot of variations that you can make on this same theme. Here are a few I thought of while writing this post:
+
+Because this technique tends to make designing models more complicated, I would suggest implementing it only after you’re satisfied with the basic structure of your model. That’s the best time to start looking at optimizing training times, and that’s when I would consider employing this technique.|||
+

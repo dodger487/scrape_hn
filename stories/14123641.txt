@@ -1,0 +1,44 @@
+The LandHere architecture is a simulated implementation of several proposed instruction set features intended to preserve correct program control flow at a hardware level. The features chosen for implementation in LandHere were intended to be simple to implement in hardware, and are not intended to constitute a complete defense againt ROP attacks; instead, they constitute a coarse set of defenses that greatly reduce but do not eliminate the possibility of control flow attacks, which can further be augmented with software-based control flow defenses for tighter protection.
+
+The LandHere architecture is a small nonstandard extension of the Intel x86_64 instruction set architecture. It adds two features which have been proposed in academic literature as possible mitigations for code-reuse attacks:
+
+In order to demonstrate the feasibility of these features and evaluate their efficacy in practice, we implemented a simulator by modifying the hardware emulator QEMU. We then correspondingly modified everything we needed to compile and run real a Linux system on this emulator, including patching GCC, glibc, binutils, and the linux operating system itself.
+
+In order to experiment with our system, you will need at least an LP-enabled version of QEMU and an image to run on it. We've provided both precompiled and source versions of both.
+
+All the source code used to build our artifacts is here. Note that these sources were built on top of older versions of the below software, so certain known bugs in the original software will not be fixed in the artifacts below.
+
+In order to encode the landing pad instructions in a backwards-compatible way, we chose to encode them as non-standard no-op instructions:
+
+Each one of these corresponds to a kind of dynamic jump in x86 assembly. When a jump of a given kind is performed, the next instruction executed must be the corresponding landing pad, or else the CPU will fault. For example, the code snippet
+
+will run without problems, because the instruction being jumped to contains a . On the other hand,
+
+will raise a fault, because the targeted instruction is not a instruction. This similarly means that every function called via a function pointer must begin with the instruction, and also that every instruction which expects control flow to return must be followed by a instruction.
+
+This is a relatively weak policy that does not prevent all possible code reuse attacks; however, it does limit the number of useable gadgets an attacker has at their disposal. An attacker might overwrite a register in such a way that it directs control flow to the wrong place, but an attacker can no longer redirect control flow to, say, the middle of a basic block, or call a chunk of code which was not intended to be called.
+
+The shadow stack does not require the modification of most user-facing code, but ensures that backwards-edge control flow (i.e. returns) are valid. We select a standard translation from stack addresses to shadow stack addresses, in this case by flipping one address bit, which means translating between the two varieties of addresses can be simple and low-cost. We will refer to this translation as .
+
+In x86_64 assembly, the instruction saves the current value of the register on the stack, so the program can return to that location in the program after the called function is complete. Our modified x86_64 assembly pushes the content of the register to both the location at and the corresponding location at . This means a running program has a redundant copy of its stack information in a location which is otherwise not being read from or written to.
+
+We also modify the instruction to pay attention to the values on the shadow stack. The instruction pops the top value on the stack and returns to that location; in our system, it first compares the value at to ensure that the two are identical: if they are not, our system raises a fault.
+
+While it's not impossible in our system for an attacker to modify both the normal stack and the shadow stack, modifying the shadow stack is much more difficult: non-control-flow data is not stored on the shadow stack, and therefore it's much less feasible that a buffer overflow would occur that would allow an attacker to overwrite memory on the shadow stack.
+
+Additionally, a real implementation might choose to introduce a new policy for virtual memory pages, in which a page can be marked as shadow memory: this would allow the and instructions to modify information on those pages, but prevent other instructions from reading or writing the shadow stack. This would prevent the attacker from ever modifying backwards edges of control flow.
+
+In both cases, our simulator only performs these control-flow checks when the simulated processor is operating in user mode.
+
+In order to evaluate these kinds of ROP defenses in practice—that is, to observe them in a real-world situation and not just in toy scaled-down examples—we modified the Linux kernel, glibc, gcc, and binutils to produce LandHere-compatible code. We then modified the build toolchain of the Void Linux distribution to cross-compile programs for this architecture and built a minimal Linux image with installable packages. The image we provide is preloaded with the package manager, which provides access to our set of precompiled LandHere-enabled binary packages.
+
+For demonstration purposes, we instructed the Linux kernel to handle LandHere-related faults by printing out the fault information and resuming the program. This allows easier debugging and examination of program faults. A stricter implementation might suspend or kill the offending process.
+
+Additionally, we did not modify other compilers to produce LandHere-compatible code, and we also did not patch other libraries that use inline assembly, notably . This means that typical use of our provided Linux image will produce some LandHere-related faults arising from use of the above. When evaluating LandHere-enabled software, it's important to take this into account.
+
+Void Linux is a very small, streamlined distribution with a very elegant and easy-to-use package building system. Additionally, for our demonstration, we implemented our features in a version of Linux which was current at the time, but made no effort to track future modifications or releases of Linux. This meant we needed to use a distribution that supported a barebones system which was less likely to require more modern kernel features. All of these requirements led us to base our demonstration on Void Linux.
+
+The Void Linux package building system, , has a convenient system for cross-compilation, and it was straightforward to add a new target architecture that corresponds to our modified . This means that any package that is built using and supports cross-compilation can be rebuilt for the architecture through Void's tool.
+
+Our research on LandHere was made possible by funding from the NSA.|||
+
