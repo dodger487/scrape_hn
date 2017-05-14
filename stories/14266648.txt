@@ -1,0 +1,59 @@
+Saltside’s SRE team is leading the charge to replace our home grown container orchestration setup with Kubernetes. Saltside makes classified (as in user posted ads, not secrets) sites. We operate in multiple markets. I’ll refer to the total number of markets as going forward. Market containers are deployed and operated separately from the others. This ensures each market’s infrastructure may be scaled accordingly and that failures in one market do not impact the others. Given each market’s infrastructure is deployed separately, it must progress through all the stages of deployment process. I’ll refer to this as going forward.
+
+Our solution leverages Helm. Our implementation is to build one helm chart per per . This creates charts. Technically we keep all the configuration in one and pick out the appropriate values based on and . This detail is not entirely relevant for this post, but I figured it may be interesting for those curious about the implementation. I’ll share details about the complete solution in future posts.
+
+Last week’s objective was to demonstrate that the “clean-build-install-test” CI process worked reliably for our chart repo. Our team runs hundreds of CI builds a day without issue. We trust CI for the current code bases. There are no flakes, so failures are considered genuine. Our chart repo’s test suite must be equally reliable. Reliability for this repo is more complicated because of how many moving parts are involved. The high level CI process looks something like this:
+
+I’d run over and over again from my own machine earlier in the week with varying results. The results were inconsistent and time consuming. The whole process tends to take ~20–25 minutes without parallelization. Instead I wanted something that would better approximate conditions in the engineering team.
+
+My experiment is simple: repeat the command in an endless loop and count each success or failure. This experiment hits the following points:
+
+This may not be most scientific experiment, but it’s the best I can come up with right now. Please let me know any improvements in the comments.
+
+There are a few existing bugs in Helm that require work arounds in our code:
+
+Here are the various scripts used as shims in the process:
+
+The test script (known as ) is executed with .
+
+One loop of this process creates a lot of output. Here is the log output (with some irrelevant text remove) for a successful run:
+
+This proves that the process does work. The question is: how often does it work? The execution can be repeated and results measured.
+
+I ran on our kops bastion node before going to sleep. I checked in morning after it ran for about 9 hours. Here are the results:
+
+The 28 consecutive successes surprised me. Earlier in the week I could not get a single success of one market, let alone all 4 in succession. Then everything broke. Something happened on the 29th run that broke itself and each after it. Was it cluster itself? Was it a bad node? Did helm/tiller break in some way? So went wrong? Let’s turn to the log:
+
+This is the last step ( ) of the proccess, so it got all the way to the end. The failure happened on the last market ( ). Here’s the relevant section:
+
+The is a helm/tiller thing. This is another known issue with Helm/Tiller. My hypothesis is there is a timeout between kube-proxy, tiller, or the helm client. These failures may also cause tiller pods to crash. Kubernetes detects the failure and restarts the pod.
+
+Helm using 1 replica tiller by default. Crashes creates a downtime while the next pod starts up. This should not create permanent issues since tiller is a stateless process and tiller stores data in Kubernetes itself with config maps — in theory. This can be confirmed by looking at the tiller logs or the Kubernetes logs to see if replica crashed.
+
+Unforutnately there is nothing in for the tiller pod nor useful events in for tiller. It seems like there was not a tiller crash in this case. I have to write that off as a transient issue if it does not repeat in the subsequent run. Here are the logs for the next run:
+
+This log shows that it failed to purge in time. That works by 'ing for the release name ( in this case) in . It is true that it may take more than 15 attempts for that to happen. The number of attempts could be increased in the next experiment. If that’s the issue, then it’s safe to assume that the next run would wait again for it to purge eventually leading to consistency. The logs for the next runs show:
+
+The logs show that the release was not found when it checked. This indicates that took longer than the expected timeout. The code dutifully continued onto the next market and failed waiting for the pods to delete. Again, it is plausible that there are too few attempts to handle the deletion case. In that case, we’d expect all these things to eventually clean after a large amount of test runs. The log shows:
+
+The next run matches that assumption. Here and were not found and successfully confirmed deleted. This time it failed again but for another Helm release ( ). Seems this may in fact be a timeout related thing (solvable by increasing the timeout). Let’s fast forward through the log until the initial clean step succeeds and examine the following runs for any patterns.
+
+The logs shows that the release registered as . Unfortunately the next step failed to completed within a (generous) timeout. The logs for all the subsequent runs are failing in the same way. Here’s the of the last completed run before I terminated the experiment:
+
+Here the logs show the same pods that stalled in in earlier runs are also stalled in .
+
+I terminated the experiment since it was apparent that there would be no change in any future runs. The results lead me to think:
+
+This may be also related to an issue I opened regarding periodic lockups in the Docker daemon. This resulted in pods stuck in the state until the Docker daemon was restarted. Our kubelet checks showed that one node had been failing health checks for hours.
+
+Earlier experiments prepared me for this scenario. I added verbose logging to the Docker daemon to help debug this problem. The test logs do not show the node information, but it can be inferred from the AWS instance id in the slack ping. These logs would most likely not be conclusive for problems with all pods on that node. Instead it may yield enough information to add to the existing bug report.
+
+Relevant snippets from the kubelet logs regarding the pending pods:
+
+This snippet is repeated throughout the entire kubelet log. Here’s another repeated snippet documenting the failing health check:
+
+Unfortunately I cannot grok any useful information from 128MB of docker daemon logs. I have archived the Kubelet and Docker daemon logs for further analysis though.
+
+There is nothing conclusive about this experiment. It must be rerun after fixing the broken kubelet. Run 2 will use updated timeouts and hope for no Kubelet errors. Check part for that analysis in part two.|||
+
+Part 1 in this series documents issues found using Helm & Kubernetes for continuously invoked delivery pipelines.

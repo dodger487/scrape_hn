@@ -1,0 +1,41 @@
+Networks are unreliable. At some point we’ve all experienced trouble connecting to Wi-Fi or had a phone call drop on us abruptly.
+
+The networks connecting our servers are generally more reliable than cellular networks and home ISPs, but given enough information moving across the wire, they’re still going to fail in unpredictable ways. Outages, routing problems, and other intermittent failures may be statistically rare, but are still bound to be happening all the time at some ambient background rate.
+
+To overcome this sort of inherently unreliable environment, it’s important to design APIs and clients that will be robust in the event of failure. One straightforward strategy is having clients retry operations against remote services. Let's take a look at our C# API client and walkthrough adding auto-retries:
+
+ButterCMS is a "Content Management System as a service"—the database, logic, and administrative dashboard of a CMS is provided as a hosted service and its content is made available through a web API. You can retrieve the content through its API client and plug it into your website. In C#, the API methods can be called through a single class.
+
+Let's take a look at the structure of the class. It has a number of public methods that send API requests through the private Execute(string queryString) and ExecuteAsync(string queryString) methods. We'll just deal with the Executemethod and its synchronous callers for simplicity's sake. Here's one of the public methods, used for retrieving a list of blog posts:
+
+Nice and simple. As you can see, it takes a postSlug parameter (which is just the unique URL segment that identifies the blog post we want to load), assembles it into the post's URL on the ButterCMS server, and passes it to the Execute(string queryString) method, which gets a JSON response and returns it for marshaling into our PostResponseclass. We can then take that data and render it in a page template on our public website.
+
+Let's dive a little deeper into what happens inside the Execute method:
+
+This method simply makes an HTTP GET request to the given URL and returns the response body as a string, which can be parsed by the caller as JSON, XML, etc. It has some built-in error checking which is used to throw exceptions in case of a bad response. This prevents callers from accidentally trying to parse them as legitimate data.
+
+Now that you've seen how the API client works, lets add auto-retries!
+
+Since our example API client is effectively read-only (only makes GET requests), we can use a "dumb" retry mechanism that simply re-sends requests until one succeeds or we exceed our maximum allowed number of retries.
+
+To do this, we need to "watch" the Execute method so that we can re-execute it if it throws an exception. This can be done with a simple wrapper method that catches the exceptions. First, let's rename our old Execute method to ExecuteSingle to more accurately express its purpose.
+
+Then let's build our wrapper method. We'll call it Execute so that our existing public methods will call it instead instead of the function we just renamed. For now we'll just make it a simple wrapper that doesn't add any functionality:
+
+The API client should now function exactly as before, so we really haven't accomplished anything yet. Let's start by writing a simple loop to retry the request up to a certain number of times. To "keep the loop going" in the event that ExecuteSingle throws an exception, we need to catch those exceptions inside the loop.
+
+This code will escape the loop via the return statement if the request is successful. If an exception is thrown by ExecuteSingle it will be swallowed and the loop will continue up to maxRequestTries times. The do { ... } while ()syntax ensures that requests will always execute at least once, even if maxRequestTries is misconfigured and set to something like 0 or -10.
+
+Of course, this code has a glaring problem—it swallows all the exceptions. If all the requests fail, it will just return a null string. But how can we handle this? We can't throw the exceptions from inside the catch (Exception) { } block or execution will escape the loop, defeating the purpose of the entire method. We should throw the exceptions after, and only if, all of the requests fail. We can do this by aggregating them in a List<Exception> and throwing an AggregateException at the end of the method.
+
+If all the requests fail, this method will now throw an AggregateException containing a list of all the exceptions thrown on each request. If any request succeeds, no exceptions will be thrown and we'll just get our response string. This is definitely sufficient. But let's make it just a little nicer—most repeated failures will be caused by a persistent problem, so each request will throw the exact same exception. If all our requests throw an InvalidKeyException (which happens when our API auth token is invalid), do we really want to return an AggregateException with, say, 3 identical InvalidKeyExceptions? Wouldn't it be more ergonomic to just throw a single InvalidKeyException? To do this, we need to "collapse" any duplicates in our exceptions list into a single "representative" exception. We can use Linq's Distinct method to do this, but it won't collapse the exceptions by default because they're...well...distinct objects and Distinct will compare them by reference. We can use its overload, which accepts a custom IEqualityComparer<T>that we can use to identify exceptions that can be considered duplicates for our purposes. Here's our implementation:
+
+This equality comparer considers two exceptions to be equal if they share the same type and Message property. For our purposes, this is a good enough definition of "duplicates".
+
+Now we can collapse the duplicate exceptions thrown by our request attempts:
+
+This is a little more ergonomic. In short, we throw only distinct exceptions generated by the request attempts. If there's only one, either because we only made one attempt or because multiple attempts all failed for the same reason, we throw that exception. If there are multiple exceptions, we throw an AggregateException with one of each type/message combo.
+
+We're all done! Our API client is now more robust and can withstand incidents related to network unreliability. If you're interested in exploring further check out the full code on Github and the ButterCMS API documentation.|||
+
+Networks are unreliable. One way to overcome this is by having clients retry API requests when they fail. Learn how to add retries to a C# API client.

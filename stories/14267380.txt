@@ -1,0 +1,116 @@
+is an overlay network to encapsulate Ethernet traffic over an existing (highly available and scalable, possibly the Internet) IP network while accomodating a very large number of tenants. It is defined in RFC 7348. For an uncut introduction on its use with Linux, have a look at my “ & Linux” post.
+
+In the above example, we have hypervisors hosting a virtual machines from different tenants. Each virtual machine is given access to a tenant-specific virtual Ethernet segment. Users are expecting classic Ethernet segments: no MAC restrictions, total control over the IP addressing scheme they use and availability of multicast.
+
+In a large deployment, two aspects need attention:
+
+A typical solution for the first point is using multicast. For the second point, this is source-address learning.
+
+(RFC 7432 and draft-ietf-bess-evpn-overlay for its application with ) is a standard control protocol to efficiently solves those two aspects without relying on multicast nor source-address learning.
+
+relies on (RFC 4271) and its MP- extensions (RFC 4760). is the routing protocol powering the Internet. It is highly scalable and interoperable. It is also extensible and one of its extension is MP- . This extension can carry reachability information ( ) for multiple protocols (IPv4, IPv6, L3VPN and in our case ). is a special family to advertise MAC addresses and the remote equipments they are attached to.
+
+There are basically two kinds of reachability information a sends through :
+
+The protocol also covers other aspects of virtual Ethernet segments ( reachability information from ARP/ND caches, MAC mobility and multi-homing) but we won’t describe them here.
+
+To deploy , a typical solution is to use several route reflectors (both for redundancy and scalability), like in the picture below. Each opens a session to at least two route reflectors, sends its information (MACs and ) and receives others’. This reduces the number of sessions to configure.
+
+Compared to other solutions to deploy , has three main advantages:
+
+On Linux, Cumulus Quagga is a fairly complete implementation of (type 3 routes for discovery, type 2 routes with MAC or IP addresses, MAC mobility when a host changes from one to another one) which requires very little configuration.
+
+This is a fork of Quagga and currently used in Cumulus Linux, a network operating system based on Debian powering switches from various brands. At some point, support will be contributed back to FRR, a community-maintained fork of Quagga.
+
+It should be noted the implementation of Cumulus Quagga currently only supports IPv4.
+
+Before configuring each , we need to configure two or more route reflectors. There are many solutions. I will present three of them:
+
+For reliability purpose, it’s possible (and easy) to use one implementation for some route reflectors and another implementation for the other ones.
+
+The proposed configurations are quite minimal. However, it is possible to centralize policies on the route reflectors (e.g. routes tagged with some community can only be readvertised to some group of ).
+
+The configuration is pretty simple. We suppose the configured route reflector has configured as a loopback IP.
+
+A peer group is defined and we leverage the dynamic neighbor feature of Cumulus Quagga: we don’t have to explicitely define each neighbor. Any client from and presenting itself as part of AS 65000 can connect. All sent routes will be accepted and reflected to the other clients.
+
+You don’t need to run Zebra, the route engine talking with the kernel. Instead, start with the flag.
+
+GoBGP is a clean implementation of in Go. It exposes an RPC API for configuration (but accepts a configuration file and comes with a command-line client).
+
+It doesn’t support dynamic neighbors, so you’ll have to use the API, the command-line client or some templating language to automate their declaration. A configuration with only one neighbor is like this:
+
+More neighbors can be added from the command line:
+
+GoBGP won’t try to interact with the kernel which is fine as a route reflector.
+
+A variety of Juniper products can be a route reflector, notably:
+
+The main factor is the CPU and the memory. The QFX5100 is low on memory and won’t support large deployments without some additional policing.
+
+Here is a configuration similar to the Quagga one:
+
+The next step is to configure each /hypervisor. Each is locally configured using a bridge for local virtual interfaces, like illustrated in the below schema. The bridge is taking care of the local MAC addresses (notably, using source-address learning) and the interface takes care of the remote MAC addresses (received with ).
+
+VXLANs can be provisioned with the following script. Source-address learning is disabled as we will rely solely on to synchronize between the hypervisors.
+
+The configuration of Cumulus Quagga is similar to the one used for a route reflector, except we use the directive to publish all local .
+
+If everything works as expected, the instances sharing the same should be able to ping each other. If IPv6 is enabled on the VMs, the command shows if everything is in order:
+
+Step by step, let’s check how everything comes together.
+
+On each , Quagga should be able to retrieve the information about configured VXLANs. This can be checked with :
+
+Quagga should also be able to retrieve information about the local MAC addresses :
+
+Each has to establish a session to the route reflectors. On the , this can be checked by running :
+
+The output includes the following information:
+
+The state of the sessions can also be checked from the route reflectors. With GoBGP, use the following command:
+
+With JunOS, use the below command:
+
+If a session cannot be established, the logs of each daemon should mention the cause.
+
+From each , Quagga needs to send:
+
+The best place to check the received routes is on one of the route reflectors. If you are using JunOS, the following command will display the received routes from the provided :
+
+There is one type 3 route for  100 and another one for  200. There are also two type 2 routes for two MAC addresses on  100. To get more information, you can add the keyword . Here is a type 3 route advertising as a for  100:
+
+Here is a type 2 route announcing the location of the MAC address for  100:
+
+With Quagga, you can get a similar output with :
+
+With GoBGP, use the following command:
+
+Each should have received the type 2 and type 3 routes from its fellow , through the route reflectors. You can check with the command of .
+
+Does Quagga correctly understand the received routes? The type 3 routes are translated to an assocation between the remote and the :
+
+The type 2 routes are translated to an association between the remote MACs and the remote :
+
+The last step is to ensure Quagga has correctly provided the received information to the kernel. This can be checked with the command:
+
+All good! The two first lines are the translation of the type 3 routes (any frame will be sent to both and ) and the two last ones are the translation of the type 2 routes.
+
+One of the strength of is the interoperability with other network vendors. To demonstrate it works as expected, we will configure a Juniper vMX to act as a .
+
+First, we need to configure the physical bridge. This is similar to the use of and with Linux. We only configure one physical interface with two old-school VLANs paired with matching .
+
+Then, we configure to advertise all known . The configuration is quite similar to the one we did with Quagga:
+
+We also need a small compatibility patch for Cumulus Quagga.
+
+The routes sent by this configuration are very similar to the routes sent by Quagga. The main differences are:
+
+Here is a type 3 route, as sent by JunOS:
+
+We can check that the vMX is able to make sense of the routes it receives from its peers running Quagga:
+
+On the other end, if we look at one of the Quagga-based , we can check the received routes are correctly understood:
+
+Get in touch if you have some success with other vendors!|||
+

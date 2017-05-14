@@ -1,0 +1,67 @@
+In this post I will briefly summarize why analytic (OLAP) workloads perform better on columnar (aka column-oriented) databases as opposed to traditional row-based (aka row-oriented) databases.
+
+Analytic workloads comprise of operations like scans, joins, aggregations etc. These operations are concerned with data retrieval, some computations over the values stored in table cells, and predicate evaluation. Such operations typically touch a very large number of rows but only a few columns in the table. As far as I understand, this is the fundamental difference between analytic queries and OLTP-style operations. Here are some examples differentiating the two types of operations.
+
+Now let’s talk about some of the factors that work in favor of column stores for efficient analytical queries.
+
+The fundamental (and most obvious) difference between column stores and row stores is the way they organize and store table data.
+
+Row-oriented databases store data on a row-by-row basis. Each row has its data stored together (contiguously) in-memory or on-disk or both. Thus its easier to grab some/all columns of a “particular row” given its ROWID. So in a single seek, row’s data can be loaded from disk into memory.
+
+However, if the operation requires to access only a handful of columns from a very large number of rows in the table (the case of analytic or data warehouse queries), row stores tend to become less efficient since we have to walk the row, skip over the columns not needed, extract the value from relevant column of interest and move on to the next row.
+
+In columnar databases, values of a particular column are stored separately or individually — contiguous layout for values of a given column in-memory or on-disk. If the query touches only few columns, it is relatively faster to load all values of a “particular column” into memory from disk in fewer I/Os and further into CPU cache in fewer instructions.
+
+In other words, column stores are capable of accessing values of a particular column independently without bothering about the other columns in the table which may not even be needed by the query plan. Thus in columnar storage format, there is no need to read (and then skip/discard) columns that are not needed and this provides better utilization of available I/O and CPU-memory bandwidth for analytical queries.
+
+The columnar storage format allows other efficient techniques to be built on top of it to deliver high performance for analytical or data warehouse type of queries.
+
+Columnar databases are capable of doing faster predicate evaluation by exploiting data level parallelism through SIMD instructions. Multiple column values can be operated (+, =, <, > etc) on in a single CPU instruction using SIMD technology.
+
+For example, with 128 bit SIMD register, predicate evaluation using “=” operator can be done on 8 2-byte column values in a single instruction — data level parallelism. Not only the evaluation is faster, but a single instruction can also load multiple column values into SIMD register from columnar in-memory storage format.
+
+Example Query: SELECT COUNT(*) FROM EMPLOYEE WHERE AGE>40 AND AGE<55
+
+AGE column can be efficiently bit-packed into fixed-width 1 byte numeric value instead of using a regular 4 or 8 byte numeric values. Thus 16 values from AGE column can be evaluated against the provided predicates in a single instruction.
+
+SQL SUM, AVG, COUNT, MIN, MAX can all be accelerated using SIMD technology.
+
+The columnar storage format allows better utilization of CPU cache since cache lines are full of related values (same column) that are needed by query executor to run some operations (evaluation, computation etc). In other words, only data that really needs to be examined is brought into cache. Thus looping through values of a column packed into columnar format is faster.
+
+This is completely different from tuple based iterator in conventional row stores where a tuple consists of values from multiple columns and operator might need value only from one column. Thus cache tends to contain mixed data.
+
+Any query eventually needs to send back the result-set (tuples) to the end user. This should happen regardless of what type (column store or row store) of data store is being used.
+
+For example, the query should ultimately send back tuples <first_name, last_name, age> to the user even though the columns are stored separately in a column store.
+
+SELECT FIRST_NAME, LAST_NAME, AGE FROM EMPLOYEE WHERE AGE>40 AND AGE<60
+
+What did we do above?
+
+<John, Smith, 35>, <Ray, Lane, 45>. The first tuple will get discarded later on when WHERE clause is executed on AGE column value.
+
+Instead, why not delay the materialization of column values and ensure we only form relevant tuples  — tuples that are actually part of result-set.
+
+How did Late Materialization help us?
+
+Data stored in database tables is usually compressed to optimize disk space storage and I/O during query processing — reduced number of bytes (compressed) will be read off disk into memory and down through the storage hierarchy.
+
+Compression algorithms operate better if the input data is somewhat related (less entropy) and this gives better compression ratios. Columnar format can take advantage of this fact and each column can be compressed individually with a compression scheme most suitable for that column. This advantage is however not available in row stores since a row contains data from multiple different types of columns. This doesn’t imply that compression algorithms are guaranteed to give better compression ratios on columnar data. It’s just that related (all column values) data has the potential to be highly compressible.
+
+Different factors can be taken into account when deciding upon a compression scheme to be used for a particular column. Factors like column cardinality, data type, sorted or not etc are important column-level characteristics that can be used to decide the compression method.
+
+The focus is not really on getting best compression ratios. Instead, we should think about schemes that enable faster processing (predicate evaluation, decompression etc) on column values. Columnar format allows us to use simple and efficient compression methods like Run Length Encoding (RLE), Dictionary Encoding, bit-vector encoding, delta encoding etc that may not give the best compression ratios but allow faster decompression.
+
+As an example, dictionary encoding is usually a good choice if the column has low cardinality — limited number of possible unique values. The encoded values (dictionary indexes) can be stored in fewer bits. COUNTRY column in a table can be efficiently represented using dictionary encoding.
+
+There are some advantages of using such light-weight compression methods:
+
+Late materialization becomes more effective since the idea of processing the column values before forming tuples actually allows us to work on compressed columnar data. Once a given column has been processed and we need to form tuples, we can decompress only the necessary values.
+
+We want to find out all the states/regions in England that had more than half million in sales.
+
+SELECT STATE FROM SALES WHERE COUNTRY=’ENGLAND’ AND SALEVALUE>500000
+
+With this I would like to conclude the post. I agree that the post doesn’t dig into specific details about using compression, vectorized processing, query plan etc. However, the goal of this post is to just give a brief overview. Subsequent posts will take a deep dive into individual topics.|||
+
+In this post I will briefly summarize why analytic (OLAP) workloads perform better on columnar (aka column-oriented) databases as opposed to traditional row-based (aka row-oriented) databases. Introduction Storage Organization Vectorized Query Execution CPU Cache Friendly Late Materialization Compression Introduction Analytic workloads comprise of operations like scans, joins, aggregations etc. These operations are concerned with data…

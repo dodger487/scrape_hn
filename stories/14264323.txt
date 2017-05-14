@@ -1,0 +1,80 @@
+Some time ago I’ve built a device together with an AI that is capable of detecting pull-ups and determining the person that did the pull-up as well as the quality of the pull-up (in this post I will just refer to the person-classification and not concern the quality of the pull-up here, since it is a very similar problem).
+
+In this post I want to share my iterations and learnings of building an AI that is based on measurements on a pull-up-bar and capable of determining the person that did the pull-up.
+
+Disclaimer: Since this was a project to learn and try out different things as much as I could, some steps might not look very clever (especially not to an experienced data-scientist) – but personally, I prefer a “learning-by-doing” approach and experiencing failures first hand even if it means that it might take longer. I’d still appreciate any feedback or hints on what I could do to further improve the system.
+
+I’ll be covering the details of the hardware in another post, but here is a brief overview:
+
+The hardware I built consists of an Arduino coupled with an IR Laser ToF sensor and a Bluetooth-module(for convenience). The Arduino and the laser are mounted on the ceiling and continuously measure the distance between the ceiling and the head of the athlete multiple times a second. The measurements then result in a curve, that is then interpreted by the AI. The following pictures show an (excellent) schematic representation of how it works and how it looks in reality.
+
+To train the AI I had a data-set of about 200 pull-ups done by some colleagues and myself. Since this is hard work those 200 had to be enough for the start. To give you an idea how a typical data-record looks like for 5 pull-ups I’ve added a chart here:
+
+And here we see a sample-data-set of four different persons in an overlay:
+
+I guess pretty much anyone can see the differences here and it should (hopefully) be fairly easy to get an AI that can distinguish between each person.
+
+In the first step I started with writing a custom algorithm to slice up the sample-sets into individual pull-ups. I didn’t have to do that by hand which made it easier to work with the data since some data-sets contained two, others contained 10 pull-ups. This algorithm is also used in the live-version to determine the point when to use a sequence for classifying.
+
+ Initially I thought this would be a simple case of smoothing the curve and then finding the local minimums and maximums but in the end I had to add handling for a whole bunch of edge-cases, which took quite a bit more time then expected.
+
+And this is what the algorithm spits out – relevant for the AI are just raw values, the smoothed line is just to find the minimums and maximums. The blue snapping line was just an iteration on the way but is not used any more currently.
+
+Learning #1: During this step I learned how incredibly helpful it was to visualize the data. It makes it so much easier (at least for me) to work with the data and to understand why certain mechanisms work and others don’t.
+
+For the first iteration of the AI, I went to try out a simple Deep Neural Network (I know, any experienced data-scientist is probably either laughing or face-palming right now) and as many might have guessed – it didn’t went that well. But here is what I did.
+
+ I used tf.contrib.learn.DNNClassifier and defined 50 input-neurons and added a cheap algorithm that either filled up the the missing data-points in the sequence with zeros or extrapolated the sequence to 50 points if it was greater than 50. I added two hidden layers, added the outputs and received an accuracy of ~63%. (training-time ~1minute)
+
+ I played a bit with the model-settings (number or hidden layers, neurons and learning-rate) and achieved various (better and worse) results but I wasn’t able to massively boost the accuracy to above 80%.
+
+Learning #2: DNNs are not typically used for classifying sequential data. (RNNs usually do a much better job here, but more on that below)
+
+ Learning #3: By squashing/extrapolating data important information can be lost.
+
+ Learning #4: Adjusting the network parameters can improve the accuracy but it can only do so much.
+
+Some reading suggested that it is still possible to classify (semi-)raw sequential data with a feed-forward DNN but it is not recommended at all, so I did not pursue this iteration any further.
+
+After the initial failure of trying to classify the raw sequential data, I went on to build a model based on meta-data. Here is a list of the meta-data I extracted:
+
+I then created a new model with 11 inputs, 2 hidden layers (22, 11) and again 7 output-classes (again using tf.contrib.learn.DNNClassifier) and achieved an accuracy of ~80%. (training-time ~45seconds for 10.000 epochs)
+
+It was definitely a step in the right direction but still nowhere near an acceptable accuracy level yet.
+
+Learning #5: Using meta-data instead of raw data and doing some pre-processing yields to much better results when working with DNNs and sequential data.
+
+After consulting Google, I found out that networks can achieve better results when using normalized data.  In my case it made sense, since the data were spread between values from 0.1 to 2000mm.
+
+ After normalizing the inputs, the net achieved an accuracy of ~85%. (training-time ~45seconds for 10.000 epochs)
+
+After more reading on the topic and further advancing my knowledge, I learned that there are superior ways for working with sequential data in machine learning: Recurrent Neural Networks – in my case I used an Long Short Term Memory (or LSTM) implementation of an RNN. I will not go into detail on how an LSTM works here. If you have not used one yet you should definitely check it out (a quick google-search will yield to more than enough answers). But in short, the reason why RNNs are so effective for sequential data is because when you feed in a data-point, the network will use the result from the previously fed-in data-point and “add” it to the current input.
+
+ A simplified number-example:
+
+That was of course a VERY simplistic and arbitrary numeric example. In a real model it will be much more complex than that. The key-learning is that the result is different if you feed in single numbers or if you allow the network to reuse results from the n previous inputs.
+
+So there was still a challenge of not all sequences having the same length, but since I was definitely not the first one having this issue there are many solutions out there.  In my case I just set up a maximum length of a sequence and filled up smaller sequences with zeros (like I did in “Iteration #1”) normalized the input-values (as in “Iteration #3”) and then fed everything in a dynamic RNN. (a big shout-out to Americ Damien the founder of tflearn.org for providing excellent Tensorflow-examples including a dynamic RNN)
+
+As an initial result I achieved an accuracy of 92.3%. (training-time ~2.5minutes for 600.000 epochs) which is a result that I am quite satisfied with.
+
+Upon closed inspection on the test-data (26 data-sets) and the training-data (170 data-sets) I found out that out of the 2 incorrectly classified test-sets both had only 3 and 4 data-sets in the training-data, and I am convinced that this should not be an issue any more once there is more data to train on for those two classes (or more training-data overall).
+
+Learning #6: RNNs can be very accurate but it takes way more learning-iterations (at least in my case they did)
+
+ Learning #7: You need to have a certain amount of data for each class, otherwise it will be very difficult to achieve a good accuracy for every class.
+
+What’s worth mentioning is, that the AI was even able to distinguish between pull-ups of the same person done in a different set of finger-holes on the pull-up-board.
+
+Future iterations of the AI could include:
+
+Building this AI was an incredibly enriching experience and I would encourage anyone eager to build up knowledge in this field to choose a similar path of learning and come up with their own challenge, making mistakes and learning through iterations. Of course I thought about going through all the popular tutorials of classifying flowers or digits. But for me, watching a number X of videos or reading tutorials and “copy – paste” the insights wasn’t the right path this time. It’s like when you sat in class and the teacher showed how to solve any problem, you saw how it’s done, but most often you just did not have that “heureka”-moment as when you came up with that solution yourself. Don’t get me wrong! Tutorials are an excellent source of learning, but sometimes it just sticks better when you’re on your own.
+
+Any comments or feedback is highly welcomed and appreciated either here in the comment section or directly via email to oh@omm-solutions.de.
+
+I’ll be linking a download to the raw data here in a bit in case anyone wants to play around with it.
+
+The source code for the RNN is not very spectacular and I’d advice you to use the original example that I used  and which is more up to date anyways.
+
+ I might release the source code for the whole server and the Arduino-hardware some time after the blog-post on the hardware is finished and after I’ve had time to clean it up a little.|||
+
