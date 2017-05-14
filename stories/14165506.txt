@@ -1,0 +1,62 @@
+Let's start by looking at a simple C function to be compiled as position-independent code (i.e. , for use in a shared library):
+
+And now, what GCC compiles it to (listing 2):
+
+Obviously what we'd like to see is:
+
+And that's what we'd get with non-PIC code generation, or with PIC and applying hidden visibility to . That ideal form is not attainable with PIC, because the PC-relative address of the callee ( ) may not be fixed at link-time; it may reside in another shared library or the main program.
+
+Readers familiar with the principles of position-independent code and GOTs/PLTs might wonder why we can't achieve this (listing 4):
+
+Here, the notation in the assembly tells the assembler to generate a special type of relocation, which the linker will use to resolve the relative address in the call instruction to a “procedure linkage table” thunk it generates in output. This thunk exists at a fixed location in the shared library (and thus a fixed relative address from the caller, no matter what address the library is loaded at) and is responsible for loading the actual address of the function and jumping to it.
+
+In order to be able to jump to the actual function , the PLT thunk needs to be able to access global data: in particular, a pointer in the “global offset table” (GOT) which it will use as its jump destination. The PLT thunk code looks like this (listing 5):
+
+The second and third instructions are related to lazy binding (more on that later) but the first one is the one we're interested in right now. Since 32-bit x86 provides no direct way to do memory loads/stores relative to the current instruction pointer, the SysV ABI provides that, when code generated as PIC calls into a PLT thunk, it must pass a pointer to the GOT as a hidden argument in .
+
+So why does that preclude the code in listing 4 above?
+
+Well, per the ABI, the only call-clobbered registers on x86 are , , and . The register used for the hidden GOT argument, , is call-saved. That means is responsible for backing up and restoring if it modifies it. So we have a horrible cascade of inefficiency:
+
+Thus the monstrosity in listing 2.
+
+Well, a first thought might be to change the register used for the hidden argument, but that can't be done without breaking the ABI contract between the compiler and linker, so it's out.
+
+What about getting rid of the requirement for the hidden argument to ? Well, that would also be an ABI change, but at least not an incompatible one. In any case it's not really practical. There's no simple way to make the PLT thunk load the GOT address without clobbering registers, and the only three registers which are call-clobbered are also used for argument-passing in certain non-default but supported "regparm" calling conventions. The choice of was almost certainly intentional, to avoid clashing with registers that could potentially be used as arguments.
+
+How about getting rid of the PLT thunk entirely? Instead of aiming to generate the code in listing 4, let's aim for this (listing 6):
+
+Not only does this eliminate nearly all of the overhead/bloat in ; it also eliminates the one-instruction visit to an extra cache line where the PLT thunk resides. Seems like a big win.
+
+Unfortunately, there's a reason, and it's a really bad one.
+
+The original purpose for having a PLT was for the main program, compiled for a fixed load address (think pre-PIE era) and not using position-independent code, to be able to call shared library functions. The type of PLT that appears in the main program does not need the hidden GOT argument in , because, being at a fixed address, it's free to use absolute addresses for accessing its own GOT. The main program does need the PLT, though, because it's incorporating “legacy” (non-PIC) object files that don't know the functions they're calling could be loaded at varying locations at run-time. (It's the linker that's responsible, when producing a dynamic-linked program from such object files, for generating the appropriate glue in the form of PLT thunks.)
+
+Position-independent code does not need a PLT. As in my example in listing 6, such code can load the target address from the GOT itself and make the indirect call/jump. Rather, the use of a PLT in position-independent shared library code was instituted to exploit another property of having a PLT: lazy binding.
+
+When lazy binding is used, the dynamic linker gets to skip looking up callee symbol names at load time; the lookup is deferred to the first time the function is called. In theory, this trades runtime overhead, in the form of complexity and major latency at the time of the first call to a function, for a moderate savings in startup-time.
+
+At least, that was the theory a few decades ago when all this machinery was designed.
+
+Nowdays, lazy binding is a huge liability for security, and its performance benefits have also come under question. The biggest problem is that, for lazy binding to work, the GOT must be writable at runtime, and that makes it an attack vector for arbitrary code execution. Modern hardened systems use , which protects part or all of the GOT read-only after loading, but GOT slots subject to lazy-binding in the PLT are excluded from this protection. To get significant benefit from the link feature, lazy binding must also be disabled, with the following link options:
+
+So basically, lazy binding is, or should be considered, deprecated.
+
+Incidentally, musl libc does not support lazy binding at all for these and other reasons.
+
+Remember lines 2 and 3 of the sample PLT thunk in listing 5? Well, the way they work is that initially (prior to lazy binding) contains a pointer to line 2, setup by the dynamic linker. The constant 0 pushed in line 2 is the PLT/GOT slot number, and the code jumped to is a thunk that invokes the code to resolve the lazy binding, using the slot number that was pushed into the stack as its argument.
+
+There's no easy way to achieve the same thing with the code in listing 6; attempting to do so would slow down the caller and require some code duplication at each call site.
+
+So, the reason we don't have efficient x86 PIC function calls is to support an obsolete misfeature.
+
+If we can (optionally) give up lazy binding, that is.
+
+Alexander Monakov has prepared this simple patch for GCC, which lets you disable PIC calls via PLT, and which probably has a chance of making it upstream:
+
+I've been playing around with some similar changes to my local gcc 4.7.3 tree and was able to achieve the following output:
+
+It's still a ways off from the ideal 2 functions, but much better than the original output.
+
+Compared to listing 6, there are two differences. Loading into to make the indirect call is utterly useless and just bad codegen that's hopefully fixed on newer GCC versions. Failure to combine the constants and (which actually resolves to ) into a single constant is a more fundamental problem, though. It would take a new relocation type to resolve: a relocation that resolves not to the fixed GOT-base-relative offset of the GOT slot for , but rather to the fixed instruction-pointer-relative offset of the GOT slot for . Having this new relocation type would make all GOT accesses mildly cheaper.|||
+

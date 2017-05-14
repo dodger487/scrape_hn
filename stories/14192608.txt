@@ -1,0 +1,147 @@
+In this tutorial, we’ll build an API, which helps to organize the workflow of a library. It allows us to borrow a book, give it back, or to create a user, a book or an author. What’s more, the administration part will be available only for admins – CRUD of books, authors, and users. Authentication will be handled via HTTP Tokens.
+
+To build this, I’m using Rails API 5 with ActiveModelSerializers. In the next part of this series, I’ll show how to fully test API, which we’re gonna build.
+
+Please clean up our Gemfile and add three gems – active_model_serializers, faker and rack-cors:
+
+ActiveModelSerializers is a library which helps to build an object, which is returned to create a JSON object. In this case, we don’t need to use any views, we just return a serializer which represents an object. It’s fully customizable and reusable – which is great!
+
+RackCors is Rack middleware which allows the handling of Cross-Origin Resource Sharing – basically, it makes cross-origin AJAX requests possible.
+
+Faker is a library which creates fake data – it’s really powerful and awesome!
+
+Well, we need to design our database schema. Let’s keep it simple – we need 4 tables. Users, books, authors and book copies. Users are basically library customers who can borrow books.
+
+Authors are books’ authors and books are books. Book copies are copies which can be borrowed by users. We won’t keep a history of each borrow – as I told before, let’s keep it simple.
+
+I also added indexes; please check the following migrations and add null:false to needed fields.
+
+After you’re done with these files, create a database and run all migrations:
+
+Our database schema is ready! Now we can focus on some methods which will be used in models.
+
+Let’s update generated models – add all relationships and validations. We also validate the present of each needed field on the SQL level.
+
+We should also remember these new routes. Please update our routes as below:
+
+One of the most important things, when you build new API, is versioning. You should remember to add a namespace (v1, v2) to your API. Why? The next version of your API will probably be different.
+
+The problematic part is compatibility. Some of your customers will probably use an old version of your product. In this case, you can keep the old product under a v1 namespace while building a new one under a v2 namespace. For example:
+
+In this case, all versions of the application will be supported – your customers will be happy!
+
+As I told before, we’ll use serializers to build JSONs. What’s cool about them is that they’re objects – they can be used in every part of the application. Views are not needed! What’s more, you can include or exclude any field you want!
+
+In the attributes, we can define which fields will be included in an object.
+
+As you can see, we also define attributes; but what’s new is the overidden author method. In some cases, we’ll need a serialized author object and in some cases not. We can specify in the options which object we need (second parameter – options = {}). Why do we need it?
+
+Check this case – we’ll create a book object. In this object we also include an author that includes books. Each book is serialized so it also will return an author. We would get an infinite loop – that’s why we need to specify if a serialized object is needed. What’s more, we can create a serializer, for each action (index, update etc.)
+
+Please also add the author and book copy serializers:
+
+Now we’re missing controllers. They’ll also be versioned on our routes. These 4 controllers will be very similar – we need to add a basic CRUD for each table. Let’s do it.
+
+As you can see, these return a basic object, for example: render Author.find(1). How does the application know that we want to render a serializer? By adding an adapter: :json options. From now on, by default the serializers will be used to render JSONs. You can read more about it here, in the official documentation.
+
+Our application needs some fake data, let’s add it by filling our seeds files and using the Faker gem:
+
+Now let’s add some data to our database:
+
+I mentioned previously that we’ll use Rack-CORS – an awesome tool that helps make cross-origin AJAX calls. Well, adding it to the Gemfile is not enough – we need to set up it in the application.rb file, too.
+
+By adding these lines, we allow it to perform any request from any remote in the specified HTTP methods. It’s fully customizable – you can find more info here.
+
+Another useful gem we can use is Rack-Attack. It can filter/throttle each request – block it, add it to a blacklist or track it. It has a lot of features; let’s check the following example.
+
+This code allows requests from the localhost.
+
+This code blocks requests at a root_path where the user agent is SomeScraper.
+
+This code blocks requests if they’re from specified IPs.
+
+Ok, let’s add it to our Gemfile:
+
+Then run bundle to install it:
+
+Now we need to tell our application that we want to use rack-attack. Add it to the application.rb:
+
+To add a filtering functionality, we need to add a new initializer to the config/initializers directory. Let’s call it rack_attack.rb:
+
+What did we add here? Basically, we’re now allow to make 5 requests per IP address per 1 second. If someone hits one of our endpoints more that 5 times in 1 second, we return 503 HTTP status as a response with the Server Error message.
+
+Like I mentioned at the beginning, we secure our API with HTTP Tokens. Each user has a unique token. Through this token we find a user in our database and set it as current_user.
+
+Normal users are able only to borrow or return a book. What’s more, if a requested book is not borrowed by us, we can’t return it. Also, we can’t borrow an already borrowed book. Let’s add a new field to the users table:
+
+Also please add an admin field to the users table:
+
+Please add a custom value to the last migration:
+
+We’ve just added an API token to users but we need to generate it somehow. We can do it before a user is created and inserted into a database. Let’s add the generate_api_key method to the user class:
+
+The way things are now, we won’t secure our API. We don’t check to see if a request contains an API key. We need to change it. To use the authenticate_with_http_token method we need to include ActionController::HttpAuthentication::Token::ControllerMethods module.
+
+Once we’re done with it, let’s write some code. We need to authorize each request – if a user/admin is found with a requested token, we set it in an instance variable for further purposes. If a token is not provided, we should return a JSON with 401 HTTP status code.
+
+Furthermore, it’s best practices to rescue from a not found record – for example, if someone requests a non-existent book. We should handle it and return a valid HTTP status code, rather than throwing an application error. Please add the following code to the ApplicationController:
+
+We need to add API keys to the database. Please run it in rails console:
+
+Ok, now let’s secure our system, some parts should only be only accessible for admins. To the ApplicationController, add the following line:
+
+When you’re done with it, we can test our API. But first, please run a server:
+
+Now let’s hit the books#show endpoint with an invalid id, to see if our application works. Remember to add a valid HTTP Token to your request:
+
+Remember that an admin should has an admin flag set to true.
+
+If you don’t have a book with 121211 id, your terminal should return:
+
+If you send a request with an invalid key, it should return:
+
+For now, we can check if someone’s request includes a Token, but we can’t check if someone can update/create a record (is an admin in fact). To do it we will add some filters and Pundit.
+
+Pundit will be used for checking if the person returning a book is the person who borrowed it. To be honest, using Pundit for only one action is not necessary. But I want to show how to customize it and add more info to Pundit’s scope. I think it could be useful for you.
+
+Let’s add it to our Gemfile and install:
+
+Let’s add more filters and method to the ApplicationController.
+
+First of all, we need to include Pundit and add a method which rescues from a 403 error. Also, we will add the authorize method, which checks if a request is from a user or an admin.
+
+Another important piece is a method which sets current_user as an admin’s request. For example, if an admin wants to modify info about a borrowed book by adding a user. In this case, we need to pass the user_id parameter and set current_user in an instance variable – like in a request from an ordinary user.
+
+Let’s first add the UserContext class (to app/policies/contexts):
+
+As you can see it’s an ordinary, plain ruby class which sets a user and an admin.
+
+Pundit by default generates the ApplicationPolicy class. But the main problem is that by default, it only includes a record and a user in a context. How can we deal with a situation where we want to keep an admin and a user?
+
+Adding a user_context would be a good idea! In this case, we store the whole instance of the UserContext class and we can also set a user and an admin in our policy classes:
+
+When we’re done with the main policy, let’s add a book copy policy (under app/policies).
+
+In the return_book? method we check if a user is an admin or a user who borrowed a book. What’s more, Pundit adds a method called policy_scope that returns all records, which should be returned by current ability. It’s defined in the resolve method. So if you run policy_scope(BookCopy), it returns all books if you’re an admin, or only borrowed books if you’re a user. Pretty cool, yeah?
+
+We’re missing the borrow and the return_book methods. Let’s add them to the BookCopiesController:
+
+As you can see, we updated the authenticate_admin filter there. We require it in all actions except in return_book and borrow methods.
+
+Also, we added the authenticate filter, which sets a current user – also for an admin and a user.
+
+Also, there is something new, the current_user_presence method. It checks if an admin passed a user_id parameter in a request and if a current_user is set.
+
+Now, we need to update the BookCopy class – add the borrow and the return_book methods:
+
+And one more thing, routes! We need to update our router:
+
+In this tutorial I covered how to create a secure API, using HTTP tokens, Rack-attack and Pundit. In the next part of the series, I’ll show how our API should be tested using RSpec.
+
+I hope that you liked it and that this part is be useful for you!
+
+The source code can be found here.
+
+If you like our blog, please subscribe to the newsletter to get notified about upcoming articles! If you have any questions, feel free to leave a comment below.|||
+
+In this tutorial we show how to build an API, which helps to organize the workflow of a library, using Rails API 5 with ActiveModelSerializers.

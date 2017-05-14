@@ -1,0 +1,70 @@
+Update #1: I posted at the Scaleway Linux kernel discussion thread to add support for the Ubuntu Linux kernel and Add new bootscript with stock Ubuntu Linux kernel #349.
+
+Scaleway has been offering ARM (armv7) cloud servers (baremetal) since 2015 and now they have ARM64 (armv8, from Cavium) cloud servers (through KVM, not baremetal).
+
+But can you run LXD on them? Let’s see.
+
+We go through the management panel and select to create a new server. At the moment, only the Paris datacenter has availability of ARM64 servers and we select ARM64-2GB.
+
+They use Cavium ThunderX hardware, and those boards have up to 48 cores. You can allocate either 2, 4, or 8 cores, for 2GB, 4GB, and 8GB RAM respectively. KVM is the virtualization platform.
+
+There is an option of either Ubuntu 16.04 or Debian Jessie. We try Ubuntu.
+
+It takes under a minute to provision and boot the server.
+
+It runs Linux 4.9.23. Also, the disk is vda, specifically, /dev/vda. That is, there is no partitioning and the filesystem takes over the whole device.
+
+Here is /proc/cpuinfo and uname -a. They are the two cores (from 48) as provided by KVM. The BogoMIPS are really Bogo on these platforms, so do not take them at face value.
+
+Currently, Scaleway does not have their own mirror of the distribution packages but use ports.ubuntu.com. It’s 16ms away (ping time).
+
+Depending on where you are, the ping times for google.com and www.google.com tend to be different. google.com redirects to www.google.com, so it somewhat makes sense that google.com reacts faster. At other locations (different country), could be the other way round.
+
+This is /var/log/auth.log, and already there are some hackers trying to brute-force SSH. They have been trying with username ubnt. Note to self: do not use ubnt as the username for the non-root account.
+
+The default configuration for the SSH server on Scaleway is to allow password authentication. You need to change this at /etc/ssh/sshd_config to look like
+
+Originally, it was commented out, and had a default yes.
+
+This will not break your existing SSH session (even restart will not break your existing SSH session, how cool is that?). Now, you can create your non-root account. To get that user to sudo as root, you need to usermod -a -G sudo myusername.
+
+There is a recovery console, accessible through the Web management screen. For this to work, it says that you first need to You must first login and set a password via SSH to use this serial console. In reality, the root account already has a password that has been set, and this password is stored in /root/.pw. It is not known how good this password is, therefore, when you boot a cloud server on Scaleway,
+
+The Ubuntu Linux kernels at Scaleway do not have ZFS support and you need to compile as a kernel module according to the instructions at https://github.com/scaleway/kernel-tools.
+
+Actually, those instructions are apparently now obsolete with newer versions of the Linux kernel and you need to compile both spl and zfs manually, and install.
+
+Naturally, when you compile spl and zfs, you can create .deb packages that can be installed in a nice and clean way. However, spl and zfs will originally create .rpm packages and then call alien to convert them to .deb packages. Then, we hit on some alien bug (no pun intended) which gives the error: zfs-0.6.5.9-1.aarch64.rpm is for architecture aarch64 ; the package cannot be built on this system which is weird since we are only working on aarch64.
+
+The running Linux kernel on Scaleway for these ARM64 SoC has the following important files, http://mirror.scaleway.com/kernel/aarch64/4.9.23-std-1/
+
+Therefore, run as root the following:
+
+And that’s it! The last two commands will show that there are no datasets or pools available (yet), meaning that it all works.
+
+We are going to use a file (with ZFS) as the storage file. Let’s check what space we have left for this (from the 50GB disk),
+
+Initially, it was only 800MB used, now it is 2GB used. Let’s allocate 30GB for LXD.
+
+LXD is not already installed on the Scaleway image (other VPS providers have alread LXD installed). Therefore,
+
+Then, we can run lxd init. There is a weird situation when you run lxd init. It takes quite some time for this command to show the first questions (choose storage backend, etc). In fact, it takes 1:42 minutes before you are prompted for the first question. When you subsequently run lxd init, you get at once the first question. There is quite some work that lxd init does for the first time, and I did not look into what it is.
+
+Now, let’s run lxc list. This will create first the client certificate. There is quite a bit of cryptography going on, and it takes a lot of time.
+
+It is weird and warrants closer examination. In any case,
+
+Let’s create a container. We are going to do each step at a time, in order to measure the time it takes to complete.
+
+Out of the 65 seconds, 25 seconds was the time to download the image and the rest (40 seconds) was for initialization before the prompt was returned.
+
+Let’s see how long it takes to launch a container.
+
+What this means, is that somehow the Scaleway Linux kernel does not have all the AppArmor (“aa”) features that LXD requires. And if we want to continue, we must configure that we are OK with this situation.
+
+Two hints here, some issue with process_label_set, and get_cgroup.
+
+Let’s allow for now, and start the container,
+
+That’s it! We are running LXD on Scaleway and their new ARM64 servers. The issues should be fixed in order to have a nicer user experience.|||
+

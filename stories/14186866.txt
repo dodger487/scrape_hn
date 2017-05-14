@@ -1,0 +1,97 @@
+The GPMF structured storage format was originally proposed to store high-frequency periodic sensor data within a video file like an MP4. Action cameras, like that from GoPro, have limited computing resources beyond that needed to store video and audio, so any telemetry storage needed to be lightweight in computation, memory usage and storage bandwidth. While JSON and XML systems where initially considered, the burden on the embedded camera system was too great, so something simpler was needed. While the proposed GPMF structure could be used stand-alone, our intended implementation uses an additional time-indexed track with an MP4, and with an application marker within JPEG images. GPMF share a Key, Length, Value structure (KLV), similar to Quicktime atoms or Interchange File Format (IFF), but the new KLV system is better for describing sensor data. Problems solved:
+
+GPMF -- GoPro Metadata Format or General Purpose Metadata Format -- is a modified Key, Length, Value solution, with a 32-bit aligned payload, that is both compact, full extensible and somewhat human readable in a hex editor. GPMF allows for dependent creation of new FourCC tags, without requiring central registration to define the contents and whether the data is in a nested structure. GPMF is optimized as a time of capture storage format for the collection of sensor data as it happens.
+
+GPMF-parser.c and .h provide a payload decoder for any raw stream stored in compliant GPMF. Extraction of the RAW GPMF from a video or image file is not covered by this tool.
+
+If you only want particular a piece of data
+
+7-bit ASCII Key created for readability. All uppercase fourCCs are reserved Keys, mixed case is for any third party ingested data.
+
+A few Keys reserved for communicating structure, although only DEVC is required at the beginning of any GPMF payload.
+
+The tradition 32-bit "Length" is broken up to help describe the data that follows.
+
+8-bits is used for a sample size, each sample is limited to 255 bytes or less.
+
+16-bits is used to indicate the number of samples in a GPMF payload, this is the Repeat field. Struct Size and the Repeat allow for up to 16.7MB of data in a single KLV GPMF payload.
+
+The final 8-bits, Type, is used to describe the data format within the sample. Just as FOURCC Keys are human readable, the TYPE is using a ASCII character to describe the data stored. A character 'f' would describe float data, 'd' for double precision, etc. All types are reserved, and are not end user definable.
+
+All GPMF data is 32-bit aligned and stored as big-endian. For data types that are not 32-bit, they are packed in their native byte or short or complex structure storage size, and only padded at the very end to meet GPMF KLV alignment needs. Storage of a single 1 byte, would have 3-pad bytes.
+
+the same data type stored 15 times would have only a only byte pad at the end.
+
+Packed data will all maintain a 32-bit alignment between GPMF KLV 3-tuples.
+
+While padding is shown as null values, any value can be used, as this data is simply ignored.
+
+The packed data size with in a GPMF KLV is the structure size times the number of samples. The storage size is rounded up to the next 32-bit aligned size.
+
+As sensor data like gyro and accelerometer commonly have three (or more) axes of the same data type, the combination of Type and Structure Size, will indicate the type of data within. Three axis GYRO data could have a Type of 's' (short 16-bit signed integer) with a Structure size of 6. As the size of the Type is known, the number of axes in each sample is Structure size / sizeof (Type). An examples of 6 samples of a 6 byte x,y,z structure GYRO data is shown here:
+
+Standalone GPMF does little for communicating the relationship between data, so that we need to nest so that metadata can describe other data. Type of null is the flag that indicates the data field is any other GPMF KLV series. We use nesting to describe any telemetry device like follows:
+
+This is a valid nested GPMF structure. DEVC describe 4*7 = 28 bytes of data, which are packed and aligned GPMF KLV values describing a camera device with a Device ID and a Device Name.
+
+Metadata, data that applies to other data, is forward looking within each nested GPMF entry. In the previous example the Device ID is applied to the Device Name, as they're part of the same nest and Device ID came before Device Name. This order of properties is particularly import when KLV 3-tuples modifies the meaning of data to follow in the same nest level, which is how SCAL and TYPE are applied. Several modify properties can be transmitted, each adding metadata to modify the meaning of the last KLV in the nest (at this nest level.) The SCAL key is used as sensors that measure physical properties typically output integers that must be scaled to produce a real-world value. This scaling converting raw data to float or Q-numbers (fixed point float) could be performed in the device, but is often stored more efficiently as the original sensor values and a scale property. These are equivalent:
+
+The second data stream is almost half the size of the first (1216 vs 628 bytes) for the same resulting precision.
+
+When adding units, the SCAL doesn't apply to SUIN, but only the ACCL the latest KLV in the stream's (STRM) nest.
+
+Note: The SI unit of "m/s²" is applied to each x,y,z axis, there is no need to declare the unit as
+
+A complete stream from a device could be:
+
+Including a stream name to improve readability and TMPC for the temperature of the device that is collecting the accelerometer data.
+
+Virtual sensors, CV or computationally extracted metadata will become a common storage type. The data form this new sources could produce multiple samples for a given time (5 faces in this frame) and the results may be delayed in delivering their findings (frame 1000 has 7 faces, yet is was reported on frame 1003.) Both the potential for delay timing and multiple samples requires custom storage.
+
+In the example below is for a fast, periodic (once per frame), face detection algorithm (no delays):
+
+The timing information is extracted just like all other sensor, yet the multiple entries of "FACE" vertically represent samples over time, and "faceX" are multiple samples at the same time. When no FACE are discovered, "FACE ? 20 0" is used to preserve the timing, just as GYRO report zeros when then camera is stationary.
+
+If the data where to occur with a significantly slower algorithm that is not periodic, say the first detection took 300ms, the second 400ms,, the third 100ms, the last 250ms, the timing relationship to the source frame would be lost. While most of GPMF data can rely of the timing provided by MP4 indexing, to handling delayed and aperiodic data introduces TICK and TOCK to make the in and out times (in time is the beginning of the processing, out-time the end.
+
+As the CV processing in this example can take time, it will be common for the processing to begin before the payload frame it which it is written. The first FACE samples begin their processing at 10023, yet the payload for normal sample data began at 10140 (within the top DEVC structure).
+
+As the SIUN is declared as an ASCII the character for degrees, squared, cubed and micro use the single byte values: 0xB0 (°), 0xB2 (²), 0xB3 (³) and 0xB5 (µ).
+
+Not all telemetry data can be described as an array of a single basic type. To support complex structures, a TYPE field is added to the property hierarchy. TYPE is always defined with 'c' and used the same ASCII Type Chars to describe a complex structure. Examples structure:
+
+The TYPE for the structure be a 'f','s','s','L' (float, short, short, unsigned long) is declared as follows:
+
+The '?' for the type field in 'myDD' is used to indicate a complex structure type.
+
+As this will likely have units that differ per parameter, we need to send units for each element of the complex structure
+
+The same for scale, each unit will likely have a different scale. If no scale is required use 1, likely the flags field will not be scaled.
+
+Arrays can be defined within the string TYPE as follows:
+
+The use of '[n]' indicates the field is repeated n times. So an array of eight floats as described with "f[8]"
+
+The metadata writing API should have a mechanism for creating and writing "sticky" metadata. Data of type sticky doesn't need to be re-transmitted if it is not changing, and it will only store the last value it is does change. Sticky data is good for slow changing properties like the sensor's temperature, or any data that is sampled near the payload frequency or slower. Any metadata the modifies the meaning of sensor data should be written as sticky data: all TYPEs, SUINs, SCALs, naming fields (DVNM, STNM) and comments that are not changing over time. This data needs to be within each payload in the event that the file is cut in to smaller segments, each segment must contain all relevant metadata so that no meaning is lost in the extracted clip.
+
+The addition of structure is not to make device vendor's life more difficult, but to communicate the meaning of data to a future reader, that may not even be aware of the device used in the original capture. The first useful metadata is a human readable name of the device. While DVNM (DeviceName) "Camera" is in the current metadata, saying "GoPro Hero5 Black" would be much better. Having a stream (STRM) with ACCL data, doesn't communicate what it contains, when adding a STNM or RMRK with "Accelerometer (up/down, right/left, forward/back)" adds a lot of clarity to the future data reader. SUIN, UNIT, SCAL and even TYPE is completely optional if you don't intend anyone other than for your own tools to process this data, but it is so much better to allow many tools to extract and process all data. Use of a standard unit (SIUN) allows downstream tools to convert accurately from m/s to MPH or kmH etc. under the end users control.
+
+GPMF data is stored much like every other media track within the MP4, where the indexing and offsets are presented in the MP4 structure, not the data payload. GPMF storage is most similar to PCM audio, as it contains RAW uncompressed sensor data, however the sample rate for the track is for the GPMF payload, not the data within. GPMF might be stored at 1Hz (stored in the track description), but contain gyro data at 400Hz, accelerometer at 200Hz and GPS at 18Hz (HERO5 launch data-rates.)
+
+Telemetry carrying MP4 files will have a minimum of four tracks: Video, audio, timecode and telemetry (GPMF.) A fifth track ('SOS') is used in file recovery in HERO4 and HERO5, can be ignored.
+
+Just as video and audio tracks can have different formats within, the 'meta' track is not exclusive for GPMF. While the use of 'meta' in MP4 files is very likely a GoPro camera, it is not always GPMF data. For a number of years GoPro cameras had a 'meta' track used for a file repair containing 'fdsc' data, this is also called the SOS track. To confirm you have a GPMF style track, scan for the sample description atom which uses the type 'gpmd' for GPMF data. The entire MP4 metadata track is typically structured like this:
+
+for more details on MP4 structure 'stts', 'stsz' and 'stco' see https://developer.apple.com/library/content/documentation/QuickTime/QTFF/QTFFChap2/qtff2.html#//apple_ref/doc/uid/TP40000939-CH204-61112
+
+Timing and sample rates are not directly expressed within GPMF and for good reasons. When you set a device up with a sample frequency of say 200Hz, or 48kHz for audio, you would think that number should be presented in the header. Adding timing to the header is good if the different channels of data share a single reference clock. A video file can accurately state it is 25.0Hz with 48kHz audio, if the video and audio are clocked together from the same crystal or timing source. However, two separate cameras will have slightly different timing, differing up to the tolerances of the clock source. A crystal may have timing with stated accuracy of 50 ppm (parts per million), which would have audio of one camera between 47,997 to 48,003Hz when compared with the other. This potential ±0.005% error is minor compared with the accuracy for the average independently clocked sensor. Camera internal sensors or data via a connected Bluetooth device, will have timing errors in the range ±1%. There is no value to storing timing metadata that will be significantly wrong in most cases. The timing and the clock extraction for GPMF is determined after capture. The amount of data stored in GPMF is compared with tracks that do have timing, like the master clock with an MP4.
+
+An example video clip has these measured sample rates:
+
+To speed the measurement of any stream of data, the more recent bitstreams have a Key of TSMP (Total Samples) the counts the ongoing number of samples for each stream – so you don’t have to count them manually. If you compare the TSMP of the first payload with the last, you can easily determine the number of samples, then compare with the time of the video track (or MP4 clock timing), establishing the average sample rate for the GPMF data. This is not including compensation for thermal clock drifts, which do occur, although for most applications they are small enough to be safely ignored. Some streams include device temperature (GPMF Key is TMPC) for thermal clock drift or temperature sensitive calibrations.
+
+As clocks can’t be trusted, what else can go wrong? The storage of GPMF data is typically a software system, like the embedded RTOS (Real-time OS) of a GoPro camera, it will have its own timing issues. Any OS is another source of an unreliable clock, as it introduces timing jitter due to process switching time, and interrupt response times inherent in all OSes. A device driver for a sensor may send a group of samples, to a thread that formats and stores GPMF, that is combined with other GPMF sensors, at any time the accumulated sample data can be flushed and time-stamped within the MP4. A 200Hz device, flushed at one second intervals, could have payload sample counts of 199, 202, 201, 198, 199, etc. Again the TSMP in every GPMF payload simplifies extraction timing for every sample stored, even with clock drift and sampling jitter. Sample code demos this.
+
+As of April 2017, only GoPro HERO5 cameras have a GPMF track. HERO4 Black will have GPMF flight telemetry when attach to the GoPro Karma drone. Both HERO4 and HERO5 can have third party BlueTooth sensor adding GPMF data.|||
+
+gpmf-parser - Parser for GPMF formatted telemetry data used within GoPro cameras.

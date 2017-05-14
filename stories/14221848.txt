@@ -1,0 +1,49 @@
+Our tool of choice is TLA+. First, we specify the system as a giant abstract state machine and list all of the possible transitions it can make. Then, we specify invariants of the system, properties that every state must have. Finally, we run the model checker, called TLC, on the spec. TLC exhaustively checks all possible states and raises an error if any state violates the invariant. Here’s our initial design:
+
+This should look mostly familiar as a programming language, but there are a few subtle differences. First, tells TLC that any number of the devices may already be in scope as part of the initial state. Real world expectations rarely start with a blank slate: the school may have preloaded some apps on devices, or we might be doing a later batch cycle. For reasons that will become apparent, we represent this as “each device is in scope either 0 times or 1 time.” We could also use , where is the set .
+
+Second, there is one TimeLoop process (representing periodic installs) and one SyncDevice process per device. In what order will they run? For each starting state, there are multiple behaviors, or timelines. TLC can choose in what order processes start, how they interleave while running, and even if they can crash mid-process. is just as valid as , and TLC will check both.
+
+Finally, is a constant. In addition to meaning we cannot change it at runtime, constants have an additional property in TLA+: we can define their value right before running checking a model. To test this with one device, we declare Devices to be the set . If we wanted to test with three devices, we could just as easily write . This allows us to make our model as large and as complicated as we need it to test our invariants.
+
+Otherwise, the spec is pretty straightforward. SyncDevice may add a device to the batch pool. At some point, TimeLoop runs, the devices in the batch pool are added to the AppScope, and then the batch pool empties.
+
+Invariants are statements that should always be true at every state in the system. When we check for safety, we’re checking that it’s impossible to reach a state where any invariant is violated. In our case, we can represent our invariant as follows:
+
+“For all devices, it must be scoped either 0 times or 1 time”. If it is scoped 2 times, we added a device that was already in scope. When we test this with one device, we get the expected error:
+
+We don’t have any logic to detect devices already in scope. A simple fix would be to pull the scope, then remove anything already in scope from the pool. If we do that, it works.
+
+But what about for two devices? That would be difficult to check with unit tests. But with TLA+, it’s trivial. We just add a second device to the model and watch it fail.
+
+This failure involves a race condition. One device syncs, which means we can start the installation. As soon as we filter the pool, the other device syncs, putting it back in the pool in time for the add step. We ended up fixing this by caching the pool during the installation process and filtering and sending the cache. That way even if the pool updates after the process starts, we don’t use the new data in our call.
+
+This system is incomplete: some apps are more important than others, and some apps are needed by more people than others. The best compromise to this is to add in “pool thresholds”. If a device sync puts the pool size above the threshold, we should immediately start the installation process. That means that if 30 students need the same app, they get it in the next few minutes, instead of whenever the TimeLoop period ends.
+
+We can specify that with an statement. Whenever TLC hits the statement, it creates a separate timeline for each branch. Again, we don’t care how we trigger the threshold sync, just that it could potentially happen.
+
+When we add this, though, TLC finds a new error in the system.
+
+Our system was built on the assumption that only one installation process can run at one time. When two can run, they can potentially make the same threshold cache. Then both filter the cache at the same time, leaving both installing the same device because it wasn’t in scope. The first will succeed normally, but by the second process, we’ll now be doing a double install.
+
+There’s a few different ways to fix this, but the simplest for us was putting a mutex on the installation process. While multiple sources could start the process, only one can run at a given time, which cleaned up the bug for us.
+
+So far we’ve proved the system doesn’t do bad things. However, we haven’t yet proved it does what we want. Specifically, we want to ensure that if we want to install the app on a device, it eventually the device is in the app scope. Safety is proving bad things don’t happen. Liveness is proving that good things do happen. This is what our liveness property looks like:
+
+That just says that if we want to install on a device, at some point in the future it’s actually in scope. And, once again, TLC finds an error.
+
+We want to install an app on two devices. The first device syncs and starts an install process. After we cache the pool, the second device syncs. Then, after the process finishes, we empty the pool, including the second device. The fix for this is pretty simple: instead of emptying the entire pool, just remove the cached devices from it. This means the entire install process is isolated from the outside world and works as we expect.
+
+You can see the complete spec here.
+
+Resounding success. We finished the system a week ahead of schedule and, while we did find some bugs, they were all implementation issues we easily tracked down. That said, we did hit a few pain points with TLA+:
+
+If you’re interested in using TLA+, the best place to start is my Learn TLA+ beginner’s guide, which is packed with exercises, real-world examples, and practical tips. It is not affiliated with eSpark and is purely a personal labour of love.
+
+We wanted to see if formal methods were useful for practical problems and the answer is absolutely. The two days of TLA+ modeling more than paid for itself in delivering a complicated system faster and with fewer bugs. It takes time to learn, but the reward is worth it.
+
+At eSpark Learning we’re building the next generation of tools to help students succeed in school and in life. We believe in humility, compassion, and work-life balance. We’re hiring!
+
+Hillel is a senior software engineer at eSpark Learning. He’s interested in software testing, civic tech, and generally being a contrarian. Find him on twitter as @hillelogram or at hillelwayne.com.|||
+
+How do we harden a system against race conditions? When it uses a complex cache? When it requires a global state? We could blanket our system in tests, hope we’ve covered every possible edge case…

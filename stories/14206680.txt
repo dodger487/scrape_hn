@@ -1,0 +1,59 @@
+At GOV.UK Verify we recently encountered a technical performance issue: a memory leak problem with our application that is responsible for any end-user facing functionality. We’ve been running extensive performance testing as we prepare for going live next April and discovered that if our performance benchmark tests were run as usual (nightly) and the application (we call it “frontend”) was not restarted for over 48 hours it would crash. Even though this issue wasn’t yet affecting the public we were keen to fix it before it got any further.
+
+The opportunity to really get to the bottom of a memory problem is quite a rarity in the life of a developer and this showed in the fact that our investigations (alongside other work) lasted over a month. This post briefly documents the things we tried to fix the issue, and of course, the cause of the problem which led to its resolution.
+
+Our frontend application is a RESTful service built using the Dropwizard framework using Java. It is a single jar file containing code and assets such as javascript, css files and images.
+
+The first thing we did was to make sure we had set the
+
+JVM (java virtual machine) parameter in order to get a heap dump at the point the application crashes which would allow us to see what was happening in the application at the time it crashed. After a few runs of the tests the app exited but we didn’t get the heap dump (.hprof) file we were expecting. A log file, hs_err_pid<pid>.log was produced by the JVM but this only told us a fatal error had been detected, the memory history and a bunch of other jvm information. This seemed strange so we attached Visual VM to a live performance test run and monitored the heap usage that way. By monitoring the heap usage this way we were able to see that the heap usage was barely growing at all over the duration of the test run, and explains why we weren’t getting a heap dump. The leak must be outside of the heap.
+
+It would’ve been great if heap space was the problem. Memory leaks in heap space and their solutions are generally well documented. Unfortunately this was not the case. Fortunately we use Metrics and collectd to push JVM and native memory usage into Graphite:
+
+The graph above shows that:
+
+The fact that the leak was outside of the heap leaves us with two possible causes:
+
+After a bit of digging around in git and graphite we noticed that around the time we first encountered the issue we had upgraded to using Java 8. One of the changes introduced by the new version was the removal of the old PermGen memory space and the introduction of Metaspace. Metaspace (like its predecessor PermGen) sits outside the heap. Could we have introduced a leak in Metaspace?
+
+Again here Visual VM allowed us to confirm this was not the case. Despite us not setting the max Meta Space size it didn’t grow significantly over time.
+
+The problem with native memory leaks is that the Java Virtual Machine (JVM) has no idea about free memory in the underlying operating system and doesn’t care about it. This led us to try a few solutions which led us nowhere.
+
+Looking back over time in graphite we could see increased memory usage in our app which started around the 5th of August. Looking at commits around this time the prime suspect was the introduction of a third party library which depended on netty which could be a candidate for excessive memory consumption; however removing the library didn’t solve the problem.
+
+We changed the Java version from 1.7 to 1.8 on our boxes before this started happening. Reverting back to Java 1.7 didn’t solve the problem.
+
+We attempted to restrict the memory pool used by the JVM as documented here but this didn’t work for us as our version of Ubuntu didn’t have the version of glibc (more on this later) that had this feature.
+
+The most likely suspect is Java Native Interface (JNI). We hadn’t explicitly made any JNI calls in our application but perhaps one of our dependencies was. But how would we find out which?
+
+After some searching we came across this blog post which suggested using jemalloc to record the underlying memory allocation while our app was running and using it to generate a graph showing memory allocation per process.
+
+The default Linux native memory allocator is glibc’s malloc. The JVM (like any other process) will call the C runtime malloc function in order to allocate memory from the operating system and then manages the heap for the Java application. Jemalloc is another malloc implementation, and has a great tool called jeprof which does memory allocation profiling which allows us to visually trace what is calling malloc.
+
+After installing jemalloc we forced our jvm to use it (instead of glibc’s malloc) by easily setting the environment variable:
+
+We also tell jemalloc to write a profile to the disk every few 1Gb allocations and record a stack trace (referenced from the blog):
+
+We then started our app with the usual jvm -jar frontend.jar … and kicked off our tests. Jemalloc should now be writing profile snapshots called jeprof*.heap. After checking the leak is occurring we generated a memory report using reproof:
+
+Which showed us something like:
+
+Here we could see that what was consuming about 43.4% of total process size - 1.02G - was coming from java.util.zip.Inflater.inflateBytes -> inflate -> updatewindow. From the javadoc, we know the Inflater class provides support for general purpose decompression using the popular ZLIB compression library.
+
+Rerunning the tests and taking thread dumps we were able to see what was calling java.util.zip.Inflater.inflateBytes:
+
+So the cause is the calls to AssetServlet, which according to the Dropwizard javadoc is the class that serves static assets such as images, css files etc from a location which happens to be inside our frontend jar file.
+
+Armed with this knowledge we tried the following options which stopped the decompression of assets and effectively stopped the memory leak:
+
+This is what no memory leak looks like:
+
+Nearly all (98.7%) of the malloc calls come from os:malloc and therefore the JVM itself.
+
+This experience underscored the importance of having a range of monitoring and diagnostic tools. Every application should be logging metrics; a visualizer like graphite is necessary to view and compare sets of historical data; and Visual VM is a great tool for connecting to a [remote] live application and seeing JVM stats in real time.
+
+Finding causes of native memory leaks has long been a tricky process but we discovered that jemalloc is a great tool for analyzing these issues. Now that we have it in our toolkit, we expect to be able to resolve this kind of issue far faster should they occur in the future.|||
+
+About the technology behind GDS digital products.

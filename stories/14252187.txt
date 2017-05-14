@@ -1,0 +1,32 @@
+The overhead of using secure random numbers can be a headache if the generation of those numbers is in your server’s critical path. In this post, I’ll look at a couple of techniques to bypass the overhead of generating random numbers in a Go program and make a recommendation on what method to use.
+
+Consider an application that needs to generate a nonce for each request which is also I/O bound, meaning it does more waiting on I/O than anything else. As well, the general requirements include being sensitive to latency through the system. This system generates the nonce by making a call to and filling a 16 byte array (not a slice). All “external calls” are modeled by a single to simulate a call without taking too much time.
+
+In reality a networked program will have many opportunities to schedule a background goroutine in the course of serving a request. There’s many function calls, channel sends, and other preempt points that allow it to run in the background. This means that pure benchmarks are not going to do a real system justice, but they will give a good comparison of overhead between different methods.
+
+In order to know that one way is better, we have to have a baseline to compare it to. Call it the naive solution. The baseline solution generates the nonce as it’s needed and immediately “makes a call” to another service.
+
+This is a solution I employ in rend, a memcached proxy and server that I created at Netflix. On program start, there is an init function that spins off a goroutine whose sole purpose is to read 16 byte arrays of random data from and send them into a buffered channel.
+
+The main purpose of this method is to avoid a blocking syscall in the hot path of a request, replacing it instead with a call to a channel receive. In the majority of cases, this should follow an optimistic path and receive a value much quicker than a syscall. For the truly brave and curious, the channel receive code is the function in this file.
+
+The advantages to this scheme are threefold:
+
+The second attempted solution is to amortize the cost of the syscalls by asking for a larger chunk of data each time and then using that data over several calls. In this case, I am assuming a scheme where separate goroutines will each pull data on their own and manage it internally.
+
+According to the man page the maximum data that can be retrieved at once without blocking in the kernel is 256 bytes. This maximum is used to attempt to amortize the cost over the most requests.
+
+Of course, if each of these independently could actually increase the performance of our program, we should try them at the same time. This method combines the previous two methods by using a separate goroutine to manage reading data and writing to a channel, but instead of reading only 16 bytes at a time it reads 256 and splits it into 16 byte chunks.
+
+This is a new idea on top of the channel idea above. Instead of having only one channel, have many. Each goroutine using the random data can run through each channel in a round-robin fashion, hopefully avoiding conflict with other consumers of random data. This also implies that each channel has an independent producer that is the only writer to that channel. The premise fo this approach is that it wil reduce lock contention on the channels.
+
+Reader suggestion time. Luna Duclos pointed out that it may have been the generator goroutine that was falling behind and not the channel lock contention getting in the way. To test this, I created one more test case where there is a single channel with 16 writers instead of a single writer. This is very similar to the initial channel test except for the loop in the func.
+
+This combines all of the above strategies into one. There’s many writers all writing into one channel, each of which is amortizing the overhead of the syscalls.
+
+The benchmarks above were all run 1000 times and summarized using benchstat. The Go source code can be found here and the raw output data from my test runs is here.
+
+The amortized approach is the clear winner here. The solution in rend, at the time of this writing, can serve to show you want a case of premature optimization looks like. I thought it would be faster to use a channel, but it turns out that it is a little bit slower overall. In reality, the program is not used at a high enough volume for the differences shown here to matter, but it’s nice to know that I, like many others, have discovered a place where I can learn from past mistakes.
+
+Hopefully, if you’re using to generate nonces in your application, you can use one of the above methods to keep the syscall overhead out of your critical path. If you do use one of the above methods or know of another one that has been useful to you, please leave a comment below or message me on twitter @sgmansfield.|||
+

@@ -1,0 +1,49 @@
+At Andela, we have multiple internal apps built by the internal Engineering teams used to manage internal process and to make us more efficient. As time passed, the number of apps increased and each app had to evolve alongside the passing of time to enable us handle our growth. We started experiencing a number of pain points(documented here) which forced us to look towards microservices for salvation.
+
+If you want to know more about our microservice journey thus far, I recommend you check out Scalable Architecture with EventSourcing and CQRS, Antifragile Microservice and From Monolith to Microservices blogposts.
+
+Our architecture has a number of building blocks working together to achieve a robust authentication/authorization layer.
+
+Each app(skilltree, kaizen, pulse, allocations) is independent and written in different frontend framework. The login page for each app is similar and simple. Below is the login page for allocations app.
+
+To login, the user just clicks the button which is a link to `http://api-prod.andela.com/login?redirect_url=http://allocations.andela.com`. Once the user clicks the button, the login endpoint of the api gateway picks it up, performs all the necessary magic, logs the user in and redirects the user to the calling application.
+
+In a monolith, it’s ok for it to be built as a stateful application. Hence, session based authentication works really well. However, that’s not the case with microservices, since you need to route requests to multiple independent services. To maintain statelessness in our system, we opted to use token authentication. We packaged user claims in the jwt. JSON Web Token(jwt) is an open, industry standard RFC 7519 method for representing claims securely between two parties.
+
+When a user logs in successfully, a jwt is returned. On subsequent requests, the user must attach this token to each request. This is needed so that the api gateway can establish the identity of the user and extract the user’s claims from the token.
+
+SSO simply means login, just once to a suite of independent applications. In our case, once you login to one application(eg Skilltree), you won’t need to login again when you attempt to access another application(eg Pulse) since you will be automatically signed in. With SSO, our users won’t go through the hassle of signing in each time they want to use one of our internal apps.
+
+The way SSO is implemented in our system is simple. When a user logs in for the first time from any frontend app, a cookie called gets created on the api-gateway. The cookie’s domain is  and hence accessible to all andela.com subdomain. When a request is made from any of the frontend apps to the api gateway, we extract the cookie named if set. If not set, we assume the user is not logged in and return a status code from the api-gateway.
+
+NOTE: All our internal apps are hosted in andela.com subdomain eg skilltree.andela.com, pulse.andela.com, allocations.andela.com etc.
+
+Since a mobile app is obviously not on andela.com subdomain, the api-gateway supports passing the jwt via Authorization header as Bearer Tokens. The auth flow for mobile apps is a little bit different from web apps. Since we are using Google oauth, the oauth flow happens in the mobile app. Once the user is successfully authenticated via google, we use the Google access tokens to exchange for a jwt from the api gateway.
+
+Our system also supports authentication. This is necessary because it’s not every time a user is involved in the authentication process. You might just need a third party app to have access to some data. Each user has an api-token they can use to access the application from a third party app. Also, we can create a service account that only has access to our system through the api-tokens.
+
+The api gateway is the middleman between the frontend apps and the suite of microservices. It’s responsible for generating the jwt and hence authentication. It achieves this by communicating with authorization and users service. The api gateway is written in and the auth logic was extracted out as a package and mounted as a middleware. You can find a snippet of the authentication code here.
+
+is the method invoked by google callback url. The method exchanges the returned for a google access token. Using this token it retrieves the user’s profile information. This profile info is packaged as a user struct and used to generate the jwt. Generating the jwt involves making a call to service endpoint and endpoint of authorization service. The information received from both endpoints will be the claims in the jwt. Once the information is retrieved, a cookie called will be set with the jwt as the value provided the calling app is on andela.com subdomain. Otherwise, the token is returned back to the user as a query string.
+
+A number of user information are packaged as claims in the jwt. Below are the claims in a sample jwt.
+
+As we moved from monoliths to microservices, we needed to centralize our authorization effort by creating an authorization service. Authorization in our systems is purely permission based. The permissions are used to restrict access to an api endpoint and also control users view on the frontend apps.
+
+in authorization service has many to many relationship with in user service. A permission has a many to many relationship with activities(endpoint). A user has many roles and hence many permissions. When a user makes a request to the api gateway, the request passes through the authorization middleware which extracts the jwt(from cookie or header), verifies that it’s valid and retrieves the permissions claim from the jwt. Afterwards, the endpoint of the authorization service is called with the permissions as well as the url and http verb of the called endpoint. The authorize endpoint essentially returns true if any of the user’s permission has access to the endpoint.
+
+Below is the ER diagram of the authorization service showing relationship with user service.
+
+The query that checks if a user is authorized or not looks like this.
+
+If this query returns any value greater than 0, then the user is authorized. From the query :method can be any of , , , , . :url is the url of the endpoint the user is trying to access eg , or . The activities table has a regex field that enables matching to a wildcard. eg a url_regex field can have value [^/?#]+ and hence will match . :permissionIds is an array of the permissions the user has access to. This permission list is retrieved from the user claims.
+
+The above authorization setup works in most scenarios. However, there are some situations where different users have access to the same endpoint but the content they see are different i.e some users can see extra properties in the returned result. In this kind of scenario, authorization still happens as usual via the authorization service, however the microservice being called will still receive the users permissions as metadata and it will return specific fields based on the user’s permission.
+
+Building a robust authentication/authorization system in a microservice architecture is not trivial. This is even more tricky when you have different applications consuming the same microservices. You also don’t want to start making modifications to code each time new endpoints are added or new applications are built.
+
+Please share your experiences building out authorization in a microservice architecture in the comment section. I will love to hear from you.
+
+If you liked this, click the💚 below so other people will see this here on Medium. Also, if you have any question or observation, use the comment section to share your thoughts/questions.|||
+
+At Andela, we have multiple internal apps built by the internal Engineering teams used to manage internal process and to make us more efficient. As time passed, the number of apps increased and each…

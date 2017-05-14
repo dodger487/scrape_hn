@@ -1,0 +1,71 @@
+The term tree-shaking was first introduced by Rich Harris’ module bundler, Rollup . Tree-shaking means that Javascript bundling will only include code that is necessary to run your application. It has been made available by the static nature of ES2015 modules (exports and imports can’t be modified at runtime), which lets us detect unused code at bundle time. This feature has become available to Webpack users with the second version. Now Webpack has built-in support for ES2015 modules and tree-shaking. In this tutorial I’ll show you how tree-shaking works in Webpack and how to overcome the obstacles that come our way.
+
+If you just want to skip to the working examples visit my Babel or Typescript repository.
+
+The way tree-shaking works in Webpack can be best shown through a minimalistic example. I’ll compare it to a car that has a specific engine. The application consists of two files. The first one holds the different engines as classes and their version as a function. Every class and function is exported from its file.
+
+The next file describes the car with its engine and serves as the entry point for our application. We will start the bundling from this file.
+
+After defining the car class, we only use the V8Engine class, the other exports remain untouched. When running the application it will output ‘V8 Sports Car’.
+
+With tree-shaking in place we expect the output bundle to only include classes and functions we use. In our case it means the V8Engine and the SportsCar class only. Let’s see how it works under the hood.
+
+When we bundle the application without transformations (like Babel) and minification (like UglifyJS), we will get the following output:
+
+Webpack marks classes and functions with comments which are not used (/* unused harmony export V6Engine */) and only exports those which are used (/* harmony export (immutable) */ __webpack_exports__[“a”] = V8Engine;). The very first question you may ask is that why is the unused code still there? Tree-shaking isn’t working, is it?
+
+The reason behind this is that Webpack only marks code unused and doesn’t export it inside the module. It pulls in all of the available code and leaves dead code elimination to minification libraries like UglifyJS. UglifyJS gets the bundled code and removes unused functions and variables before minifying. With this mechanism it should remove the getVersion function and the V6Engine class.
+
+Rollup, on the other hand, only includes the code that is necessary to run the application. When bundling is done, there are no unused classes and functions. Minification only deals with the actually used code.
+
+UglifyJS doesn’t support the new language features of Javascript (aka ES2015 and above) yet. We need Babel to transpile our code to ES5 and then use UglifyJS to clean up the unused code.
+
+The most important thing is to leave ES2015 modules untouched by Babel presets. Webpack understands harmony modules and can only find out what to tree-shake if modules are left in their original format. If we transpile them also to CommonJS syntax, Webpack won’t be able to determine what is used and what is not. In the end Webpack will translate them to CommonJS syntax.
+
+We have to tell the preset (in our case babel-preset-env) to skip the module transpilation.
+
+Let’s look at the output what we got after tree-shaking: link to minified code.
+
+We see the getVersion function removed as expected, but the V6Engine class remained there in the minified code. What can be the problem, what went wrong?
+
+First Babel detects the ES2015 class and transpiles it down to it’s ES5 equivalent. Then comes Webpack by putting the modules together and in the end UglifyJS removes unused code. We can read what is the exact problem from the output of UglifyJS.
+
+WARNING in car.prod.bundle.js from UglifyJs
+
+Dropping unused function getVersion [car.prod.bundle.js:103,9]
+
+Side effects in initialization of unused variable V6Engine [car.prod.bundle.js:79,4]
+
+It tells us that the ES5 equivalent of the V6Engine class has side effects at initialization.
+
+When we define classes in ES5, class methods have to be assigned to the prototype property. There is no way around skipping at least one assignment. UglifyJS can’t tell if it is just a class declaration or some random code with side effects, because it can’t do control flow analysis.
+
+Transpiled code breaks the tree-shaking of classes. It only works for functions out of the box.
+
+There are multiple on-going bug reports related to this on Github in the Webpack repository and in the UglifyJS repository. One solution can be to complete the ES2015 support in UglifyJS. Hopefully it will be released with the next major version. Another solution can be to implement an annotation for downleveled classes that mark it as pure (side effect free) for UglifyJS. This way UglifyJS can be sure that this declaration has no side effects. Its support is already implemented but to make it work, transpilers have to support it and emit the @__PURE__ annotation next to the downleveled class. There are ongoing issues implementing this behavior in Babel and Typescript.
+
+The developers behind Babel thought why not make a minifier based on Babel that understands ES2015 and above? They created Babili, which can understand every new language feature that Babel can parse. Babili can transpile ES2015 code into ES5 code and minify it including removal of unused classes and functions. Just like UglifyJS would have already implemented ES2015 support with the addition that it will automatically catch up with the new language features.
+
+Babili will remove unused code before transpilation. It is much easier to spot unused classes before downleveled to ES5. Tree-shaking will also work for class declarations, not just functions.
+
+We only have to replace the UglifyJS plugin with the Babili plugin and remove the loader for Babel. The other way around is to use Babili as a Babel preset and use only the loader. I would recommend using the plugin, because it can also work when we are using a transpiler that is not Babel (for example Typescript).
+
+We always have to pass ES2015+ code down to the plugin, otherwise it won’t be able to remove classes.
+
+ES2015+ is also important when using other transpilers like Typescript. Typescript has to output ES2015+ code and harmony modules to enable tree-shaking. The output of Typescript will be handed over to Babili to remove the unused code.
+
+The output now won’t contain the class V6Engine: link to minified code.
+
+The same rules apply for libraries as for our code. It should use the ES2015 modules format. Luckily more and more library authors release their packages in both CommonJS style format and the new module format. The entry point for the new module format is marked with the module field in package.json.
+
+With the new module format unused functions will be removed, but for classes it is not enough. The library classes also have to be in ES2015 format to be removable by Babili. It is very rare that libraries are published in this format, but for some it is available (for example lodash as lodash-es).
+
+One last culprit can be when the separate files of the library modify other modules by extending them; importing files have side effects. The operators of RxJs is good example for this. By importing an operator it modifies one of the classes. These are considered side effects and they stop the code from being tree-shaken.
+
+With tree-shaking you can bring down the size of your application considerable. Webpack 2 has built-in support for it, but works differently from Rollup. It will include everything but will mark unused functions and classes, leaving the actual code removal to minifiers. This is what makes it a bit more difficult for us to tree-shake everything. Going with the default minifier, UglifyJS, it will remove only unused functions and variables. To remove classes also, we have to use Babili which, understands ES2015 classes. We also have to pay special attention to modules, whether they are published in a way that supports tree-shaking.
+
+I hope this article clarifies the inner workings behind Webpack’s tree-shaking and gives you ideas to overcome the obstacles.
+
+You can see the working examples in my Babel and Typescript repository.|||
+
+The term tree-shaking was first introduced by Rich Harris’ module bundler, Rollup. Tree-shaking means that Javascript bundling will only include code that is necessary to run your application. It has…

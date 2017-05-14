@@ -1,0 +1,74 @@
+Over the past couple of years I’ve talked a lot about a project called Jerakia. Jerakia is a data lookup system inspired by Hiera, but built to be a stand-alone solution that is decoupled from Puppet, or any particular configuration management system that not only offers opportunities to integrate with other tools aside from Puppet thanks to it’s REST API server architecture but also offers a solution to people with far reaching edge cases around data complexity that are hard or impossible to solve in Hiera, it does this largely thanks to being configurable with native Ruby DSL.  If you’ve never heard of Jerakia before, you can read my initial blog post that covers the basics or see the official website.
+
+Being able to deal with secret data, such as passwords and other sensitive data that needs to be served by Puppet has proved to be a very important requirement for Puppet users.  Shortly after Hiera was first released as a third party tool by R.I Pienaar in 2012 I developed one of the first pluggable backends for it, the now deprecated hiera-gpg.  hiera-gpg became hugely popular very quickly as people finally had a way to store production sensitive data along side other non-production data (eg: in the same Git repo) without compromising the details since anyone browsing the Git repo could only see the encrypted form of the key values.
+
+As hiera-gpg grew in popularity as the first plugin of it’s kind to be able to solve the problem, it also suffered from a few design limitations and eventually hiera-eyaml was developed and became the next evolutionary step for handling sensitive data from Hiera.  hiera-eyaml had a better and more modern design than hiera-gpg and has served many users well over the years, but it re-implements a lot of what the yaml backend does with added capabilities to handle encryption, Hiera has always had the ability to support pluggable backends so you can source your data from a variety of different systems, whether they be files, databases or REST API services, but to be able to support encryption within a Hiera lookup you are tied to using a file based YAML back end.
+
+Jerakia initially released with the ability to handle encrypted values from any data source, and up until now it’s done that using a mish-mash of the hiera-eyaml library to provide the decryption mechanism.  I’ve always felt this level of integration wasn’t ideal, hiera-eyaml was never designed to be a standalone solution to be used outside of Puppet and Hiera and the role of providing reliable and secure encryption for your sensitive data is an important one, and so I started looking at platforms that were built specifically for encryption, and more importantly, a shared encryption solution that I could use throughout my toolchain and still maintain the flexibility to store data where and how I want.  I’ve settled on Vault (but you don’t  have to!).
+
+Vault is an open source encryption platform by Hashicorp, the makers of many great software platforms such as Vagrant and Terraform.  Vault is a highly feature rich system for handling all of your encryption and cryptography needs, most of the features of Vault I won’t even touch on in this post, since there are so many.  To take a quote directly from the website; [source]
+
+Many people use Vault as a place to store their secret data, like an encrypted database, and can use either the command line or the HTTP API to authenticate and retrieve the encrypted values.  Jerakia strives not to be a database but to offer users flexibility in where and how they want to store their data but perform hierarchical lookups in a uniformed fashion regardless of the source of the data, so I was particularly interested in Vault when I read about the introduction of the Transit Backend that is now available.
+
+In a nutshell, the transit backend turns vault from an encrypted database into “cryptography as a service”.  You create an encryption key that authenticated clients can use to encrypt and decrypt data on-the-fly using Vaults’ API but Vault itself never stores the encrypted or decrypted data, but as a dedicated encryption platform it offers a an excellent level of protection around authentication and key storage protection.
+
+This immediately seemed like a great idea for providing the encryption functions to support sensitive data in Puppet and other tools and for a tool like Jerakia.  So the 2.0.0 release of Jerakia now has native support for Vault integration using the Transit secret backend.
+
+Jerakia has always had the concept of output filters. These are pluggable, data source agnostic and give you the ability to pass the results from any data lookup from any source to a filter that can perform modifications to the results before it’s sent back to the requestor.  In Jerakia 1.x there was an output filter called encryption which was a filter that tried to pick out hiera-eyaml style encoded strings and decrypt them using the slightly hacky integration I touched on earlier.
+
+In Jerakia 2.0 the concept of encryption has become a bit more of a first class citizen, and it’s also pluggable.  In Jerakia 2.0 you can enable encryption and specify a provider for the encryption mechanism you want to use – the shipped provider for encryption in 2.0 is vault, but the API allows you to extend Jerakia with your own providers if you wish, even hiera-eyaml.
+
+The output filter encryption will now use whichever encryption provider has been configured to provide decryption of data regardless of the source, based on a signature (a regular expression) that is advertised by the provider. So if a returned value matches the regular expression advertised by the providers signature, the encryption output filter will flag that as an encrypted value and attempt to decrypt it, otherwise the value will be returned unaltered.  We’re also not tied to a particular data source, Jerakia will detect an decrypt the data no matter which data source is used for the lookup.
+
+Furthermore, an encryption provider can advertise an encrypt capability which allows you to encrypt and decrypt values right on the command line using the Jerakia CLI.   You can use the Jerakia CLI to encrypt a secret string, copy that into your data, whether that be YAML files, or a database or some other data source, and that’s it.
+
+So I’ve covered Vault and the encryption capabilities provided by Jerakia – now let’s look at how to tie the two together, and use Vaults’ transit backend as an encryption provider for Jerakia, and therefore handle secrets in Puppet / Hiera.
+
+To start with, you’ll need to install and configure Vault and unseal it. Once unsealed, theres a few steps we need to cover in Vault before we integrate Jerakia.  The following steps assume you have an unsealed Vault installation that you can run root commands against.
+
+The first thing we need to do is enable the transit backend in Vault, this can be achieved by mounting it with the following command
+
+Once the backend is mounted, we need to create a key for Jerakia to use for encryption and decryption of values.  The name of the key is configurable, but by default Jerakia will try and use a key called jerakia.
+
+Now we have a dedicated key that Jerakia will use for encrypting and decrypting data.  The second step is to create a policy to restrict activity to just the endpoints used for encrypting and decrypting, we’ll also call that policy jerakia. To create a policy, we’re going to create a new file called jerakia_policy.hcl and then import that policy into Vault.
+
+The file should contain the following rules;
+
+Once created and saved, we need to import the policy into vault.
+
+We can do a quick test now to make sure everything is ok by trying to encrypt a value on the command line using the Jerakia transit key and the policy that we’ve just created
+
+If you had a similar output, then we’re good to go! But before we can plug Jerakia into this mix we need to give Jerakia itself something to authenticate with against Vault.  We could use a simple Vault token, which is supported, but this raises issues of expiry and renewal which we probably don’t want to be dealing with every 30 days (or whatever you set your token TTL to).  The recommended way of authenticating to Vault is to use the AppRole authentication backend of Vault.  When using this method of authentication, we configure Jerakia with a role_id and a secret_id and Jerakia uses this to obtain a limited lifetime token from the Vault server to use for interacting with the transit backend API.  When that token expires, Jerakia will automatically request a new token using it’s role_id and secret_id to get a new token.
+
+First we need to create a new AppRole for Jerakia, we’ll give it a token TTL of 10 minutes (optional) but it’s important that we tie this role to the access policy that we created earlier;
+
+Now we can read the AppRole jerakia and determine the role_id
+
+The role_id that we see here we are going to use later on.  But we’re not quite done yet, we need to create a secret_id along with our role_id and the combination of these two values will give Jerakia the authentication it needs to request tokens.  So let’s create that;
+
+Now we have the two crucial pieces of information that we need to integrate Jerakia with Vault, the role_id and secret_id.  Now Vault is ready to be a cryptography provider to Jerakia, we just now need to add some simple configuration to Jerakia to glue all this together.
+
+With an out-of-the-box installation of Jerakia, we don’t have encryption configured by default, it must be enabled.  If we look at the options on the command line for the sub-command secret we’ll see that there are no sub-commands available.
+
+So the first thing we need to do is enable an encryption provider and give the configuration that it needs. We can do that in jerakia.yaml.  In the configuration file we configure the encryption option with a provider of vault and the specific configuration that our provider requires.  In this example I’m using a Vault instance that is over HTTP, not HTTPS so I need to set vault_use_ssl to false, see the documentation for options to enable SSL.  Because I’m not using SSL I need to set the vault_addr option as well as the secret_id and role_id.
+
+Now I’ve configured an encryption provider in jerakia.yaml, that provider should advertise it’s capabilities to Jerakia and on the CLI I now see some new options available when running jerakia help secret….
+
+Now we should be all set to test encrypting and decrypting data using the Vault encryption provider in Jerakia, we can use the CLI commands to encrypt and decrypt data… Let’s give that a spin;
+
+Now Jerakia can use Vault as a provider of “cryptography as a service”, in a secure, authenticated way.  The only thing left now is to enable our Jerakia  data lookups to be encryption enabled, and we do that by calling the encryption output filter our lookup written in our policy.  We use the output_filter method to add a filter to our lookup, like this;
+
+The inclusion of output_filter :encryption in this lookup tells Jerakia to pass all results to the encryption filter, which will match all returned data values against the signature provided by the encryption provider and if it matches, it will use the encryption provider to handle the decryption of the value before it it passed to the requestor.
+
+So let’s add our encrypted value from earlier to this lookup…
+
+This encrypted value can then be imported into any type of data source that you are using with Jerakia, here we’re using the default file data source so we’ll add it to test.yaml in our common path.
+
+Because this string matches the regular expression provided by the vault encryption providers signature, and we’ve enabled the encryption output filter, if we try and look up the key password from the namespace test (test::password in Hiera speak), Jerakia automatically decrypts the data using the Vault transit backend.
+
+Of course, this also means when Puppet / Hiera is integrated with Jerakia this now becomes transparent to Puppet and now we have our Puppet secrets, stored encrypted in any data source with decryption provided by Vault.
+
+Theres a whole lot of really awesome functionality about Vault that I haven’t even touched on in this post, it’s extensive.  Having one tool for your cryptography needs across your infrastructure rather than a variety of smaller less dedicated tools doing their own thing simplifies things a lot.  If you don’t want to use Vault, the encryption feature of Jerakia is entirely pluggable and could be stripped out and replaced with whatever platform you want to use.
+
+The subject of handling sensitive data in Puppet, and other tools, is an ongoing challenge, I’d certainly welcome any feedback over the approach used here.|||
+

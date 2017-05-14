@@ -1,0 +1,88 @@
+Compilers can optimise away functions you may want to time. Deák Ferenc explores ways to stop this happening.
+
+Recently, I attended a course held by Andrei Alexandrescu (of Modern C++ Design and C++ Coding Standards fame) about C++ optimization. Some of the concepts that were suggested during the lecture have opened up a series of questions, which have lead to some research and finally the creation of this article, in which we explore the delicate interface of the compilers in regard to concepts of real life. We’ll look the way a compiler digests information and some of the measures it takes in order to assure highest performance of delivered application so vital for most systems. But mostly we will try to find loopholes in the contract covering the interfacing of the compiler in relation to the real life notion it represents.
+
+When we programmers look at a source, with or without exhaustive experience in certain fields, some patterns will emerge, mental maps will be charted and some conclusions will be drawn from our in-mind analysis of the few lines observed. Using the familiar building blocks of the language (such as conditions, loops, jumps, etc) we will automatically recognize situations that certain pieces of code will provide us with, and we will act accordingly. However, when an optimizing compiler looks at the code, it sees something completely different.
+
+It is extremely difficult, or might not even be possible, to fully understand all the operations performed by the compiler while generating optimized code, due to our very different view and approach of the same problem. The transformation of the source code into the generated binary code goes through a sequence of steps (each deserving a dedicated chapter in the big book of compiler implementation) and from the various intermediary representations, taking into consideration a series of settings, the final result may emerge having a wide variety of embodiments due to settings to optimization, environment and target system.
+
+During the course, while circumstantiating various techniques regarding C++ optimizations Alexandrescu was talking about measuring the time some operations take, how your compiler might disregard all your hard work while optimizing the final code (because the only code you should benchmark and optimize is Release code), and finally how to trick the compiler into actually performing what you want it to do, regardless of optimizations settings.
+
+And let’s admit it: the best compilers available nowadays are the C++ compilers, which are among the most advanced ones available – in today’s performance oriented world they generate possibly the fastest and most efficient code which satisfies the requirements of lots of platforms and systems. And they have really advanced mechanisms of providing you with the fastest code. They can calculate during compile time complex operations of known data (there go your carefully handcrafted unit tests with vigorously chosen constant data), they can see if you ever intended the use of a function and if not they… just don’t call it if they detect it does not affect other data, they … can do a lot of unimaginable things to make your application faster.
+
+Let’s consider the code in Listing 1.
+
+In the context above, when the code is compiled with high optimizations (-O3, -O2 for gcc/clang) enabled, the body of the function will be present in the generated code (unless you have told the compiler that this is a method in which case it will … miraculously disappear in the void) but the only thing that the will do is:
+
+This, however, might change once you change the optimization settings or the compiler. http://gcc.godbolt.org provides an excellent platform for comparing the output of various compilers when applied to the same source (as a side note: both clang and gcc are able to calculate the result of the function above being 60 and directly feeding it into the required place if we assign it to a variable which is printed).
+
+In order to avoid this uncertainty, Alexandrescu has suggested the following solution: “Use I/O combined with a non-provable false test”. His solution is a short function, like Listing 2.
+
+And from this point on, we use the syntax in Listing 3.
+
+As per [Alexandrescu], the code in Listing 1 will be treated by the optimizer in a fashion that guarantees the call (or calculation, as we have observed for certain simple situations) of the and it will assure you the code will not be ‘optimized away’. What the code above does is the following: it defines a function which will act as a placeholder, it is never optimized away (due to the fact that it contains an I/O operations which are never optimized away), but regardless does nothing (because no user-land process in a sane system can have their PID equal to 1, the value (un)officially being reserved to the process).
+
+And this unprovable false was the spark for this article. I have started looking for ‘contractual loopholes’ in the standard libraries and functions, specifically researching situations where the compiler could have been clever enough to determine that a condition will always evaluate to false, and use this knowledge while generating code.
+
+The C and C++ standard libraries contain a huge number of functions, providing abstractions of real life concepts which easily can be translated into computer code. However, due to particularities of computing systems, these translations on certain occasions are unable to fully model the real life situations, thus providing me with the required attack surface.
+
+There are several functions and structures related to time retrieval in the C++ standard libraries we can find in , and its counterpart C library’s . One of them is the function, which populates a structure with human readable values of the current time. As per [n1256], Listing 4 is the list of its fields (and the declaration was taken from my t ).
+
+As the comment says, all of these fields are restricted to meaningful values; however, no-one can stop me writing code like Listing 5.
+
+Now, we humans know that in reality this will never happen (just like checking if the hour is ); however, the compiler currently is not clever enough and the suggested feature of contracts in the C++17 standard currently has no coverage for this situation [CppContracts], thus the compiler will happily generate the following code (showing the output from clang 3.9.1, since this came up with the cleanest code – the comment is from me):
+
+However, all compilers I have tested with this piece of code provided me with the same result: a comparison which can never be true.
+
+There is an exhaustive library of mathematical functions available in C++ and C (found in or the corresponding header files) which can take almost all basic mathematical concepts and translate them into corresponding function calls providing the expected result. One of these is the functions which computes the sine of the argument (given in radians). If no error occurs, the sine of the argument is returned, the value is in the range [-1 .. +1] as per the definition of the trigonometrical function. So, from a human’s point of view it really makes no sense to check for values . However, again, the compiler is not clever enough to realise this, so the following call:
+
+where the number is the value precalculated by the compiler (as presented above) however the call to the and the comparison after ( = Unordered Compare Scalar Single-Precision Floating-Point Values and Set EFLAGS) are present in the generated code.
+
+The code above was generated by gcc 6.3. I’ve had the same result with gcc 6.2 and 6.1. The gcc 5.x series produces also similar code (not exactly this, but a bit longer using a different set of assembly commands) which is identical to the code generated by gcc 4.9.x however the gcc 4.8 and 4.7 series did not generate any code for this senseless check which behaviour was also manifested by clang 3.9, 3.8. Basically, all clangs up to 3.0. Microsoft’s Visual C++ compiler generated code, which was very similar to the code generated by gcc 5.x family with the check inside.
+
+The interesting part came, however, when I increased the complexity of the function. I have added the following line
+
+in the body of the loop after the line . Suddenly the compilers which did not take into consideration my senseless juggling with sine started paying attention to it and all of them generated some code to handle it. However, if I put the new line before the existing line nothing changed, the behaviour was the same as without the line. Seems that I have really stepped on the toes of some optimizers.
+
+After several experimentation stages with the function , I have drawn the conclusion that the more complex the function I want to measure gets, the least possible is for the call to the senseless to be optimized away. And when the complexity of the function has reached a stage when the compiler was not able to automatically calculate its result during compile time, the senseless sine check was always called. I leave to the imagination of the reader to try to envision what other misconducts can be done with the function from the mathematical library.
+
+Not a very widely known name, but there is a header file which has it roots in C’s containing all kind of functions which can be used to manipulate… well, null terminated byte strings. You can find in there a wide range of functions for checking various properties of characters (in the likes of is this an UPPERCASE character, is this a digit, etc...).
+
+Among them is the very useful function which, as its name suggests, will convert its argument (an , representing a character) to its lower case equivalent using character conversion rules as per the current C locale. The function, however, will return its unmodified argument if no lowercase version is available in the current C locale. And its counterpart , which behaves the same way, but it converts the argument to an uppercase character if possible.
+
+We can exploit this, in order to create another unprovable false. Let’s consider:
+
+Again, the compiler does not know that the uppercase of the character does not exist, due to specification will return and this is again a false which cannot be optimized away.
+
+The C++17 standard supposedly will include a notion of contracts which will be like a run time assertion for allowing checks for validity of input arguments or other dependants, but as per the latest (as of February, 2017) available draft [n4618] I have found no mention of them. Due to the nature of some of the falses from above, these would be very easily identifiable at the compilation time and the compiler could take steps in order for them to not to behave as erratic as today.
+
+For example let’s consider the function. Currently one of the declarations it has is the following:
+
+which says nothing to the compiler about the nature of the function, ie: that its return value is always between -1 and +1 (inclusive).
+
+Let’s revise the declaration of the function, empowered with the concepts of contracts using the syntax from [CppContracts] (please note, the code below is not valid C++):
+
+Due to the almost documentation like nature of a contract, the compiler instantly knows that the following
+
+will always be false and can generate proper code in order to achieve maximum performance and speed.
+
+There is just a tiny little problem with the code above: is not part of the upcoming C++ contracts specification, so the declaration above is just a small dream that might come true one day.
+
+The list of the presented falses is just a subset of all those that exist out there, when you shall look specifically for them you shall find even more, from various libraries, through operating system specific data, to miscellaneous functions. I just wanted to follow up on [Alexandrescu], list a few more currently in existence and offer a theoretical way to mitigate the not so serious threat they represent. Once the compilers fully support the contracts, I am sure a new set of improved C++ libraries will come in existence which will help the compilers in their everyday job.
+
+The techniques presented above, however, have a minor downside to them: Strictly speaking the measurement of time variations will include a tiny fraction consumed by the function call together with the performed operations, which introduces variable distortions in the performance measurements thus degrading the quality of the data we receive. In order to achieve constant time and minimum overhead we can use the following technique: we always call the function we want to measure via a volatile function pointer (Listing 6). This introduces only a few extra bytes in the code (see Listing 7), and by using it we do not depend on calling external functions with all their side effects, and indeed the calls are performed as we would expect them to be. Also and interesting fact is, that in this case the compiler is not able to do the precalculation of the result of the function, nor will it inline the called function into the body of the calling function.
+
+In order to have a base of comparison for the variations in the generated code, I have created the test application also in two other programming languages with syntax very familiar to C and which also compile into binary code: Go and D.
+
+Listing 8 is the Go version of the same program. The corresponding assembly code generated was (only showing the interesting parts, since Go compiled an executable file of 1.1Mb) is in Listing 9.
+
+The same application in D is shown in Listing 10, and the generated code, which was compiled with optimizations on (-O) (the final executable was 594Kb long, I took only the relevant parts) is in Listing 11.
+
+Although this is not necessarily related to the article, regardless it’s interesting to see how various compilers handle the same situation.
+
+I have referenced frequently [Alexandrescu] through the article, and with his permission I have re-used code written by him which was presented at the course. It was awesome.
+
+Regarding Appendix 1: it came into existence during the review phase of the article when one of the reviewers draw my attention towards the distorted time measurements and kindly suggested the solution to mitigate this problem. Thank you!
+
+[Alexandrescu] Fastware: The art of optimizing C++ code, Kongsberg, 2017 January|||
+

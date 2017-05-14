@@ -1,0 +1,109 @@
+In this article, I explore the Linode cloud’s capabilities at running challenging computer vision tasks like deep learning, multiple object detection and face recognition.
+
+Mining content in photos and videos is something I think is very useful. Such a mining engine opens up the possibility of running rich queries like “show me all my 2005 videos that have me, mom, and our pets” over your photo collections.
+
+So I wrote a tool called deepvisualminer to “visually mine” photos and videos, by discovering objects and recognizing individuals in them, using a mixture of deep learning techniques and traditional computer vision techniques.
+
+I have been using this project to test out Linode’s number-crunching capabilities. You too can deploy this project on a Linode or any machine and mine your own photos and videos, and I’ll show you how below.
+
+But first, here are a couple of demos.
+
+The object labels in these demos may look a tad boring, but that’s only because I used a small number of labels. You can always use bigger datasets to expand the number of labels.
+
+And just to dispel any notion that face recognition is applicable only to human faces, I will show you how to configure the system for recognizing cat faces.
+
+The system comes with preconfigured support for human and cat faces, but in principle — and with a lot of data preparation effort — it can be used for any species.
+
+So how does all this work? At a high level, each of your photos and videos are passed through a Pipeline, which is a set of image processing and output generating components. Each component is dedicated to one detection, recognition or output task as shown here.
+
+A multiple object detector is a component that uses deep learning — specifically, a pre-trained YOLO deep convolutional neural network — to identify objects and their locations in a photo or video. The system uses DarkFlow framework — a TensorFlow implementation/port of YOLO — for doing this. A pipeline can have multiple object detectors, each trained to identify different sets of objects. The pre-trained model is capable of identifying 80 types of objects listed in this paper (p.14). Since face locations are not identified explicitly, the system needs a different way to locate faces.
+
+A face detector is a component that detects locations of faces through the older cascade classifier technique using Haar-like or local binary patterns as input features. The software has out-of-the box support for detecting human and cat faces because pre-trained models for them are publicly available, but the technique can generalize to any face or object if it’s trained correctly. A pipeline can have multiple face detectors, for example, one for human faces and one for cat faces.
+
+A face recognizer is a component that matches a face against a set of faces it’s been trained on and finds the closest match. It uses techniques like eigenfaces, fischerfaces and lbphfaces. A pipeline can have multiple face recognizers — for example, one for human faces and one for your pet cats. A recognizer is capable of using only relevant regions of interest output by another detector, so that many detector-recognizer pairs can be set up.
+
+While there are deep learning techniques for face detection and recognition that are much more accurate than these older techniques, they were not considered in this project because they typically require the user to prepare large datasets and involve considerable preprocessing effort. These older techniques are comparatively easier for users to train, though they tend to be inaccurate.
+
+In addition, there are a bunch of outputter components. One generates JSON format reports which can then be forwarded to a database or text search engine like Solr, forming the basis for a rich querying engine. Others generate annotated images and videos.
+
+Now that you’ve seen the demos and know the big picture, let’s get into deploying this software to run it on your own photo collections.
+
+First, select one or more machines to run this software. You can create multiple machines if you have many photo collections to process. Deep learning stacks are often deployed nowadays on machines equipped with GPUs, but regular server CPUs are much more accessible to most people.
+
+CPUs: The software creates a pipeline on each CPU core and distributes photos and videos across those pipelines. While a single core machine is fine for small photo collections, large ones require more cores if you want the job to complete faster.
+
+RAM: If the pipeline includes a multiple-object detector and is deployed on an 8-core machine, it creates 8 different multiple object detectors, each of which loads its own memory-heavy model. If a pipeline includes two object detectors, we’re talking about 16 detectors each with associated memory. In general, select high RAM instances with a minimum of 8 GB.
+
+Storage: The software expects photos and videos to be on the local filesystem, and is not capable of reading them from remote sources. This means the machine should have enough storage capacity not just for the photo collection you wish to mine but also for storing the pipeline’s configured outputs, possibly including text reports, annotated photos, annotated video frames and annotated videos (annotated video frames are especially heavy on storage — for example, a single three minute 30-FPS video results in 5400 annotated frames and if each frame is a 50-KB JPEG image, the total storage comes to 260 MB).
+
+I recommend starting with the Linode 8GB plan for a regular pipeline with a single deep detector or the Linode high memory 60GB if there are multiple. Follow the Getting started and Securing your Server articles — the latter’s especially important because you’ll be uploading your personal photos and videos to a public server and should not risk having them stolen or misused.
+
+Next, install Docker on those machines. Read the Install Docker section in project docs for detailed steps.
+
+But why Docker in the first place? In this project, it’s being used like a distribution-agnostic installer. Since this software depends on many low-level native libraries, a pre-built Docker image with all binaries and dependencies installed in predictable locations with fixed versions in a fixed OS environment means it “just works” anywhere Docker itself works (including on Windows and MacOS).
+
+I have created public Docker images for this software. See Download the Docker images for steps. Since Linode machines are typically Haswell CPUs, you should download the deepvisualminer-haswell optimized image containing an optimized build of TensorFlow. If you wish to run it on your laptop or elsewhere, start with the other deepvisualminer image — it’s the most compatible one and should work on lower CPU architectures.
+
+It’s also possible to build these images from scratch on your own if you don’t want to use our public images, or wish to deploy the software on other CPU architectures like ARMs. See Build your own Docker images for details.
+
+Once downloaded or built, run a quick test of the images on the target machine on which you wish to run the software. See Test Docker images for how to do this.
+
+The only other thing you need to know about Docker if you are new to it is that this software runs inside containers derived from these images. These containers run on the target machines and can be configured to access the filesystems of their hosts.
+
+Time to transfer your photo collections from wherever they are located to the target machines...
+
+For transferring from a local laptop to your Linode, an efficient way is to compress or TAR your photo collection and transfer it via rsync/SCP/SFTP.
+
+For downloading from Google Drive, install a command line tool like gdrive on the target machine and download your collections directly to the target machine.
+
+While face recognition is an exciting feature, it does involve some data preparation effort. This step is entirely optional if you don’t want any face recognition in your pipeline.
+
+So what exactly does it mean to “train” the face recognizer and how is it done? Training means running an algorithm that derives a mathematical model of faces based on a set of sample facial images. The implicit assumption here is that these sample images are representative of all facial images the recognizer will be asked to recognize in future.
+
+The summary of steps are described here, while detailed commands and caveats are in Train the face recognizer section:
+
+The final output of the iterative training and accuracy improvement is a set of face recognition models to be used later in the pipeline.
+
+Now, it’s time to configure one or more pipelines.
+
+Each pipeline configuration specifies a list of components and their inputs and outputs in a YAML format text file. Take a look at this example pipeline and other pipelines in the project directory to get an idea.
+
+If you have trained a face recognizer using your own photos, you should create your own pipeline file and configure the model directory correctly.
+
+If you want to modify/enable/disable any of the output formats, you should create your own pipeline file.
+
+Download one of the example pipelines linked above, edit it to match directory and other file paths on your target machine, and upload the edited file to your target machines. They can then be shared with the container by mounting the host’s directories or files in the container.
+
+Finally, all the pieces are in place for the actual visual mining.
+
+See Start the Visual Mining for command syntax and examples.
+
+Since the reports directory is actually on the target machine and shared within a container, report files and other outputs such as annotated photos/frames/videos will be available on the target machine.
+
+The text reports are in JSON format. See example report for a photo and example report for a video.
+
+These can then then be forwarded directly to a JSON-capable database such as PostgreSQL or MongoDB, or forwarded to a text search engine such as Solr or ElasticSearch.
+
+A 580-MB photo collection with all pipeline components enabled — including a deep-learning multiple object detector, a human-face detector, a cat-face detector, a cat-face recognizer, JSON report writer, annotated photo writer, annotated video writer and even an annotated video frame writer — took about 2 hours on a Linode 8GB machine with 4 cores and 8GB RAM using the deepvisualminer-haswell optimized image. Getting rid of the annotated writers and keeping only the JSON report writer and the rest should take about 1 hour.
+
+RAM, CPU and load remained well within limits throughout the detection and recognition phases.
+
+The deep detector is very fast even on a CPU. In fact, that is YOLO’s major feature — that it can do multiple object detection in real-time.
+
+On a 4800-frame video — with a pipeline of multiple-object detection, cat-face detection, cat-face recogntion and JSON reporting - a deepvisualminer-haswell container containing the optimized version of TensorFlow completed the job in 59 minutes, just half the time taken by a deepvisualminer non-optimized container which took 110 minutes. Using the optimized image is highly recommended.
+
+While training the deep learning neural network for better accuracy and training performance on Linode is something I’m interested in, it’s complicated enough to warrant its own mini project. I decided to keep training out of scope of this particular exploration for now.
+
+I’m sure you’ll notice soon enough that the deep-learning multiple object detector is magnitudes better at detecting many things regardless of factors like pose or lighting, compared to the face detectors which detect just one type of object but suck even at that.
+
+So one improvement that makes a lot of sense is to retrain the multiple- object detector on a dataset of faces and get rid of the face detectors altogether. But training a deep neural network is not a simple task and requires planning both the data preparation work and the computational resources required. I’ll probably make it the subject of a future article.
+
+While this demo application was for personal uses, these same techniques can be used in more serious work, such as:
+
+Thanks to all the researchers and developers and their open-source work which made a tool like this feasible:
+
+4. The OpenCV project and all its contributors (http://opencv.org/)
+
+Thanks to Dave Roesch and Keith Craig for providing Linode infrastructure and suggestions that made this article possible.|||
+
+In this article, I explore the Linode cloud’s capabilities at running challenging computer vision tasks like deep learning, multiple object detection and face recognition. Mining content in photos…

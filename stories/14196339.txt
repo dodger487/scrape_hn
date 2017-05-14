@@ -1,0 +1,69 @@
+Weld is a runtime and language for high performance data analytics, developed in the Stanford Infolab. It is implemented in Rust, a modern take on a fast systems programming language. In this blog post we provide our experiences implementing a low-level systems research project in Rust (with no prior experience with the language). We hope this will help other developers evaluate Rust when choosing a language for their system.
+
+First, a bit of background on Weld. The Weld language includes common functional operators like , , , and . Writers of analytics libraries who want to improve performance can make their APIs lazy and emit Weld code for individual functions. Our runtime can then optimize entire call graphs and produce fast native code without unnecessary intermediate data materialization. Weld is essentially a just-in-time (JIT) compilation system for analytics libraries.
+
+In brief, Rust was a joy to work with. Its powerful pattern matching made writing compiler optimization rules very easy, and we found that code that compiled usually “just worked” because of the stringent checks Rust’s own compiler performs on code the programmer writes. Additionally, writing C APIs in Rust was also very easy; Rust provides good support and documentation for doing this. While there are a few features the Rust developers are working on which we hope appear in the stable compiler soon (namely, incremental compilation and the keyword), we wholeheartedly reccomend Rust to those looking for a fun, powerful programming language for their next project.
+
+Stay tuned for another blog post that describes Weld in greater detail. For now, keep reading for our thoughts on writing Weld in Rust, and join the discussion on Weld on our Google Group!
+
+Weld is written in around 12000 lines of Rust code. It includes a compiler with a tokenizer, parser, the abstract syntax tree (AST) definition, transformations on the AST, and a code generator targeting LLVM, as well as a C API for interacting with the compiler. Rust’s excellent LLVM bindings ( ) made generating and JIT compiling LLVM code particularly easy.
+
+We used Rust v.1.14 (stable) when developing Weld.
+
+Weld’s optimizer takes an AST and applies a set of rule-based optimizations to it. These optimizations find a subtree in the AST and replace it with a more efficient subtree.
+
+Each expression in Weld is an type:
+
+is an which specifies the kind of expression:
+
+Rust’s pattern matching makes writing transformations rules easy. We wrote a method for the type which, given a function which takes an and returns an , applies the function to each node in the AST. If the is , the node to which the function was applied is replaced by the expression . If the is , the expression is not substituted. This allows us to express transforms on the AST elegantly by defining a function which specifies a set of match rules and then calling .
+
+Below, we have a simple match rule which matches on two literals being summed. The expression is replaced by summing the integers at compile time and replacing the add operation with a single literal:
+
+is taking a closure here. The nested statements destructure a sub-expression to build the match rule. If we find a match, we replace the expression with an expression which adds the literal values.
+
+One point of tedium is that we need to use statements to destructure each expression instead of being able to “nest” destructuring structs. For example, a similar implementation in Scala is much more concise since patterns are nested:
+
+The reason we cannot nest match rules in Rust is that each expression in our implementation is actually a . is Rust’s type designating heap allocated memory, and because we want to support in-place updates to the AST we want to use this type instead of just . Unfortunately, Rust doesn’t support nesting patterns for these boxed values, since the pattern would match on a instead of the (in the code above, dereferences the box). This causes deeply nested statements even for simple match rules.
+
+Rust solves this problem using the keyword, which allows matching on the contents of the . Unfortunately, this keyword is not yet available in the stable version of the Rust compiler.
+
+Handling errors is a tedious undertaking in a systems project, and especially in low-level projects written in C and C++. However, Rust’s type makes it very easy. is an enum with two variants: and . These variants specify whether a function call was successful (in which case the function would return ) or caused an error (in which case it would return ).
+
+Most functions in the Weld implementation return a , which enables use of the macro. This macro checks if the is or . If it is , it exits the function and returns the . If it is , it unwraps the value contained in the . This makes it easy to propagate errors deep in a call stack up to some place where they can be presented to the user. As an example, the following code appears in Weld’s parser:
+
+The method also returns a . If tokenization fails, the first line of the function exits and returns an error. Otherwise, is set to the value contained in the returned by .
+
+In all, and make error propagation very easy. We found that Rust did a much nicer job in making error handling code (something every program should do!) elegant when compared to the s and error codes C programmers are accustomed to.
+
+Our first stab at writing a parser for Weld’s IR used a parser-generator library called . Unfortunately, one major limitation of this library was the amount of code it generated. Because (when we used it) created a parser with over 10000 lines of code, Rust took over a minute to compile it. This was partially caused by the lack of incremental compilation in stable Rust. These compile times took a significant toll on productivity especially since we modified the IR’s parser fairly often. Eventually, we opted to implement our own recursive descent parser from scratch to reduce the compilation time.
+
+In general, we found that Rust code took some time to compile; changing a single file and then running takes roughly 10 seconds on a standard laptop, while (which enables compiler optimizations) takes around a minute. However, because of the copious compile-time guarantees Rust makes in its language, we often found that compiled code was working code; this certainly isn’t true in most C code we write!
+
+In addition, Rust has been looking into incremental computation for some time now; we hope this feature makes it into the stable compiler soon.
+
+Weld interfaces with C by exposing its API as a set of C functions. This allows Weld’s API to be called by languages such as Python, which have utilities for calling C functions (e.g., Python’s module). An initial concern with Rust was whether it would be easy to support exporting C-style APIs easily; we quickly found that Rust had good support for this.
+
+In Rust, a C function can be exported by using the qualifier on a function, marking it as public, and using the annotation:
+
+The above function will be exported and callable from C. The declaration of this function in C would look as you might expect:
+
+Rust also provides wrappers for C data types in the external crate. Weld uses these to return integers and strings back into C:
+
+Things get interesting when we need to pass richer data types from Rust to C. Weld uses opaque handles ( with a typedef) in its API to do this. The pointers are heap-allocated Rust values (i.e., values with type ). Of course, C doesn’t understand what a “ ” is, so we need to acquire a raw pointer before passing it out of Rust.
+
+One tricky thing here is that Rust figures out when it should release memory it allocates. For example, a boxed value is freed when it goes out of scope. When passing values to C, however, this isn’t exactly what we want; Rust shouldn’t release a value when a goes out of scope, because some C code might still be using its underlying data.
+
+Rust gets around this with ’s function. automatically forgets about the heap allocated memory, so it can be passed into C without fear of Rust deallocating it. When a heap allocated object is passed back into C, we can use the function to reconstruct a and tell Rust to treat it as an ordinary object it allocated. Alternatively, we can just dereference the passed pointer in Rust and do operations on it. Note that both of these operations are since Rust can’t make any guarantees about whether the pointer is valid.
+
+In all, Weld’s API looks something like the follows. For every type in the API, Rust allocates boxed memory and casts it to a (a raw pointer) before returning it. When a C caller passes the pointer back (as a raw pointer), we use to reconstruct the Rust object, and then use the object. Below is an example for the type, which wraps a Rust and holds configuration options.
+
+In C, the header file declaring the above API looks like this:
+
+In general, despite its many language features Rust is still able to seamlessly integrate with existing C programs. While developers need to be cognizant of when Rust frees memory to prevent dangling pointers and leaks, the Rust docs do a fantastic job documenting how to avoid these problems.
+
+To summarize, implementing Weld in Rust was definitely a positive experience. As other Rust users have reported at length, the language has a larger learning curve than other languages, but after grappling with the borrow checker for a few days the advantages of the language begin to outweigh its complexity.
+
+We hope this blog post helps other systems developers in evaluating whether Rust is a good choice for them, in particular when writing libraries which need to be called by non-Rust code.|||
+
+The Stanford DAWN blog
