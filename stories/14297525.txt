@@ -1,0 +1,108 @@
+Here is a seemingly simple question for you: Is it possible that the CLR will call a finalizer for an instance when an instance method is still running? In other words, is it possible in the following case to see ‘Finalizing instance.’ before ‘Finished doing something.’?
+
+The answer is: “It depends”. In debug builds this will never happen (as far as I can tell), but in release builds this is possible. To simplify this discussion, let’s consider the following static method:
+
+The local variable ‘heavyWeightInstance’ is used only in first two lines and theoretically can be collected by the GC after that. One might set the variable to null explicitly to release the reference, but this is not needed. The CLR has an optimization that allows collection of instances once they are no longer being used. The JIT compiler emits a special table, called ‘Pointer Table’ or (GCInfo, see gcinfo.cpp at coreclr repo) that gives the GC enough information to decide when a variable is reachable and when is not.
+
+An instance method is just a static method with an ‘instance’ pointer passed via the first argument. This means that all reachability optimizations are valid for both instance and static methods.
+
+To prove that this is indeed the case, we can run the following program and look at the output.
+
+As we would expect, running this program in release mode and with no debugger attached will lead to the following output:
+
+Doing something. The answer is … 42
+
+Calling GC.Collect…
+
+Finalizing instance.
+
+Object is dead
+
+Finished doing something.
+
+
+
+The output shows that the object was collected during the execution of the instance method. Now let’s look at how this happens.
+
+There are a few options for doing that. First, you can use WinDbg and run !GCInfo command for a given method table (here is a good blog post for you, Figure out variable lifetime using SOS). Second, you can build CoreClr and run your application with JIT trace enabled.
+
+The first option seemed simpler, however I’ve decided in this case to use the second one. And, believe me, the second option is not as complicated as you would think. You just need to follow the instructions – Viewing JIT Dumps and do the following:
+
+And here is the output:
+
+*************** After end code gen, before unwindEmit()
+
+IN0002: 000012 call     CORINFO_HELP_NEWSFAST
+
+IN0003: 000017 mov      rcx, 0x1FE90003070
+
+
+
+// Console.WriteLine(“Doing something. The answer is … ” + data);
+
+IN0004: 000021 mov      rcx, gword ptr [rcx]
+
+IN0005: 000024 mov      edx, dword ptr [rsi+8]
+
+IN0006: 000027 mov      dword ptr [rax+8], edx
+
+IN0007: 00002A mov      rdx, rax
+
+IN0008: 00002D call     System.String:Concat(ref,ref):ref
+
+IN0009: 000032 mov      rcx, rax
+
+IN000a: 000035 call     System.Console:WriteLine(ref)
+
+
+
+// CheckReachability(this);
+
+IN000b: 00003A mov      rcx, rsi
+
+// After this point, ‘this’ pointer is reachable for GC
+
+IN000c: 00003D call     Reachability.Program:CheckReachability(ref)
+
+// Console.WriteLine
+
+IN000d: 000042 mov      rcx, 0x1FE90003078
+
+IN000e: 00004C mov      rcx, gword ptr [rcx]
+
+IN000f: 00004F mov      rax, 0x7FFB6C6B0160
+
+*************** Variable debug info
+
+2 vars
+
+  0(   UNKNOWN) : From 00000000h to 00000008h, in rcx
+
+  0(   UNKNOWN) : From 00000008h to 0000003Ah, in rsi
+
+*************** In gcInfoBlockHdrSave()
+
+Register slot id for reg rsi = 0.
+
+Set state of slot 0 at instr offset 0x12 to Live.
+
+Set state of slot 0 at instr offset 0x17 to Dead.
+
+Set state of slot 0 at instr offset 0x2d to Live.
+
+Set state of slot 0 at instr offset 0x32 to Dead.
+
+Set state of slot 0 at instr offset 0x35 to Live.
+
+Set state of slot 0 at instr offset 0x3a to Dead. 
+
+
+
+The dump from the JIT compiler is slightly different from the one you might get from WinDBG or theVisual Studio ‘Disassembly’ window. The main difference is that it shows way more information, including the number of local variables (when they were used in terms of ASM offsets) and the GCInfo. Another useful aspect that it shows instruction offset that helps to understand the GCInfo table.
+
+In this case, it is clear that ‘this’ pointer is no longer needed after instruction 0x3A, i.e. right before the call to CheckReachability. And this is the very reason, why the instance was collected once GC was called inside CheckReachability method.
+
+The main idea of this blog post is to show that there is no magic happening during GC. The JIT and the GC are working together to track some auxiliary information that helps the GC to clean objects as soon as possible.
+
+But I want you to be cautious with this knowledge. The C# language specification states that this optimization is possible but not required: “if a local variable that is in scope is the only existing reference to an object, but that local variable is never referred to in any possible continuation of execution from the current execution point in the procedure, the garbage collector may (but is not required to) treat the object as no longer in use”. So you should not rely on this behavior in your production scenarios.|||
+

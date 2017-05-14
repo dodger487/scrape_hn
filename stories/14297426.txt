@@ -1,0 +1,84 @@
+Back in the mists of time, before Friday Q&A was a thing, I posted some articles running performance tests on common operations and discussing the results. The most recent one was from 2008, running on 10.5 and the original iPhone OS, and it's long past time to do an update.
+
+Previous Articles
+
+If you'd like to compare with decades past, here are the links to the previous articles:
+
+Overview
+
+Performance testing can be dangerous. Tests are usually highly artificial, unless you have a specific application with a real-world workload you can test. These particular tests are certainly artificial, and the results may not reflect how things actually perform in your own programs. The idea is just to give you a feel for the rough order of magnitude, not put a precise number on everything.
+
+It's particularly difficult to measure extremely fast operations, like an Objective-C message send or a simple arithmetic operation. Modern CPUs are heavily pipelined and parallel, and the time such an operation takes in isolation may not correspond with the time it takes when in the context of a real program. Adding one of these operations into the middle of other code may not increase the running time of that code at all, if it's sufficiently independent that the CPU can run it in parallel. On the other hand, it could increase the running time a lot if it ties up important resources.
+
+Performance also depends on external factors. Many modern CPUs will run faster when cold, and throttle down as they get hot. Filesystem performance will depend on the storage hardware and the state of the filesystem. Even relative performance can differ.
+
+If something is performance critical, you always want to measure and profile it so you can see exactly what takes time in your code and know where to concentrate your efforts. It can and will surprise you to find out what's actually slow in working code.
+
+All that said, it's still really useful to have a rough idea of how fast various things are compared to each other. It's worth a little effort to avoid writing a ton of data to the filesystem if you don't have to. It's probably not worth a little effort to avoid a single message send. In between, it depends.
+
+Methodology
+
+The code used for these tests is available on GitHub:
+
+The code is written in Objective-C++, with the core performance measuring code written in C. I don't yet have a good enough handle on how Swift performs to feel like I could do a good job of this in Swift.
+
+The basic technique is simple: run the operation in question in a loop for a few seconds. Divide the total running time by the number of loop iterations to get the time per operation. The number of iterations is hardcoded, and I chose that number by experiment to make the test run for a reasonable amount of time.
+
+I attempt to account for the overhead of the loop itself. This overhead is completely unimportant for the slower operations, but is substantial for the faster ones. To do this, I time an empty loop, then subtract the time per iteration from the times measured for the other tests.
+
+For some tests, the test code appears to get pipelined in with the loop code. This produces amazingly low times for those tests, but the results are false. To compensate for this, all of the fast operations are manually unrolled so that a single loop iteration executes the test ten times, which I hope produces a more realistic result.
+
+The tests are compiled and run without optimizations. This is contrary to what we normally do in the real world, but I think it's the best choice here. For operations which mostly depend on external code, like working with files or decoding JSON, it makes little difference. For short operations like arithmetic or method calls, it's difficult to write a test that doesn't just get optimized away entirely as the compiler realizes that the test doesn't do anything that's externally visible. Optimization will also change how the loop is compiled, making it hard to account for loop overhead.
+
+The Mac tests were run on my 2013 Mac Pro, with a 3.5GHz Xeon E5 running OS X 10.11.4. The iOS tests were run on an iPhone 6s running iOS 9.3.1.
+
+The Mac Tests
+
+Here are the Mac numbers. Each test lists what it tested, how many iterations the test runs, the total time it took to run the test, and the per-operation time. All times are listed with loop overhead subtracted.
+
+The first thing that stands out in this table is the first entry in it. The 16-byte test takes less than a nanosecond per call. Looking at the generated code, the compiler is smart enough to turn the call to into a sequence of instructions, even with optimizations off. This is an interesting lesson: just because you write a function call doesn't mean the compiler has to generate one.
+
+A C++ virtual method call and an ObjC message send with a cached IMP both take about the same amount of time. They're essentially the same operation: an indirect function call through a function pointer.
+
+A normal Objective-C message send is a bit slower, as we'd expect. Still, the speed of continues to astound me. Considering that it performs a full hash table lookup followed by an indirect jump to the result, the fact that it runs in 2.6 nanoseconds is amazing. That's about 9 CPU cycles. In the 10.5 days it was a dozen or more, so we've seen a nice improvement. To turn this number upside down, if you did nothing but Objective-C message sends, you could do about 400 million of them per second on this computer.
+
+Using to call a method is much slower, as expected. has to construct the message at runtime, doing the work that the compiler does at compile time for each call. Fortunately, is rarely a bottleneck in real programs. It appears to have slowed down since 10.5, with an call taking about twice as much time in this test compared to the old one, even though this test is running on faster hardware.
+
+A retain and release pair take about 23 nanoseconds together. Modifying an object's reference count must be thread safe, so it requires an atomic operation which is relatively expensive when we're down at the nanosecond level counting individual CPU cycles.
+
+Autorelease pools have become quite a bit faster than they used to be. In the old test, creating and destroying an autorelease pool took well over 300ns. Here, it shows up at 25ns. The implementation of autorelease pools has been completely redone and the new implementation is a lot faster, so this is no surprise. Pools used to be instances of the class, but now they're done using runtime functions which just do some pointer manipulation. At 25ns, you can afford to sprinkle anywhere you even suspect you might accumulate some autoreleased objects.
+
+Allocating and freeing 16 bytes costs much like before, but larger allocations have become significantly faster. Allocating and freeing 16MB took about 4.5 microseconds back in the day, but only took about 300 nanoseconds here. Typical apps do tons of memory allocations, so this is a great improvement.
+
+Objective-C object creation also got a nice speedup, from almost 300ns to about 100ns. Obviously, the typical app creates and destroys a lot of Objective-C objects, so this is really useful. On the flip side, consider that you can send an existing object about 40 messages in the same amount of time it takes to create and destroy a new object, so it's still a significantly more expensive operation, especially considering that most objects will take more time to create and destroy than a simple instance does.
+
+The tests show an interesting contrast between the various operations. A on an uncontended queue is extremely fast, under 30ns. GCD is smart and doesn't do any cross-thread calls for this case, so it ends up just acquiring and then releasing a lock. takes a lot longer, since it has to find a worker thread to use, wake it up, and get the call over to it. Creating and destroying a is pretty cheap, with a time comparable to creating an Objective-C object. GCD is able to share all of the heavyweight threading stuff, so the individual queues don't contain very much.
+
+I added tests for JSON and property list serialization and deserialization, which I didn't test the last time around. With the rise of the iPhone, these things became a lot more prominent. These tests encode or decode a simple three-element dictionary. As expected, it's relatively slow compared to simple, low-level stuff like message sends, but it's still in the microseconds range. It's interesting that JSON outperforms property lists, even binary property lists, which I expected would be the fastest. This could be because JSON sees more use and so gets more attention, or it might just be that the JSON format is actually faster to parse. Or it might be that testing with a three-element dictionary isn't realistic, and the relative speeds would look different for something larger.
+
+Zero-second delayed performs come in pretty heavyweight, relatively speaking, at about twice the cost of a . Runloops have a lot of work to do, it seems.
+
+Creating a pthread and then waiting for it to terminate is another relatively heavyweight operation, taking a bit under 30 microseconds. We can see why GCD uses a thread pool and tries not to create new threads unless it's necessary. However, this is one test which got a lot faster since the old days. This same test took well over 100 microseconds in the old test.
+
+Creating an instance is fast, at about 3 microseconds. In constrast, creating an is much slower, taking about 10 milliseconds. is really a relatively light structure that represents an area of a window, while an represents a chunk of pixel buffer in the window server. Creating one involves communicating with the window server to have it create the necessary structures, and it also requires a lot of work to set up all the various internal objects an NSWindow needs, like views for the title bar. You can go crazy with the views, but you might want to go easy on the windows.
+
+File access is, as always, pretty slow. SSDs make it a lot faster, but there's still a ton of stuff going on there. Do it if you have to, try not to do it if you don't have to.
+
+The iOS Tests
+
+Here are the iOS results.
+
+The most remarkable thing about this is how similar it looks to the Mac results above. Looking back at the old tests, the iPhone was orders of magnitude slower. An Objective-C message send, for example, was about 4.9ns on the Mac, but it took an eternity on the iPhone at nearly 200ns. A simple C++ virtual method call took a bit over a nanosecond on the Mac, but 80ns on the iPhone. A small malloc/free at around 50ns on the Mac took about 2 microseconds on the iPhone.
+
+Comparing the two today, and things have clearly changed a lot in the mobile world. Most of these numbers are just slightly worse than the Mac numbers. Some are actually faster! For example, autorelease pools are substantially faster on the iPhone. I guess ARM64 is better at doing the stuff that the autorelease pool code does.
+
+Reading and writing small files stands out as an area where the iPhone is substantially slower. The 16MB file tests are comparable to the Mac, but the iPhone takes nearly ten times longer for the 16-byte file tests. It appears that the iPhone's storage has excellent throughput but suffers somewhat in latency compared to the Mac's.
+
+Conclusion
+
+An excessive focus on performance can interfere with writing good code, but it's good to keep in mind the rough performance of the common operations we perform in your programs. That performance changes as software and hardware improves. The Mac has seen some nice improvements over the years, but the progress on the iPhone is remarkable. In eight years, it's gone from being almost a hundred times slower to being roughly on par with the Mac.
+
+That's it for today. Come back next time for more fun stuff. Friday Q&A is driven by reader suggestions, so if you have a topic you'd like to see covered next time or some other time, please send it in!
+
+Spam and off-topic posts will be deleted without notice. Culprits may be publicly humiliated at my sole discretion.|||
+

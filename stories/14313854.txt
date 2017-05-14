@@ -1,0 +1,41 @@
+A while ago, I built a system-tray application in Rust to notify me of new e-mail called buzz. It was working fine, but every now and again, it would fail to connect to the mail server on boot if it started before my network connection was up. Sounds easy enough to fix, so I just added a loop around my connect (even made it have exponential backoff!) and considered the issue dealt with.
+
+Fast forward a few days, and the same issue happens again. I boot my computer, buzz starts before my network is ready, and while it now continues trying to connect for a while, each attempt fails with the same error: “Name or service not known”. Hmm… I kill buzz and restart it, and lo and behold it connects immediately without issue. What sorcery is this?
+
+It’s time to do some debugging. First, let’s write a sample program:
+
+Running it prints “connected” — great. Now, let’s disconnect the internet and run it again — it prints
+
+over and over again. Okay, still as expected. Now let’s turn the internet back on
+
+Something is definitely fishy. So, let’s ask Google:
+
+This takes us to a somewhat promising Thunderbird issue named “Thunderbird “Failed to connect to server” after connecting to Internet”, but it fails to reach any helpful conclusions. But we shall not surrender!
+
+Ooooh, “#2825 (Pidgin cannot reconnect after changing networks)” looks promising. Among the comments:
+
+is where Linux keeps track of the DNS nameservers to use when looking up the IP addresses of domain names. Depending on your network configuration, that file is empty when you are offline, and then entries are filled in when you connect to a network. The comment suggests that the contents of this file is cached, which would mean our program never learns of any nameservers (it always see the empty list), and so all DNS resolution fails for all eternity!
+
+Armed with the knowledge about , our Google searches are suddenly a lot more helpful, and reveal that this problem is actually something many projects have encountered. Let’s see what Rust does, why our program doesn’t work, and how we might fix it.
+
+takes an argument that implements . “Implementors” at the bottom of that page shows that is implemented for , which makes a lot of sense given that we’re passing in a to it in our code above. Let’s click the link at the top right of the page to see what it’s doing to turn that string into an IP address!
+
+Scrolling down a little, we see that it calls , which is defined a bit further up. It again calls , which seems to just be a stub of some sort:
+
+That’s not very helpful. It’s time we go explore the rust GitHub repository. There’s a lot of stuff here, but let’s just try to take the fast path to what we’re looking for. The gives us a starting point: statements like these inside the standard library are using other modules from the standard library, which lives in . And how about that, right there there’s a little subdirectory. Let’s open that up. And then we want , because that’s the module the function was using.
+
+So, calls , and then returns . There’s a call to in there suffixed with a , which I assume deals with the case where the lookup fails, but let’s ignore that for a second. There’s no call to here. This means that unless the application calls itself, it will simply never get to use the internet. That’s pretty sad. Let’s fix that!
+
+The most straightforward fix is to just call directly from our application if fails. But, in order to do that, we, well, need to be able to call . is a function in libc (at least on UNIX-like systems), so the place to look would be the Rust crate. If you look today, there is a function in , but this was not the case when I looked. So, time to file a pull request!
+
+The README clearly states the process for adding an API, and it basically comes down to “add a function to , submit, and then fix failing tests”. It turns out that is actually somewhat funky as far as libc functions go, so it took quite a bit of digging to get it right on all the UNIX-y platforms that libc supports. But with the aid of the amazing Alex Crichton, green checkmarks eventually started appearing, and PR#585 landed (if you want to know what the process is like, I encourage you to read through the comments there).
+
+Okay, so we now have , which means we can fix our application by adding a dependency on and calling the function manually after each failed connection attempt. While this would work, it doesn’t feel particularly elegant. And what about other people who will inevitably also run into the same issue? No, we can to better. Time to fix Rust!
+
+First, I filed #41570, an issue outlining the issue, giving much of the same reasoning and examples that I’ve given in this post. I actually did that before my libc PR, but that’s sort of beside the point. I then asked for opinions about what the best place to implement the fix would be, suggesting the function we found above. Alex Crichton responded (again!), and PR#41582 was born. I’ll spare you some of the details (read the comments if you want them), but two primary changes were needed:
+
+It took a few iterations to get the kinks ironed out, and all os targets to be happy, but on May 5th at 5:35pm, the Rust build system accepted and merged my PR! A few hours later, at midnight UTC, a new nightly release of Rust was published, which included my fix. After a quick and a recompile, now works correctly without any changes to the code! Yay progress!
+
+Hopefully this post has given some insight into what is involved in making a contribution to the Rust standard library, and may give you some pointers to what you might do if you find something you would like to fix in Rust! It doesn’t even have to involve coding — the Rust team would love documentation changes too. Happy hacking!|||
+
+A while ago, I built a system-tray application in Rust to notify me ofnew e-mail called buzz. It was workingfine, but every now and again, it would fail to c...

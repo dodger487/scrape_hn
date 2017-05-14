@@ -1,0 +1,135 @@
+In the previous post, we started a series dedicated to familiarise C++ developers to the world of LISP meta-programming, based on the Clojure programming language. The goal is to offer a different perspective on meta-programming, how we can approach it, and the kind of use cases it can address.
+
+We started the series by an introduction on Clojure, homoiconicity and how meta-programming works in LISP dialects. We ended up by introducing the concept of macro as functions from fragment of AST to AST, pluggable into the Clojure compiler.
+
+In today’s post, we will continue our exploration of macros. We will illustrate how they work through simple examples to make sure to keep everyone afloat before diving deeper in the future posts. We will end up by a small discussion on C++ constexpr.
+
+Note: this post builds on the previous post of the series. Unless you already know Clojure, you need to read this first post to be able to follow this one.
+
+In this first section, we will implement our first very basic macros. The goal is to start building an intuition on how they work, and what they can do.
+
+As we saw in our previous post, a macro is a function that is given as arguments fragments of an AST. It returns another AST that will replace the original fragments it is given. A macro is also different from a simple function because it is called at compile time.
+
+Our very first macro will just swallow the AST fragment that is given to it, and replace it with nil, the null pointer of Clojure. We will call this macro swallow, for the AST it will take as argument will never get out.
+
+You can find below its implementation. The syntax of macros is strictly identical the syntax of functions, but for the use of defmacro instead of defn. Other than this, it is a perfectly normal function:
+
+
+
+ In fact, macros are almost like functions. The difference lies in the evaluation of the macro. Instead of receiving evaluated arguments (at run-time), the macro will receive fragments of AST as argument (at compile time).
+
+To better explain how this work, let us consider the following piece of code, which defines a function test-swallow, in which we call swallow on (+ a b):
+
+The macro will be called at compile time. It will receive (+ a b) as its code argument: a list made of the symbols +, a and b. We insist on the fact that the macro does not receive the values associated to these symbols (they do not have any at compile time anyway) but the symbols themselves.
+
+The macro will then perform its work: in our case, it will ignore its arguments and return nil. So the whole code (swallow (+ a b)) will be replaced by nil at compile time. As a consequence, the function test-swallow will behave exactly as if its body was just nil.
+
+In fact, after compilation, it is nil, just as if we would have written this:
+
+Hence calling test-swallow will always return nil:
+
+We just saw that the swallow macro takes the fragment of AST and replace it by a new AST consisting of only nil. The resulting code does not contain any trace of the code that was passed to the swallow macro.
+
+This is completely different from what would happen with a function that would ignore its argument and systematically return nil. In case of a function, the argument would still be evaluated, and the result of this evaluation would be discarded.
+
+To better illustrate this key difference, we can give to swallow a code that performs a side effect, for instance printing “Hello world”. The code is simply discarded by the macro. So the resulting code does not perform any side effect:
+
+If instead, we had defined a function such as no-swallow that systematically returns nil as well, the outcome would have been very different. The argument would have been evaluated, triggering the side effect, as shown below:
+
+To better illustrate the fact that an AST is being provided as argument to a macro, and that this AST consists of symbols, we will write a macro that:
+
+We will name this macro print-macro:
+
+Let us write a test driver for this macro. We will create a function named add-two that adds its two arguments a and b. But instead of summing our arguments directly, we surround the addition with the print-macro:
+
+The macro will return the code fragment (+ 1 2) unchanged, so the function will do the sum as we expect. But at compile time, we see the result of the println:
+
+(*) Yes, we can do side effects inside macros, and thus inside the compiler. We will see in future posts interesting usage for this.
+
+Our previous example of macros were not very useful. In this section, we will show how to shift computations from run-time to compile time using macros.
+
+Let us start simple, and add numbers at compile time. Please note that this is not very useful, the JVM will likely do these optimizations by itself, but we will start simple here.
+
+You can find below the code that corresponds to the function add that adds two numbers, and the corresponding add-m macro that can do the exact same thing, but at compile time, when called on two numbers.
+
+The code is almost identical. The difference is that if you call (add-m 1 2), the compiler will execute the macro with the fragments of AST 1 and 2, the macro will sum these numbers, and you should end up with the value 3.
+
+Do not take my word for it. We need proof the computation indeed happens at compile time. To do this, we will use a very powerful tool available in the Clojurian’s toolbelt: macro expansion.
+
+In all the code that follows, we will use a function that allows to see the effect of macros on a piece of code, walk/macroexpand-all (*). It effectively allows us to see what code will be compiled after having been transformed by our macros.
+
+We will not go through all the details behind the macro expansion process, as it is a quite large topic. We will only use it to check that our add-m macro does indeed return a constant at compile time:
+
+(*) The slash corresponds to the separation between the namespace of the function and its name. Here “walk” is an namespace alias for “clojure.walk”.
+
+An interesting feature of macro is that they can call any function. As we saw with our previous example with println, it includes calling functions with side effects. In our specific case, our add-m function can call our add function:
+
+We already had the need for ways to debug and test meta-functions: macro expansion allows us to see the effect of calling a macro on a piece of code. Being able to call any functions is another very important feature: it allows Clojure developpers to move most of the heavy lifting of macros inside standard functions that can be tested much easier.
+
+In the context of compile time computations, macro expansion allows to verify that we return a constant, while factorizing into functions allows to check that the constant is valid (through unit tests for instance). We will come back to testing, when discussing constexpr later in this post.
+
+Until now, the macros we wrote returned only constants. In this section, we will see how we can return more complex code fragments, and use this to inline functions.
+
+The ability to return any code fragment from a macro gives us the power to inline the content of a function. Instead of writing a function, we write a macro that returns what would be the body of the function.
+
+The following macro returns a code fragment that represents the sum of the two parameters a and b (themselves code fragment) given to the macro:
+
+We will dissect this expression in a second. For now, let us first verify that it behaves as we expect. To do so, we use macroexpand on (add-inline 1 2).
+
+So the call to the macro was effectively replaced at compile time by the body of the macro. This is usually what we call inlining.
+
+We will now dissect this macro, and in particular the meaning of the weird characters it contains: the backquote and the tilde.
+
+The backquote escapes a piece of code. It tells Clojure to not evaluate the piece of code that follows, and to return it as a fragment of AST instead. We call this quoting an expression. So in our case, it asks Clojure to return the list starting with the symbol +.
+
+The tilde asks Clojure to replace part of an escaped expression (a quoted expression) by the value of the variable name that follows the tilde. So in our case, it asks Clojure to replace the symbol a and b by their value: the arguments of the macro themselves.
+
+One way to see it is as string interpolation but for AST fragments. The backquote allows to create a kind of string. The tilde allows to replace part of the string by the value of a variable that has the same name. Here is an example of string interpolation taken from Wikipedia (using Python):
+
+Pushing forward the analogy, the add-inline macro returns the AST (+ a b) where a and b are replaced by their values: the fragment of AST provided as argument of the macro when it is called.
+
+This process works for whatever value the arguments of the macro might have. You can find below some examples with more complex arguments than simple integers:
+
+Note: Please make sure you understand these examples before going along, as we will use these mechanisms quite extensively in the future.
+
+One thing that clearly appears in the previous examples is that the process of macro-expansion is rather mechanical. The call to (add-inline (+ 1 2) x) will be expanded into (clojure.core/+ (+ 1 2) x). Whether or not the variable x exists does not matter, the macro will be expanded the same.
+
+If then the compiler figures out that the variable x does not exist, the code will not compile. But the compilation error will likely be obfuscated. The code that does not compile does not necessarily look like the original source code. For all we know, it may be completely different.
+
+In addition to this, macros might also create invalid piece of code. The macro might be bugged. The resulting code might not compile. This is why macroexpand-all is such an important tool. We have the exact same problem in C++, when template meta programming starts to trigger weird error messages that does not look like the source code we have written.
+
+Clojure macros, C++ templates and meta-programming in general is tricky. Because it happens at compile time, and because it affects our source code, it is especially hard to prove correct or debug. If a language wants to embrace meta-programming to perform complex tasks at compile time, it need powerful tools to debug meta-functions and test them.
+
+This is where I think C++ needs something more. Constexpr functions do help (see next section), concepts will definitively help too, but this is not enough still yet.
+
+The section about compile time computation might have made you think about C++ constexpr functions. This section will briefly talk about constexpr and its importance. A more detailed discussion on constexpr, featuring more involved examples, will follow in the next post.
+
+Before C++11, we could already write C++ meta-functions computing values at compile time. For instance, and to continue on the simple example we introduced in Clojure, we could compute a compile time addition as follows:
+
+We will not go into the details of the different ways to write this meta-function. We recommend you to have a look at this recent article that goes into more details if you want to know more.
+
+The addition of constexpr in C++ did not strictly speaking increased the expressive power of meta-programming in C++. But it sure made it more convenient, as judged by the ease by which we can define compile time computations:
+
+One important note is that a constexpr function can be used to perform both run-time and a compile time computations, depending on the call-site.
+
+As we saw in our previous example, there is not much of a syntax difference between standard functions and macros in Clojure. This characteristic helps tremendously in popularizing the use of meta-programming for Clojurians.
+
+With constexpr, there is a part of C++ meta-programming that has access to the same syntax as the one used for standard function. In this restricted part of C++ meta-programming, there is no need to learn a second language inside the language.
+
+This is a huge boost to the adoption of meta-programming in C++, not by the increase in expressive power, but by the removal of some entry barriers, which effectively increase accessibility.
+
+The constexpr keyword allows to re-use some of our run-time functions as compile time meta-functions. This is a bit different but close to the ability of Clojure to re-use and call any functions inside meta-functions.
+
+As for Clojure, this helps testing our constexp meta-functions. In C++, these functions are made even easier to test than in Clojure since they cannot have any side-effects. The flip side is that constexpr functions have (as of this writing) a more limited reach (see next post) than macros.
+
+This also helps maintenance by removing the burden of defining the same logic twice, once as a function and once as a meta-functions, for cases when we need both. It is always nice not to repeat one-self.
+
+In today’s post, we made our first Clojure macros. We discovered how they work, showed how they could be used to inline code, and played with them to shift simple computations at compile time.
+
+We also talked about the importance of having good debugging and testing tools when doing meta-programming. In this context, we saw how constexpr helped C++ meta-programming adoption, by allowing a similar syntax for runtime and compile time computations and by facilitating tests on meta-functions.
+
+In the next post, we will go a deeper into the world of meta-functions to perform more complex compile time computations. We will discuss macros and constexpr, compare them, and describe some of the advantages of both approaches.
+
+You can follow me on Twitter.|||
+
+In the previous post, we started a series dedicated to familiarise C++ developers to the world of LISP meta-programming, based on the Clojure programming language. The goal is to offer a different perspective on meta-programming, how we can approach it, and the kind of use cases it can address. We started the series by an…

@@ -1,0 +1,102 @@
+Now that we've shown you how to build instant RESTFul API's with RESTHeart and secure your RESTHeart installation, there's just one more step to building instant, secure API's from Compose MongoDB: taking RESTHeart into production.
+
+Over the last few weeks, we've looked at how RESTHeart is a great way to build out a REST API from your MongoDB database. We've gone from a database schema to an "instant" API and then looked at how to make that API more secure with SSL and authentication. Now, we've reached the point where we want to put this into production. We want to have this all running up in the cloud so we can have the seamless API we've been dreaming of. In this third article in our the series, we'll take a small back step and use the Database Identity Manager to secure our credentials. Then, we'll use the Bluemix and CloudFoundry CLIs to deploy RESTHeart to the cloud using the IBM Bluemix Container Service.
+
+In our previous article, we used RESTHeart's to store our users' credentials in a flat file. While that might be ok for some simple use cases, this method stores our users' passwords in the open and does not scale nicely. Fortunately, RESTHeart also ships with a and, since we're already connecting to MongoDB with RESTHeart anyway, it's a breeze to implement.
+
+To use the Database Identity Manager, first pop open your file, navigate to the Security section, and add the following:
+
+Notice that we're also specifying the settings for the as well. This will give us a foundation for role-based security, and since this is something we'll likely want to change only during development, it makes sense to use the for now.
+
+Next, open your file and add the following:
+
+This configuration tells RESTHeart to use the Database Identity Manager, which is bundled with your installation automatically. The field refers to the database that contains your users, and the field is the collection that contains your user accounts. The underscore ( _ ) at the beginning of the collection name means that RESTHeart will treat the accounts collection as a special, reserved collection. Reserved collections are not exposed via the API, and that makes sense; you don't want your usernames and passwords exposed to the world. Finally, make sure you set the option to or your password will be stored in plain text.
+
+Next, beneath the previous dbim section, let's specify the access control settings:
+
+These settings create 3 roles: ADMIN, OPERATOR, and USER and provide various levels of permission to those users. The reserved role specifies what public users are able to access within the API. If you're going to have public access to your RESTFul API, it's best to separate the public section of your application from the rest of your data.
+
+Now, let's try running RESTHeart with our new configuration:
+
+And let's check to logs to make sure it worked:
+
+Uh oh - we got an exception.
+
+Digging into the docs, we'll see that we need to create an initial user in the database before we can start up RESTHeart. But before we do create our user, let's take a quick detour to talk about generating encrypted passwords so our first user will be a secure one.
+
+When we created our file and set the value to , what we told RESTHeart was that our password would be supplied and stored in an encrypted form. A best practice for security, especially in production, is to NEVER store your users' passwords in plain text.
+
+However, MongoDB doesn't have a BCrypt function built into it. So how can we encrypt our passwords? Fear not!
+
+There are many different utilities available to use BCrypt from the command line. For now, we'll choose the Node.JS version and install it using , but in practice any trusted implementation should produce the same results.
+
+Start by installing the command-line wrapper for the library:
+
+Next, let's generate a salted, hashed version of the password for our new user.
+
+This outputs the salted hash string for our new password. We can now safely store this password in our database, and RESTHeart will know how to authenticate against it.
+
+Now that we have a good, strongly encrypted password, we can create our user. We can do this either through the command line interface, or through a script on the server. Since the method we choose doesn't really matter, let's make it simple and use the command line interface:
+
+Next, let's insert a new user with the ADMIN role we created in our access manager.
+
+Notice two things here: first, that we used our encrypted hashed password that we created in the previous step, and second that our "role" looks exactly how we defined it in the file. If all was successful, we should see the user and password when we query the database:
+
+Finally, let's exit the mongo shell and try running RESTHeart one more time:
+
+Alright, that's better. Now that we are using our Database Identity Manager, we can authenticate calls against the database the same as we did before:
+
+Notice that we supply our plaintext password here, rather than the encrypted one. The Database Identity Manager will correctly compare our plaintext password against the encrypted one we stored in the database.
+
+Now that you have your RESTHeart system secured, it's time to deploy them to the open web. Using a service such as the Bluemix Container Service means that we can deploy RESTHeart quickly without having to manage servers or Docker infrastructure ourselves.
+
+Navigate to console.ng.bluemix.net and create an account (or log into your existing account). There are two ways you can deploy your application: in a clustered environment using Kubernetes, or as Docker single and scalable containers. Since our application only has one container, we'll choose the single and scalable containers option.
+
+Follow the instructions on the IBM Bluemix site for creating single and scalable containers. Once you've created the container, download the CloudFoundry CLI in the format appropriate for your platform. We can verify the installation was completed successfully by running the following command:
+
+Next, install the Bluemix CLI for your platform and install the IBM Container Service plugin:
+
+You can verify the installation by checking out the list of installed plugins:
+
+Once you've installed the Bluemix CLI, you'll need to set up your API within the correct region. You'll only need to do this the first time you run the Bluemix CLI:
+
+Now, it's time to log into Bluemix so we can push our RESTHeart image up to it:
+
+Next, we'll want to create a private image registry in the Bluemix Container Service to upload our RESTHeart container image bundled with our custom configuration changes. This needs to be private, rather than on a public registry such as DockerHub, because this image will have full access to our database.
+
+The first step is to create a namespace in the bluemix container registry. You can think of a namespace as the base URL of your registry; you'll likely have a different namespace for every organization or project you wish to deploy.
+
+If we wanted a namespace for this project of compose_restheart, we would have the following:
+
+And now, we'll initialize the Bluemix Container Service for our namespace and account:
+
+Once we've initialized the Container Service, we can start to build our local image. First, we'll put together a simple Dockerfile to tell docker how to build our custom RESTHeart image:
+
+Finally, let's build our container using the Bluemix CLI, which will automatically upload the build image to our private image repository. The flag gives us a tag name that we can use to refer to our image later:
+
+Remember to replace with your actual namespace. If you used our namespace above, your command would look like the following:
+
+We can double-check our image actually made it all the way to our images repository typing the following into the terminal:
+
+You should see your new image listed there.
+
+Now that we've built our RESTHeart container and made it available to the Bluemix Container Service in our private registry, there's just one step left: it's time to run the container!
+
+If all goes well, you should now have a container running in the IBM Bluemix Container Service. You can double-check that your container is running by running the following command:
+
+Your service is now running in the cloud, but we still need to attach it to a public IP address. To find out the IP addresses available to you, run the following command:
+
+NOTE: If you don't see any IP addreses in this list, run the following command to request one.
+
+Then, run the previous command to see the IP addresses leased to you.
+
+Finally, let's bind one of those ip addresses to our running container:
+
+Now, just load up a web browser and navigate to your IP address and port. You can test this now by acessing the built-in data browser by navigating to .
+
+For more information on using the Bluemix Container Service, check out the running single containers tutorial on the Bluemix site.
+
+In this article, we put together the final pieces for a production RESTHeart deployment, allowing you to safely and securely expose MongoDB on the public Internet. You can now create dynamic API's that are automatically generated from your MongoDB data and that can be accessed only by those with the correct roles and permissions. We'll continue to explore the IBM Bluemix Container Service and ways to integrate other Bluemix services in future articles.
+
+If you have any feedback about this or any other Compose article, drop the Compose Articles team a line at articles@compose.com. We're happy to hear from you.|||
+

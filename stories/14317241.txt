@@ -1,0 +1,58 @@
+At FOSDEM, in the awesome Guile track, I briefly demoed a new experimental GuixSD feature as part my talk on system services: the ability to run system services in containers or “sandboxes”. This post discusses the rationale, status, and implementation of this feature.
+
+Our computers run many programs that talk to the Internet, and the Internet is an unsafe place as we all know—with states and assorted organizations collecting “zero-day exploits” to exploit them as they see fit. One of the big tasks of operating system distributions has been to keep track of known software vulnerabilities and patch their packages as soon as possible.
+
+When we look closer, many vulnerabilities out there can be exploited because of a combination of two major weaknesses of GNU/Linux and similar Unix-like operating systems: lack of memory-safety in the C language family, and ambient authority in the operating system itself. The former leads to a huge class of bugs that become security issues: buffer overflows, use-after-free, and so on. The latter makes them more exploitable because processes have access to many resources beyond those they really need.
+
+Security-sensitive software is now increasingly written in memory-safe languages, as is the case for Guix and GuixSD. Projects that have been using C are even considering a complete rewrite, as is the case for Tor. Of course the switch away from memory-unsafe languages won’t happen overnight, but it’s good to see a consensus emerging.
+
+The operating system side of things is less bright. Although the principle of least authority (POLA) has been well-known in operating system circles for a long time, it remains foreign to Unix and GNU/Linux. Processes run with the full authority of their user. On top of that, until recent changes to the Linux kernel, resources were global and there was essentially a single view of the file system, of the process hierarchy, and so on. So when a remote-code-execution vulnerability affects a system service—like in the BitlBee instant messaging gateway (CVE-2016-10188) running on my laptop—an attacker could potentially do a lot on your machine.
+
+Fortunately, many daemons have built-in mechanisms to work around this operating system defect. For instance, BitlBee, and Tor can be told to switch to a separate unprivileged user, and can do that and also change root. These techniques do reduce the privileges of those processes, but they are still imperfect and ad hoc.
+
+The optimal solution to this problem would be to honor POLA in the first place. As an example, the venerable GNU/Hurd is a capability-based operating system. Thus, GNU/Hurd has supported fine-grained virtualization from the start: a newly-created process can be given a capability to its own server (which implements the POSIX notion of processes), to a specific TCP/IP server, etc. In addition, its POSIX personality offers interesting extensions, such as the fact that processes run with the authority of zero or more UIDs. For instance, the Hurd’s program starts off with zero UIDs and gains a UID when someone has been authenticated.
+
+Back to GNU/Linux, “namespaces” have been introduced as a way to retrofit per-process views of the system resources, and thus improve isolation among processes. Each process can run in a separate namespace and thus have a different view of the file system, process tree, and so on (a process running in separate namespaces is often referred to as a “container”, although that term is sometimes used to denote much larger tooling and practices built around namespaces.) Why not use that to better isolate system services?
+
+Apparently this idea has been floating around. systemd has been considering to extend its “unit files” to include directives instructing systemd to run daemons in separate namespaces. GuixSD uses the Shepherd instead of systemd, but running system services in separate namespaces is something we had been considering for a while.
+
+In fact, adding the ability to run system services in containers was a low-hanging fruit: we already had to run code in containers, so all we needed to do was to provide a containerized service starter that uses .
+
+The Shepherd itself remains unaware of namespaces, it simply ends up calling instead of and that’s it. The changes to the service definitions of BitlBee and Tor are minimal. The end result, for Tor, looks like this:
+
+The form above instructs Guix to import our library, which provides , into PID 1. The method of the service specifies the command to start the daemon, as well as file systems to map in its mount name space (“bind mounts”). Here all we need is write access to and to (for logging via syslogd). In addition to these two mappings, automatically adds and a bunch of files in as we will see below.
+
+So what do these containerized services look like when they’re running? When we run , disappointingly, we don’t see anything special:
+
+Again this is because the Shepherd has no idea what a namespace is, so it just displays the daemon’s PID in the global namespace, . The process is running as user , as requested by the command-line option.
+
+We can invoke and take a look at what the BitlBee process “sees” in its namespace:
+
+There’s no and generally very little in BitlBee’s mount namespace. Notably, the namespace lacks , which is where setuid programs live in GuixSD. Its directory contains the minimal set of files needed for proper operation rather than the complete of the host. contains nothing but BitlBee’s own state files, as well as the socket to libc’s name service cache daemon ( ), which runs in the host system and performs name lookups on behalf of applications.
+
+As can be seen in , there’s only a couple of processes in there and “PID 1” in that namespace is the daemon. Finally, the directory is a private tmpfs:
+
+Our process runs in a separate mount, PID, and IPC namespace, but it runs in the global user namespace. The reason for this is that we want the option (which instructs to setuid to an unprivileged user at startup) to work as expected. It also shares the network namespace because obviously it needs to access the network.
+
+A nice side-effect of these fully-specified execution environments for services is that it makes them more likely to behave in a reproducible fashion across machines—just like fully-specified build environments help achieve reproducible builds.
+
+GuixSD and its upcoming release include this feature and a couple of containerized services, and it works like a charm! Yet, there are still open questions as to the way forward.
+
+First, we only looked at “simple” services so far, with simple static file system mappings. Good candidates for increased isolation are HTTP servers such as NGINX. However, for these, it’s more difficult to determine the set of file system mappings that must be made. GuixSD has the advantage that it knows how NGINX is configured and could potentially derive file system mappings from that information. Getting it right may be trickier than it seems, though, so this is something we’ll have to investigate.
+
+Another open question is how the service isolation work should be split between the distro, the init system, and the upstream service author. Authors of daemons already do part of the work via and sometimes . Going beyond that would often hamper portability (the namespace interface is specific to the kernel Linux) or even functionality if the daemon ends up lacking access to resources it needs.
+
+The init system alone also lacks information to decide what goes into the namespaces of the service. For instance, neither the upstream author nor the init system “knows” whether the distro is running and thus they cannot tell whether the socket should be bind-mounted in the service’s namespace. A similar issue is that of D-Bus policy files discussed in this LWN article. Moving D-Bus functionality into the init system itself to solve this problem, as the article suggests, seems questionable, notably because it would add more code to this critical process. Instead, on GuixSD, a service author can make the right policy files available in the sandbox; in fact, GuixSD already knows which policy files are needed thanks to its service framework so we might even be able to automate it.
+
+At this point it seems that tight integration between the distro and the init system is the best way to precisely define system service sandboxes. GuixSD’s declarative approach to system services along with tight Shepherd integration help a lot here, but it remains to be seen how difficult it is to create sandboxes for complex system services such as NGINX.
+
+GNU Guix is a transactional package manager for the GNU system. The Guix System Distribution or GuixSD is an advanced distribution of the GNU system that relies on GNU Guix and respects the user's freedom.
+
+In addition to standard package management features, Guix supports transactional upgrades and roll-backs, unprivileged package management, per-user profiles, and garbage collection. Guix uses low-level mechanisms from the Nix package manager, except that packages are defined as native Guile modules, using extensions to the Scheme language. GuixSD offers a declarative approach to operating system configuration management, and is highly customizable and hackable.
+
+GuixSD can be used on an i686 or x86_64 machine. It is also possible to use Guix on top of an already installed GNU/Linux system, including on mips64el, armv7, and aarch64.|||
+
+GuixSD is GNU's advanced system distribution. GNU is an
+operating system which respects the freedom of computer users. You are free to
+run the system for any purpose, study how it works, improve it, and share it
+with the whole world.

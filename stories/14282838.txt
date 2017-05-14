@@ -1,0 +1,38 @@
+As Quora has continued to grow, we've continued to invest in the scalability of our infrastructure. Caching is a key component of our architecture, and we use Memcached as our primary store to cache results from slower, persistent databases.
+
+While data stores like MySQL, HBase, and Redis offer a variety of tools to monitor performance and efficiency, Memcached doesn't support the same level of detailed introspection out of the box. For example, we regularly analyze Redis backup files to find the relative size of each key, but because Memcached doesn't have any persistence, we can't take the same approach. Rather, Memcached provides only general server status and slab information through its client API, and it doesn't expose more detailed information about memory usage and expiration/eviction semantics. As a result, we were using Memcached to cache the results of a wide variety of functions on the same cluster, but we were blind to how many resources each function used, and we had little direction to optimize our caching.
+
+To better understand what was happening with our Memcached processes under the hood, we built a tool called MCInspector, which we're excited to release as open source today. MCInspector analyzes the memory used by Memcached processes in order to provide an accurate, aggregated summary of all items in a server's memory, and it can also be used to create a filtered dump of all keys in use.
+
+With MCInspector, we were able to identify optimizations that significantly improved both our memory usage and database performance. In this post, we'll describe how we implemented MCInspector as well as our results from using it in production.
+
+Memcached stores objects compactly, using chunks of fixed-size blocks called slabs. Most of the address space in a Memcached server is part of a slab, which is used to store key/value pairs and associated metadata. To analyze slab usage, MCInspector first directly copies the memory of a Memcached process, then scans that memory to find item headers, and finally collects data about them. By directly scanning the memory of a Memcached process, we're able to examine any part of Memcached's inner workings, rather than only the components exposed through the client API or console interface. In order to implement this behavior, we needed to first dive into the Memcached source code, where the structure of data stored in memory is defined.
+
+Let's go through each of these three steps—copying, scanning, and analyzing—in more detail.
+
+First, MCInspector copies the memory contents of a running Memcached process into MCInspector's local address space using the virtual filesystem, which contains information about running processes. We find the allocated memory regions in the process by reading , then use the system call (added in kernel version 3.2) to copy the contents of each region into local address space. Because most of the memory in Memcached servers tends to be in use, MCInspector performs copies in 64MB chunks, in order to avoid allocating too much memory and having Memcached be killed by the OS OOM-killer. Our initial implementation of MCInspector used and read from , but we found that the newer API had significantly less overhead. Moreover, the copied data doesn't need to be consistent, so we don't have to explicitly interrupt the Memcached process while reading its memory.
+
+After copying memory, MCInspector parses that data to find item headers. From the Memcached source code, we know that a space character is always found at a specific position in each item, which we can use as a heuristic to find each header structure. In order to check that each match is indeed an item header, we validate that each value in the header falls within a reasonable range. The below figure illustrates this process in more detail:
+
+Finally, we need to aggregate the data. At Quora, we follow the convention that the category name of each key is a prefix of the key string, ending with the colon character. So, after we find an item, we can simply increment counters for the corresponding category, using metadata like key size, value size, and relevant timestamps.
+
+ 
+
+Results
+
+ 
+
+On an EC2 r3.xlarge instance, the required time to perform a complete analysis on a Memcached process with 130 million objects is about 85 seconds, including 7 seconds to copy memory chunks between processes. MCInspector uses 100% of one CPU core, but since we run Memcached on multi-core virtualized hardware, the performance impact to both the running Memcached process and the client is negligible; neither end-to-end query latency nor throughput noticeably regresses while running the analysis. Though memory is being changed by the Memcached server while this analysis is running—which means the memory snapshot seen by MCInspector is inconsistent—by comparing MCInspector's results with the field in the Memcached output, we found that more than 99.9% of all records are detected (even with high concurrent read/write traffic on the running Memcached process).
+
+With MCInspector deployed to our production servers, we were able to make a number of performance optimizations that we wouldn't have been aware of otherwise.
+
+With these optimizations, the cache ages of some of our critical keys have tripled, while our the total pool size has remained unchanged. Furthermore, load on our MySQL cluster has decreased by over 30%, which provides significantly higher query capacity without any additional cost, making Quora more resilient to traffic spikes. Finally, MCInspector has become an an essential debugging tool for application-level caching issues as well as a key input when scaling up our tier.
+
+ 
+
+Future Work
+
+You can download MCInspector from our Github repository. MCInspector is designed with a plugin architecture in mind, so it should be straightforward to add your own new features that use cache objects' metadata. We plan to keep adding our own new plugins as well!
+
+If you're interested in learning more about our Infrastructure team, which works on scalability problems like this one, check out our careers page!|||
+

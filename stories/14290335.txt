@@ -1,0 +1,144 @@
+The following are slides and a transcript of my talk on ACCU2017 conference in Bristol, UK.
+
+Good afternoon everybody. Thanks for coming, and I hope that during this talk I will be able to tell a thing or three which might be of interest.
+
+As it is said on the tin, I am determined to speak about Determinism (pun intended).
+
+I have to apologise in advance for the number of slides, text, and bullet points – but the topic is quite complicated, and we WILL need most of that stuff.
+
+The first part of the talk will be about ME trying to convince YOU that determinism is a good thing to have – AND that it is worth the trouble of implementing it.
+
+As you can see – there are quite a few items on the list of topics for part I, and we’ll discuss each of them in due course. For now, however, I want to emphasise the most interesting ones, such as Same-Executable Determinism vs Cross-Platform one, Replay-Based Regression Testing, and production post-factum (and even post-mortem) debugging (with a video by an AAA game company showing how they used this technique for one of their games).
+
+In the second part of the talk – we’ll proceed with discussing HOW TO IMPLEMENT those deterministic components which have so many useful properties.
+
+As you can see – it is an even longer list, and once again, for the time being I will merely highlight the most interesting points. These include dealing with multithreading which is a bad source of non-determinism, a technique which I tend to name “call wrapping” (which allows to isolate determinism coming from any conceivable system call), Compatibility Issues, which tend to plague the deterministic implementations – but fortunately only when we’re going beyond Same-Executable Determinism (which is fairly rare), and some of non-issues – which may LOOK as a threat to determinism on the first glance, but which are not.
+
+By this time – we’ll cover those topics related to making of – and benefiting from – deterministic COMPONENTS. In the third and last part of this presentation – we will briefly discuss issues which are related to building the whole large DISTRIBUTED SYSTEMS from these COMPONENTS. Let’s note, however, that building distributed systems is a very large topic – which also depends on the specifics of the applications involved – and we will be able to provide only a very cursory overview of it.
+
+Before we can really start with the presentation, I’d like to make two important announcements. First of all, I have to confess that it is not really MY presentation.
+
+Rather – it is a presentation by this guy (and you can also see him on my t-shirt too).
+
+It means that if there is anything good with this presentation – it should be attributed to me, and if there is anything bad – it is all HIS fault.
+
+BTW, if you think that my accent is bad – you should be grateful that it is not him speaking; his accent is MUCH worse than mine.
+
+And the second and the last thing I want to mention before we can start: slides for this presentation are available online at ithare.com, so if you have your WiFi working and need to take a second look at a slide which is already gone – you can find it there.
+
+Preliminaries aside, we can proceed with the substance of this talk.
+
+The first part of the talk is all about different definitions of determinism, and benefits which can extract out of it.
+
+First of all, let’s start with defining determinism. Our very first definition will go along the following lines: “A program is deterministic if and only if  its outputs are 100% defined by its inputs”.
+
+This definition is quite obvious, and while (as we’ll see later) it leaves quite a bit of room for further interpretation – it will do for the time being.
+
+There are several important observation which follows from our Definition 1. The first one is that “Non-deterministic program cannot be fully testable using only deterministic testing”
+
+This observation is quite obvious (ok, formally it will take half a page to write the proof down – but within this presentation we don’t have enough time to spend it on formalities).
+
+The second observation is that ““Non-deterministic tests have two problems, firstly they are useless, secondly they are a virulent infection that can completely ruin your entire test suite.” This observation, made by Martin Fowler back in 2011, is not easily formalisable – but very briefly, the reasoning behind goes along the lines of “non-deterministic tests won’t be trusted, and will get ignored”. As a side note – sure, there are special methods for testing RNGs (starting from good ol’ Marsaglia Die-Hard testing suite) — but that’s pretty much all usable non-deterministic testing we’ve got (and whoever has run the Marsaglia test – knows how difficult it is to interpret test results, which further supports arguments pushed forward by Fowler).
+
+Now, from these two observations, we can deduce the following observation 3: “Non-deterministic programs are not fully testable”. Let’s note that this observation is not entirely strict, and that it is possible to construct use cases when it doesn’t work (RNG testing is one such example), but it certainly stands for the vast majority of real-world applications.
+
+To illustrate the importance and power of our Observation 3, let’s consider the following two trivial examples. A side note: while code snippets in this presentation are using C/C++ – they’re not really language-specific, and exactly the same concepts will apply across the board.
+
+The first of our examples will be a deterministic function f1(). Test harness for such a function will be fairly straightforward – we’ll just need to intercept stdout, then call the function with required parameters – and bingo! – we have our test – and can run it as a part of our build process to make sure there are no regressions.
+
+But let’s imagine that a bit later, we decided to IMPROVE our function f1(), and produced another function f2(), adding a printout of current time. The whole function became non-deterministic – and this also greatly complicated our job as testers. Not only we need to provide many more test cases – but also RUNNING THOSE TESTS AND ANALYSING RESULTS IS GOING TO BE MUCH MORE COMPLICATED. Sure, our test harness can get or set current time before running f2() – but we don’t have any guarantee that the time will stay the same until the call to time() is reached. As a result – we’d need to account for potential discrepancies – and probably to re-run the test several times to make sure that discrepancy percentage is within the expected boundaries. And for a non-deterministic program which is more complicated than f2() function – this task will become insurmountable very quickly.
+
+On the other hand – of course, we can just parse out current time from our output and make our testing deterministic and well-defined once again – but it will mean that we’re consciously making certain aspects of our function f2() essentially untestable.
+
+From a bit more practical point of view, let’s note that for our program to be deterministic, it is sufficient that (a) we can record all its inputs; (b) when replaying these  recorded inputs against the same program, we always get the same outputs.
+
+This interpretation of determinism is of a very significant practical importance; in fact – most of the benefits we can get from determinism, are based on this record-replay paradigm.
+
+As a result – from this point on, we will assume that we do have a way to record all the program inputs – and to replay them later. How to do it – is a different story, which we’ll discuss a bit further down the road.
+
+Going a bit further into definitions – let’s define two different (and again – very practically important) subtypes of practical deterministic programs:
+
+Definition 2a. “Program is “same-executable- deterministic” if replay guarantees to produce the same result only when it is run on exactly the same executable as the one where recording was made”
+
+Definition 2b. Program is “cross-platform-deterministic” if replay guarantees to produce the same result on ANY platform as long as source code is the same”
+
+As we can see, the difference is all about the relations between the recording program – and the replaying one. In definition 2a of “same-executable determinism”, it MUST be the same executable (that is, not only coming from the same source code – but also produced by the same compiler with the same compiler options for the same target platform). In definition 2b of “cross-platform determinism”, it should be still the same source code, but compiler, compiler options, and even platform can be different.
+
+As we’ll see later, in practice “same-executable determinism” is sufficient to get most of the deterministic goodies; on the other hand – “cross-platform determinism” for real-world programs is known to be VERY ELUSIVE (in particular, due to floating point issues).
+
+And, as we’ll also see later, there are some in-between variations too.
+
+Now, as we defined what determinism is about – we can proceed to discussing its benefits.
+
+The most obvious benefit of determinism, is 100% reproducibility of your bugs. And for anywhere decent developer team, 100% reproducible bug becomes a dead bug very quickly. I worked for quite a few teams where 95% reproducible bugs of reproducible bugs were fixed within a few hours.
+
+From my experience, if going beyond 3rd-party bugs, the most elusive bugs were ones in multithreading – and exactly due to problems with reproducing them. If a bug happens only once a month on a customer’s server – it isn’t likely to be fixed overnight. Once upon a time, we even went as far as writing our own fiber-based thread simulator – exactly to make the system deterministic, and to make bugs reproducible. And as soon as simulator was in place – debugging has sped up at least by factor of 10.
+
+While we’re at it – let’s note that to have 100% reproducibility of the bugs – it is sufficient to have “same-executable determinism”.
+
+Our next determinism-related improvement in testability is Replay-Based Regression Testing. The idea behind it is simple – if we have version N and have records of the inputs and outputs of the real system on version N – we can run them over version N+1, and see whether there are any discrepancies.
+
+One problem behind such Replay-Based Regression Testing is that for it to work, we need that version N+1 should have EXACTLY the same functionality as version N has had (otherwise we’ll be spending time on figuring out whether the discrepancy is legitimate or not, and all subsequent replay after very first legitimate discrepancy will be impossible). And – well, for most of the development out there it is not realistic.
+
+This, however, can be mitigated by the following approach:
+
+One way to implement this split is to attribute all the commits to issues (you’re already doing it in your project, aren’t you?) – and attributing issues to either category is usually pretty easy, which gives us a pretty good idea of whether a specific commit is expected to modify logic.
+
+In practice, most of the time it will turn out that most of added new features (which usually take majority of development) will fall into this category. Most of the time – new features will require some effort from end-user to be activated – and without this new input, the feature should silently sit there, doing exactly nothing.
+
+Then, we can make version N½ consisting only of version N + non-modifying changes, and replay-test it using records from version N. As version N½ is not supposed to have any observable differences from version N – it should produce exactly the same results as version N.
+
+While this half-hearted approach to regression testing cannot test ALL the changes, even regression-testing HALF of the changes (and from what I’ve seen, it usually was more than half) – is a significant improvement compared to regression-testing NONE of the changes.
+
+Let’s note that to enable replay-based regression testing, we need a bit more than same-executable determinism, but less than full-scale cross-platform determinism; in my Overload article on the topic, I named it “Same-platform determinism against minor changes”. In practice – it can cause some issues, but these issues are inherently solvable during testing (and without costing arm and leg either).
+
+Two further fields where determinism comes handy, are equivalence testing and fuzz testing.
+
+Equivalence testing arises when we need to do one of the following:
+
+In practice – equivalence testing can (and should) use records from production – and tends to work very well in these scenarios. Moreover, the first option – testing new implementation – is the only way I know to replace badly-obsoleted-code which nobody-dares-to-touch. Even when new equivalent version is written – convincing management to replace an old working-but-unmaintainable one is usually impossible without a very serious equivalence testing.
+
+As for fuzz testing – it is routinely used for finding security holes in the code; within this presentation, we won’t elaborate on fuzz testing as such – but will rather emphasise synergies of fuzz testing with a replayable deterministic program. First, let’s note that strictly speaking, fuzz testing DOES require determinism (but in practice does work without it <wink />). Second, records allow for a very obvious way to implement fuzz testing for your program: as we already have our records which can be replayed and result analysed – they form an ideal substrate for fuzz testing – because fuzz tester such as an afl will be able to mutate the records and to replay them.
+
+As for required type of determinism to achieve replay-based equivalence testing and fuzz testing – it depends. For replay-based equivalence testing to replace  outdated implementation – we usually need “Same-platform determinism against minor changes”. For replay-based equivalence testing across platforms – we need full-scale “cross-platform determinism” (though let’s note that for testing environments, unlike for production cross-platform determinism, it is achievable). And for fuzz testing – we’re perfectly fine with same-executable determinism.
+
+However well we’re writing our code, from time to time we’re facing the ultimate nightmare: bug in production. These bugs are traditionally very difficult to reproduce – and can easily live for many years in commercially released code.
+
+The holy grail of production debugging – is to fix bugs from the very first occurrence. To achieve it, ideally – we’d like to reproduce it under debugger.
+
+
+
+With deterministic recording/replay, reproducing (and therefore fixing) these otherwise next-to-impossible to identify bugs becomes a breeze: Just record all inputs on the production box – and send them to developers after the problem occurs. BTW, here, “the problem” can be pretty much anything – from core dump, via assertions, and all the way to “user has pressed a button labeled ‘Houston, we have a problem!’”
+
+To achieve this holy grail of post-factum debugging – we need merely a quite-easily-achievable Same-Executable Determinism.
+
+All this stuff may sound as “too theoretical to be of practical use”. To illustrate the power of determinism-based post-factum debugging  in a very practical sense, I want to show one real-world video made by a AAA game development company (specifically Bungie) – which illustrates what they managed to achieve.
+
+Very briefly – they had their game deterministic, and for internal playtesting they added a “the game is lagging” button to the game controller. If this button was pressed – record of those input events which lead to this situation – was sent to developers.
+
+And here goes the fragment of this presentation – illustrating the real-world power of determinism and its abilities for production debugging (my apologies for the video quality – multiple re-compressions don’t help it at all, but it should be enough to get the idea).
+
+Here goes a Fragment from David Aldridge’s presentation “I Shot You First: Networking the Gameplay of HALO: REACH” (courtesy David Aldridge and GDC [[for video see GDC Vault presentation around 1:08-1:10; while I was given permission to use it for presentation – I am not sure whether it is ok to use it on the site]]).
+
+I rest my case about determinism-based production debugging being perfectly feasible in practice.
+
+Two even further goodies which can be obtained from determinism, are related to low-latency stuff – more specifically, to low-latency fault tolerance and to low-latency migration of stateful objects.
+
+Low-latency fault tolerance can be achieved via methods which are similar to fault tolerance known as “virtual lockstep” (which was briefly used by VMWare). Very briefly:
+
+Low-latency migration of stateful objects is a close cousin of the low-latency fault tolerance. It allows to migrate stateful objects from one server to another one (which in turn is often necessary for load balancing and maintenance) – and to do it without incurring the latency cost of serialisation+data_transfer+deserialization.
+
+BTW, let’s note that to achieve both these features – we need merely a relatively-easily-achievable “same-executable” type of determinism.
+
+With all the long list of deterministic benefits, it would be surprising if we didn’t have an “Others” category.
+
+These include at least Deterministic Lockstep and User Replay.
+
+Deterministic Lockstep family of protocols is often used in simulations, including games. The idea is to exchange only the inputs between simulating computers – and that determinism will guarantee that all the instances of the program running on different simulating computers will produce exactly the same result.
+
+
+
+ When it comes to user replay – we’re primarily speaking about ability to record the game on one device (or Server) – and to replay it on another one.
+
+We need to note, that both these techniques require Cross-Platform Determinism (at least across all the platforms of interest) – and as we’ll see, this is not trivial to achieve.|||
+

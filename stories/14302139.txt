@@ -1,0 +1,127 @@
+An API Gateway is a façade that sits between the consumers and producers of an API. Cross-cutting functionality such as authentication, monitoring, and traffic management is implemented in your API Gateway so that your services can remain unaware of these details. In addition, when multiple services are responsible for different APIs (e.g., in a microservices architecture), an API Gateway hides this abstraction detail from the consumer.
+
+There are dozens of different options for API Gateways, depending on your requirements. The Amazon API Gateway is a hosted Gateway that runs in Amazon. Traefik, NGINX, Kong, or HAProxy are all open source options, with their own strengths and weaknesses.
+
+And, of course, there's Envoy, which we've grown fond of at Datawire. Envoy is interesting because, in addition to providing the reverse proxy semantics you need to implement an API Gateway, it also supports the features you need for distributed architectures (in fact, the Istio project builds on Envoy to provide a full-blown services mesh).
+
+So let's take a closer look at deploying Envoy as a full-fledged, self-service API gateway. If you've been following along with our Envoy experiments so far, you've seen that to get a working microservice-based application, we've had to:
+
+Of the five steps, only one has to do with our real application -- the other four have to do with Envoy.
+
+While you could do all these steps manually, we thought there should be an easier way, so we wrote Ambassador, an Envoy-based API Gateway. Here's what Ambassador does:
+
+with, of course, more to come over time.
+
+We're going to assume that your basic infrastructure is set up enough that you have a Kubernetes cluster running in your cloud environment of choice -- and if you don't, your first stop should be another tool we're working on, Datawire's Loom, for help getting set up! For now, we assume that:
+
+That last point is worth a little more discussion. To run something in Kubernetes, we have to be able to pull an Docker image from somewhere that the cluster can reach. When using Minikube, this is no problem, since Minikube runs its own Docker daemon: by definition, anything in the Minikube cluster can talk to that Docker daemon. However, things are different once GKE or EC2 come into play: they can't talk to a Docker daemon on your laptop without heroic measures, so you'll need to explicitly push images somewhere accessible.
+
+Where, exactly? For our purposes today, it doesn't really matter: DockerHub, gcr.io, your private registry, whatever. Going into production, you might want to think about bandwidth costs -- for example, on GKE, pulling images from gcr.io will never incur bandwidth charges, and that might well be an important factor.
+
+We'll be using the same simple user service as before for our application, so once again we'll be using Python, Flask, and Postgres. Here's the really easy way to get all that running:
+
+This will spin up pods for the itself and for its backing Postgres instance. Once it's applied, you should see its pods and services:
+
+At this point, our is running, but it can't be reached from outside our cluster. To verify that it's running, we can get a shell on the pod:
+
+and then do a health check with :
+
+If that works, you'll see the usual health check result:
+
+Given that we can talk to the locally, it's time to set up access from the outside world -- which is exactly what Ambassador is all about.
+
+First things first: are you going to speak TLS to Ambassador or not? It's possible to switch this later, but you'll likely need to muck about with your DNS and such to do it, so it's a pain.
+
+We recommend using TLS, speaking to Ambassador only over HTTPS. To do this, you need a TLS certificate, which means you'll need the DNS set up correctly. So start by creating the Ambassador's kubernetes service:
+
+Be aware that repeating this command will wipe out any certificates you previously saved. On the other hand, repeating it probably means that you had to change hostnames anyway, so that's probably OK.
+
+Applying will create an L4 load balancer that will later be used to talk to Ambassador. By leaving the service intact as you mess with deployments, pods, etc., you should be able to stably associate a DNS name with the service, which will let you request the TLS certificate that you need.
+
+Sadly, setting up your DNS and requesting a cert are a bit outside the scope of this document -- if you don't know how to do this, check with your local DNS administrator. (If you are the local DNS admin and are just hunting a CA recommendation, check out Let's Encrypt.)
+
+Once you have the cert, you can publish certificates:
+
+will push the cert into Kubernetes secret storage, for Ambassador's later use.
+
+Again: if you repeat the above, you will wipe out your certificates and you'll have to rerun .
+
+If you really, really, really want to, you can spin up Ambassador without TLS. We do not recommend this for any production use but you can do it:
+
+will create a service to listen only for plaintext HTTP on port 80.
+
+Be aware that executing this command will wipe out any certificates you previously saved. On the other hand, if you're disabling HTTPS, that's probably what you want to happen.
+
+Once its service is created, we can get Ambassador running in our fabric. Here's the easy way:
+
+Once that's done, you should see two pods and services for Ambassador's component parts:
+
+Ambassador comprises two pods and two services:
+
+At present, only one of each should be run.
+
+You'll need the Ambassador admin interface to configure Ambassador. This isn't exported outside the cluster: you use to reach it (best do this in a new shell window):
+
+Once this is done, will reach the admin interface.
+
+In order to get access to your microservices through Ambassador, you'll need an external URL to Ambassador's service interface. We'll use as shorthand for the base URL of Ambassador.
+
+Make sure that the service has an external IP address listed, then, if you're using TLS, you can set by hand with something like
+
+where is the name you set up when you requested your certs.
+
+Without TLS, if you have a domain name, great! do the above. If not, look at the line of and set based on that. (On Minikube, you'll need to use ) .
+
+In any case, do not include a trailing in , or the examples in this document won't work.
+
+Once all of the above is done, you should be able to do
+
+to verify that Ambassador is running. If all is well, you'll see output like:
+
+and we're in business! If this doesn't work, the most likely scenario is that you're using TLS and the certificates aren't correctly set up -- use
+
+to check what certificates (if any) have been set up where Ambassador can see them, and use
+
+to reset everything after you've changed certificates.
+
+Once you get a clean health check, you can start setting up mappings. Ambassador maps resources named by URL prefixes to services running in Kubernetes. We can map URLs starting with to our with the following request:
+
+Once that's done, we can speak to the using Ambassador:
+
+We can verify all the mappings that Ambassador knows about with
+
+At present, of course, this will show us only the :
+
+Finally, you can remove mappings with a request:
+
+but let's not delete the just yet!
+
+Ambassador also tracks various runtime statistics, which can be retrieved with
+
+This will return a JSON dictionary of statistics about resources that Ambassador presently has mapped. Most notably, the dictionary lets you know basic health information about the services to which Ambassador is providing access:
+
+Of course, an API gateway isn't about only mapping a single service. Suppose we write a new service, now that Ambassador is up and running? Let's set up a service to keep track of the grues that lurk in the caverns our users might go exploring. We'll call that the . The code (which you can find in the repo on GitHub is very similar to the , and you can get it running with:
+
+At this point, we can map to the with a single :
+
+Note the new keyword: by default, Ambassador rewrites whatever prefix matches in a URL to a single , effectively removing it. The code, though, expects requests with a prefix of , so we tell Ambassador to preserve that. We could, of course, rewrite to anything else we wanted.
+
+Once that's done, we can speak to the using Ambassador:
+
+and Ambassador will show us both services if we ask if for its list of mappings:
+
+Note that that single to create the mapping is the only thing that a service author needs to do to get their service hooked into the world: one post, and a few seconds later you can reach your service from wherever. While this obviously means that you need apps to pay attention to security and authorization, it makes things very easy as you develop services.
+
+Ambassador has to keep track of all of the services as well as handling the minutiae of network communications between everyone. All of this routing information needs to be propagated to all the Envoy instances. Luckily, Kubernetes and Envoy provide 90% of the basic functionality, so Ambassador just implements the last 10%.
+
+On the routing side of the world, Kubernetes already has to keep track of where every instance of every service is running, and it already provides APIs to access this information. So all we need to take a crack at this is a simple way to associate URL prefixes with service names.
+
+On the configuration side of the world, Envoy already supports the Service Discovery Service for dynamic configuration of where services can be found (as we saw last time). At this point, it also supports dynamic discovery of clusters and routes, and of course it supports hot reloads, so we have multiple mechanisms for managing Envoy's configuration itself[^1].
+
+[^1]: Ambassador currently uses the hot-reload capability, because Envoy only recently gained the ability to use a route-discovery service.
+
+We've shown how to deploy a microservice in Kubernetes, and expose the microservice to external users through Ambassador, an Envoy-based API Gateway. The logical next step is monitoring, so we'll tackle that next.
+
+We’re happy to help! Look for answers in the rest of the Microservices Architecture Guide, join our Gitter chat, send us an email at hello@datawire.io, or contact our sales team.|||
+
+Envoy's powerful L7 routing capabilities make it well suited for an API Gateway for a microservices architecture.

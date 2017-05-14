@@ -1,0 +1,55 @@
+Update: We’re happy to announce that our session has been accepted at BlackHat USA 2017. Hope to see you there! We will speak in detail about the inner workings of iCloud keychain and the OTR vulnerability.
+
+Longterm Security, Inc. offers consulting services and training to help companies build, ship, and run secure software. You can contact us on our website or by email.
+
+While reviewing attack surfaces on iOS for potential sandbox escapes, we uncovered a critical flaw in a custom Off-The-Record implementation relied upon by iCloud Keychain Sync in addition to a memory trespass error (CVE-2017–2451). The flaws were reported and addressed in one of Apple’s latest security updates. We are currently not aware of any additional uses of the custom OTR implementation.
+
+iCloud Keychain Sync allows users to share passwords across their devices in a secure manner. The protocol has noticeably more security hardening than other cross-device password sharing mechanisms, such as Google Chrome’s password syncing feature, since it employs end-to-end encryption using device-specific keys. This encryption makes iCloud Keychain Sync highly resilient against both compromised user passwords and even a compromised iCloud backend.
+
+The flaw undermined that end-to-end encryption capability and could have allowed a privileged attacker to steal user keychain secrets. In this post we share our findings with the greater security and cryptography communities.
+
+iCloud Keychain, released with iOS7, enables users to share passwords and credit card numbers across all of their devices. iCloud Keychain Sync provides ease of use for securely synchronizing secrets between devices. The iCloud Keychain Recovery mechanism provides a way for users to restore their iCloud Keychain data even when they’ve lost all of their devices. For further details on the Keychain Recovery we refer you to the iOS Security Guide, Apple’s 2016 BlackHat Presentation, and a post by Rich Mogull.
+
+For hardening, iCloud Keychain Sync employs end-to-end encryption when exchanging keychain items so that only the two devices exchanging keychain material can decrypt the information. The encryption relies on a syncing identity key which is unique to each device, and the plaintext of the secrets and encryption keys are never exposed to iCloud. This makes it exceedingly difficult even for an adversary with unrestricted access to the iCloud backend or iCloud communications to decrypt keychain data when transmitted or ephemerally stored in iCloud.
+
+The data transmission occurs via iCloud Key-Value Storage, which is tied to an individual iCloud account for each user. Third-party applications, as well as Apple applications, can use the key-value store to synchronize data for users enrolled in iCloud services. Applications are only allowed access to key-value storage data under their own identifier, and communication to the key-value storage servers is arbitrated by syncdefaultsd and other iCloud system services. Communicating directly with iCloud Key-Value Storage requires knowledge of a user’s password credentials or an intercepted iCloud authentication token. Keychain sync stores data under the com.apple.security.cloudkeychainproxy3 identifier.
+
+Exchanging Messages
+
+iCloud Keychain Sync employs a custom, open-sourced OTR implementation. The Off-The-Record Messaging protocol notably has deniability properties as well as forward secrecy.
+
+In order to receive or transmit OTR data, a device must be part of the “signed syncing circle” which is also stored in the iCloud KVS. Along with metadata about each device, the “signed syncing circle” contains the public syncing identity key of each device.
+
+The implementation encrypts data with AES-128 in CTR mode using keys derived from an authenticated ECDH key exchange. The authentication is performed with the identity keys of each peer, using ECDSA signatures with SHA-256.
+
+Since the encryption is pairwise between two devices, a device has to negotiate an OTR session (if it has not already) and transmit a new OTR message to each device that is part of the “signed syncing circle” to exchange keychain secrets. The attributes of the messages in the iCloud KVS specify the sender and receiver of each OTR message so that the appropriate receiving device can handle the message contents.
+
+It’s worth noting here that not every keychain item will be synchronised by default, instead only keychain items with the kSecAttrSynchronizable attribute set are shared with iCloud Keychain Sync. This includes system WiFi passwords and Safari credentials (such as credit card numbers) when the iCloud Keychain feature is enabled.
+
+As described in the iOS Security Guide, a “signed syncing circle” is created to form a group of trust between multiple devices. In detail, each device generates its own syncing identity keypair, which is an elliptic curve keypair on the secp256r1 curve. The private key is stored in the keychain with the ‘kSecAttrAccessibleAlwaysThisDeviceOnlyPrivate’ attribute so it is only available when a device is unlocked and does not end up in backups.
+
+The “signed syncing circle” is signed both with the private keys from the syncing identities of each device as well as with a key derived from the user’s iCloud password.
+
+In order to update the “signed syncing circle” with a new device, an existing member of the circle must approve an application ticket and add the requesting member’s public key to the circle. This application ticket must be signed with a key derived from the user’s iCloud password, and the approving device similarly prompts the user for the iCloud password to verify. This requires user interaction on the requesting device and on the device already in the circle, to verify that both devices have knowledge of the user’s current iCloud password.
+
+The flaw we uncovered can be seen in the signature verification routine for OTR (available in the Security project). Due to improper error handling, the signature validation could be rendered ineffective by an adversary.
+
+At line [1], the return code of the routine is set to ‘errSecSuccess’ when four bytes are successfully extracted from the incoming handshake message. At line [2], if the incoming message is too short to include the HMAC data, the function will exit. However, the return code will improperly indicate that the signature verification succeeded. This allows an adversary to craft an OTR message which can negotiate a key successfully while bypassing the actual signature verification.
+
+People in the security community may recognise similarities to the Goto-fail flaw with this bug. We look forward to hearing how static analysis tools may be improved to better verify cryptographic code. It could be difficult to find this flaw without annotations since it’s much more of a semantic flaw than the goto-fail error was. This could be a prime example for crypto fuzzing.
+
+Considering that OTR uses ephemeral keys for encryption, this flaw implies that a syncing identity key is no longer required for an adversary with Man In The Middle capabilities to negotiate an OTR session to receive secrets. Although an attacker can not join a signing circle with this flaw, they can impersonate any of the peers in the circle when keychain items are being synced in order to intercept keychain secrets.
+
+For an adversary to gain access to user Keychain secrets, an adversary could leverage this flaw with one of several capabilities to receive keychain secrets. First, assuming that two-factor authentication is not enabled for the user, an attacker with the victim’s iCloud password would be able to directly access and modify entries in the user’s iCloud KVS data. Second, a sophisticated adversary with backend access to iCloud KVS would also be able to modify entries to perform the attack. Third, the ‘syncdefaultsd’ service does not perform certificate pinning for TLS communications. Without key-pinning, a maliciously issued TLS certificate from any trusted system Certificate Authority could intercept TLS sessions to the iCloud KVS web servers and also perform the attack.
+
+The fix addresses the signature verification failure through improved error handling. When combined with another capability, exploiting the flaw could have allowed a privileged attacker to intercept keychain secrets from devices with iCloud Keychain enabled.
+
+Some food for thought on password security. Over the past couple of years many people working in incident response and law enforcement have seen weak passwords or leaked passwords with password reuse, not only phishing, as a primary method of entry for attackers. That’s what makes password safety so critical in the real world.
+
+And in 2016 alone, the security community and general public saw well over five hundred million credentials surface publicly from mass-hack password dumps combined with poor password storage practices. Due to the risk of future mass dumps, passwords alone are just no longer a strong defense mechanism for sensitive data.
+
+Tying back to iCloud — besides well funded adversaries who might be interested in iCloud Keychains, there are opportunistic attackers and criminals looking to leverage and monetize leaked password dumps in any way they can think up. They represent an immediate and constant threat to iCloud as well as any other cloud service. Passwords alone would be fairly risky when storing a trove of user data including credit card numbers.
+
+For these reasons it is a very good idea for organizations to further harden access to any important personal information. Current best practices include multifactor authentication and end-to-end encryption (such as OTR for example).|||
+
+We discovered a goto-fail like flaw in Apple’s OTR implementation
