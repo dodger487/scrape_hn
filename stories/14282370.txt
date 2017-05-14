@@ -1,0 +1,237 @@
+Before doing a deep dive into the topic of scopes, I’d like to make a “quick” detour and talk in more detail about symbols, symbol tables, and semantic analysis. In the spirit of “Anything worth doing is worth overdoing”, I hope you’ll find the material useful for building a more solid foundation before tackling nested scopes. Today we will continue to increase our knowledge of how to write interpreters and compilers. You will see that some of the material covered in this article has parts that are much more extended versions of what you saw in Part 11, where we discussed symbols and symbol tables.
+
+In the final four articles of the series we’ll discuss the remaining bits and pieces. Below you can see the major topics we will cover and the timeline:
+
+While our Pascal program can be grammatically correct and the parser can successfully build an abstract syntax tree, the program still can contain some pretty serious errors. To catch those errors we need to use the abstract syntax tree and the information from the symbol table.
+
+Why can’t we check for those errors during parsing, that is, during syntax analysis? Why do we have to build an AST and something called the symbol table to do that?
+
+In a nutshell, for convenience and the separation of concerns. By moving those extra checks into a separate phase, we can focus on one task at a time without making our parser and interpreter do more work than they are supposed to do.
+
+When the parser has finished building the AST, we know that the program is grammatically correct; that is, that its syntax is correct according to our grammar rules and now we can separately focus on checking for errors that require additional context and information that the parser did not have at the time of building the AST. To make it more concrete, let’s take a look at the following Pascal assignment statement:
+
+
+
+ The parser will handle it all right because, grammatically, the statement is correct (according to our previously defined grammar rules for assignment statements and expressions). But that’s not the end of the story yet, because Pascal has a requirement that variables must be declared with their corresponding types before they are used. How does the parser know whether x and y have been declared yet?
+
+Well, it doesn’t and that’s why we need a separate semantic analysis phase to answer the question (among many others) of whether the variables have been declared prior to their use.
+
+What is semantic analysis? Basically, it’s just a process to help us determine whether a program makes sense, and that it has meaning, according to a language definition.
+
+What does it even mean for a program to make sense? It depends in large part on a language definition and language requirements.
+
+Pascal language and, specifically, Free Pascal’s compiler, has certain requirements that, if not followed in a program, would lead to an error from the fpc compiler indicating that the program doesn’t “make sense”, that it is incorrect, even though the syntax might look okay. Here are some of those requirements:
+
+It is much easier to enforce the above requirements when we have enough context about the program, namely, an intermediate representation in the form of an AST that we can walk and the symbol table with information about different program entities like variables, procedures, and functions.
+
+After we implement the semantic analysis phase, the structure of our Pascal interpreter will look something like this:
+
+From the picture above you can see that our lexer will get source code as an input, transform that into tokens that the parser will consume and use to verify that the program is grammatically correct, and then it will generate an abstract syntax tree that our new semantic analysis phase will use to enforce different Pascal language requirements. During the semantic analysis phase, the semantic analyzer will also build and use the symbol table. After the semantic analysis, our interpreter will take the AST, evaluate the program by walking the AST, and produce the program output.
+
+Let’s get into the details of the semantic analysis phase.
+
+In the following section, we’re going to discuss how to implement some of the semantic checks and how to build the symbol table: in other words, we are going to discuss how to perform a semantic analysis of our Pascal programs. Keep in mind that even though semantic analysis sounds fancy and deep, it’s just another step after parsing our program and creating an AST to check the source program for some additional errors that the parser couldn’t catch due to a lack of additional information (context).
+
+Today we’re going to focus on the following two static semantic checks*:
+
+Let’s start with our first check and make sure that in our Pascal programs variables are declared before they are used. Take a look at the following syntactically correct but semantically incorrect program (ugh… too many hard to pronounce words in one sentence. :)
+
+The program above has one variable declaration and two variable references. You can see that in the picture below:
+
+Let’s actually verify that our program is syntactically correct and that our parser doesn’t throw an error when parsing it. As they say, trust but verify. :) Download spi.py, fire off a Python shell, and see for yourself:
+
+You see? No errors. We can even generate an AST diagram for that program using genastdot.py. First, save the source code into a file, let’s say semanticerror01.pas, and run the following commands:
+
+Here is the AST diagram:
+
+So, it is a grammatically (syntactically) correct program, but the program doesn’t make sense because we don’t even know what type the variable y has (that’s why we need declarations) and if it will make sense to assign y to x. What if y is a string, does it make sense to assign a string to an integer? It does not, at least not in Pascal.
+
+So the program above has a semantic error because the variable y is not declared and we don’t know its type. In order for us to be able to catch errors like that, we need to learn how to check that variables are declared before they are used. So let’s learn how to do it.
+
+Let’s take a closer look at the following syntactically and semantically correct sample program:
+
+The program is grammatically correct, all the variables are declared, and we can see that adding two integers and assigning the result to an integer makes perfect sense. That’s great, but how do we programmatically check that the variables (variable references) x and y in the assignment statement x := x +y; have been declared?
+
+We can do this in several steps by implementing the following algorithm:
+
+This is what a flowchart of our algorithm could look like:
+
+Before we can implement the algorithm, we need to answer several questions:
+
+Our plan of attack will be the following:
+
+Let’s find an answer to the question “What information about variables do we need to collect?”
+
+So, what necessary information do we need to collect about a variable? Here are the important parts:
+
+Symbols will hold that information (name, category, and type) about our variables. What’s a symbol? A symbol is an identifier of some program entity like a variable, subroutine, or built-in type.
+
+In the following sample program we have two variable declarations that we will use to create two variable symbols: x, and y.
+
+In the code, we’ll represent symbols with a class called Symbol that has fields name and type :
+
+As you can see, the class takes the name parameter and an optional type parameter (not all symbols have type information associated with them, as we’ll see shortly).
+
+What about the category? We will encode category into the class name. Alternatively, we could store the category of a symbol in the dedicated category field of the Symbol class as in:
+
+However, it’s more explicit to create a hierarchy of classes where the name of the class indicates its category.
+
+Up until now I’ve sort of skirted around one topic, that of built-in types. If you look at our sample program again:
+
+You can see that variables x and y are declared as integers. What is the integer type? The integer type is another kind of symbol, a built-in type symbol. It’s called built-in because it doesn’t have to be declared explicitly in a Pascal program. It’s our interpreter’s responsibility to declare that type symbol and make it available to programmers:
+
+We are going to make a separate class for built-in types called BuiltinTypeSymbol. Here is the class definition for our built-in types:
+
+The class BuiltinTypeSymbol inherits from the Symbol class, and its constructor requires only the name of the type, like integer or real. The ‘builtin type’ category is encoded in the class name, as we discussed earlier, and the type parameter from the base class is automatically set to None when we create a new instance of the BuiltinTypeSymbol class.
+
+By the way, built-in types are the reason why the type parameter in the Scope class constructor is an optional parameter.
+
+Here is our symbol class hierarchy so far:
+
+Let’s play with the builtin types in a Python shell. Download the interpreter file and save it as spi.py; launch a python shell from the same directory where you saved the spi.py file, and play with the class we’ve just defined interactively:
+
+That’s all there is to built-in type symbols for now. Now back to our variable symbols.
+
+How can we represent them in code? Let’s create a VarSymbol class:
+
+In this class, we made both the name and the type parameters required and the class name VarSymbol clearly indicates that an instance of the class will identify a variable symbol (the category is variable). The type parameter is an instance of the BuiltinTypeSymbol class.
+
+Let’s go back to the interactive Python shell to see how we can manually construct instances of our variable symbols now that we know how to construct BuiltinTypeSymbol class instances:
+
+As you can see, we first create an instance of the built-in type symbol and then pass it as a second parameter to VarSymbol‘s constructor: variable symbols must have both a name and type associated with them as you’ve seen in various variable declarations like var x : integer;
+
+And here is the complete hierarchy of symbols we’ve defined so far, in visual form:
+
+
+
+ Okay, now onto answering the question “Where and how should we store the collected information?”
+
+Now that we have all the symbols representing all our variable declarations, where should we store those symbols so that we can search for them later when we encounter variable references (names)?
+
+The answer is, as you probably already know, in the symbol table.
+
+What is a symbol table? A symbol table is an abstract data type for tracking various symbols in source code. Think of it as a dictionary where the key is the symbol’s name and the value is an instance of the symbol class (or one of its subclasses). To represent the symbol table in code we’ll use a dedicated class for it aptly named SymbolTable. :) To store symbols in the symbol table we’ll add the insert method to our symbol table class. The method insert will take a symbol as a parameter and store it internally in the _symbols ordered dictionary using the symbol’s name as a key and the symbol instance as a value:
+
+Let’s manually populate our symbol table for the following sample program. Because we don’t know how to search our symbol table yet, our program won’t contain any variable references, only variable declarations:
+
+Download symtab01.py, which contains our new SymbolTable class and run it on the command line. This is what the output looks like for our program above:
+
+
+
+ And now let’s build and populate the symbol table manually in a Python shell:
+
+
+
+ At this point we have answers to two questions that we asked earlier:
+
+
+
+ Now let’s find the answer to our third question: ‘How do we implement the “go over all variable declarations” step?’
+
+This is a really easy one. Because we already have an AST built by our parser, we just need to create a new AST visitor class that will be responsible for walking over the tree and doing different actions when visiting VarDecl AST nodes!
+
+Now we have answers to all three questions:
+
+
+
+ Let’s create a new tree visitor class and give it the name SemanticAnalyzer. Take a look the following sample program, for example:
+
+To be able to analyze the program above, we don’t need to implement all visit_xxx methods, just a subset of them. Below is the skeleton for the SemanticAnalyzer class with enough visit_xxx methods to be able to successfully walk the AST of the sample program above:
+
+Now, we have all the pieces to implement the first three steps of our algorithm for our first static semantic check, the check that verifies that variables are declared before they are used.
+
+Here are the steps of the algorithm again:
+
+
+
+ Let’s implement those steps. Actually, the only thing that we need to do is fill in the visit_VarDecl method of the SemanticAnalyzer class. Here it is, filled in:
+
+If you look at the contents of the method, you can see that it actually incorporates all three steps:
+
+To see all of those steps in action, download file symtab02.py and study its source code first. Then run it on the command line and inspect the output:
+
+You might have noticed that there are two lines that say Insert: INTEGER. We will fix this situation in the following section where we’ll discuss the implementation of the final step (Step 4) of the semantic check algorithm.
+
+
+
+ Okay, let’s implement Step 4 of our algorithm. Here is an updated version of Step 4 to reflect the introduction of symbols and the symbol table: When you see a variable reference (name) such as in the assignment statement x := x + y, search the symbol table by the variable’s name to see if the table has a variable symbol associated with the name. If it does, the variable has been declared. If it doesn’t, the variable hasn’t been declared yet, which is a semantic error.
+
+To implement Step 4, we need to make some changes to the symbol table and semantic analyzer:
+
+First, let’s update our SymbolTable class by adding the lookup method that will be responsible for searching for a symbol by name. In other words, the lookup method will be responsible for resolving a variable name (a variable reference) to its declaration. The process of mapping a variable reference to its declaration is called name resolution. And here is our lookup method that does just that, name resolution:
+
+The method takes a symbol name as a parameter and returns a symbol if it finds it or None if it doesn’t. As simple as that.
+
+While we’re at it, let’s also update our SymbolTable class to initialize built-in types. We’ll do that by adding a method _init_builtins and calling it in the SymbolTable‘s constructor. The _init_builtins method will insert a type symbol for integer and a type symbol for real into the symbol table.
+
+Here is the full code for our updated SymbolTable class:
+
+
+
+ Now that we have built-in type symbols and the lookup method to search our symbol table when we encounter variable names (and other names like type names), let’s update the SemanticAnalyzer‘s visit_VarDecl method and replace the two lines where we were manually creating the INTEGER built-in type symbol and manually inserting it into the symbol table with code to look up the INTEGER type symbol.
+
+The change will also fix the issue with that double output of the Insert: INTEGER line we’ve seen before.
+
+Here is the visit_VarDecl method before the change:
+
+Let’s apply the changes to the familiar Pascal program that has only variable declarations:
+
+Download the symtab03.py file that has all the changes we’ve just discussed, run it on the command line, and see that there is no longer a duplicate Insert: INTEGER line in the program output any more:
+
+You can also see in the output above that our semantic analyzer looks up the INTEGER built-in type twice: first for the declaration of the variable x, and the second time for the declaration of the variable y.
+
+
+
+ Now let’s switch our attention to variable references (names) and how we can resolve a variable name, let’s say in an arithmetic expression, to its variable declaration (variable symbol). Let’s take a look at the following sample program, for example, that has an assignment statement x := x + y; with three variable references: x, another x, and y:
+
+We already have the lookup method in our symbol table implementation. What we need to do now is extend our semantic analyzer so that every time it encounters a variable reference it would search the symbol table by the variable reference name using the symbol table’s lookup name. What method of the SemanticAnalyzer gets called every time a variable reference is encountered when the analyzer walks the AST? It’s the method visit_Var. Let’s add it to our class. It’s very simple: all it does is look up the variable symbol by name:
+
+
+
+ Because our sample program SymTab4 has an assignment statement with arithmetic addition in its right hand side, we need to add two more methods to our SemanticAnalyzer so that it could actually walk the AST of the SymTab4 program and call the visit_Var method for all Var nodes. The methods we need to add are visit_Assign and visit_BinOp. They are nothing new: you’ve seen these methods before. Here they are:
+
+
+
+ You can find the full source code with the changes we’ve just discussed in the file symtab04.py. Download the file, run it on the command line, and inspect the output produced for our sample program SymTab4 with an assignment statement.
+
+Here is the output on my laptop:
+
+Spend some time analyzing the output and making sure you understand how and why the output is generated in that order.
+
+At this point, we have implemented all of the steps of our algorithm for a static semantic check that verifies that all variables in the program are declared before they are used!
+
+So far we’ve looked at the programs that had their variables declared, but what if our program has a variable reference that doesn’t resolve to any declaration; that is, it’s not declared? That’s a semantic error and we need to extend our semantic analyzer to signal that error.
+
+Take a look at the following semantically incorrect program, where the variable y is not declared but used in the assignment statement:
+
+To signal the error, we need to modify our SemanticAnalyzer‘s visit_Var method to throw an exception if the lookup method cannot resolve a name to a symbol and returns None. Here is the updated code for visit_Var:
+
+Download symtab05.py, run it on the command line, and see what happens:
+
+You can see the error message Error: Symbol(identifier) not found ‘y’ and the contents of the symbol table.
+
+Congratulations on finishing the current version of our semantic analyzer that can statically check if variables in a program are declared before they are used, and if they are not, throws an exception indicating a semantic error!
+
+Let’s pause for a second and celebrate this important milestone. Okay, the second is over and we need to move on to another static semantic check. For fun and profit let’s extend our semantic analyzer to check for duplicate identifiers in declarations.
+
+Let’s take a look at the following program, SymTab6:
+
+Variable y has been declared twice: the first time as integer and the second time as real.
+
+To catch that semantic error we need to modify our visit_VarDecl method to check whether the symbol table already has a symbol with the same name before inserting a new symbol. Here is our new version of the method:
+
+
+
+ File symtab06.py has all the changes. Download it and run it on the command line:
+
+Study the output and the contents of the symbol table. Make sure you understand what’s going on.
+
+
+
+ And, as a reminder, the structure of our interpreter now looks like this:
+
+
+
+ We’re done with semantic checks for today and we’re finally ready to tackle the topic of scopes, how they relate to symbol tables, and the topic of semantic checks in the presence of nested scopes. Those will be central topics of the next article. Stay tuned and see you soon!|||
+
+Anything worth doing is worth overdoing. Before doing a deep dive into the topic of scopes, I’d like to make a “quick” detour and talk in more detail about symbols, symbol tables, and semantic analysis. In the spirit of “Anything worth doing is worth overdoing”, I hope you’ll …

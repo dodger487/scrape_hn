@@ -1,0 +1,100 @@
+This post explores an old but wonderful vulnerability that enables us to really showcase the (oft underestimated) power of the use-after-free vulnerability class.
+
+We’re going to take a step back and consider the wider class of “use-after-invalidation”, of which use-after-free is one type of use of invalidated state. We will see one single area of vulnerable code that has it all: use-after-invalidation leading to out of bounds reads and writes; use-after-free leading to object aliasing; use-after-free leading to information leakage and more. It’s hard to imagine a better real vulnerability exists for the study of this area.
+
+We’ll dive into all the different side effects a use-after-free can have, and -- of course!! -- get to the stage of working and highly reliable exploits.
+
+ships an out of date WebKit and Linux distributions are no different. So it wasn’t really a surprise to me to look at an old but still supported Linux distribution, Ubuntu 12.04 LTS, and find the same vulnerability present. To explore this vulnerability, I’m using 32-bit and 64-bit versions of fully patched Ubuntu 12.04 LTS, and the WebKit backend for the Konqueror browser.
+
+[Note: since starting to write this post, Ubuntu 12.04 LTS has passed end of life.]
+
+The vulnerability is a range of issues leading to memory corruption in the C++ code backing the JavaScript API. The manifestation of the vulnerability changed over its lifetime as various code changes and optimizations were made. The 2013 exploit is based on this version of the
+
+We won’t dwell on this one for long because this behaves differently to our Ubuntu version. But briefly:
+
+For the purposes of discussion, let’s assume that we have a JavaScript of length 2, containing the values 0, 0. At [1] above, the used size is 2. At [2], the loop will iterate twice, locating the two defined values and eventually leaving the loop with being set to 2. [3] is where the problems occur: inserting into the sort tree causes a callback into JavaScript and this callback can mess with the that we’re currently sorting. If our callback specifically calls , we’ll get some fireworks. Shifting the essentially removes the first element and internally this is accomplished by bumping the pointer along one element (8 bytes), and reducing the size by one. At [4], the code still believes the has length two, so will iterate twice and write two sorted values. However, the write will start at an pointer that was bumped along by one element. This is an out-of-bounds write, aka. buffer overflow! You might wonder if it’s possible to just make the array smaller via more conventional means such as , and achieve similar results. As it happens, the code is very reluctant to reallocate the backing store to a smaller size so the exploitation path is the only obvious one.
+
+// Check that it is possible to allocate an array large enough to
+
+for (SparseArrayValueMap::iterator it = map->begin(); it != end; ++it) {
+
+There’s a lot going on here, but in an attempt to make sense of the possibilities, there is a color code:
+
+Most of the problems occur because the pointer is cached as a stack local variable at [1], but the memory allocation for the actual storage can get moved during the JavaScript sort callback at [4] and [9], if for example the is shifted or expanded. Direct fallout is at [3], [5], [11], [12], [13] with a significant secondary fallout at [10] that we’ll cover later.
+
+Another problem occurs because the length of the sort node allocation at [2] can become invalid, with buffer overflow resulting at [8] if the attacker does things in the right order. This is an interesting use-after-invalidation leading to out-of-bounds write. This post will concentrate on the use-after-free opportunities but still, it’s interesting to see a single vulnerable area lead to side a wide range of side effects and different vulnerability classes.
+
+The final problem of note occurs because the end iterator of a map is taken at [7] but the map itself could be changed (have keys added or removed) in the callback at [9], which may invalidate any existing iterators.
+
+To continue exploring the effects of these vulnerabilities, and how they might lead to exploitation, we need to understand our exact invalidation options and also how the allocator affects matters.
+
+By invalidation options, we’re talking about what exactly to do inside the JavaScript callback to change the state of the mid-sort. Here is what we can do:
+
+The allocator used has a bearing on how the various invalidations above behave. Looking in , we see the storage is allocated like this (example from one of the constructors):
+
+Let’s look at some specific JavaScript proof of concept code for some of the problems:
+
+This is an interesting situation, but not one we’ll use for any of our exploits, so let’s get it out of the way:
+
+, of length 2. This will result in a buffer allocation of size 2 at point [2] in the C++ code. As the element values 1 and 2 are compared in the first sort iteration, the JavaScript callback adds lots of elements to the that will go into the sparse map because the indexes are very large. Later, at point [8] in the C++ code, the sparse map will be iterated and all of the elements will be added to the buffer allocated earlier. But, the sparse map contains 256 elements and the buffer is only 2 elements large. The buffer contains some slop space due to a default minimum capacity of 16, but 256 elements is enough to fill the slop space and smash some adjacent allocation. On 64-bit, the eventual crash looks like:
+
+Since this is a linear buffer overflow, heap spraying would be needed to place an interesting chunk in the area of corruption. Heap spraying is usually probabilistic instead of deterministic, so is disfavored for highly reliable exploits. We’ll see below how use-after-invalidation vulnerabilities can offer significantly greater reliability.
+
+If you run this in 32-bit Konqueror, it’ll output something like: “leaked: 0xad9955c0”. If you run it in 64-bit Konqueror, it will crash. We’ll get to that later as it complicates our 64-bit exploit. To focus on why this works on 32-bit, let’s use a diagram:
+
+In the above diagram, we see how the exact same single chunk will look before and after the operation. The same allocation, contains both a C++ object header (24 bytes on 32-bit) as well as the actual variable length of elements, which are all 8 bytes each in order to accommodate a double floating point value if necessary. The C++ object header, a , is colored yellow. Element storage is colored green. The object member labelled , a pointer to the beginning of the chunk, and it is this useful value that we leak.
+
+The leak occurs because the chunk of memory to iterate for the sort, shown in orange above, is fixed at the beginning of the sort. However, the splice operation is called in the middle of the sort, in the JavaScript sort callback, when elements 0 and 1 are being compared. The splice shifts the C++ object header along into the predetermined (and now invalid!) iteration range. When elements 2, 3 are read, the reads actually read the values of the object. These values will be treated as doubles but luckily the JavaScript class can convert a double into raw bytes for extraction of the pointer.
+
+This is an exceptionally reliable primitive -- likely deterministic, because no allocator churn is involved. This is more of a use-after-invalidation than a use-after-free because nothing is actually freed. No out-of-bounds access relative to a heap chunk occurs either.
+
+Finally, we should note that this primitive isn’t just a use-after-invalidation read, it’s also a use-after-invalidation write because if the sort changes the ordering of the elements, the object will be corrupted. There are a large number of possibilities here that remain unexplored.
+
+If we run this on 64-bit, our alerts will come out something like: 2; 9c04c290; 7fbd.
+
+The situation we cause here is simple but powerful. First, a dense 2 element is created. This is a 40 byte header plus 2x 8 byte elements on 64-bit, for a total of a a 56 byte allocation. During the sort JavaScript callback, the is expanded such that it no longer fits inside the 56 byte allocation. A new allocation is made, the current contents are copied, and the old allocation is freed. The vulnerability is that the storage pointer cached at [1] in the C++ code becomes invalid and using it at [12] and [13] is a use-after-free write.
+
+What will the use-after-free trample over? Because of the bucketing and LIFO nature of the allocator, the attacker gets to choose the object that occupies the recently freed slot simply by causing an allocation of the same size. In the JavaScript above, we just allocate a 56 byte backing buffer. As luck would have it, backing buffers are also allocated with so we’re set. The use-after-free tramples over our nice pristine zero filled buffer. The number of elements in the sorted is written, which is the value 2 as seen in the alerts. The elements are also written, which we have chosen to be JavaScript objects in this case. That gives us another useful information leak, telling us where in virtual memory any JavaScript object resides.
+
+As in most of these situations, there remain many unexplored avenues in the tree of possibilities:
+
+Situation #4: invalidated pointer to map leading to use-after-free read leading to arbitrary free
+
+On 64-bit, this leads to:
+
+As you will appreciate, that’s pretty serious looking. And such a simple JavaScript file. What happened? This is in fact a pretty similar use-after-free to situation #3. It starts off identically, object sizes and all. However, instead of creating and leaving a zero filled buffer in the freed slot, we set a few of the zeros to the byte value 0x41, at offset 8. Offset 8 corresponds to the object member . This member is loaded through a stale pointer at [5] in the C++ code. This is a use-after-free read with bad pointer dereference as the immediate side effect. The crash occurred trying to load , with map being a nonsense pointer value of 0x41414141. If we had used a valid pointer value instead, we’d maybe iterate over some map keys and then call delete on whatever the valid pointer was, at [10]. The ability to free arbitrary pointers is pretty powerful and could lead to tertiary side effects such as use-after-free like situations of more arbitrary object types.
+
+The reliability of this attack is very high. It’s almost deterministic because the allocator behavior for handing out memory chunks is deterministic, and the attacker controls the exact order of allocations and frees from JavaScript. However, for completeness, we should note that we haven’t fully analyzed the situation with regards threading and timers. These are questions we would need to answer if trying to make a truly 100% reliable exploit:
+
+Now that we’ve enumerated various different use-after-invalidation possibilities, it’s time to consider chaining some of them together to try and get a reliable exploit working. We will start with 64-bit just because.
+
+The number of different side effects we have to play with, as partially enumerated above, is large and possibly even a little overwhelming. If we consider secondary and tertiary etc. side effects that are possible, we’re into a blossoming tree of weird machine explorations! As always, though, one key to reliable exploitation is to try and keep things as simple as possible. So we’re going to try and rewire objects to get to a stage where we can cleanly read and write arbitrary locations in the virtual address space. The typical way of doing this is to gain control of a
+
+After a bit of consideration, we’re going to do this by:
+
+By chaining together the primitives we already have, we’ve gained a new powerful primitive: arbitrary object aliasing!
+
+But before we can get all excited and use this primitive, we need to resolve an important issue: going back to primitive #2 above, the ability to leak the address of an object, we see that it crashed on 64-bits :( Why is this? The answer is in the way JavaScriptCore internally represents JavaScript values. They are 8 byte values on both 32-bit and 64-bit, and can variously represent JavaScript numbers (doubles), boolean values, undefined values, null values and also arbitrary JavaScript objects. The way these different types are encoded differs between 32-bit and 64-bit, hence the difference in behavior. Of interest is when an 8 byte value is considered a JavaScript object -- termed a cell -- instead of a simple type like a number. Extracted and summarized from
+
+// (This is the 32 bits case)
+
+// (This is the 64 bits case)
+
+returns the latter 4 bytes of the value, . Decoding all of this, the format of a cell pointer on 32-bit will be the actual 32-bit cell pointer followed by 0xfffffffb. On 64-bit, it will simply be the actual raw pointer itself (the tag mask selects for x86_64 style 48-bit pointers, with a partial alignment constraint). Aha! So this means that on 64-bit, as we’re trying to use and leak our real pointer to the object, it will get interpreted as a JavaScript cell pointer and obviously that is not going to end well. On 32-bit, any pointer value we want to leak will work fine unless it is followed in memory by the 4 byte value 0xfffffffb. Looking at the full
+
+unsigned m_length; // The "length" property on the array        void* subclassData; // A JSArray subclass can use this to fill the vector
+
+But on 64-bit, we really want to leak a real pointer value. It’s a headache that attempting the leak creates a JavaScript reference that causes a crash when used. In order to solve this issue, we can actually resort to combining situation #2 and situation #3 above. The full sequence is:
+
+Ok. Now that we’ve fixed our information leak primitive on 64-bit, our object aliasing primitive that depends on it will now work. Let’s describe the full exploitation sequence:
+
+Surprise! Bonus! The very same exploit file actually works on 32-bit. The code acts a bit differently to use different object sizes, object field offsets and deltas. But the steps taken are the same for both the 64-bit and 32-bit cases.
+
+There are some similarities but It takes a different path and also achieves reliable code execution. This is perhaps a testament to the quality of the vulnerability. Briefly, this alternate exploit works like this:
+
+The main quirk here enabling this alternate and slightly simpler exploit on 32-bit is the observation that on 32-bit, . Due to the 8 byte granularity of small buckets, these two different objects occupy the same heap bucket size of 24.
+
+The astute reader will note that use-after-free in WebKit might be subject to the same exploitation technique in JavaScript: allocate a backing buffer into the freed hole and then enjoy a wide variety of side effects. This is definitely a concern! And it also illustrates the power and possibilities of the use-after-free vulnerability class. Using this technique, the attacker gets to choose arbitrary bytes for every field in the object that is being used after free. The attacker can pick an arbitrary vtable (call-after-use-after-free), arbitrary flags / arbitrary length (read-after-use-after-free), fake arbitrary object pointers (call or read or write-after-use-after-free), etc. If the code paths available to the attacker include write-after-use-after-free, the attacker might well be able to access information leaks, or perform precision corruption of other similarly sized object types.
+
+I think that use-after-invalidation and use-after-free are wonderful and maybe underappreciated vulnerability classes. Perhaps after reading this post, you concur? We selected a suitably interesting and powerful vulnerability and demonstrated a large range of reliable, controllable and powerful side effects.|||
+
