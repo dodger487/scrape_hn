@@ -1,0 +1,47 @@
+In today’s IT world, most companies, both small and large alike, have multiple APIs. Regardless of numerous best practices, most of the time fault tolerance can’t fully guarantee that client requests will be processed correctly, that it will be possible to restore the system after a failure and continue processing the requests that were lost when the system crashed. Even IT giants are plagued by this issue, not to mention smaller enterprises.
+
+I work at Calltouch, whose main goal is to make services fault-tolerant and give users control over their data and the requests that clients made to the API. We need to be able to quickly get a failed service up and running and process incoming requests while a service’s having difficulties doing so. Processing starts from the failure point. This approach makes it nearly impossible to lose client requests on our side.
+
+When we studied solutions available on the market, we discovered great performance and virtually unbounded possibilities for data management and processing, given quite moderate technical and financial requirements.
+
+Calltouch has a service API that receives payload requests for building reports directly in the web interface. The data contained in these requests is extremely important: it’s used in marketing, and if it’s lost, the service may display some erratic behavior. As is often the case, a service may experience certain problems following the rollout or an update, sometimes leading to downtime. That’s why it’s necessary to be able to quickly process those payload requests that weren’t delivered to the service API due to failure. Load balancing and backups alone aren’t enough, and here’s why:
+
+A relatively simple task (storing requests and quickly accessing them) entails high overhead expenses. That said, we decided to conduct a research of available solutions that allow storing incoming requests and providing high-speed access to them.
+
+We considered several approaches to storing data.
+
+Save payload requests by using Nginx logs and store them someplace. In case of problems, the service API accesses the data that’s stored somewhere and performs any necessary processing.
+
+Implement the duplication of HTTP requests to multiple locations and write an auxiliary service for saving data.
+
+Configuring a web server to save data to logs for further processing has its downsides. This solution is rather expensive, and the data access speed is going to be extremely slow. It requires additional services for processing logs, aggregating and storing data. And it takes a huge amount of money to deploy new services, to train system administrators and, potentially, to buy new hardware. Most importantly, if a similar solution hasn’t been in place before, you’ll have to spend some time deploying it to production. These factors drove our decision to drop the first option right from the start and explore ways to implement the second one.
+
+We were choosing between Nginx, GoReplay и Lwan.
+
+The first item we crossed off our list was Lwan, since GoReplay could do everything we needed, so it boiled down to Nginx with @post_action vs GoReplay. GoReplay was ideal for this scheme, but we decided to take our time and think carefully about where and how to better store requests.
+
+We didn’t have to worry about storage until some later time, but we needed to have some form of a link between the processed and raw (unprocessed) data. The API for which we were implementing request duplication didn’t support IDs in client-side requests. At some point, it became necessary to be able to insert additional data into an incoming payload request, which would enable us to link raw data to the processed one: after all, not only raw data would make its way to the database. Then we had to think of a way to deal with all the incoming data.
+
+To solve the request ID issue, we decided to add to each request a header containing a UUID on the server side and then to proxy these requests to the service API, so that it would modify or delete duplicate requests once they’re processed. Here we chose Nginx over GoReplay, because it supports numerous modules, including the one that allows writing to multiple databases. This simplified the data processing scheme and reduced the number of auxiliary services required to implement this solution. Besides, we didn’t have to learn new languages and tweak GoReplay to meet our needs.
+
+The simplest way was to pick an Nginx module that could write all the payload contained in incoming requests to some database. We didn’t fancy the idea of writing extra code or messing with the configuration file. A Tarantool module that allows proxying all the data to Tarantool out of the box proved to fit the bill perfectly for us.
+
+Now let’s take a look at the simplest configuration and a short Lua script for Tarantool that logs the bodies of all incoming requests. Service interaction is explained in the image below:
+
+In this setup, we need Nginx with a couple of Tarantool modules:
+
+Example of Nginx upstream configured to work with Tarantool:
+
+Example of configuration for proxying data to Tarantool with post_action:
+
+Example of a Tarantool procedure that receives incoming data from Nginx:
+
+This little Lua script and relatively simple Nginx configuration can be regarded as pretty much the whole solution. The API part isn’t considered here, as it doesn’t make much sense: you just have to implement it, whichever approach you stick with. You can augment this scheme with master-master replication that Tarantool provides and with multi-node load balancing implemented with Nginx or twemproxy.
+
+Since post_action sends data to Tarantool a few milliseconds after a request is received and processed by the API, our scheme has one peculiarity. If the API is as fast as Calltouch, you have to make several delete requests or issue a timeout before making a request to Tarantool. We went with the first option not to slow down our services, so they work as fast as they used to.
+
+I’d like to wrap this article up by saying that Nginx alone with nginx_upstream_module in conjunction with Tarantool is enough to achieve incredible flexibility and simplicity when working with HTTP requests, and to access data at high speed without disrupting the main workflow and making any significant changes to the existing infrastructure. This bundle can handle various tasks, from generating complex statistics to simply saving requests, not to mention the fact that you can use it as a regular web service and implement the API based on nginx_upstream_module and Tarantool.
+
+Here’re some of my ideas for potential Calltouch improvements:|||
+
+In today’s IT world, most companies, both small and large alike, have multiple APIs. Regardless of numerous best practices, most of the time fault tolerance can’t fully guarantee that client requests…

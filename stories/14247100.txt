@@ -1,0 +1,193 @@
+This guide answers the question of how to setup and operate a fully functional, secure Kubernetes cluster on a cloud provider such as DigitalOcean or Scaleway. It explains how to overcome the lack of external ingress controllers, fully isolated secure private networking and persistent distributed block storage.
+
+Be aware, that the following sections might be opinionated. Kubernetes is an evolving, fast paced environment, which means this guide will probably be outdated at times, depending on the author's spare time and individual contributions. Due to this fact contributions are highly appreciated.
+
+This guide is accompanied by a fully automated cluster setup solution in the shape of well structured, modular Terraform recipes. Links to contextually related modules are spread throughout the guide, visually highlighted using the Terraform icon.
+
+The professional hobbyist cluster operators aim for resilience—a system's ability to withstand and recover from failure. On the other hand, they usually have a limited amount of funds they can or want to spend on a basic cluster. It's therefore crucial to find a good balance between resilience and cost.
+
+After experimenting with various setups and configurations a good reference point is, that a basic cluster can be operated on as little as two virtual hosts with 1GB memory each. At this points it's worth mentioning that Kubernetes does not include swap memory in its calculations and will evict pods pretty brutally when reaching memory limits (reference). As opposed to memory raw CPU power doesn't matter that much, although it should be clear that the next Facebook won't be running on two virtual CPU cores.
+
+For a Kubernetes cluster to be resilient it's recommended that it consists of at least three hosts. The main reason behind this is that etcd, which itself is an essential part of any Kubernetes setup, is only fault tolerant with a minimum of three cluster members (reference).
+
+At this point it's time to choose a cloud provider based on a few criteria such as trustworthiness, reliability, pricing and data center location. The very best offer at this time is definitely Scaleway where one gets a three node cluster up and running with enough memory (3x2GB) for less than €10/month. Unfortunately, Scaleway has currently only two data centers located in Paris and Amsterdam.
+
+DigitalOcean is known for their great support and having data centers around the globe which is definitely a plus. The downside is that a three node cluster with a suitable amount of memory (3x1GB) sets you back $30/month.
+
+Linode, Vultr and a couple of other providers with similar offers are other viable options. While they all have their advantages and disadvantages, they should be perfectly fine for hosting a Kubernetes cluster.
+
+While Linux comes in many flavors, Ubuntu (LTS) is the distribution of choice for hosting our cluster. This may seem opinionated—and it is—but then again, Ubuntu has always been a first class citizen in the Kubernetes ecosystem.
+
+CoreOS would be a great option as well, because of how it embraces the use of containers. On the other hand, not everything we might need in the future is readily available. Some essential packages are likely to be missing at this point, or at least there's no support for running them outside of containers.
+
+That being said, feel free to use any Linux distribution you like. Just be aware that some of the sections in this guide may differ substantially depending on your chosen operating system.
+
+This is a tough one. Almost every single guide fails to bring the security topic to the table to the extent it deserves. One of the biggest misconceptions is that private networks are secure, but private does not mean secure. In fact, private networks are more often than not shared between many customers in the same data center. This might not be the case with all providers. It's generally good advise to gain absolute certainty, what the actual conditions of a private network are.
+
+While there are definitely some people out there able to configure iptables reliably, the average mortal will cringe when glancing at the syntax of the most basic rules. Luckily, there are more approachable solutions out there. One of those is UFW, the uncomplicated firewall—a human friendly command line interface offering simple abstractions for managing complex iptables rules.
+
+Assuming the secure public Kubernetes API runs on port 6443, SSH daemon on 22, plus 80 and 443 for serving web traffic, results in the following basic UFW configuration:
+
+This ruleset will get slightly expanded in the upcoming sections.
+
+Kubernetes cluster members constantly exchange data with each other. A secure network overlay between hosts is not only the simplest, but also the most secure solution for making sure that a third party occupying the same network as our hosts won't be able to eavesdrop on their private traffic. It's a tedious job to secure every single service, as this task usually requires creating and distributing certificates across hosts, managing secrets in one way or another and, last but not least, configuring services to actually use encrypted means of communication. That's why setting up a network overlay using VPN—which itself is a one-time effort requiring very little know how, and which naturally ensures secure inter-host communication for every possible service running now and in the future—is simply the best solution to address this problem.
+
+When talking about VPN, there are generally two types of solutions:
+
+VPN software running in userland has in general a huge negative impact on network throughput as opposed to IPsec, which is much faster. Unfortunately, it's quite a challenge to understand how the latter works. strongSwan is certainly one of the more approachable solutions, but setting it up for even the most basic needs is still accompanied by a steep learning curve.
+
+A project called WireGuard supplies the best of both worlds at this point. Running as a Kernel module, it not only offers excellent performance, but is dead simple to set up and provides a tunnel interface out of the box. It may be disputed whether running VPN within the Kernel is a good idea, but then again alternatives running in userland such as tinc or fastd aren't necessarily more secure. However, they are an order of magnitude slower and typically harder to configure.
+
+As mentioned above, WireGuard runs as a Kernel module and needs to be compiled against the headers of the Kernel running on the host. In most cases it's enough to follow the simple instructions found here: WireGuard Installation.
+
+Scaleway uses custom Kernel versions which makes the installation process a little more complex. Fortunately, they provide a shell script to download the required headers without much hassle.
+
+Once WireGuard has been compiled, it's time to create the configuration files. Each host should connect to its peers to create a secure network overlay via a tunnel interface called wg0. Let's assume the setup consists of three hosts and each one will get a new VPN IP address in the 10.0.1.1/24 range:
+
+In this scenario, a configuration file for kube1 would look like this:
+
+To simplify the creation of private and public keys, the following command can be used to generate and print the necessary key-pairs:
+
+After creating a file named on each host containing the correct IP addresses and public and private keys, configuration is basically done.
+
+What's left is to add the following firewall rules:
+
+Executing the command on each host will start the VPN service and, if everything is configured correctly, the hosts should be able to establish connections between each other. Traffic can now be routed securely using the VPN IP addresses (10.0.1.1–10.0.1.3).
+
+In order to check whether the connections are established successfully, comes in handy:
+
+Last but not least, to automatically launch WireGuard whenever the system boots, a simple systemd service unit needs to be created:
+
+Executing will launch the service whenever the system boots.
+
+There are plenty of ways to set up a Kubernetes cluster from scratch. At this point however, we settle on kubeadm. This dramatically simplifies the setup process by automating the creation of certificates, services and configuration files.
+
+Before getting started with Kubernetes itself, we need to take care of setting up two essential services that are not part of the actual stack, namely Docker and etcd.
+
+Docker is directly available from the package registries of most Linux distributions. Hints regarding supported versions are available in the official kubeadm guide. Simply use your preferred way of installation. Running on Ubuntu will install a stable version, although not the most recent one, but this is perfectly fine in our case.
+
+Kubernetes recommends running Docker with Iptables and IP Masq disabled. The easiest way to achieve this is by creating a systemd unit file to set the required configuration flags:
+
+If this file has been placed after Docker was installed, make sure to restart the service using .
+
+etcd is a highly-available key value store, which Kubernetes uses for persistent storage of all of its REST API objects. It is therefore a crucial part of the cluster. kubeadm would normally install etcd on a single node. Depending on the number of hosts available, it would be rather stupid not to run etcd in cluster mode. As mentioned earlier, it makes sense to run at least a three node cluster due to the fact that etcd is fault tolerant only from this size on.
+
+Even though etcd is generally available with most package managers, it's recommended to manually install a more recent version:
+
+In an insecure environment configuring etcd typically involves creating and distributing certificates across nodes, whereas running it within a secure network makes this process a whole lot easier. There's simply no need to make use of additional security layers as long as the service is bound to an end-to-end secured VPN interface.
+
+This section is not going to explain etcd configuration in depth, refer to the official documentation instead. All that needs to be done is creating a systemd unit file on each host. Assuming a three node cluster, the configuration for kube1 would look like this:
+
+It's important to understand that each flag starting with does only apply during the first launch of a cluster. This means for example, that it's possible to add and remove cluster members at any time without ever changing the value of .
+
+After the files have been placed on each host, it's time to start the etcd cluster:
+
+Executing should show a list of cluster members. If something went wrong check the logs using .
+
+Now that Docker is configured and etcd is running, it's time to deploy Kubernetes. The first step is to install the required packages on each host:
+
+Before initializing the master node, we need to create a manifest on kube1 which will then be used as configuration in the next step:
+
+Then we run the following command on kube1:
+
+After the setup is complete, kubeadm prints a token such as . It's important to write it down, we'll need it in a minute to join the other cluster nodes.
+
+Kubernetes is built around openness, so it's up to us to choose and install a suitable pod network. This is required as it enables pods running on different nodes to communicate with each other. One of the many options is Weave Net. It requires zero configuration and is considered stable and well-maintained:
+
+Unfortunately, Weave Net will not readily work with our current cluster configuration. To cut a long story short kube-proxy needs to be patched to run in userspace mode.
+
+Luckily, this can be done painlessly using jq, a powerful tool for querying and manipulating JSON:
+
+Pods will restart after a couple of seconds and run stably. The master node is ready.
+
+All that's left is to join the cluster with the other nodes. Run the following command on each host:
+
+That's it, a Kubernetes cluster is ready at our disposal.
+
+As soon as the cluster is running, we want to be able to access the Kubernetes API remotely. This can be done by copying from kube1 to your own machine. After installing kubectl locally, execute the following commands:
+
+You're now able to remotely access the Kubernetes API. Running should show a list of nodes similar to this:
+
+As of version 1.6, kubeadm configures Kubernetes with RBAC enabled. Because our hobby cluster is typically operated by trusted people, we should enable permissive RBAC permissions to be able to deploy any kind of services using any kind of resources. If you're in doubt whether this is secure enough for your use case, please refer to the official RBAC documentation.
+
+Services can now be deployed remotely by calling . It's also possible to apply multiple files by pointing to a folder, for example:
+
+This guide will make no further explanations in this regard. Please refer to the official documentation on kubernetes.io.
+
+There are downsides to running Kubernetes outside of well integrated platforms such as AWS or GCE. One of those is the lack of external ingress and load balancing solutions. Fortunately, it's fairly easy to get an NGINX powered ingress controller running inside the cluster, which will enable services to register for receiving public traffic.
+
+Because there's no load balancer available with most cloud providers, we have to make sure the NGINX server is always running on the same host, accessible via an IP address that doesn't change. As our master node is pretty much idle at this point, and no ordinary pods will get scheduled on it, we make kube1 our dedicated host for routing public traffic.
+
+We already opened port 80 and 443 during the initial firewall configuration, now all we have to do is to write a couple of manifests to deploy the NGINX ingress controller on kube1:
+
+One part requires special attention. In order to make sure NGINX runs on kube1—which is a tainted master node and no pods will normally be scheduled on it—we need to specify a toleration:
+
+Specifying a toleration doesn't make sure that a pod is getting scheduled on any specific node. For this we need to add a node affinity rule. As we have just a single master node, the following specification is enough to schedule a pod on kube1:
+
+Running will apply all manifests in this folder. First, a namespace called ingress is created, followed by the NGINX deployment, plus a default backend to serve 404 pages for undefined domains and routes including the necessary service object. There's no need to define a service object for NGINX itself, because we configure it to use the host network ( ), which means that the container is bound to the actual ports on the host, not to some virtual interface within the pod overlay network.
+
+Services are now able to make use of the ingress controller and receive public traffic with a simple manifest:
+
+The NGINX ingress controller is quite flexible and supports a whole bunch of configuration options.
+
+At this point we could use a domain name and put some DNS entries into place. To serve web traffic it's enough to create an A record pointing to the public IP address of kube1 plus a wildcard entry to be able to use subdomains:
+
+Once the DNS entries are propagated our example service would be accessible at . If you don't have a domain name at hand, you can always add an entry to your hosts file instead.
+
+Additionally, it might be a good idea to assign a subdomain to each host, e.g. kube1.example.com. It's way more comfortable to ssh into a host using a domain name instead of an IP address.
+
+Thanks to Let’s Encrypt and a project called kube-lego it's incredibly easy to obtain free certificates for any domain name pointing at our Kubernetes cluster. Setting this service up takes no time and it plays well with the NGINX ingress controller we deployed earlier. These are the related manifests:
+
+Before deploying kube-lego using the manifests above, make sure to replace the email address in with your own.
+
+To enable certificates for a service, the ingress manifest needs to be slightly extended:
+
+After applying this manifest, kube-lego will try to obtain a certificate for service.example.com and reload the NGINX configuration to enable TLS. Make sure to check the logs of the kube-lego pod if something goes wrong.
+
+NGINX will automatically redirect clients to HTTPS whenever TLS is enabled. In case you still want to serve traffic on HTTP, add to the list of annotations.
+
+Now that everything is in place, we are able to expose services on specific domains and automatically obtain certificates for them. Let's try this out by deploying the Kubernetes Dashboard with the following manifests:
+
+Optionally, the following manifests can be used to get resource utilization graphs within the dashboard using heapster:
+
+What's new here is that we enable basic authentication to restrict access to the dashboard. The following annotations are supported by the NGINX ingress controller, and may or may not work with other solutions:
+
+This example will prompt a visitor to enter their credentials (user: admin / password: test) when accessing the dashboard. Secrets for basic authentication can be created using , and need to be added to the manifest as a base64 encoded string.
+
+Data in containers is ephemeral, as soon as a pod gets stopped, crashes, or is for some reason rescheduled to run on another node, all its data is gone. While this is fine for static applications such as the Kubernetes Dashboard (which obtains its data from persistent sources running outside of the container), persisting data becomes a non-optional requirement as soon as we deploy databases on our cluster.
+
+Kubernetes supports various types of volumes that can be attached to pods. Only a few of these match our requirements. There's the type which simply maps a path on the host to a path inside the container, but this won't work because we don't know on which node a pod will be scheduled.
+
+There's a concept within Kubernetes of how to separate storage management from cluster management. To provide a layer of abstraction around storage there are two types of resources deeply integrated into Kubernetes, PersistentVolume and PersistentVolumeClaim. When running on well integrated platforms such as GCE, AWS or Azure, it's really easy to attach a persistent volume to a pod by creating a persistent volume claim. Unfortunately, we don't have access to such solutions.
+
+Our cluster consists of multiple nodes and we need the ability to attach persistent volumes to any pod running on any node. There are a couple of projects and companies emerging around the idea of providing hyper-converged storage solutions. Some of their services are running as pods within Kubernetes itself, which is certainly the perfect way of managing storage on a small cluster such as ours.
+
+Currently there are a couple of interesting solutions matching our criteria, but they all have their downsides:
+
+Even though we would definitely prefer using open source software, Portworx offers the best solution currently available. Setup is simple, deployment and operation is transparent. It launches just a single pod per instance where others create a whole bunch of pods and sidecars. Things might change in the future, but for now we're going to settle on Portworx.
+
+As we run only a three node cluster, we're going to deploy PX on all three of them using a DaemonSet with master toleration. The official documentation states that PX should be deployed manually on each host using . The main reason behind this statement is probably PX's need for mounting volumes in shared mode (e.g. ). Officially, the Kubernetes pod specification doesn't support this flag, but we can work around this by appending to the mount path in the pod spec.
+
+Before deploying the Portworx DaemonSet we need to provide a raw, unformatted block device that will be used for storage on each host. These can either be attached volumes or local loopback devices. On Scaleway, the volume on which the operating system is installed is called . Attaching another volume will be available as . On DigitalOcean things work a little differently. Attached volumes are referenced with something like .
+
+Make sure to edit the daemonset manifest listed below and replace the value of the env variable with a block device available in your environment. The resulting manifests turn out pretty lean for such a seemingly complex service:
+
+It's worth mentioning that the storage class manifest contains a few important parameters:
+
+Further parameters are listed in the Portworx storage class documentation.
+
+In order to operate on the storage cluster use the control tool (documentation) via one of the Portworx containers. Here are some examples:
+
+The storage class we created can be consumed with a persistent volume claim:
+
+This will create a volume called minio-persistent-storage with 5GB storage capacity. Please note that there's currently a bug in PX related to ReadWriteMany volume claims (bug report). Volumes can only be claimed in ReadWriteOnce access mode for the time being.
+
+In this example we're deploying Minio, an Amazon S3 compatible object storage server, to create and mount a persistent volume:
+
+The volume related configuration is buried in the deployment manifest:
+
+The minio-persistent-storage volume will live as long as the persistent volume claim is not deleted (e.g. ). The Minio pod itself can be deleted, updated or rescheduled without data loss.
+
+This was hopefully just the beginning of your journey. There are many more things to explore around Kubernetes. Feel free to leave feedback or raise questions at any time by opening an issue here.|||
+
+guide -  Kubernetes clusters for the hobbyist.

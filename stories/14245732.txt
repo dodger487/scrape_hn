@@ -1,0 +1,63 @@
+TL;DR: In bug 1336763, I have landed a series of patches that should hopefully make tab closing faster for the majority of cases for users that are using multi-process Firefox.
+
+The rest of this blog post tries to explain why.
+
+Perhaps you’ve seen this dialog before:
+
+This dialog shows up when a website that you’ve interacted with (or one of its subframes) has set an event handler for the event, and you attempt to close the tab or browse away from the website.
+
+Here’s the documentation for how works, but long story short, you can do a thing in the event handler that will cause the browser UI to show that dialog, which means giving the user the opportunity to cancel their request to close or navigate away from the website1.
+
+In any event2, if a page is going to be unloaded, and that page (or one of its subframes) has set one or more event handlers, then it is necessary to run those event handlers to see if we’re going to show the dialog, or go ahead and unload the page straight away.
+
+When closing a tab in multi-process Firefox, what we’ve been doing is sending a message to the content process for that tab to check for (and run any) event handlers. The parent sends that message, and then just kinda waits for the content process to respond with whether or not the close should occur. If the content process doesn’t respond within 5 seconds (I know), then we consider it a wash, and just close the tab.
+
+The content process is sometimes doing stuff on the main thread, and sometimes it’s just waiting for messages from the parent. In the latter case, tab closes happen pretty smoothly – the message comes in, events are fired (and hopefully those don’t take too long, but you never know), and then hopefully a result goes up to the parent, and it can move on.
+
+That’s the best case scenario – but lots of things can prevent the best case scenario; for one thing, the main thread might be busy doing other stuff when the message is sent from the parent. Perhaps it’s doing a garbage collection, or a cycle collection, or it’s blocked on some busy JavaScript that some silly advertisement company is running in the background of one of your tabs. In that case, the message from the parent won’t be processed until the main thread is ready.
+
+Once the message is received, we’re still not out of the woods – the event handlers can run any kind of JavaScript inside them, more or less. For example, one anti-pattern I’ve seen in the wild is to use the  event as an opportunity to send a sync XMLHttpRequest in order to get some data to a server before the page goes away3. So the script on the page has an opportunity to delay you, even if it’s not going to cause the dialog to appear.
+
+This problem seems to plague all browsers.  is a real pain, and our current implementation can cause slow tab closing even if the tab doesn’t have  event handlers set4. The patches in bug 1336763 offer what I think is a decent, simple solution for that common case in Firefox.
+
+In bug 1336763, I’ve made it so that for any given tab running in a content process, if a event is ever added in that tab (or in any of its subframes), the content process tells the parent process so it can mark that tab as having listeners we need to fire. If the events are removed, we unmark the tab. If no events are ever added, there’s no mark at all.
+
+The parent process remembers these markings, so that if the user decides to close the tab, the parent can know immediately whether or not it needs to message to tell the content process to run event handlers. In the cases where no event handlers have been set, we can close immediately without asking for permission from the content process at all.
+
+Using some Gecko terminology here, we start by storing a count on something called the TabChild. It might simplify things a bit if you try to imagine the TabChild as the representative of everything in a particular browser tab, and that underneath that TabChild are a bunch of nodes, forming a tree-like structure.
+
+The inner windows under the TabChild contain the documents that are loaded in a tab. For simple web pages, that might just be a single document. In that case, we have a TabChild with just a single inner window node under it.
+
+More complicated pages might contain iframes (which themselves contain iframes, etc). In those cases, we have a TabChild with a single inner window node under it, and that node has any number of inner window children (and those children have any number of inner window children, etc)5.
+
+When any of those subframes have a event listener added to them via script, the inner window node tells the TabChild to increment its internal count. If a event listener is removed via script, the TabChild is told to decrement its internal count.
+
+If the TabChild count ever goes above 0, then we need to tell the parent “Hey, you have at least one event listener here”. If that count continues to go up, the TabChild doesn’t need to tell the parent anything – it just needs to record the increase. If the count ever drops back to 0, then the TabChild needs to tell the parent again, “All event listeners are clear”.
+
+Pretty straight-forward so far, but there are a few other cases we also have to consider.
+
+There are a couple of ways for a set of event handlers to go away. We’ve already mentioned one – script on the page might remove them via .
+
+One way is if the inner window gets navigated away from. If we’re on a page, and that page set a event handler, and the user clicks on a link, the user might end up navigating away (assuming the dialog wasn’t shown and they didn’t cancel), which essentially replaces the inner window with one for a different page. In that case, script didn’t remove the event handlers – the page went away, and so the event handlers on the page we’ve unloaded are no longer relevant.
+
+Another way is if an <iframe> which has set a event handler is removed from the DOM. Instead of replacing the inner window, we’re snipping the inner window out of the tree structure entirely.
+
+In both of these cases, if there are event handlers in the subframe, it’s necessary to tell the TabChild so that the right number can be decremented from the TabChild count.
+
+So what this means is that we need the inner windows to keep a track of how many event handlers have been set as well. That way, when they start to tear themselves down, they can tell the TabChild, “Hey, I’m going away now – decrement X number of event handlers”.
+
+It might seem redundant to have these two counts – counts in the inner windows, and a total count in the TabChild. It would seem like one can be easily inferred from the other; just sum the counts for the inner windows, and you should have your TabChild count.
+
+Having the TabChild keep a count is an optimization that prevents us from having to walk the inner window tree to collect a sum every time the count changes. It’s a classic space / time tradeoff, and I think it’s worth the extra integer member on the TabChild.
+
+Here’s one way to compare the behaviour across different browsers:
+
+This is going to hang the main thread in that tab for 15 seconds, but is otherwise inert.
+
+Now try to close the tab. In Firefox, the tab closes right way. In Safari and Chrome (the two other browsers I have on this machine), the tab hangs out for a while. In Chrome, it appears to wait the full 15 seconds. In Safari, it seems to hit some kind of shorter timeout6.
+
+This was a neat set of patches to work on, precisely because it had me tour the depths of Gecko (dealing with things like inner / outer windows, the stuff that manages events, etc), which end up resulting in a simple property that the front-end can ultimately access to optimize closing tabs. So it nicely spanned the gap between low-level Gecko and higher-level Firefox, all for an event that was added back in 2004, for better or worse.
+
+If all goes well, this change should ship in Firefox 55, and apply to multi-process tabs.|||
+
+TL;DR: In bug 1336763, I have landed a series of patches that should hopefully make tab closing faster for the majority of cases for users that are using multi

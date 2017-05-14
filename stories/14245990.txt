@@ -1,0 +1,136 @@
+I have always heard that it was possible to guess the content of "HTTPS" requests based on traffic patterns. For example: a large long download from youtube.com, is, well, very likely to be a video :).
+
+But how easy is it to go from a traffic dump, captured with something like to the list of pages visited by an user? Mind me: I'm talking about pages here - URLs. Not just domain names.
+
+Turns out it's not that hard. Or at least, I was able to do just that within a few tries. All you need to do is crawl web sites to build "indexes of fingerprints", and well, match them to the https traffic.
+
+In this post, I'd like to show you how some properties of HTTPS can easily be exploited to violate your privacy - or track your behavior - without actually deciphering the traffic.
+
+Let me get this straight from the beginning: there is no new attack described in this document, no new discovery about TLS and its implementation. It's all about playing with information that has always been available in cleartext on TLS (or SSL) streams.
+
+If you are curious about the conclusions, you can jump there and skip all the gory details of the article.
+
+Note that given the recent news that the US Senate voted to kill various privacy rules, one of the widely given advices to protect your privacy was to use HTTPS.
+
+This is great advice: you should always use HTTPS. However, it won't always achieve the goal you may think it achieves. For example, your ISP will still be able to see which sites you visit and what you do on those sites, even if you use HTTPS and strong encryption.
+
+Note also that the recipes in here apply to HTTP/1.0 and HTTP/1.1 only, no HTTP/2.0.
+
+When your browser makes an HTTPS request, both your request and reply are encrypted.
+
+However, there are a number of things that are not encrypted, and easily visible to an attacker through a traffic dump obtained with tools like or .
+
+From this data, and I'll show you examples briefly, one can easily tell:
+
+Now, whenever your browser fetches a remote page and tries to display it to you, there are a few other things to keep in mind:
+
+So, where am I going with all of this? How do I glue all of this together?
+
+Well, the basic idea is really simple: if you forget about caching, if you fetch the same HTTPS static resources twice you'll see two requests for the same page which have the same size, and receive two responses of roughly the same size, and roughly fetch the same set of resources the page is made of (eg, css, js, ...).
+
+When I say "roughly", I actually mean "almost the same" under many circumstances, if you take into account a few glitches. Of course real life is not that simple, but we'll get to that later.
+
+All of this in turn means that if you account for those "facts of life", maybe, and I say maybe, an attacker (or an ISP...) can:
+
+Of those steps, we established that 1 is simple to do. A very fast version in C / C++ to run on an embedded device to produce a "summary" to send to some "collection and processing pipeline" would probably take less than a day of work to write by an experienced programmer.
+
+Building a crawler, like the one in 2, also does not sound that hard to do. It's been done before, hasn't it? Note also that an attacker doesn't have to crawl the entire internet beforehand. As long as the content has not changed, he can do so whenever, based on the observed domains you browsed.
+
+An entrepreneurial kind of attacker could also build an index and sell it as a service. He could even sell packages with different kinds of indexes based on which behaviors you want to track of your users. For example: want to know what your users are doing financially? Here's an index of popular banks and financial sites. Want to know their sexual preferences? Here's an index of popular sites for dating, forums, or with sexual content. And so on.
+
+The hard part seems to be mostly in 3: matching the fingerprint (and of course, building it). Or is it that hard? Let's start talking about the facts of life we temporarily set aside earlier.
+
+There are several problems with using the size of a request and/or the size of a reply as a fingerprint:
+
+So, let's go over those HTTP features that mess up my grand scheme to snoop on your HTTPS transactions.
+
+First, we have a problem with chunked encoding. Well, sometimes we do.
+
+Let me explain. With old HTTP/1.0, or before chunked encoding was introduced, HTTP was a simple "open connection", "send request", "get reply back", "close connection", "open new connection", "send new request", and so on.
+
+At a certain point, someone figured out this was expensive, so they looked for a way to reuse the same connection for multiple requests. The main problem was figuring out when a reply ended. So they introduced chunked encoding. With this encoding, a reply is made of a few bytes that indicate how big the "next chunk is", followed by that many bytes of reply itself, then another few bytes for the next chunk. If the size of the chunk is 0, the reply is complete.
+
+For example, to return the string "Hello world", a chunked reply with 2 chunks could look like: .
+
+The problem this poses is that the encoding is encrypted, so the number of chunks returned and size markers themselves are not visible. Each size marker takes two bytes, and the number of chunks can be a constant, or change all the time depending on the server implementation.
+
+However, many web servers or HTTP frameworks just return the whole reply as a single chunk.
+
+The reason is simple: HTTP requires that cookies and errors must be returned in headers, before anything else. So if you have php / node / java / ... code generating the content, and your framework or web server wants to support setting a cookie or returning an error at any time, it must buffer the whole reply, and flush the buffer only when it is sure no error or cookie can be set anymore. Once we have the whole reply in a buffer, it is cheaper to just send a single chunk.
+
+Reverse proxies, though, don't have this problem. Quite the opposite: they have an incentive to use small buffers to reduce memory consumption and latency. Depending on the implementation and configuration, and on network or backend load conditions, you may end up with a varying number of chunks - different for each reply.
+
+If I had to guess, most web servers end up returning a single chunk. Either way, it is easy to detect the different behaviors at crawling time, and look at how many chunks are returned on average for replies.
+
+For each chunk, the size will increase by 2 bytes, and our algorithm will need to work on a range of sizes.
+
+Second, we have a problem with cookies: they can affect both the request and the response size.
+
+On the request side, the browser might be passing a cookie. On the response side, the server might be setting (or changing) a cookie.
+
+There are two common ways cookies are used:
+
+Either way, cookies can be observed while crawling. The first case is generally simple: your browser will get a coookie once, and keep returning it. So it's a constant added to every request size to the server, and to responses setting it.
+
+The second case is more complex: the size of the request and reply will keep varying based on the state. A few crawling sessions could be used to narrow down a range of minimum cookie size and maximum, which would once again give us a range, and be enough for the algorithm described.
+
+Every time you click a link on a web page, the browser has to load the new page. When loading this new page, it generally passes down a "Referrer" header indicating the URL of the page that contained the link (well, depending on the referrer policy, and a few other rules).
+
+This means that the size of the request to load a page changes based on the URL that contianed the link the user clicked on.
+
+If we use the request size to tell pages apart well, this is a problem.
+
+However, there are a few important things to note that actually help the steps described above:
+
+The problem is thus most visible on the first HTTP transaction tracked of a user, where the origin is unknown, and the content of the referrer header can't be guessed.
+
+The algorithm described below can however take this into account, by broadening the range of sizes considered acceptable in those cases, or by only looking at the response size.
+
+There are several other parameters that can affect the request size and response size, or what is observed on the wire.
+
+Things like different browsers sending different headers, negotiating gzip encoding, language settings, or caching behaviors sending headers with 'If-Modified-Since' or CORS causing OPTIONS requests.
+
+The web server can also have dynamic pages with advertisements or banners that are changed server side, or that react to any of the client provided headers.
+
+My experiments here were very limited: just what I could simulate easily with the browsers on my laptop.
+
+However, I believe that with relatively modest efforts it would be possible to add heuristics to take into account those differences, by, for example, crawling multiple times simulating different browser behaviors, increasing the size ranges accepted, and so on.
+
+To take into account all of the above, the algorithm I used does something like this:
+
+Note that this algorithm also works well when trying to understand what an users is typing on an input form, where ajax is used for autocomplete.
+
+Those sites are relatively simple: as the user types in more characters, more HTTPS requests are sent to the server to narrow down the list of possible responses.
+
+Unfortunately, the same approach I described before can be used: by measuring the request size and response size, and by querying ("crawling") the web site once by myself and registering the request and response size, the algorithm could successfully guess the string that was being looked up.
+
+I tried two web sites: on one, users were supposed to enter the source and destination airport, where whatever the user typed was the prefix of either the city or airport code. On the second web site, the autocomplete was used to fill in the address.
+
+What I did, in both cases:
+
+Again, modulo a few glitches caused by "what happens in real life", it worked.
+
+So where, does the approach described here work well? Well, within a few experiments of tuning the algorithm, by "crawling" a small set of web sites and then analyzing the of a random browsing session, I was able to tell with reasanoable certainty that I had been looking on my bank's web site for a mortgage, and tried to sell stocks on my trading account.
+
+I was also able to guess which destination I was buying an airplane ticket for with the autocomplete trick I described before, or which category of images I was browsing in a couple random web sites I tried.
+
+Not all pages could be guessed due to the facts of life I explained earlier, and this was an extremely limited experiment with a very naive and rough implementation. Still, I am pretty sure that things can be improved by using using more advanced data mining algorithms, heuristics, a better crawler, and in general by spending more time on this.
+
+Which is all kind of scary, and brings up the next question.
+
+What can I really do to protect my privacy? I don't have great advice at this point. You should keep using HTTPS as much as possible, that's still great advice. Note that your credit card number or SSN are still secure, what you type cannot be deciphered with the approach I described - an attacker can only make informed guesses. However, you should assume that an attacker knows exactly which pages you are visiting, how long you spend on them and how you got there - despite HTTPS.
+
+The general advice is to use a VPN to increase your privace, but I am personally not very fond of this suggestion.
+
+On one side, it makes it very easy to tell that you are purposedly trying to hide your traffic. On the other, it does not really solve the problem. The VPN provider himself could be profiting from your data: they have your credit card on file, they know the IP you are coming from, they see your traffic going out, they even know you are a person that for some reason is willing to pay to protect his own privacy, and they might just be profiling you and selling your data just like your ISP may be doing.
+
+And once we established that even with VPNs there's nothing technically protecting your privacy, the only thing that's left is the user agreement you "signed", which I am sure you read, right? And you are sure it's better than the one you signed with your ISP?
+
+If I was in charge of running any sort of law enforcement or spy agency, I'd probably monitor traffic from/to VPN providers more closely than that of any other random ISP.
+
+The next suggestion would be "go for tor!", which I sometimes use. But it is often slow, and certainly does not give you the best browsing experience, especially if you disable javscript, cookies, and are seriously protecting your privacy.
+
+Some web sites, like duck duck go (and kudos to their developers) return headers filled with random data, just to prevent this sort of analysis.
+
+It should be trivial to create a browser extension to add random data in request headers, but preventing reply analysis requires work on the server side.|||
+
