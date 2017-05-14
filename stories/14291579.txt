@@ -1,0 +1,144 @@
+A recent paper suggested a new mathematical point of view on version control. I first found out about it from , a new version control system (VCS) that is loosely inspired by that paper. But if you poke around the home page, you won’t find many details about what makes it different from existing VCSes. So I did a bit of digging, and this series of blog posts is the result.
+
+In the first part (i.e. this one), I’ll go over some of the theory developed in the paper. In particular, I’ll describe a way to think about patches and merging that is guaranteed to never, ever have a merge conflict. In the second part, I’ll show how puts that theory into action, and in the third part I’ll dig into ’s implementation.
+
+Before getting into some patch theory, a quick caveat: any real VCS needs to deal with a lot of tedious details (directories, binary files, file renaming, etc.). In order to get straight to the interesting new ideas, I’ll be skipping all that. For the purposes of these posts, a VCS only needs to keep track of a single file, which you should think of as a list of lines.
+
+A patch is the difference between two files. Later in this series we’ll be looking at some wild new ideas, so let’s start with something familiar and comforting. The kind of patches we’ll discuss here go back to the early days of Unix:
+
+In order to actually have a useful VCS, you need to be able to delete lines also. But deleting lines turns out to add some complications, so we’ll deal with them later.
+
+For an example, let’s start with a simple file: my to-do list for this morning.
+
+Looking back at the list, I realize that I forgot something important. Here’s the new one:
+
+To go from the original to-do list to the new one, I added the line with the socks. In the format of the original Unix “diff” utility, the patch would look like this:
+
+The “1a2” line is a code saying that we’re going to add something after line 1 of the input file, and the next bit is obviously telling us what to insert.
+
+Since this blog isn’t a command line tool, we’ll represent patches with pretty diagrams instead of flat files. Here’s how we’ll draw the patch above:
+
+Hopefully it’s self-explanatory, but just in case: an arrow goes from left to right to indicate that the line on the right is the same as the one on the left. Lines on the right with no arrow coming in are the ones that got added. Since patches aren’t allowed to re-order the lines, the lines are guaranteed not to cross.
+
+There’s something implicit in our notation that really needs to be said out loud: for us, a patch is tied to a specific input file. This is the first point where we diverge from the classic Unix ways: the classic Unix patch that we produced using “diff” could in principle be applied to any input file, and it would still insert “* put on socks” after the first line. In many cases that wouldn’t be what you want, but sometimes it is.
+
+The best thing about patches is that they can enable multiple people to edit the same file and then merge their changes afterwards. Let’s suppose that my wife also decides to put things on my to-do list: she takes the original file and adds a line:
+
+Now there are two new versions of my to-do list: mine with the socks, and my wife’s with the garbage. Let’s draw them all together:
+
+This brings us to merging: since I’d prefer to have my to-do list as a single file, I want to merge my wife’s changes and my own. In this example, it’s pretty obvious what the result should be, but let’s look at the general problem of merging. We’ll do this slowly and carefully, and our endpoint might be different from what you’re used to.
+
+First, I need to introduce some notation for an obvious concept: the composition of two patches is the patch that you would get by applying one patch and then applying the other. Since a “patch” for us also includes the original file, you can’t just compose any two old patches. If is a patch taking the file to the file and is a patch taking to , then you can compose the two (but only in one order!) to obtain a patch from to . I’ll write this composition as : first apply , then .
+
+It’s pretty easy to visualize patch composition using our diagrams: to compute the composition of two paths, just “follow the arrows”
+
+to get the (dotted red) patch going from to .
+
+I’m going to define carefully what a merge is in terms of patch composition. I’ll do this in a very math-professor kind of way: I’ll give a precise definition, followed by some examples, and only afterwards will I explain why the definition makes sense. So here’s the definition: if and are two different patches taking the file to the files and respectively, a merge of and is a pair of patches and such that
+
+We can illustrate this definition with a simple diagram, where the capital letters denote files, and the lower-case letters are patches going between them:
+
+Instead of saying that , a mathematician (or anyone who wants to sound fancy) would say that the diagram above commutes.
+
+Here is an example of a merge:
+
+And here is an example of something that is not a merge:
+
+This is not a merge because it fails the condition : composing the patches along the top path gives
+
+but composing them along the bottom path gives
+
+Specifically, the two patches disagree on which of the shoes in the final list came from the original file. This is the real meaning underlying the condition : it means that there will never be any ambiguity about which lines came from where. If you’re used to using or commands with your favorite VCS, you can probably imagine why this sort of ambiguity would be bad.
+
+Merging patches is an old idea, of course, and so I just want to briefly explain how the presentation above differs from “traditional” merging: traditionally, merging was defined by algorithms (of which there are many). These algorithms would try to automatically find a good merge; if they couldn’t, you would be asked to supply one instead.
+
+We’ll take a different approach: instead of starting with an algorithm, we’ll start with a list of properties that we want a good merge to satisfy. At the end, we’ll find that there’s a unique merge that satisfies all these properties (and fortunately for us, there will also be an efficient algorithm to find it).
+
+The main problem with merges is that they aren’t unique. This isn’t a huge problem by itself: lots of great things aren’t unique. The problem is that we usually want to merge automatically, and an automatic system needs an unambiguous answer. Eventually, we’ll deal with this by defining a special class of merges (called perfect merges) which will be unique. Before that, we’ll explore the problem with some examples.
+
+Let’s start with a silly example, in which our merge tool decides to add some extra nonsense:
+
+No sane merge tool would ever do that, of course, but it’s still a valid merge according to our rule in the last section. Clearly, we’ll have to tighten up the rules to exclude this case.
+
+Here is a more difficult situation with two merges that are actually reasonable:
+
+Both of these merges are valid according to our rules above, but you need to actually know what the lines mean in order to decide that the first merge is better (especially if it’s raining outside). Any reasonable automatic merging tool would refuse to choose, instead requiring its user to do the merge manually.
+
+The examples above are pretty simple, but how would you decide in general whether a merge is unambiguous and can be performed automatically? In existing tools, the details depend on the merging algorithm. Since we started off with a non-algorithmic approach, let’s see where that leads: instead of specifying explicitly which merges we can do, we’ll describe the properties that an ideal merge should have.
+
+The main idea behind the definition I’m about to give is that it will never cause any regrets. That is, no matter what happens in the future, we can always represent the history just as well through the merge as we could using the original branches. Obviously, that’s a nice property to have; personally, I think it’s non-obvious why it’s a good choice as the defining property of the ideal merge, but we’ll get to that later.
+
+Ok, here it comes. Consider a merge:
+
+And now suppose that the original creators of patches and continued working on their own personal branches, which merged sometime in the future at the file :
+
+We say that the merge is a perfect merge if for every possible choice of the merge , there is a unique patch so that and . (In math terms, the diagram commutes.) We’re going to call a continuation, since it tells us how to continue working from the merged file. To repeat, a merge is perfect if for every possible future, there is a unique continuation.
+
+Let’s do a few examples to explore the various corners of our definition. First, an example of a perfect merge:
+
+It takes a bit of effort to actually prove that this is a perfect merge; I’ll leave that as an exercise. It’s more interesting to see some examples that fail to be perfect.
+
+Let’s start with the silly example of a merge that introduced an unnecessary line:
+
+This turns out (surprise, surprise) not to be a perfect merge. To understand how our definition of merge perfection excludes merges like this, here is an example of a possible future without a continuation:
+
+Since our patches can’t delete lines, there’s no way to get from to .
+
+Here’s another example, the case where there is an ambiguity in the order of two lines in the merged file:
+
+This one fails to be a perfect merge because there is a future with no valid continuation: imagine that my wife and I manually created the desired merge.
+
+Now what patch (call it ) could be put between and to make everything commute? The only possibility is
+
+which isn’t a legal patch because patches aren’t allowed to swap lines.
+
+If you’ve been casually reading about pijul, you might have encountered the word “pushout.” It turns out that the pattern we used for defining a perfect merge is very common in math. Specifically, in category theory, suppose you have the following diagram (in which capital letters are objects and lowercase letters are morphisms):
+
+If for every and there is a unique such that the diagram commutes, then is said to be the pushout of . In other words, what we called a “perfect merge” above could also be called a “pushout in the category with files as objects and patches as morphisms.” For most of this article, we’ll ignore the general math terminology in favor of language that’s more intuitive and specific to files and patches.
+
+The main problem with perfect merges is that they don’t always exist. In fact, we already saw an example:
+
+The pair of patches above has no perfect merge. We haven’t actually proved it, but intuitively it’s pretty clear, and we also discussed earlier why one potential merge fails to be perfect. Ok, so not every pair of patches can be merged perfectly. You probably knew that already, since that’s where merge conflicts come from: the VCS doesn’t know how to merge patches on its own, so you need to manually resolve some conflicts.
+
+Now we come to the coolest part of the paper: a totally different idea for dealing with merge conflicts. The critical part is that instead of making do with an imperfect merge, we enlarge the set of objects that the merge can produce. That is, not every pair of patches can be perfectly merged to a file, but maybe they can be merged to something else. This idea is extremely common in math, and there’s even some general abstract nonsense showing that it can always be done: there’s an abstract way to generalize files so that every pair of patches of generalized files can be perfectly merged. The miraculous part here is that in this particular case, the abstract nonsense condenses into something completely explicit and manageable.
+
+A file is an ordered list of lines. A digle (for directed graph file) is a directed graph of lines. (Yes, I know it’s a terrible name, but it’s better than “object in the free finite cocompletion of the category of files and patches,” which is what the paper calls it.) In other words, whereas a file insists on having its lines in a strict linear order, a digle allows them to be any directed graph. It’s pretty easy to see how relaxing the strict ordering of lines solves our earlier merging issues. For example, here’s a perfect merge of the sort that caused us problems before:
+
+In retrospect, this is a pretty obvious solution: if we don’t know what order shoes and garbage should go in, we should just produce an output that doesn’t specify the order. What’s a bit less obvious (but is proved in the paper) is that when we work in the world of digles instead of the world of files, every pair of patches has a unique perfect merge. What’s even cooler is that the perfect merge is easy to compute. I’ll describe it in a second, but first I have to say how patches generalize to digles.
+
+A patch between two digles (say, and ) is a function (call it ) from the lines of to the lines of that respects the partial order, in the sense that if there is a path from to in then there is a path from to in . (This condition is an extension of the fact that a patch between two files isn’t allowed to change the order.) Here’s an example:
+
+And now for the merge algorithm: let’s say we have a patch going from the digle to the digle and another patch going from to . To compute the perfect merge of and ,
+
+That’s it: two steps. Here’s the algorithm at work on our previous example: we want to merge these two patches:
+
+So first, we write down the two to-be-merged files next to each other:
+
+For the second step, we see that both of the “to-do” lines came from the same line in the original file, so we combine those two into one. After doing the same to the “work” lines, we get the desired output:
+
+By generalizing files to digles, we got a very nice benefit: every pair of patches has a (unique) perfect merge, and we can compute it easily. But there’s an obvious flaw: all the tools that we use (editors, compilers, etc.) work on files, not digles. This is where the paper stops providing guidance, but there is an easy solution: whenever a merge results in something that isn’t a file, just make a new patch that turns it into a file. We’ll call this flattening, and here’s an example:
+
+If your eyes haven’t glazed over by now (sorry, it’s been a long post), you might be feeling a bit cheated: I promised you a new framework that avoids the pitfalls of manual merge resolution, but flattening looks an awful lot like manual merge resolution. I’ll answer this criticism in more detail in the next post, where I demonstrate the tool and how it differs from . But here’s a little teaser: the difference between flattening and manual merge resolution is that flattening is completely transparent to the VCS: it’s just a patch like any other. That means we can do fun things, like re-ordering or reverting patches, even in the presence of conflicting merges. More on that in the next post.
+
+It’s time to finally address something I put off way at the beginning of the post: the system I described was based on patches that can’t delete lines, and we obviously need to allow deletions in any practical system. Unfortunately, the paper doesn’t help here: it claims that you can incorporate deletion into the system I described without really changing anything, but there’s a bug in the paper. Specifically, if you tweak the definitions to allow deletion then the category of digles turns out not to be closed under pushouts any more. Here’s an example where the merge algorithm in the paper turns out not to be perfect:
+
+(Since this post has dragged on long enough, I’ll leave it as an exercise to figure out what the problem is).
+
+Fortunately, there’s a trick to emulate line deletion in our original patch system. I got this idea from pijul, but I’ll present it in a slightly different way. The idea is to allow “ghost” lines instead of actually deleting them. That is, we mark every line in our digle as either “live” or “ghost.” Then we add one extra rule to our patches: a live line can turn into a ghost line, but not the other way around. We’ll draw ghost lines in gray, and arrows pointing to ghost lines will be dashed. Here’s a patch that deletes the “shoes” line.
+
+The last remaining piece is to extend the perfect merge algorithm to cover our new digles with ghost lines. This turns out to be easy; here’s the new algorithm:
+
+The bit in italics is the only new part, and it barely adds any extra complexity.
+
+I showed you (in great detail) a mathy way of thinking about patches in a VCS, although I haven’t shown a whole lot of motivation for it yet. At the very least, though, next time someone starts droning on about “patch theory,” you’ll have some idea what they’re talking about.
+
+In the next post, I’ll talk about pijul, a VCS that is loosely based around the algorithms I described in this post. There you’ll get to see some (toy) examples where pijul’s solid mathematical underpinnings help it to avoid corner cases that trip up some more established VCSes.
+
+I’d like to thank Pierre-Étienne Meunier for his comments and corrections on a draft of this post. Of course, any errors that remain are my own responsibility.|||
+
+A recent paper suggested a new mathematical
+point of view on version control. I first found out about it from pijul,
+a new version control system (VCS) that is loosely inspired by that paper. But
+if you poke around the pijul home page, you won’t find
+many details about what makes it different from existing VCSes. So I did a bit
+of digging, and this series of blog posts is the result.

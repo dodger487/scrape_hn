@@ -1,0 +1,69 @@
+When doing my last performance tests for bool packing, I got strange results sometimes. It appeared that one constant generated different results than the other. Why was that? Let’s have a quick look at branching performance.
+
+Just to recall (first part, second part) I wanted to pack eight booleans (results of a condition) into one byte, 1 bit per condition result. The problem is relatively simple, but depending on the solution you might write code that’s 5x…8x times slower than the other version.
+
+Let’s take a simple version that uses :
+
+And see the results:
+
+The chart shows timings for 100 samples taken from running the code, vector size ( ) is 1mln.
+
+Do you know what the difference between the above results is?
+
+It’s only - the value of !
+
+If it’s 254 then you got the yellow performance, if it’s 127, then you got those green, blue squares. The generated code is the same, so why we see the difference? The same code can run eve 4x slower!
+
+So maybe vector implementation is wrong?
+
+Again, when running with , you get the top output, while returns the bottom one.
+
+OK, but also some of the versions of the algorithm didn’t expose this problem.
+
+For example, the optimized version. That packed 8 values at ‘once’.
+
+The samples are not lining up perfectly, and there are some outliers, but still, the two runs are very similar.
+
+And also the baseline (no packing at all, just saving into bool array)
+
+This time, is slower… but still not that much, only few percents. Not 3x…4x as with the first two cases.
+
+What’s the reason for those results?
+
+So far I didn’t explain how my input data are even generated. Let’s unveil that.
+
+The input values simulate greyscale values, and they are ranging from 0 up to 255. The threshold is also in the same range.
+
+As you might already discover, the problem lies in the branching (mis)predictions. When the Threshold value is large, there’s little chance input values will generate TRUE. While for Threshold = 127 we get 50% chances (still it’s a random pattern).
+
+Here’s a great experiment that shows some problems with branching: Fast and slow if-statements: branch prediction in modern processors @igoro.com. And also Branch predictor - Wikipedia.
+
+Plus read more in The Software Optimization Cookbook: High Performance Recipes for IA-32 Platforms, 2nd Edition
+
+For a large threshold value, most of my code falls into FALSE cases, and thus no additional instructions are executed. CPU sees this in it’s branch history and can predict the next operations. When we have random 50% pattern, the CPU cannot choose the road effectively, so there are many mispredictions.
+
+Unfortunately, I don’t have tools to measure those exact numbers, but for me, it’s a rather clear situation. Maybe you can measure the data? Let me know!
+
+But why the other code - the optimized version didn’t show the effect? Why it runs similarly, no matter what the constant is?
+
+Let’s look at the generated assembly: play @ godbolt.org.
+
+And for first manual version: https://godbolt.org/g/csLeHe
+
+As we can see the optimized version doesn’t use branching. It uses instruction, but this is not a real branch. Strangely GCC doesn’t use this approach and uses branches so that the code could be possibly slower.
+
+See Branch and Loop Reorganization to Prevent Mispredicts | Intel® Software
+
+Great book about perf:Branch and Loop Reorganization to Prevent Mispredicts | Intel® Software
+
+See also this explanation for avoiding branches: x86 Disassembly/Branches wikibooks
+
+So, if I am correct, this is why the optimized version doesn’t show any effects of branch misprediction.
+
+The first, non-optimal version of the code contains two jumps in the loop, so that’s why we can experience the drop in performance.
+
+Still, bear in mind that conditional moves are not always better than branches. For example read more details at Krister Walfridsson’s blog: like The cost of conditional moves and branches.
+
+Charts made with Nonius library, see more about in my micro-benchmarking library blog post.|||
+
+Branches can ruing the performance. In the post I analyse one case of branching related to my recent experiments and optimizations.
