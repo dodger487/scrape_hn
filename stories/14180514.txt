@@ -1,0 +1,45 @@
+TLDR: the challenges for the BsidesSF CTF were run in Docker containers on Kubernetes using Google Container Engine. Because of the two infrastructure issues, it was possible to exploit one of the early challenges, steal service account keys, and then use those keys to directly access flags. One of these problems was discovered (but not exploited) by a competitor.
+
+On the weekend before RSA (Feb 11 — Feb 13), we ran the capture the flag competition for BsidesSF. It was targeted at beginner/intermediate players and turned out to be pretty successful, with over 500 teams participating internationally. We decided to run all our challenges in docker containers on Google Container Engine (GKE). I won’t delve too much into this decision, but as a small team with time constraints Docker and Kubernetes allowed us to focus our efforts on writing interesting challenges and made deployment, maintenance, and scaling dead simple. Though it worked out for us, there are many reasons why these tools might not be suitable for CTFs.
+
+CTF is intended to be a hacker’s playground and many challenges will allow competitors to run arbitrary code on your machines. Competitors should be able to do essentially whatever they want as long as they are not able to interfere with other teams, damage the challenge, or access resources that are out of scope (other flags, the scoreboard, etc.) For this reason, isolation of the challenge resources is critical. After talking with a few other CTF organizers, I learned that this isolation is most often achieved with completely separate hosts, VMs under ESXi or Xen, or simple chroot jails. With Docker, many of our challenges deployed were on the same host and isolation was provided by kernel namespaces and control groups- features of the linux kernel that underly this technology.
+
+Docker and Kubernetes together introduce new attack surface that could allow competitors to break the challenge isolation. Namely:
+
+Let’s run through each of these.
+
+The Docker docs have very thorough documentation about the Docker security model. Though containers are generally not considered a suitable replacement for VMs, we decided that we trusted the isolation provided by the linux kernel enough. We ran all our challenges as an unprivileged user within the container, and challenges that required network isolation were deployed to different clusters. We also had plans for using the Kubernetes container security context and applying seccomp profiles, but sadly didn’t have time for this. Either way, a container escape is certainly not trivial and generally requires a kernel vulnerability like Dirty Cow. It seemed unlikely that someone would bring one of these out for our relatively unknown, beginner to intermediate CTF.
+
+The next hardening task was to ensure that processes running inside the containers could not access the Kubernetes API. This unfortunately was the first place where we failed to do our research. We assumed that the containers represented a trust boundary, and that processes running in these containers would usually not need to access or modify the cluster state. The nodes that were running the containers would obviously need access to the API to allow scheduling of containers, but it made sense that access to the API from within the containers would be restricted unless explicitly enabled. @traviscline, a CTF competitor, quickly proved this wrong.
+
+As it turns out, when pods (a Kubernetes abstraction for a group of containers) are created they are automatically assigned the default service account, and a new volume is created containing the token for accessing the Kubernetes API. That volume is then mounted into all the containers in the pod, at  . The access token in this directory is all you need to view cluster state, and execute arbitrary commands in the containers.
+
+Here’s what it looked like from Travis’s perspective:
+
+After being notified, I worked to remediate the issue as quickly as possible. Looking through the documentation, there didn’t seem to be an easy way to disable the feature. With a bit more research, I found this issue on Github. Apparently the auto-mounting of API credentials is a feature maintained for backwards compatibility, and at the time there wasn’t a way to disable it. The workaround was to mount an empty, read-only volume at the the location where Kubernetes mounts the service account credentials.
+
+In hindsight, this was a pretty obvious oversight that could have easily been avoided with a more thorough read-through of the documentation. That being said, I would argue that this is an insecure default that should be disabled out of the box. This behavior could allow an attacker to pivot from a relatively simple web application bug (file disclosure) to a full infrastructure compromise. The Kubernetes community is quite aware of this issue. The long term solution is the role-based access control plugin which allows for more fine-grained access control and can be used limit what resources service accounts have access to. This feature was recently promoted to Kubernetes beta, and will likely make its way into GKE soon.
+
+Here is where we made our second mistake. Private docker registries on Google’s platform are simply buckets in Google Cloud Storage. The nodes in the cluster need to be able to pull from the registry, so read-only credentials are given to the nodes via service account credentials passed in the instance metadata, which is available to the node via an http service listening at . We unfortunately glossed over this important detail during planning. Because some of our containers had flags baked into the images rather than mounted as volumes, it was possible to use a remote code execution vulnerability in one of the challenges to read the service account credentials and then pull our containers.
+
+Using an RCE or SSRF, an attacker would issue requests to the metadata service for the default service account email and access tokens.
+
+Using those two pieces of information, you can use Docker to directly pull the images from our private registry.
+
+This assumes that you have some internal knowledge: the name of our project and the image names, neither of which would be too difficult guess and are probably discoverable by other means.
+
+We could have avoided this issue by ensuring that all challenge resources (flags, binaries, source code, etc.) were added to the containers via mounted volumes. Had we done this for all challenges, our images essentially could have been public — pulling them would not give a CTF participant anything interesting. For some of our challenges, completely removing the private resources from the images would have been difficult. A more ideal setup would be denying access to the metadata service from within the containers. I have not attempted this, but it likely could be achieved by using a tool like Lyft’s metadataproxy to proxy connections from the containers to the metadata service.
+
+Unlike the previous issue this is certainly not an insecure default, but how the platform was designed to work. Its not specific to GKE, Google Cloud and AWS both rely on an http service as a method for distributing metadata and certain secrets to instances, making these secrets available to any process running on the machine. This is definitely a useful thing to know about when building on these platforms.
+
+It was an interesting experiment, but we will probably won’t be using this same setup for our next CTF. While Kubernetes makes it very easy to get everything up and running, it adds a great deal of complexity and attack surface. It fundamentally was not designed for running untrusted code, and thus is probably not a good choice for Capture the Flag where the threat model involves giving attackers arbitrary code execution.
+
+For a great overview of further hardening options for containers on GKE as well as the Kubernetes security roadmap, check out Alex Mohr and Jessie Frazelle’s talk at Google Next 2017. This is a really excellent talk and I am very sad it was not presented two months earlier.
+
+Securing a self-hosted Kubernetes cluster can be its own can of worms, and the best guidance I have seen is from Jesse Endahl’s talk at BsidesSF 2017. Kelsey Hightower also maintains a great tutorial on setting up a Kubernetes cluster.
+
+If you’d like to learn more about the Docker security model, and security of containers in general check out the NCC whitepaper on container security.
+
+Want to chat about CTF, containers, or anything else security related? Follow me on Twitter.|||
+
+TLDR: the challenges for the BsidesSF CTF were run in Docker containers on Kubernetes using Google Container Engine. Because of the two infrastructure issues, it was possible to exploit one of the…
