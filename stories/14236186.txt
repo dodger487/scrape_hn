@@ -1,0 +1,49 @@
+The design, implementation and deployment of a system to transparently compress hundreds of petabytes of image files for a file storage service
+
+The design, implementation, and deployment of a system to transparently compress hundreds of petabytes of image files for a file storage service Horn et al., NSDI’17
+
+When I first started reading, I thought this paper was going to be about a new compression format Dropbox had introduced for JPEG images. And it is about that, but it’s also about so much more, as we also learn a little bit of what it’s like to think and operate at Dropbox scale and what it takes to roll out an algorithmic improvement in production. It’s a rare treat to to get such a full ‘soup to nuts’ treatment.
+
+Lepton (available as open source) is a compression tool that replaces the Huffman code at the lowest layer of baseline JPEG compression with a parallelized arithmetic code.
+
+Lepton has been running in production on Dropbox since April 2016, as of February 2017 it had been run on over 150 billion user files (203 PiB of input), reducing total size by more than 46 PiB!
+
+Dropbox manages roughly one exabyte of data, with JPEG images accounting for about 35% of that.
+
+Lepton must be lossless – i.e., it needs to be able to recover the exact bytes of the original file, even for intentionally malformed files. Since the Dropbox back-end stores files in independent 4 MiB chunks across many servers, Lepton must also be able to decompress any substring of a JPEG file in isolation.
+
+An image stored in Lepton format needs to be decoded to restore the original file format when a user accesses it. Users are sensitive to file download latency, both time-to-first-byte and time-to-last-byte, so decompression must be fast. Decoding speed must be fast enough to saturate a typical user’s Internet connection (> 100 Mbps), which requires multithreaded decoding.
+
+Dropbox applies compression immediately upon upload of new JPEG files. In the background, existing files are also being compressed at a rate of roughly a petabyte per day – consuming about 300 kW continuously!
+
+A kWh of the encoding process is enough to compress 72,300 images at an average size of 1.5MB each – saving 24GiB of storage.
+
+Looked at another way, an Intel Xeon E5 can process 181,500,000 images per year saving 58.8 TiB of storage. This costs $9,031 per year on the Amazon S3 infrequent access tier. The capital expense of the Xeon is much less than this and so is comfortably recouped within the first year of operation.
+
+A JPEG file has two sections: headers, and image data itself (the ‘scan’).
+
+Regular JPEG files use a Huffman code to write the coefficients. When Huffman coding, more probable values consume fewer bits in the output, saving space overall. The Huffman probability tables themselves are given in the header.
+
+Lepton was inspired by the PackJPG compression tool, and achieves similar compression to PackJPG but without PackJPG’s requirements for global operations. This allows Lepton to distributed decoding across independent chunks, and use multiple threads within each chunk. For fast decoding, Lepton format files are partitioned into segments (one per decoding thread) and each thread’s segment starts with a “Huffman handover word” that allows the thread’s Huffman encoder (we have to restore the original Huffman encoding for the user) to resume in mid-symbol at a byte boundary.
+
+Lepton’s full probability model is detailed in an appendix to the paper.
+
+In tests, Lepton is the fastest of any format-aware compression algorithm, and also compresses about as well as the best-in-class algorithms. (Lepton 1-way in the figure below is a single threaded version modified for maximum compression savings).
+
+Lepton decoding is an order of magnitude faster than PackJPG, and encoding time is also substantially better than any other algorithm achieving appreciable compression. It does this while also constraining memory usage:
+
+Determinism is made difficult by the ‘undefined behaviours’ which C++ compilers exploit to produce efficient code under heavy optimisation. Lepton is statically linked, and all heap allocations are zeroed before use – even so, this setup did not detect a potential buffer overrun. An additional fail-safe mechanism did detect this though: before deploying any version of Lepton, it is run on over a billion randomly selected images to compress and then decompress the files. “This system detected the non-deterministic buffer overrun after just a few million images were processed and has caught some further issues since.”
+
+Security is enforced using Linux’s secure computing mode (SECCOMP). When this is activated, the kernel disallows all system calls except , , , and . Such a program cannot allocate memory, so Lepton allocates a zeroed 200 MiB region of memory upfront before initiating SECCOMP.
+
+In production at Dropbox, Lepton encodes images at between 2 and 12 GiB per second, with uniform savings across file sizes.
+
+A Dropbox blockserver has 16 cores, and handles requests to store or retrieve data chunks. A Lepton decode (or encode) uses 8 cores, so 2 simultaneous Lepton operations can saturate a machine. At peak, an individual blockserver can get up to 15 encode requests. Overloaded blockservers (3 or more compression operations occurring at a time) can offload work first to other blockservers that have capacity, and secondly to a dedicated Lepton processing cluster.
+
+Here are the error codes observed during the first two-months of the backfill process: “the top 99.9864% of situations were anticipated.”
+
+Note the small numbers of ‘impossible’ (but observed) error codes such as from an abort signal (SECCOMP disallows SIGABRT). A small number of roundtrip failures were expected thouh – due to corruptions in the JPEG file (e.g., runs of zeroes written by hardware failing to sync a file) that cannot always be represented in the Lepton file format.
+
+There are plenty more details and examples in the full paper.|||
+
+The design, implementation, and deployment of a system to transparently compress hundreds of petabytes of image files for a file storage service Horn et al., NSDI'17 When I first started reading, I thought this paper was going to be about a new compression format Dropbox had introduced for JPEG images. And it is about that,…

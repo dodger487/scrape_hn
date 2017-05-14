@@ -1,0 +1,49 @@
+Computers on the internet are uniquely identified by an IP address. For decades the world has used Internet Protocol version 4 (IPv4), which allows for about 4 billion unique addresses. As more of the world has come online, and we carry internet-capable devices in our pockets, we have run out of IPv4 addresses. Layers and layers of workarounds have been built to mitigate the problem. The current protocol—Internet Protocol version 6 (IPv6)—fixes various problems with IPv4; it has a significantly expanded address space that allows for the creation of many more unique IP addresses. Unfortunately, IPv6 has suffered from lack of adoption. This is finally changing.
+
+As of April 10, 2017, Google reported IPv6 adoption at 14%, with the United States at just over 30%. ISPs and private networks within enterprises are moving to IPv6-only or dual-stack networks (those that support both IPv6 and IPv4 connections). Cellular carriers are switching to IPv6-only networks, meaning devices have no IPv4 connectivity, but rely on a NAT64/DNS64 gateway to connect to legacy IPv4 internet networks.
+
+Given these trends, we recently took the initiative to add IPv6 support for the Dropbox desktop application. Version 24 of the Dropbox client, released April 17, 2017, supports IPv6-only and dual-stack networks.
+
+Adding IPv6 support involves making changes to address resolution and connection establishment. This has to be done in a cross-platform manner and support alternative mechanisms like proxies. Transferring files over the internet is one of Dropbox’s core tasks and users expect that to happen seamlessly and quickly. These changes needed to happen without affecting the user experience. Here is how we implemented IPv6 support while ensuring the client stayed functional for all existing users who are still on IPv4.
+
+Under IPv4, functions like could be used for address lookup. In addition, functions like and could be used to convert between various IP address representations. None of these work with IPv6 addresses.
+
+The function  has long been the recommended cross-platform way to look up IP addresses for a given host. It accepts a hostname and returns a list of addresses, both IPv6 and IPv4, ordered by the host’s preferred address family. Callers are then expected to iterate through these until a connection succeeds.
+
+Parameters that determine which address families are returned are accepted by . In the Berkeley sockets API, a family specifies the socket type. (IPv4) and (IPv6) are two valid socket types. There is an additional constant, , that indicates should return all the families that it can. Under the hood, will attempt both an A and an AAAA query to the DNS server.
+
+Unfortunately has a couple of downsides. It is a blocking function and it does not support caller specified timeouts. Once has been called, there is not much the calling thread can do until it returns. The default timeouts implemented by operating systems are within the 30-90 second range. In a naive implementation, we may end up waiting several minutes for the , then spend another few seconds falling back to resolving with . This adds up to a lot of delay.
+
+To mitigate this, we use a thread pool (specifically Python’s module) to perform the resolution. We concurrently start both and resolutions. Since we want to favor IPv6 connections, we wait a few seconds for to succeed, and otherwise, we select the one that finishes first. Operating systems aggressively cache DNS lookups, so the lookup time and CPU penalty is paid very rarely.
+
+Based on our metrics, about 80% of connection attempts resolve successfully on the call and we don’t need to bother with the result of the call. But when the call takes longer than a few seconds, we noticed that both the and calls will fail in >86% of cases. This usually indicates the user is on a bad network, or their computer suspended/shut down right when we were attempting to connect. In fact, the odds that only one of the calls will succeed is very low, representing about 0.3% of all connection attempts.
+
+The dual lookups introduce some complexity to our code, but there are no well designed, cross-platform DNS resolution alternatives. Third-party solutions like c-ares exist, but we did not want to introduce overhead for such a simple task.
+
+One interesting implementation detail we discovered is that Python’s non-blocking sockets can encounter delays similar to blocking sockets if the method is passed a DNS hostname, instead of an IP address. This is because it uses  under the hood. Be sure to perform lookup first if you intend to use non-blocking sockets.
+
+Once we have a list of IP addresses, which may be a mix of IPv6 and IPv4, we can attempt to connect to each of them in order and stop when a connection is successfully established, correct? Unfortunately things are not so easy.
+
+On an IPv4-only or IPv6-only network, if none of the addresses work, the user’s network has a problem. However, on a dual-stack network, it is possible for IPv4 to be functioning, and IPv6 to be down. Why is that?
+
+Among other reasons, IPv6 networks generally operate a NAT64/DNS64 gateway to allow IPv6 hosts to connect to the IPv4 internet. It is possible for this gateway to be down or slow. What would happen if had returned a list of 2 IPv6 addresses followed by 2 IPv4 addresses?
+
+We would have first spent several seconds (we use a 10 second timeout per attempt) trying to connect to , and another 10s connecting to , before finally connecting to .
+
+That does not sound appealing. There is a clever and simple-to-implement strategy—codified as Happy Eyeballs: Success with Dual-stack hosts—to deal with this situation. We pick the first IPv6 address ( ) and the first IPv4 address ( ) from the results. Since we want to favor IPv6, we start the connection to IPv6. If that connection takes too long (the RFC recommends 300ms), we then start the IPv4 connection. Then we pick the winner of the two. In this case, since we have a functioning IPv4 network, we would pick . If this sounds similar to our approach for address resolution, it’s because Happy Eyeballs definitely served as inspiration for that solution.
+
+If we were unable to connect to either address, we would try the rest of the addresses— —in order.
+
+Since Dropbox servers don’t advertise native AAAA records and dual-stack users may connect via IPv4, we can’t say how many Dropbox users actually connect via an IPv6 network; we are working to resolve this. In terms of resolving addresses to both IPv4 and IPv6 addresses, fewer than 0.5% of hosts were able to resolve Dropbox servers to a IPv6 address during connection attempts.
+
+Some Dropbox users connect via proxies and we wanted to support IPv6 wherever it was possible. Dropbox supports SOCKS4, SOCKS5 and HTTP(S) proxies. SOCKS4 and SOCKS5 use a binary protocol to request a connection from the proxy. SOCKS4, and the extension SOCKS4a, do not support IPv6 and will remain unusable on IPv6 networks. For SOCKS5, we added support for    to allow IPv6 addresses. HTTP(S) proxies require no negotiation, so they do not require any client-side changes. The client simply sends the request URL and the proxy uses a connection that that it supports.
+
+Finally, in order to connect to the proxy when both the client and proxy are on an IPv6-only network, we can re-use the logic for establishing connections.
+
+To make these critical changes with minimal hiccups, we spent several weeks with features enabled only for in-office and beta builds. This ability to deploy to the office every day allowed us to quickly detect and fix issues. We made extensive use of Google’s publicly available DNS64 servers during development. Combined with the Network Link Conditioner on MacOS, developers could quickly verify code changes.
+
+The safety net provided by out-of-process updaters ensured that if we ended up with a bug that prevented users from connecting to Dropbox, we could fix the bug, release a build, and update users without requiring manual intervention and without users even noticing. When one of the beta builds ended up performing local DNS resolution even for proxies, we were able to roll out a new build quickly and the affected users had functionality restored within days.
+
+Adding IPv6 support was an interesting technical challenge due to the variety of implementations required, and the need to be backwards compatible. There is wealth of information on the internet about migrating to IPv6. We hope this article adds to it and helps others transition to the modern protocol.|||
+
+Computers on the internet are uniquely identified by an IP address. For decades the world has used Internet Protocol version 4 (IPv4), which allows for about 4 billion unique addresses.

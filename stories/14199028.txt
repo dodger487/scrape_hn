@@ -1,0 +1,152 @@
+After quantization, huffman / entropy coding is one of the more significant contributors to the file size savings in JPEG compression. This page provides a tutorial on how the huffman coding works in a JPEG image. If you have ever wondered how JPEG compression works, this may provide you with some detailed insight.
+
+In attempting to understand the inner workings of JPEG compression, I was unable to find any real details on the net for how Huffman coding is used in the context of JPEG image compression. There are many sites that describe the generic huffman coding scheme, but none that describe how it will appear in a JPEG image, after factoring in the DHT tables, interleaved chroma subsampling components, etc. While it is relatively easy to understand the JPEG marker extraction, the Start of Scan data segment is the least understood and most important part of the image data. Therefore, I decided to create a page to walk through a decompression example. Hopefully others will find this useful!
+
+The relevant sections in the JPEG Standard are quite obscure -- enough so that I set out to analyze several JPEG images to reverse-engineer how the huffman coding was being applied in a JPEG JFIF file.
+
+[09/22/2009]: Corrected Table 5 (added entry for DC 00 code).
+
+ [09/19/2008]: Corrected Table 1 (added entry for codes of length 9 bits).
+
+ [12/03/2007]: Corrected typo in text near Table 5 (code 00101). Added JPEGsnoop output (at end of Tutorial).
+
+ [01/27/2007]: Added section describing how to expand DHT into bit strings.
+
+The goal of this tutorial is to take a simple JPEG image and try to decode the compressed image data by hand, learning how the Huffman compression scheme works in the process.
+
+Most digital photos are full-color natural/organic images, which means that all three image components (one luminance and two color channels) will all have both low and high-frequency content. In addition, nearly all digital photos use chroma subsampling, which makes the extraction process a little more complicated. For the purposes of showing the basic huffman extraction, we will start with the simplest of all JPEG images:
+
+For the purposes of this tutorial, my working image will simply be a 16x8 pixel image, with two solid color blocks: one black and the other white. Note that each block is 8x8 pixels in size. The actual image is here: . If you want to download it, right-click and select Save Picture As...
+
+Creating the sample image was trivial, working at 1600% view. Important that dimensions and any changes in the content are on 8-pixel boundaries. Overall image dimensions should be a multiple of 8 pixels as well, in both directions. The image below is a magnified version with a grid overlayed.
+
+Once the image was created, it was saved with Photoshop CS2's Save for Web... command. This kept the file size down as it discards other extraneous file information (metadata, etc.) that is not relevant to this tutorial. Some other important points:
+
+It should be noted that when you save a JPEG image from within Photoshop it always contains three components (Y, Cb, Cr). If you change the mode to grayscale (via Mode->Grayscale), the three components are still saved, even though the JPEG standard supports an image with only one component (which would be assumed to be grayscale).
+
+Huffman coding is a method that takes symbols (e.g. bytes, DCT coefficients, etc.) and encodes them with variable length codes that are assigned according to statistical probabilities. A frequently-used symbol will be encoded with a code that takes up only a couple bits, while symbols that are rarely used are represented by symbols that take more bits to encode.
+
+A JPEG file contains up to 4 huffman tables that define the mapping between these variable-length codes (which take between 1 and 16 bits) and the code values (which is an 8-bit byte). Creating these tables generally involves counting how frequently each symbol (DCT code word) appears in an image, and allocating the bit strings accordingly. But, most JPEG encoders simply use the huffman tables presented in the JPEG standard. Some encoders allow one to optimize these tables, which means that an optimal binary tree is created which allows a more efficient huffman table to be generated.
+
+For a reasonable explanation of how it works, please see this example of Huffman coding an ASCII string and the overview from Wikipedia.
+
+For more details, please see my article on Optimized JPEGs - optimizing the huffman tables, particularly the first introductory sections and the section near the end titled "Standard Huffman Tables".
+
+For those who are trying to understand the complex huffman decoding in a JPEG image, I'm happy to report that JPEGsnoop can now report all of the variable length code decoding for each MCU (use the Detailed Decode option). For the sample output, scroll to the bottom of this tutorial.
+
+The following is the decode method done by hand, which is obviously impractical for most images, but is shown here in detail to help one learn the process involved.
+
+The above hex dump datastream shows the beginning of the Start of Scan (SOS marker 0xFFDA) marked in yellow, followed by some additional details in green and then the actual scan data selected in dark blue. Finally, the image is terminated with an End of Image (EOI marker 0xFFD9). So, the huffman-coded data content is only 9 bytes long.
+
+For the sake of comparison, the original image (16 pixels by 8 pixels) contains a total of 128 pixels (2 MCUs). With 8 bits per channel (RGB), this corresponds to an uncompressed image size of 384 bytes (128 pixels x 8 bits/channel x 3 channels x 1 byte/8 bits). Clearly, using a run-length encoded format such as GIF would have produced even more image compression in examples like this (although GIF actually takes 22 bytes to code the stream because there are 16 separate runs). JPEG is not really designed to be optimized for this type of synthetic (non-organic) image.
+
+If one uses optimized JPEG encoding, it is possible to reduce the image content size even further. In the example image, the optimized version has much smaller huffman tables (DHT) and shorter bitstrings to represent the same codewords. The net effect is that the image content size is reduced even further (to 7 bytes).
+
+To help resiliency in the case of data corruption, the JPEG standard allows JPEG markers to appear in the huffman-coded scan data segment. Therefore, a JPEG decoder must watch out for any marker (as indicated by the 0xFF byte, followed by a non-zero byte). If the huffman coding scheme needed to write a 0xFF byte, then it writes a 0xFF followed by a 0x00 -- a process known as adding a stuff byte.
+
+For our extraction purposes, we will replaceme any padding bytes (0xFF00 with 0xFF):
+
+The expectation is that image content is 3 components (Y, Cb, Cr). Within each component, the sequence is always one DC value followed by 63 AC values.
+
+For each MCU, with no chroma subsampling, we would expect the following data to be encoded:
+
+Note that some people get the order of the chrominance channels mixed up, and assume that it is YCrCb instead.
+
+The figure below shows what the DCT matrix from a single MCU (8x8 pixel square) in a digital photo typically looks like. These are the entries after quantization, which has caused many of the higher-frequency components (towards the bottom-right corner of the matrix) to become zero. By the distribution of values in the frequency-domain matrix representation, it is possible to determine that the 8x8 pixel square had very little high-frequency content (i.e. it had only a gradual intensity / color change).
+
+The DC component represents the average value of all pixels in the 8x8 MCU. Since we have deliberately created an image where all pixels in the 8x8 block are the same, we expect this value to represent either the black or white "color". The code provided in the DC entry (#0) indicates a huffman-encoded size (e.g. 1-10 bits) which is the number of bits needed to represent the average value for the MCU (eg. -511...+511).
+
+Note that the DC component is encoded as a relative value with respect to the DC component of the previous block. The first block in the JPEG image is assumed to have a previous block value of zero.
+
+Following the single DC component entry, one or more entries are used to describe the remaining 63 entries in the MCU. These entries (1..63) represent the low and high-frequency AC coefficients after DCT transformation and quantization. The earlier entries represent low-frequency content, while the later entries represent high-frequency image content. Since the JPEG compression algorithm uses quantization to reduce many of these high-frequency values to zero, one typically has a number of non-zero entries in the earlier coefficients and a long run of zero coefficients to the end of the matrix.
+
+For the purposes of this tutorial, I have deliberately created an image that has constant color across all 8x8 pixels in each of the two MCU. Because there are no changes in value across each 8x8 pixel region, there is no AC (or higher frequency content) within the block. As a result, all 63 entries in the AC portion are expected to be zero (unlike the figure above). This allows us to focus on the DC component, which we do expect to change from MCU to MCU block.
+
+The hex string shown earlier (after removal of padding bytes) can be represented in binary as the following:
+
+Using a utility such as JPEGsnoop, you can extract the Huffman tables from the JPEG image file. Often, you will find four huffman table entries (tagged with a DHT marker):
+
+The huffman compression tables are encoded in a somewhat confusing manner. Although you can draw out the binary tree by hand, it will be easier if you rely on a tool such as JPEGsnoop to generate all of the binary comparison strings for each huffman code in all four DHT sections.
+
+The following four tables were extracted from the JPEG file that was created by Photoshop for the purposes of this tutorial. Other JPEG images may be reliant on different DHT tables, so it is important to extract them prior to analyzing the file. Note that turning on JPEG Optimization will create vastly different Huffman tables, with far fewer entries. For a point of comparison, the image described in this tutorial would only need optimized huffman tables of one entry each to represent our image content.
+
+NOTE: It is important to realize that in each case the DHT entries in the JPEG file only list the Length and Code values, not the actual Bit String mapping. It is up to you to rebuild the binary tree representation of the DHT table to derive the bit strings! Please see the DHT Expansion section near the end of this tutorial for more details.
+
+The following table shows how the bit fields that follow a DC entry can be converted into their signed decimal equivalent. To use this table, start with the DC code value and then extract "Size" number of bits after the code. These "Additional Bits" will represent a signed "DC Value" which becomes the DC value for that block. Note that this table applies to any JPEG file -- this table is not written anywhere in the JPEG file itself.
+
+For example, let's assume that one was about to decompress a chrominance DC entry. If the previously-decoded "DC Code" was 05, then we must extract 5 bits following the code bits. If the next 5 bits were 00101, then this can be interpreted as decimal -26. The bits 10001 would be +17 and 11110 would be +30.
+
+Referring to the Y(DC) table (Table 1), we start with the first few bits of the coded stream (1111 1100 1111...) and recognize that code x0A matches the bit string 1111 110.
+
+This code implies that hex A (10) additional bits follow to represent the signed value of the DC component. The next ten bits after this code is 0 1111 1111 1. Table 5 above shows the DC values represented by these "additional bits" -- in this case, the bit string corresponds to a value of -512.
+
+Our progress so far:
+
+After the DC component, we begin the 63-entry AC matrix for the Y Luminance. This uses a different Huffman table (Table 2).
+
+In the above huffman code table, the code 1100 corresponds to an EOB (End of Block). Therefore, the AC components was cut short early (no other codes). This means that all 63 entries of the matrix (all entries except the 1st entry, which is the DC component) are zeros. Since we have finished the luminance component, we then move on to the chrominance components (Cb and Cr).
+
+Again, the AC is terminated right away. Now, we move on to the second chrominance channel, Cr.
+
+Refer to Table 3 for the relevant Huffman codes.
+
+This marks the end of the DC.
+
+Refer to Table 4 for the relevant Huffman codes.
+
+This marks the end of the AC.
+
+This code indicates that the value is stored in the next ten bits (A in hex is 10 in decimal):
+
+The end-of-block indicator means that all remaining values are zero. Since we haven't even started with the first value, all 63 values can be interpreted as zero. This means that there is no non-DC image content, which is to be expected since all 64 pixels (8x8) in the block are the same color.
+
+Because the scan data must end on a byte boundary, there may be a remainder of bits that will simply be tossed. In this case we see 6 bits (all-1's) that will be discarded.
+
+Now that we have the DCT (Discrete Cosine Transform) values, we can try to determine what the content of the image was in the spatial domain. Remember that the DC & AC values that we decompressed from the huffman coding are the frequency-domain representation of the image, not the real YCbCr values.
+
+Given that all of the values in the Cb and Cr channels (chrominance) are zero, we can assume that the image is grayscale and instaed focus on the luminance values (brightness).
+
+Second, all of the AC component values are zero, which means that there is no higher frequency content in the images -- in fact, we can determine that all of the image data in each 8x8 block is of the same color & intensity (i.e. only the DC component remains).
+
+We can determine the following:
+
+Note that the DC components are encoded as a difference from the previous block (with the first block assumed to start relative to zero). Therefore, we know that block 1 has a DC value of -512, but that block 2 has a DC value of +1020 relative to block 1. So, we now know:
+
+Finally, we want to convert the DCT DC value to an RGB value. Assuming that the gain of the DCT transform is 4, we divide the values by 4 to get block1 = -128, block2 = +127.
+
+Now, we have to convert between YCbCr and RGB. Please refer to the formulae provided on the JPEG color conversion page. There, you will see that we require a level shift of +128 to get input values in the range (0..255).
+
+... and these are the original values that were used to create the JPEG image!
+
+Note that the DHT tables that appear in the JPEG file only define the number of codes for each bitstring length, followed by a sequence of all the code words. The bit strings that are used to represent each of these code words is not included! It is the job of the JPEG decoder to derive these bit strings from the little information that is provided.
+
+There are many methods in which the generation of the binary strings is performed in a decoder, and most of them are heavily optimized for performance (e.g. the djpeg huffman routines). These implementations are quite difficult to learn from. I find it much more instructive to generate these bit sequences by drawing out the huffman binary tree by hand.
+
+In an extreme simplification, binary trees are composed of a root node which has a left and right branch to other nodes. Each of these nodes can either be a leaf node (the end of a branch) or split further into two more nodes.
+
+The following was extracted directly from the DHT (Define Huffman Table, shown above in Table 2: Luminance AC) in the JPEG file using JPEGsnoop.
+
+So, how do we create the binary bit-strings for each of these codes?
+
+Well, we start to build a binary tree, creating new branches and putting the code words into leaf nodes of the tree. Row 1 of the tree contains code words that only require 1 bit to encode, row 2 contains code words (leaf nodes) that only require 2 bits to encode and so on.
+
+We first start with row 0:
+
+This process continues until we have used all of the codewords defined in the DHT table. The diagram below shows the expansion of the first four rows of the above DHT.
+
+NOTE: I understand from VG that the above representation may be "right-oriented" rather than "left-oriented"
+
+Once the binary tree has been completed, you can read off the bit strings for each code word by combining the bit labels of each branch on the path down from the root node. For example, code word 0x04 is encoded by the binary bit string 1011 because we need to take branch 1 from the root node, 0 from the node on row 1, 1 from the node on row 2 and branch 1 from the node on row 3.
+
+This process can be quite laborious, and the binary tree often takes on a shape that would be difficult to draw through to completion. To make this easier, I have added a feature, DHT Expand, to JPEGsnoop that determines the binary bit strings for each of the code words appearing in the DHT table.
+
+Below is the expansion of the first few rows of the table, using JPEGsnoop with the DHT Expand mode enabled.
+
+Implementations in real JPEG decoders optimize this mechanism heavily as the bitstring search / parsing process is not a trivial task in processors designed to work with 32-bit words or bytes. Most of them end up creating large lookup tables that define lower and upper bounds for a match of a particular bitstring / code.
+
+Obviously the above is an extremely simple example JPEG image. However, real images will have some other characteristics that you will encounter:
+
+Some more detail regarding Huffman coding with chroma subsampling and other factors are described in the JPEG decoder page.
+
+Running JPEGsnoop on the image shown above, with the Scan Segment->Detailed Decode option enabled, the following output is shown:|||
+

@@ -1,0 +1,44 @@
+One of the defining features of Unix is its hierarchical filesystem: directories on Unix systems can contain other directories, without a limit to the depth of the nesting. This isn’t a big deal nowadays, but Unix was one of the first operating systems to feature a hierarchical filesystem. And believe it or not, developers today are still writing code today that misuses , and doesn’t handle long file paths correctly.
+
+This constant is defined by POSIX, and is supposed to be the largest possible size for a filesystem path. There a few compelling reasons to define such a limit:
+
+The problem is that you can’t meaningfully define a constant like this in a header file. The maximum path size is actually to be something like a filesystem limitation, or at the very least a kernel parameter. This means that it’s a dynamic value, not something preordained. The header file doesn’t know what filesystems you’re trying to use, or what kernel you’re running, it just exports a static value. For this reason alone we know that the value of is at best a lower bound.
+
+Most filesystems will have some limits on files, such as a maximum length on components in a file path. The limit on path components (also known as the file name limit) is defined as , generally 255 bytes. But a file path can have many components, and thus a full path can be much longer. Unix filesystems have directory inodes that map relative file names to file inodes, and file inodes do not actually contain file names at all.
+
+Unix also allows filesystems to be mounted hierarchically. Even if a hypothetical filesystem had a size limitation on the length of full path names (and none of the mainstream ones do), that filesystem could be mounted at a mount point other than . The mounted filenames would all be exposed with the mount point as a prefix, and thus their full file names would become longer than what the underlying filesystem supported!
+
+Exercise for the reader: Consider how one could implement hard links on a Unix system, and why hard links preclude storing full file paths in inodes.
+
+As a practical consideration, the kernel must enforce a limit on the length of all strings supplied via system calls. There are a couple of reasons for this, but the most important is that the kernel must actually do a memory copy of non-value parameters like strings from userspace into kernel memory, e.g. using . For system call arguments that are file names, the kernel will return if the supplied file name is too long. On Linux, system calls like perform this check via . The check is performed using the 4096 byte value, which, as I just finished explaining, is not really a file path limit!
+
+is actually defined as the maximum permitted size of file paths supplied via system calls. If you try to open a path whose length equals or exceeds 4096 bytes, you’ll get an error. But that doesn’t mean it’s impossible to open such a file: it just means that you need to use a shorter (relative) file path when opening the file.
+
+Many functions defined in libc can accept or return file names, and those file names are not necessarily limited by the size of .
+
+To make things more sane, POSIX defines a less well-known symbol called , analogous to . This function lets you get at low-level information about kernel limits related to things like path lengths:
+
+The maximum relative path name can be fetched for a path by supplying the value as the second argument. There are a few important usage caveats here.
+
+The first thing you’ll notice when using this API is that takes a file path as its argument. Thus you can’t use to get the maximum file path for arbitrary files, because there isn’t an arbitrary limit. You can only use with a file whose name you already know.
+
+When you do know the filename, the return value for with is the maximum relative path size, since Unix files don’t really have absolute paths. Therefore the data returned with is not as general as what you might think at first: most code will need the ability to handle longer paths than what returns.
+
+The evolution of the Unix filesystem APIs is illustrative of how to properly deal with long file paths. I’m going to use accessing the current directory as an example of how things have changed. Back in ancient times, you would have used to get the current directory name:
+
+The buffer supplied to is supposed to be at least bytes in length. This will fail in a bunch of cases, since isn’t a reliable way to tell the maximum length of a directory name. This was fixed by introducing a new, more general method, called . The major difference is that it accepts another parameter indicating the buffer size:
+
+If the buffer you supply is too small, will return -1 and set to . Since paths can be of arbitrary size, to correctly use you actually need a loop that resizes the underlying buffer and retries when this happens.
+
+The POSIX specification for says the behavior is undefined if is a null pointer. GNU libc takes advantage of this by turning into an allocating version when a null pointer is supplied as the buffer. To simplify this further, GNU libc defines an extension called that takes no parameters, and just returns a newly-allocated directory name for you:
+
+The GNU libc implementation of is actually implemented by calling with a null pointer. Portable code can check to see if is available, and then fall back to a loop that uses if necessary.
+
+Not everything in POSIX has been updated for compatibility with long file names. POSIX defines a function called , which can be used to get a “canonical” path for a file, i.e. one that doesn’t include extra slashes or dots. It takes a path to canonicalize, and an output buffer to store the canonical path in:
+
+The caller is supposed to supply an output buffer to whose size is at least bytes. As we know, this isn’t sufficient. Unlike the previous example of getting the current directory, POSIX doesn’t define a version of that specifies the size of the buffer the return value should be copied into.
+
+As in the previous example, POSIX does not specify implementation behavior when a null pointer is used as the output parameter. As before, GNU libc takes advantage of this to turn into an allocating version when the second parameter is null. When using this interface, you supply a null value for , and then later you’re expected to call on the returned pointer. To make things even easier, GNU libc exports a non-standard function called which is like , but only takes one argument, the file path to be resolved. Under the hood, is implemented by just calling with the supplied path, and a null parameter for the resolved path. This is exactly analogous to the previous example, and is a good example of how intentional ambiguity in the POSIX specification allows vendor extensions.
+
+The GNU libc man page for has some interesting notes here about these issues and the vagaries of and . The source code is also interesting: the GNU libc source code for is nearly 200 lines long, which includes the logic for computing the right buffer size, and a lot of very careful error handling. This code also demonstrates the correct usage of using with . Take a gander if you’re interested in seeing very portable, correct C file handling code.|||
+
