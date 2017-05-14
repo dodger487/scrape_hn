@@ -1,0 +1,88 @@
+All my previous posts on machine learning have dealt with supervised learning. But we can also use machine learning for unsupervised learning. The latter are e.g. used for clustering and (non-linear) dimensionality reduction.
+
+For this task, I am using Kaggle’s credit card fraud dataset from the following study:
+
+The dataset gives > 280,000 instances of credit card use and for each transaction, we know whether it was fraudulent or not.
+
+Datasets like this needs special treatment when performing machine learning because they are severely unbalanced: in this case, only 0.17% of all transactions are fraudulent.
+
+While we could try to work with classifiers, like random forests or support vector machines, by applying over- or under-sampling techniques, we can alternatively try to find anomalies in the data (assuming we expect our fraud cases to be anomalies within the whole dataset).
+
+When dealing with such a severe unbalance of response labels, we also need to be careful when measuring model performance. Because there are only a handful of fraudulent instances, a model that predicts everything as non-fraud will already achieve a > 99% accuracy. But despite its high accuracy, such a model won’t necessarily help us find fraudulent cases - the proverbial “needle-in-a-haystack” - that we actually want to find!
+
+Below, I will show how you can use autoencoders and anomaly detection, how you can use autoencoders to pre-train a classification model and how you can measure model performance on unbalanced data.
+
+The dataset contains numerical input variables V1 to V28, which are the result of a PCA transformation of the original features (which could not be provided due to confidentiality issues).
+
+The response variable Class tell us whether a transaction was fraudulent (value = 1) or not (value = 0).
+
+There are two additional features, Time (time in seconds between each transaction and the first transaction) and Amount (how much money was transferred in this transaction).
+
+Because Time only tells us the order in which transactions have been done, it doesn’t actually tell us anything about the actual times (i.e. time of day) of the transaction. Therefore, I am normalizing them by day and bin them into four groups according to time of day.
+
+We can see now that the transactions in this dataset have all been recorded on two consecutive days and there are roughly the same number of transactions on these two days.
+
+Now, I remove the columns I used to create the Time bins.
+
+The distribution of transactions over the four Time bins shows, that the majority of fraud cases have happened in group 1 (although, I can’t say when exactly because the original Time feature did not tell us when the first transaction occurred).
+
+I also want to look at the distribution of the amounts of money that were transferred:
+
+Interestingly, fraudulent credit card transactions had a higher mean amount of money that was transferred, but the maximum amount was much lower compared to regular transactions.
+
+For modeling, I am using R’s H2O implementation with the h2o package. For more details and other examples, see my posts on my machine learning webinar, on building neural nets with h2o and on performing grid search for hyperparameter tuning.
+
+Then, I am splitting the dataset into training and test sets. Because I want to check how a pre-trained model with perform, I am splitting my data into two separate training sets and one independent test set for final model comparison.
+
+First, I am training the unsupervised neural network model using deep learning autoencoders. With h2o, we can simply set .
+
+Here, I am applying a technique called “bottleneck” training, where the hidden layer in the middle is very small. This means that my model will have to reduce the dimensionality of the input data (in this case, down to 2 nodes/dimensions).
+
+The autoencoder model will then learn the patterns of the input data irrespective of given class labels. Here, it will learn, which credit card transactions are similar and which transactions are outliers or anomalies. We need to keep in mind though, that autoencoder models will be sensitive to outliers in our data, which might throw off otherwise typical patterns.
+
+Because training can take a while, I am saving the model:
+
+Because I had used a bottleneck model with two nodes in the hidden layer in the middle, we can use this dimensionality reduction to explore our feature space (similar to what to we could do with a principal component analysis). We can extract this hidden feature with the function and plot it to show the reduced representation of the input data.
+
+Here, we do not see a cluster of fraudulent transactions that is distinct from non-fraud instances, so dimensionality reduction with our autoencoder model alone is not sufficient to identify fraud in this dataset.
+
+But we could use the reduced dimensionality representation of one of the hidden layers as features for model training. An example would be to use the 10 features from the first or third hidden layer:
+
+For measuring model performance on test data, we need to convert the test data to the same reduced dimensions as the trainings data:
+
+Now, this actually looks quite good in terms of identifying fraud cases: 92% of fraud cases were identified! However, many non-fraud cases were also classified as fraud. For real-life application, this wouldn’t be a good model. Let’s try some other techniques…
+
+We can also ask which instances were considered outliers or anomalies within our test data, using the function. Based on the autoencoder model that was trained before, the input data will be reconstructed and for each instance, the mean squared error (MSE) between actual value and reconstruction is calculated.
+
+I am also calculating the mean MSE for both class labels.
+
+This, we can now plot:
+
+As we can see in the plot, there is no perfect classification into fraud and non-fraud cases but the mean MSE is definitely higher for fraudulent transactions than for regular ones.
+
+We can now identify outlier instances by applying an MSE threshold for what we consider outliers. We could e.g. say that we consider every instance with an MSE > 0.02 (chosen according to the plot above) to be an anomaly/outlier.
+
+As we can see, outlier detection is not sufficient to correctly classify fraudulent credit card transactions either (at least not with this dataset).
+
+We can now try using the autoencoder model as a pre-training input for a supervised model. Here, I am again using a neural network. This model will now use the weights from the autoencoder for model fitting.
+
+Now, this looks much better! We did miss 17% of the fraud cases but we also did not mis-classify too many of the non-fraud cases.
+
+In real-life, we would now spend some more time trying to improve the model by e.g. performing grid search for hyperparameter tuning, going back to the original features (which we did not have here) and trying different engineered features and/or trying different algorithms. But here, I will leave it at that.
+
+Because of the severe bias towards non-fraud cases, we can not use performance measures like accuracy or area under the curve (AUC), as they would give overly optimistic results based on the high percentage of correct classifications of the majority class.
+
+An alternative to AUC is to use the precision-recall curve or the sensitivity (recall)-specificity curve. To calculate and plot these metrics, we can use the ROCR package. There are different ways to calculate the area under a curve (see the PRROC package for details) but I am going to use a simple function that calculates the area between every consecutive points-pair of x (i.e. x1 - x0, x2 - x1, etc.) under the corresponding values of y.
+
+Precision is the proportion of test cases predicted to be fraud that were indeed fraudulent (i.e. the true positive predictions), while recall or sensitivity is the proportion of fraud cases that were identified as fraud. And specificity is the proportion of non-fraud cases that are identified as non-fraud.
+
+The precision-recall curve tells us the relationship between correct fraud predictions and the proportion of fraud cases that were detected (e.g. if all or most fraud cases were identified, we also have many non-fraud cases predicted as fraud and vice versa). The sensitivity-specificity curve thus tell us the relationship between correctly identified classes of both labels (e.g. if we have 100% correctly classified fraud cases, we will have no correctly classified non-fraud cases and vice versa).
+
+We can also look at this a little bit differently, by manually going through different prediction thresholds and calculating how many cases were correctly classified in the two classes:
+
+This plot tells us that we can increase the number of correctly classified non-fraud cases without loosing correctly classified fraud cases when we increase the prediction threshold from the default 0.5 to 0.6:
+
+Our final model now correctly identified 83% of fraud cases and almost 100% of non-fraud cases.
+
+If you are interested in more machine learning posts, check out the category listing for machine_learning on my blog.|||
+

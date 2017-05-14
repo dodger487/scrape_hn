@@ -1,0 +1,44 @@
+Flickr is an image and video hosting website which is owned by Yahoo and resides on the flickr.com domain.
+
+To handle authentication on Flickr, requests are made to login.yahoo.com to get an access token for the user.
+
+When a user wants to login to Flickr.com he clicks a sign-in button which redirects him to the following url:
+
+This is the Yahoo account login page where a user is prompted to enter his credentials. After completing the login form and clicking login, the user is first redirected to a Yahoo endpoint where his credentials are verified and then, if they are valid, he is redirected back to the following Flickr url:
+
+What happens now is that in the background Flickr verifies the .ys and .data parameters against the Yahoo verification server and logs the user in.
+
+So, it appears that if a user is already logged in to Yahoo and clicks the initial link:
+
+The flow just happens in the background without the need for a user to enter his credentials in Yahoo. This poses a higher risk of account takeover, due to the fact that the user just needs to click a single link (like in some OAuth implementations) for the authentication to happen for him. Knowing this I have started looking for potential bypass to this flow.
+
+The first thing I have noticed is that the second .done parameter can be manipulated. This parameter actually controls where the login tokens are sent. It appears that Yahoo’s servers only verify that it starts with https://www.flickr.com/signin/yahoo/ but we can still append ../ so if we append ../../test to the .done original value the .ys and .data tokens will be sent to https://www.flickr.com/test endpoint.
+
+So, this gives us a lead since if we find an open redirect somewhere on the https://www.flickr.com/ origin we will be able to send the token to our own server. However, I wasn’t able to find one on the main domain. So, I looked for other ways to leak the token.
+
+After some digging I came across this page: https://www.flickr.com/html.gne?tighten=0&type=comment which states that images can be embedded in the comments on different Flickr pages. I thought that maybe if I could post an external image in a comment, the tokens will be leaked to my own server via the referrer field, since they’re still in the landing url. So I posted a comment on my own uploaded image with following content:
+
+The image was really embedded in the comment, but unfortunately Yahoo were manipulating its src  value to the following:
+
+That was actually an internal Yahoo proxy so that Flickr won’t be leaking requests to external servers. BUT, it appeared that if I use some browser tricks I can manipulate the Flickr image processing logic. When posting the following comment:
+
+the comment was not manipulated by the proxy and the src value stayed as is. So what should have happened now is that the image will be shown in the comments section of the photo, right? No, also the browser accepts this as a valid url there was some Content Security Policy applied:
+
+The img-src configuration blocked it since it was not on the white list, so I wasn’t actually able to embed external images after all.
+
+Upon understanding this, I have tried to look if there are other endpoints on Flickr that are also allowing comments. After some time, I came across the forums page: https://www.flickr.com/help/forum/en-us/. It appeared that this page also supports the comments html embedding feature. And more importantly it appeared that there is no CSP applied on all https://www.flickr.com/help/forum/* pages.
+
+So I have posted the following comment on a thread in the forum:
+
+And it worked, an external image was embedded here:
+
+So all I had to do now was to construct the final url which looked like this:
+
+What happened when a user clicked on the link is that he was redirected to https://www.flickr.com/help/forum/en-us/72157668446997150/page14?data={some-token}&.ys={second-token} and from here the following request was issued by his browser:
+
+As you can see the Referer field contained the tokens which were sent to www.attacker.com. So what the attacker had to do now is just browse to the following url in his browser:
+
+and he was logged in to the victim’s account.
+
+Yahoo resolved this by doing several things. First – the .done parameter on the login.yahoo.com endpoint only allows https://www.flickr.com/signin/yahoo/ now as a valid value. The image embedding logic’s bypass using “/\/\” is also fixed. And finally, there is now CSP applied on the Flickr forum.|||
+
