@@ -1,0 +1,78 @@
+Earlier this year we announced the release of Algolia Offline, which compacted the power of Algolia down to an offline search experience while retaining most of its features. One of the biggest constraints of packaging a search engine into a mobile library is the “binary size”: how much space the compiled library occupies. Fitting an entire search engine under 1 MB was an exciting adventure!
+
+On mobile, the binary size of your application is doubly important, because it impacts users twice: first when they download the app, and again by eating space on their device’s storage.
+
+On iOS, Apple prevents users from downloading an application “Over The Air” (i.e. from a mobile network, not Wi-Fi) if it weighs over 100 MB compressed to prevent runaway fees on data connections—that limit used to be 50 MB prior to iOS 7.
+
+Even if you are below that threshold, many users are still reluctant to install apps if they are too big. Mobile storage is far from being the most affordable medium, and competition for space is fierce. Remember the last time your phone’s disk was full: probably the first thing you did was open up your application list and scroll through those taking the most space to look for apps you could afford to get rid of.
+
+As a result, mobile developers strive to make their apps as streamlined as possible. This constraint naturally translates to all mobile libraries, including Algolia Offline.
+
+While Apple imposes restrictions on your applications, they also provide a useful tool to make them lighter for the end user: App Thinning. Introduced with iOS 9, App Thinning ensures that users only download the code and resources that are relevant for their device (hardware architecture and resolution). It became almost inevitable with the advent of Retina HD displays, which come with 3x resolution, meaning 9x as many pixels!
+
+Unfortunately, Android has yet to come out with a similar tool. Google Play has a feature called “Multiple APK”, whereby you can publish different variations of your app for different device configurations. Contrary to App Thinning, however, it is entirely manual, making deployment a lot more cumbersome. The official documentation itself states that “[this] is not the normal procedure”.
+
+Even with App Thinning, binary size is still a concern: the problem has been mitigated, not eliminated.
+
+Back in 2012, Algolia started as an offline SDK, so one could be forgiven for thinking that shipping a small library was easy enough for us. However, from 2013 on we switched to a cloud-hosted engine, and its rules are very different from mobile: it’s a different animal altogether.
+
+With a cloud-hosted product, you control every part of your environment. You have big, fat servers with terabytes of disk: storage space is much less of an issue. Conversely, you have hundreds of thousands of customers to serve in milliseconds, so speed starts to be your main headache. It’s a well-known engineering problem: the space–time tradeoff. With a cloud-hosted product, the cursor is set firmly on “time”.
+
+In addition, since our move to a cloud product, our search engine has been augmented with lots of new features. Each feature means more code, which means bigger binaries in the end.
+
+As a result, when we resurrected the Offline SDK to become Algolia Offline, it weighed around 3 MB. The challenge was now to bring it down to around 1 MB.
+
+We didn’t have to reinvent the wheel to shrink our application by two thirds. Compilers have been around for decades… since the times when binary size was always an issue. Compilers provide lots of nice options to squeeze your code into the fewest possible bits.
+
+Our CTO Julien Lemoine posted a great article back in early 2013 explaining how to reduce binary size with the Android NDK. A lot of the tricks he mentioned still apply. Let’s review them.
+
+The first obvious step is to ask the compiler to optimize for space ( option, instead of the default ). In our case, this alone saves 419 kB.
+
+Next, let’s be careful with inline expansion. Inlining code can bring significant performance benefits, not only because it saves a function call, but also because it makes other optimizations possible—optimizations which would have been impossible across a function boundary. As a consequence, though, the compiled size grows bigger, because the same code is duplicated in several places in your binary.
+
+Algolia relies heavily on inlining, even forcing it for specific functions (typically those used within tight loops). In Algolia Offline, however, we disable this behavior and let the compiler decide. This saves another 144 kB.
+
+Optimized code is nice, but what if it’s not actually used? When a linker produces a library, it merely takes every object file (i.e. the machine code equivalent of every source file), and links them together. But what if some portions of the files are not actually used? Dead code stripping is the answer. It removes from every object functions that are not useful to the library’s business. In our case, this saves 312 kB.
+
+There’s a twist to dead code stripping in the case of a dynamic library. In a static library, you only want to strip private symbols that are not useful to public functions. You cannot know which of these functions will be used, because a static library is merely a collection of reusable pieces of compiled code. In a dynamic library, however, you know which public functions will be used: only the functions exported by the library! An important step is therefore to ensure that you only export the minimum viable set of functions to serve your purpose. By tightly controlling the exports, we save another 288 kB.
+
+We can take dead code stripping one step further with Link-Time Optimization (LTO). By looking at the binary as a whole, LTO can optimize away dead code across object file boundaries, which a regular linkage cannot do. It results in a more compact binary: 57 kB saved—at the cost of a significantly longer link phase during the build.
+
+We chose to ban the C++ standard I/O stream library from Algolia Offline, as it is still a major cause of bloat, especially on Android. We have compile- and link-time checks to make sure we don’t rely on it. The gain is far from negligible: one single, seemingly innocuous in our code adds 144 kB to the binary size!
+
+It’s worth noting that we now use exceptions. We avoided them in the past because they require some limited form of Run-Time Type Information (RTTI), so compilers used to trigger full RTTI support when exceptions were enabled… and RTTI causes binary bloat. Modern compilers are better optimized, so we can enjoy exceptions without paying the price of full RTTI.
+
+I am a huge fan of Clang, LLVM’s C/C++ compiler. LLVM is an awesome piece of software, one of the best surprises of the 2010 decade, when it started to get traction, in particular with Apple backing it.
+
+We’ve been compiling Algolia with Clang on Linux for months—it resulted in both a non-negligible performance increase (5%) and more compact binaries.
+
+Oddly enough, we are still stuck with GCC on Android! Although Clang is Android NDK’s default toolchain since r11 (latest version is r14), it still suffers from a number of drawbacks that are deterring us from relying on it at the moment. In particular, I had trouble making LTO work on our project with Clang—and without LTO, Clang cannot compete with GCC in terms of binary size.
+
+It is worth noting that we already use Clang’s Standard Template Library (STL), though.
+
+However smart they are, compilers can only act on your code. But when you dissect our library, you will see that code does not account for the entire size of the binary. A substantial part of it is occupied by data tables.
+
+Here, no compiler magic can save you; only proper software engineering can. (Remember that “Data Structures 101” course?)
+
+Our data falls into five broad categories: Unicode, HTML entities, stop words, plurals and CJK segmentation.
+
+Plurals and CJK segmentation are way too big to fit in a mobile library: 5 MB for segmentation and 48 MB for plurals. We had to discard those features altogether in Algolia Offline. (As you might have guessed, I did not include them in the initially advertised size of 3 MB…) With regard to the other three data tables, we found a way to make them more compact.
+
+The main idea behind the compaction of our data tables is to transform random access structures into a big blob with an auxiliary index. A random access data structure is typically an array: all elements have the same size; therefore, computing the address of a given element is trivial (a multiplication). But if elements have different intrinsic sizes, you are forced to make them as big as the biggest element, which results in a lot of wasted space.
+
+In a blob, by contrast, all elements are stored contiguously with no wasted space between them. This makes the structure more compact, but random access becomes impossible: computing the address of a given element is no longer easy. To solve that, we rely on an auxiliary structure (called an “index”, even if it has little to do with indices in Algolia’s engine) that contains the offset of each element in the BLOB. Because an offset is an integer and is typically much smaller than the actual element, this additional data structure doesn’t overcome the benefit of the blob.
+
+By applying this principle to our data, we saved:
+
+Overall, the binary shrunk by 669 kB. Of course, we had to trade some CPU time for this: around 5% for Unicode and HTML entities—a lot more (around +50%) for stop words, but they are accessed only a few times per query, so their performance doesn’t really matter.
+
+Combining all the above optimizations on both code and data brought the library back at around 1 MB per hardware architecture (with slight variations across architectures and platforms). While it might still sound big, it is actually an acceptable overhead in most use cases, especially these days where high-resolution images sometimes account for the major part of an application’s bundle.
+
+Here is a summary of our efforts:
+
+The above numbers are for the hardware architecture armeabi-v7a on Android but, despite small variations, they would be similar on iOS or for other hardware architectures.
+
+We hope that these tips & tricks will be useful for reducing the size of your mobile libraries or applications. There are always trade-offs to be made between speed and space, but with sensible compiler and linker settings, and carefully crafted data structures, you can achieve dramatic space savings without sacrificing much of execution speed.
+
+In the end, Algolia Offline performs a typical search query under 50 ms on a mid-range device. That’s more than the cloud-hosted engine, of course; but thanks to the lack of any network transmission, the elapsed processing time is about the same. This makes instant search a reality on mobile—even offline.|||
+

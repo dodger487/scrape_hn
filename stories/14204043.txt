@@ -1,0 +1,31 @@
+Just how many virtual hard drives is it practical to add to a Linux VM using qemu/KVM? I tried to find out. I started by modifying virt-rescue to raise the limit on the number of scratch disks that can be added¹:
+
+I hit some interesting limits in our toolchain along the way.
+
+256 is the maximum number of virtio-scsi disks in unpatched virt-rescue / libguestfs. A single virtio-scsi controller supports 256 targets, with up to 16384 SCSI logical units (LUNs) per target. We were assigning one disk per target, and giving them all unit number 0, so of course we couldn’t add more than 256 drives, but virtio-scsi supports very many more. In theory each virtio-scsi controller could support 256 x 16,384 = 4,194,304 drives. You can even add more than one controller to a guest.
+
+At around 490-500 disks, any monitoring tools which are using libvirt to collect disk statistics from your VMs will crash (https://bugzilla.redhat.com/show_bug.cgi?id=1440683).
+
+qemu uses one file descriptor per disk (maybe two per disk if you are using ioeventfd). qemu quickly hits the default open file limit of 1024 ( ). You can raise this to something much larger by creating this file:
+
+It’s called for a reason, so you should be careful adjusting settings here except on test machines.
+
+The Linux guest kernel uses quite a lot of memory simply enumerating each SCSI drive. My default guest had 512 MB of RAM (no swap), and ran out of memory and panicked when I tried to add 4000 disks. The solution was to increase guest RAM to 8 GB for the remainder of the test.
+
+Booting with 4000 disks took 10 minutes² and shows about a gigabyte of memory disappears:
+
+What was also surprising is that increasing the number of virtual CPUs from 1 to 16 made no difference to the boot time (in fact it was a bit slower). So even though SCSI LUN probing is not deterministic, it appears that it is not running in parallel either.
+
+If you’re using libvirt to manage the guest, it will fail at around 8000 disks because the XML document describing the guest is too large to transfer over libvirt’s internal client to daemon connection (https://bugzilla.redhat.com/show_bug.cgi?id=1443066). For the remainder of the test I instructed virt-rescue to run qemu directly.
+
+My guest with 8000 disks took 77 minutes to boot. About 1.9 GB of RAM was missing, and my ballpark estimate is that each extra drive takes about 200KB of kernel memory.
+
+We pass the list of drives to qemu on the command line, with each disk taking perhaps 180 bytes to express. Somewhere between 10,000 and 11,000 disks, this long command line fails with:
+
+So that’s the end of my testing, for now. I managed to create a guest with 10,000 drives, but I was hoping to explore what happens when you add more than 18278 drives since some parts of the kernel or userspace stack may not be quite ready for that.
+
+¹That command will not work with the virt-rescue program found in most Linux distros. I have had to patch it extensively and those patches aren’t yet upstream.
+
+²Note that the command within the guest is not an accurate way to measure the boot time when dealing with large numbers of disks, because it doesn’t include the time taken by the BIOS which has to scan the disks too. To measure boot times, use the wallclock time from launching qemu.|||
+
+><rescue> ls -l /dev/sd[tab] Display all 4001 possibilities? (y or n) Just how many virtual hard drives is it practical to add to a Linux VM using qemu/KVM? I tried to find out. I started by modifying virt-rescue to raise the limit on the number of scratch disks that can be added¹: virt-rescue --scratch=4000 I hit…
