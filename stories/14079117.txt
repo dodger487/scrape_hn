@@ -1,2 +1,118 @@
-|||
+It’s taken me a long time to build up an understanding of the Postgres permissions system, so I thought I’d write it down to help others get up to speed faster.
+
+First let’s talk about what things can be guarded by permissions. The big ones are databases and tables/views, but you can also set permissions on schemas, functions, sequences, types, languages, tablespaces, domains, foreign servers, foreign data wrappers, and large objects. (Phew!) There are also a few permissions that apply to the whole cluster. (In Postgres terminology, the “cluster” is the server process(es) keeping its files in and listening on 5432 (or whatever), and a “database” is a namespace in the cluster where you define tables. You can list the databases in your cluster with .) We’ll explore below what actions can be allowed or retricted for each of these subjects. Collectively, let’s call permissionable things “topics”.
+
+Second let’s ask who has permissions. In Postgres permissions come first from your user, and second from any groups your user is a part of. Collectively, users and groups are called “roles”. Or to be more accurate, before Postgres 8.1 users and groups were separate things, but now everything is just a role. A role can even be both a “group” and a “user” at the same time: it can have members but also serve as a direct login.
+
+The key to understanding Postgres is that the stored permission between any role and any topic is only ever a or a . When Postgres does a permissions check, it takes all your roles’ permissions on the topic, and if there are any with a , you’re in. In other words your effective permission is the of all your roles’ permissions. (There is one exception to this, explained below, but it rarely matters.)
+
+You can see what groups each role belongs to with (list users). You can add someone to a role with , or remove them with , where is the group and is the user. (I am using “group” and “user” loosely here for clarity, but remember that they are all roles.)
+
+So some consequences of this: If you a permission from a role , it loses its direct , but it might still get the permission indirectly from other roles. The isn’t remembered in any way. It just sets the to a for . It doesn’t override other possible sources of a .
+
+Another consequence is that commands like have an immediate effect of setting a lot of s, but they are not remembered either. So if you add some more tables, they will not automatically share the same grants as the old tables.
+
+The complement of is . This lets you say what the s and s should be for future objects. It does not change any existing objects; it just says how to set up new ones. You can combine and to get 100% coverage: first for the old objects, then for the new. Actually it would probably be less racy to do the first, in case someone else is making more objects while you type.
+
+The final trick in all this is a magic role named . Every other role is a member of the role, so if it has any s, then everyone will apply those s. Note there is no way to cancel a from the role, because of what we said above about how permission checks do an . You might something from a troublemaker and give them a , but if the role has a , they can do the thing anyway. Of course you can a permission from the role itself, but then you have to individually the permission to all the roles that should have it.
+
+One wrinkle here is that a role can have either the or attribute. If it has , then it does not benefit from permissions of roles it belongs to. In other words, its own direct s are the only ones it’s got (ha!). In practice this is not a significant block though, because if you belong to an role but have , you can still and act with the permissions of that role. So should not be used as a way of restricting what people can do. Also note that even with , you still inherit permissions from the role. In general I don’t see much point to , except for the psychological benefit of making people more explicitly prepare before running dangerous commands.
+
+So you have the role, and you have , and both are a kind of default, but in different ways. It is important to keep these separate! In fact I’m pretty sure I’ve seen places in the docs where permissions are referred to as “defaults”. If you are working with either of these, watch out that you are clear on how they differ!
+
+Okay, so those are the mechanics. Now let’s look at some specific permissions. At the top level you have cluster-wide permissions. These are stored as attributes on your role. They are:
+
+LOGIN: This means you can connect to the cluster. You still must in addition have permission to to an individual database (covered below), but if your role doesn’t have this basic attribute, you can’t get in at all.
+
+SUPERUSER: This means you can do anything. You’ve got root. Your other permissions don’t matter, because when Postgres sees you have this, it doesn’t ask any further questions.
+
+CREATEDB: You can create more databases.
+
+CREATEROLE: You can create more roles.
+
+REPLICATION: You can start streaming replication. Normally you’d only give this to a special role used by slaves to connect to the master database.
+
+You can set these permissions with or change them with . You can see them with .
+
+The next level is the database. If you type you can see the databases in your cluster, and the last columm shows the permissions on each. For example:
+
+For each database, you’ll see several lines of permissions. Each line shows a role, an equals sign, and then the list of permissions for that role. Someones a line is missing the role and starts with just an equals sign; this is for the role. It shows the permissions that everyone gets for free. Whatever you see here is allowed for anyone.
+
+There is also a forward slash followed by another role name. That shows who granted those permissions.
+
+So in the above example you can see that for the database, the role has permissions, and has , granted by .
+
+Each permission is shown by a single letter. They mean:
+
+c: to the database. It has always worried me that by default databases let anyone connect. In theory this is okay since you can’t or change anything, but you can still list the tables ( ), list their colums , etc. More precisely, connecting lets people query the tables in and . They can see the names of all the other database users, all the other databases, and quite a bit more. Personally I feel this is a significant shortcoming in Postgres’s system.
+
+You can revoke access to these system tables, but at the cost of breaking important things. For instance pgadmin fails if it can’t list the databases. Another idea is to use RLS on the system tables, but that is not supported.
+
+Of course, if you can connect to any database, you can do these things. I’m not aware of any information you can get about database by connecting there that you can’t also get while connected to database . So you could argue that granting everyone is not a problem! I don’t have a good answer to that, even though it feels suspicious. I think the moral, then, is that all database roles require more trust than you might expect.
+
+C: This allows you to a new schema within the database. As the owner of that schema, you’ll be able to do lots of things with it, like create tables, etc.
+
+Finally, individual letters may be followed by an asterisk ( ). That means that the user not only has the permission, but may also the permission to others. The object owner may always grant permission, so Postgres doesn’t bother to show asterisks for them.
+
+For permission purposes, Postgres treats tables and views as the same thing. So will include views, too.
+
+You can list the permissions for tables and views (and sequences too) using or (They do the same thing.):
+
+What you see here is a lot like the output from . A blank means you have never made any permissions changes for this object, so its permissions still match the default. (When I say “the default”, I don’t mean the defaults you’ve established with , but rather the default defaults that Postgres ships with.) Note that once you change something, even if you change it back, the column will never go back to blank again.
+
+Of course now there are more letters than before. That’s because tables have lots of permissions:
+
+SELECT ( ): You can read from the table.
+
+UPDATE ( ): You can write to the table.
+
+INSERT ( ): You can append to the table.
+
+DELETE ( ): You can delete from the table.
+
+TRUNCATE ( ): You can really delete from the table.
+
+REFERENCES ( ): This lets you create foreign key constraints elsewhere that reference this table. You need the permission on both tables. Also, you can grant this permission for just specific columns. (I confess I don't really get this permission. What is the use of forbidding foreign keys? I mean I get why not anyone can create a foreign key, but what is the use of making it a separate permission from other DDL commands? Besides, if a foreign key makes sense, why not just define it yourself?)
+
+In the first version of this post, I questioned the usefulness of this permission, but the folks from the Postgres mailing list were really helpful in making it click for me. As Peter Holzer explains, only a table’s owner may add constraints to it (or run at all). But suppose owns the table , and owns the table . Joe wants to add a column pointing to Fred’s table. He would need the privilege on Fred’s table to do it.
+
+And why can’t Postgres just check Joe’s privilege instead? It’s because making a foreign key does more than just read from the table. Joe’s foreign key could prevent Fred from changing/deleting his own records, as well as costing Fred time checking the constraint. I don’t know how often this permission will come into play for me, but I’m happy to figure out why it’s there!
+
+TRIGGER ( ): You can add a trigger to the table.
+
+It is also useful to see the default privileges for each table (from ):
+
+Here you can see that new tables will start out with whatever permissions we have prepared as the defaults.
+
+Note that you can also say . Normally when you alter default privileges, it only affects (future) objects you own. If you want to change the privileges for future objects created by someone else, you can use . Naturally you can only that if you belong to that role.
+
+With all these rules, it is natural to want to see the final calculated rights of each user in the system. Unfortunately Postgres doesn’t have a built-in way to show that. You can say , but that does not compute inherited permissions.
+
+Fortunately there is a function called you can use to get most of the way there. It does consider role memberships: for instance if belongs to the role and has , then will return true. Change to and it will return false. I do wish there were a way to run the computation as if all roles were , but this is close enough for me! Others have put this together in a nice query to get the permissions for any table you like. Here is a version I like:
+
+Of course you could just as well filter on user to see one person’s permissions for all the tables. If you do a lot of permissions work, it might even be worth wrapping this up into a view so you can filter on whatever you like.
+
+Incidentally, there are lots of other functions to ask questions not covered by psql commands.
+
+If you squint, a sequence is pretty much just a tiny table: you can from it (call ), or it (call ), or do both at once (call ). So it appears in with the tables and views. But unlike tables and views, they also have the permission, which allows or .
+
+The permission is not just an abbreviation for plus ; it has its own bit. You can see it in as (vs. and ). Yet if you have it, you don’t need or to use the sequence. Granting only would let someone use the sequence normally but not call , which might be useful.
+
+I can’t think of any reason to give someone just on a sequence. Even won’t work, because only tells you the last time you called . You will get an error like ERROR: currval of sequence "widgets_id_seq" is not yet defined in this session .
+
+Functions have just an permission. New functions will grant execute permission to , so be careful if you are creating something sensitive. If you like, you can change this with .
+
+You can see functions in psql with or , but neither will show the permissions. Instead you should use a query like
+
+The format of is like anything else:
+
+Here we have already revoked execute from , then granted it to .
+
+Note that usually functions execute with the permissions of the invoker, but you can create “setuid” functions that execute with the permissions of the definer. These can be very useful, but they have similar dangers to Unix setuid programs, so you have to be careful with them.
+
+Schemas have just and permissions. lets you add more stuff to the schema (tables, functions, sequences, etc.). is a prerequisite to using objects within the schema. For instance to from a table, you must first have permission on its schema. (You must also have permission on the table.) Note that even without , you can still list the schema contents, and even query for its tables’ definitions etc.
+
+To be honest I find the schema permission kind of confusing and superfluous, and I don’t think I’m the only one. I can’t think of any security system you can build with this permission you can’t build with permissions on individual tables, functions, etc., and because you can say GRANT ... ON ALL whatevers IN SCHEMA foo , it is not even necessary as an abbreviation. I guess if you really want to lock people out, you might as well use it as an extra layer though.
+
+There are permissions for more specialized database objects too, like types and foreign data wrappers. But if you have made it this far, you should have no problem understanding the documentation for those. You might also want to read about RLS to get really fine-grained access control. Here I’ve only tried to cover the basics, and give you an accurate mental model of how Postgres decides who can do what. If you have any questions, comments, or corrections, I’m happy to listen!|||
 

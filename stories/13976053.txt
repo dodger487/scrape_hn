@@ -1,0 +1,56 @@
+Thousands of servers are closely monitored at Criteo and when inconsistent behaviors are detected, an investigation is started based on these deviant machines. The level of details provided by the monitoring is close to what is provided by performance counters. Our team is using them to guess where the problem could come from. The next step is to have a closer look to one of the faulting machines in order to figure out whether our guess is valid… or not.
+
+Lately, we got a few situations where the number of running threads was growing up to hundreds, even thousands. To limit the impact on production machines, we are taking dumps with procdump from SysInternals and we are loading them into WinDBG to dig into the CLR data structures with SOS commands. However, when you are dealing with 20+ GB dumps and thousands of threads, the investigation starts to become complicated simply due to the mass of data, the performance hit and the complexity of the highly multi-threaded code.
+
+The magic of using sos with WinDBG on a .NET dump is the ability to navigate among your data; either your types, BCL or other libraries types. With !do, you are able to see the values of the fields in the instances of objects manipulated by your application. However, it is clearly less efficient than the navigation provided by the Watch or QuickWatch panes in Visual Studio. In addition, you first need to find the instance(s) you are interested in and it usually means calling !dumpheap -stat and !dumpheap -mt to narrow down the search. On multi-GB dumps, it will cost you minutes just before being able to !do one of the possibly interesting instances.
+
+One solution is to build tools that leverage sos commands textual output to automate well known scenari. The LeakShell tool has been built as a WinDBG companion application to ease a memory leaks hunt. Even if LeakShell has been enhanced to directly consume dumps, parsing text outputs from !dumpheap -stat might be fragile if it changes but also not very scalable in large dumps.
+
+As developers, we would definitively prefer to write our own tool based on clean and easy to use APIs instead of parsing cryptic textual output. This is exactly the purpose of ClrMD as stated by its first line of documentation: CLR MD is a C# API used to build diagnostics tools. This Microsoft project (thank you so much Lee Culver!) is available from Github and provides a managed wrapper that brings the power of sos and symbol engine to your C# code. Take the time to follow the tutorials and open the samples code: you have everything you need!
+
+This series of posts will detail how to write your own tool with ClrMD and describe some of the code we had to write to help our investigations for real world production machines servicing millions of requests per second worldwide.
+
+The basic scenario that our tool needs to support is opening a dump file and automate CLR data structures analysis to provide high level summaries.
+
+When you start a project that will use ClrMD, you should tell Nuget to get the official version for you. Right-click the References node of your project and select Manage NuGet Packages. Look for microsoft.diagnostics.runtime (don’t forget the “Include prerelease” check) and install it
+
+As stated by the last line of the description: no other dependency is required.
+
+Note: this version 0.8.31 is still in beta but you could get the latest level of code from Github (more on this in a later post).
+
+The root class you’re starting with in ClrMD is DataTarget:
+
+This class wraps a debugging session, either a live one by calling AttachToProcess or a post-mortem analysis on a dump file with the LoadCrashDump. For the rest of the series, we will focus on the dump analysis.
+
+The first step is to tell ClrMD to open a .dmp file and use it to create the DataTarget:
+
+Since .NET 4.0, it is possible to load “several” versions of the CLR in the same process at the same time. The list of the loaded CLR runtimes is provided by the DataTarget.ClrVersions property and for simplicity sake, only the first one will be taken into account in the rest of the series. This property returns a list of ClrInfo:
+
+Several members of this class relate to “Dac”: this makes reference to the data access layer provided by mscordacwks.dll. As most of you should know (if this is not the case, read this detailed post), this library is used by sos.dll and ClrMD to access the internal CLR data structures. This sos/mscordacwks pair is unique per version of the CLR and therefore unique to the dumps you download from a server.
+
+The symbol engine API used by WinDBG and ClrMD behind the scene are slightly different in figuring how to get the right version; i.e. the version corresponding to your dump (which might be different from the one your machine). An easy way to load the right dac is to copy the sos/mscordacwks dlls from the server (from C:\Windows\Microsoft.NET\Framework64\<v4.0.30319>) where the dump was taken and paste them in the dump folder.
+
+You tell WinDBG where to find mscordacwks.dll with the following command:
+
+Next, here is the command to explicitly load sos from a folder:
+
+The story is a little bit different for ClrMD: you have to manually simulate the work WinDBG is doing. The ClrInfo instance will help getting the right version of the Runtime instance corresponding to the right version of mscordacwks.dll that you copied from the dump machine:
+
+If you were not able to copy the dll with the dump file, you could leverage the symbol engine to automatically retrieve it (with the risks of not finding the exact same version if your machines have been patched and the symbols/mscordacwks.dll are not available from the Microsoft servers):
+
+As explained in the getting started page, this call will try to use the “local” mscordacwks.dll from current machine Windows subfolder and if there is no matching version, it will use the DataTarget.SymbolLocator.Find method to download this dll from the Microsoft public servers.
+
+WinDBG and Visual Studio are taking two environment variables into account when time comes to load .pdb symbols files (_NT_SYMBOL_PATH) and sos.dll/mscordacwks.dll
+
+After the srv prefix, the different locations where the files could be found are listed in order, prefixed by the * character; from a local one to the Microsoft remote web site.
+
+The ClrMD SymbolLocator also leverages the _NT_SYMBOL_PATH environment variable (unlike what the documentation states). Note that secure https syntax for the web site is not supported by the SymbolLocator implementation so be very careful on checking the value stored in your environment variables…
+
+If this environment variable is not set, the following default values will be used by the symbol locator (exposed by its SymbolPath property) to download the .pdb symbol files:
+
+and they are stored locally into:
+
+Unlike WinDBG, to find binary files such as mscordacwks.dll, ClrMD does not take into account the _NT_EXECUTABLE_IMAGE_PATH environment variable. Even worse, if the dll has not been downloaded into the local cache, the CreateRuntime() call throws a FileNotFoundException with the name of the searched dac as its Message property value (ex: mscordacwks_Amd64_Amd64_4.6.1076.00.dll). Note that the deprecated TryDownloadDac method does not throw an exception but returns null instead.
+
+Once a runtime has been created from the DataTarget, it is now possible to dig into the dump… to detect string duplicates as the next post will present.|||
+

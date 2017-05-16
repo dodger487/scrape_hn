@@ -1,0 +1,87 @@
+I think many developers have been wondering: How many bytes does an object instance take in managed code? What’s the limit for a CLR object? Are there any differences between 32-bit and 64-bit systems for memory allocation?
+
+
+
+First, let’s recap, there are 2 kinds of objects in .NET: value types and reference types that are created on the stack and in the heap (managed by GC), respectively. Value types are intended for storing plain data, like integers or characters. Every field in a value type object is being copied during the variable assignment. Also, the life-cycle of such objects depends on the usage scope. Default sizes of value types are defined in Common Type System:
+
+Reference types, on the other hand, are references to a memory location spanned by an object instance in heap.
+
+ The following diagram shows the internal structure of CLR objects:
+
+For reference type variables, a fixed size value (4 bytes, DWORD type) containing the address of an object instance created in heap (there are also Large Object Heap, HighFrequencyHeap, etc., but I won’t focus on this subject here) is pushed to stack. For example, in C++, this value is called a pointer, in .NET – a reference to the object.
+
+The initial value of SyncBlock is null. However, SyncBlock may store the hash code of an object (when calling the GetHashCode method) as well, or the syncblk record, which is placed by runtime into object header during synchronization (using lock, or Monitor.Enter directly.).
+
+Each type has its own MethodTable, and all instances of the same type use the same MethodTable. This table stores information about the type itself (interface, abstract class, etc).
+
+Reference type pointer is a reference to object stored in a variable at offset +4 offset. The rest are class fields.
+
+Let’s move on to practice. It’s impossible to detect the object size with standard functionality of CLR. Yes, we have the sizeof operator in C#, but it is designed for value types. In the case of referenced types, it is useless.
+
+There is an extension of Visual Studio debugger called SOS (Son of Strike) for such purposes.
+
+Before using it, we should enable unmanaged code debugging:
+
+To activate SOS, we need to open VS > Debug > Windows > Immediate Window during debugging and enter the following:
+
+After this, it will be loaded successfully:
+
+SOS includes lots of commands. In our case, we will need the following ones:
+
+• !DumpStackObjects (!DSO) – displays the list of detected objects within a current stack;
+
+• !DumpObj (!DO) – displays the information about an object at a specified address;
+
+• !ObjSize – returns the full size of an object. We will examine this command later.
+
+To learn about the rest of commands, enter !Help.
+
+Now, let’s calculate the estimated size for the class instance – so far, it is 64 bytes.
+
+However, let’s recall the passage about the object structure from the beginning of this article. So, the final size will be:
+
+and run debugger (F5).
+
+ We need to enter the following commands into Immediate Window:
+
+The following screenshot shows the address of myObject which will be passed to the !DO command as a parameter:
+
+And the size of myObject is 72 bytes, isn’t it? No, it’s not. The thing is we forgot to add string size of the StringValue variable. 4 bytes is just a reference. Now, it’s time to find out its real size.
+
+Thus, the real size of myObject is 100 bytes. Additional 28 bytes are taken by the StringValue variable.
+
+Additional 28 bytes are taken by the StringValue variable.
+
+However, let’s check it by using StringValue variable address (01b8c008):
+
+First, characters in CTS (System.Char type) are Unicode ones and span 2 bytes.
+
+Second, string is nothing but an array of characters. For example, we assigned the “String” value to StringValue field, which equals 12 bytes virtually.
+
+Third, System.String is a reference type. It means that it is placed in GC Heap and will consist of SyncBlock, TypeHandle, Reference point + the remaining fields of the class. Reference point will not be considered in this case, since it was already calculated in the MyExampleClass class (reference, 4 bytes in size).
+
+Fourth, the System.String structure looks as follows:
+
+Additional class fields comprise of the following variables: m_stringLength of Int32 type (4 bytes), m_firstChar of Char type (2 bytes). The Empty variable is not calculated since it is an empty static field.
+
+Let’s also look at the size – 26 bytes instead of previously calculated 28. Let’s recalc:
+
+StringValue = SyncBlock (4) + TypeHandle (4) + m_stringLength (4) + m_firstChar (2) + “String” (12) = 26 Additional 2 bytes are result of the alignment carried out by the CLR memory manager.
+
+Additional 2 bytes are result of the alignment carried out by the CLR memory manager.
+
+Basic difference lies in the size of DWORD – a memory pointer. For the 32-bit systems, it is 4 bytes, for 64-bit systems – 8 bytes.
+
+So, while an empty class equals 12 bytes in x86, it equals 24 bytes in x64.
+
+It is considered that the size of System.String is limited only by available system memory.
+
+However, any instance of any type cannot take more than 2Gb. This limitation applies to both, x86, and x64 systems.
+
+For example, even though List has the LongCount() method, it does not mean that it can store 2^64 objects. As a workaround, we can use the BigArray class that is specifically designed for such purposes.
+
+In this article, I wanted to review CLR object size calculation process. Of course, there are pitfalls, especially when it comes to the !ObjSize command, which can lead to double counting because of the intern strings.
+
+The question of object size and its memory alignment raises only in case of huge demand for resources usage optimization.|||
+
+This article determines the length of an object’s instance and a CLR object as well as differences between 32-bit and 64-bit systems for memory allocation

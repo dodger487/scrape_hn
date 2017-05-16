@@ -1,0 +1,157 @@
+Anyone who's worked in the IT industry for a while will have become used to the hype cycle, where the industry seemingly becomes obsessed with one particular pattern or technology or approach. And for the last couple of years – as a survey of the most recent articles and presentations on InfoQ will show – microservices as an architecture has garnered the most attention. Meanwhile, the term "monolith" seems to have become a dirty word; an application that's difficult to maintain or scale, a veritable "big ball of mud."
+
+This article is a defence of monoliths. But to be clear, when I talk about monoliths, I don't mean an app consisting of one huge lump of code; instead it's a combination of multiple modules. Some of its modules are third-party open source, others are built internally. This article isn't a defence for any old monolith, it's a defence for the "modular monolith". Modules are important, and we discuss them further shortly.
+
+Of course, any architecture is a trade-off between competing forces, and context is all important. In my own case, the two main monoliths I've been involved with are enterprise web apps, which are accessed in-house. For the last 13 years, I've worked on a large government benefits administration application running on .NET, and for the last five years I've also worked on an invoicing system running on Java. Both systems are monoliths in the sense that most of the business logic is in a single deployable webapp. I'm sure that many other visitors to the InfoQ website work on similar systems.
+
+In part 1 of this article I explore some of the key differences between the microservices and monolith approaches; there are pros and cons to both. In part 2, I elaborate on some important implementation patterns for modular monoliths and look at the implementation of the Java monolith I work on (its code is available on github).
+
+We start off with a discussion on maintainability (by which you'll see I actually mean modularity).
+
+Whatever its architecture, any non-trivial system represents a substantial investment by the business; the systems I work on are strategic to their respective businesses, and are expected to have a lifetime measured in decades. It's therefore imperative that they are maintainable, that they remain malleable to change. The way to achieve that is through modularity.
+
+Exactly how a module is represented depends on the technology. The source code for a module should be separated out in some way from the rest of the code of the app, and when compiled it may be packaged with additional metadata. A module also has well-defined dependencies, with well-defined interfaces: APIs and possibly SPIs. On the Java system I work on, the modules are JARs built by Maven modules, while on the .NET system they are either C# projects (building a single DLL) or structured as NuGet packages.
+
+Why do modules matter? Ultimately, it's about ensuring that the code is understandable, encapsulating functionality and constraining how different parts of the system interact. If any object can interact with any other object, then it's just too difficult for a developer to fully anticipate all side-effects when code is changed. Instead we want to break the app into modules small enough that a developer can understand each module's scope and can reason about its function and responsibility. Moreover, modules must have a stable interface to other modules (even if their implementation changes behind that interface); this will allow those modules to evolve independently of one another. Proper separation of concerns keeps code maintainable over the long term.
+
+In breaking up the application into modules, we should also ensure that the dependencies between modules are in one direction only: the acyclic dependencies principle. We'll talk shortly about how to enforce such constraints; whatever the tooling used to enforce these rules, it must be run as part of CI build pipeline so that any commits that would violate the dependency constraints are rejected.
+
+We should also group code by module so that less stable code depends upon more stable code: the stable dependencies principle. In any given module, all of the classes in that module should have the same rate of change as the other classes in that module. Each module should also only have a single reason to change: the single responsibility principle. If we follow these principles, then the module should end up encapsulating some coherent (nameable) business or technical responsibility. And as developers we will know which module holds the code when we need to change it.
+
+It isn't necessary that the source code of all the modules that make up the application be in a single source code repository; after all, the source code for third party open source modules aren't in your repo. On the other hand, it's also not a good idea to create a separate source code repo for every single module, at least, not in the beginning. Chances are that your idea of the responsibilities of a module will change quite a bit, especially in a complex domain. Moving code out too early on is likely to backfire.
+
+So, when should source code for a module move out to its own repo? One reason is when you think you might want to reuse that module within some other application; such a module then has its own release lifecycle and is versioned independently of any application that might be consuming it. Another reason is traceability, so you can easily identify which parts of your monolith have changed (from release to release). Then, any manual user acceptance testing can focus just on the stuff that's changed. A further more pragmatic reason is to reduce contention on the HEAD of a repo, when too many pushes mean that the CI pipeline can't keep pace. If the codebase can't be built and tested in a reasonable timeframe, then enforcing architectural constraints in CI become impossible, and architectural integrity cannot be ensured.
+
+Technical modules are good candidates for moving out into separate repos, for example auditing, authentication/authorization, email, document (PDF) rendering, scanning and so on. You might also have some standardized business sub-domains, such as notes/comments, communication channels, documents, aliases or communications. Figure 1 shows that how we modularize/deploy functionality makes for a spectrum of choices. We can start off with a feature implemented as part of the core domain (option 1), and then gradually modularize (options 2 and 3) as the responsibilities become clearer. Eventually, we can move out the functionality into its own service, deployed as a separate process (options 4 and 5), the difference being whether interactions between the services is synchronous or asynchronous. If this is done for every feature in the application, we have a "pure" microservices architecture.
+
+A key differentiator between monoliths and microservices is therefore that monoliths are more tolerant to changes of modules' responsibilities than a microservices architecture would be:
+
+But opinions on this differ. For example, Martin Fowler's "Monolith First" article is generally in favour of the above approach, but links to some of his colleagues who take an opposing view.
+
+Building a modular monolith means deciding on how to represent the boundaries of the modules, it means deciding on the direction of the (acyclic) dependencies, and it means deciding on how to enforce those dependency constraints.
+
+Tools such as Structure101 can help with this, allowing you to both map packages/namespaces in your existing codebase to "logical" modules, and optionally enforcing these rules within the CI pipeline. Thus, you can change your module boundaries without moving code about, just by changing the mappings. On the other hand, the boundaries between the modules are not necessarily obvious unless the codebase is looked at through the Structure101 lens, and a developer may not realize that they have broken a dependency constraint until they commit their code causing the CI build to fail.
+
+A more direct approach, requiring no special tooling, is to move code around, for example (on the JVM) creating separate Maven modules (option 2 in figure 1). Then, Maven itself can enforce dependencies, both prior to and within the CI pipeline. In .NET, this option likely means separate C# projects (rather than namespaces within a single C# project), referenced directly rather than wrapped up as NuGet packages.
+
+You may also need to write custom checks to enforce these architectural dependencies. For example, in the .NET application I work on, each module consists of an C# project and an C# project. We fail the build if this naming convention isn't followed. We also require that projects may only reference other projects; we fail the build if an project references another project directly.
+
+So, moving to option 2 is a good pragmatic first step, but you may decide to go further by moving those modules out into their own separate codebases (option 3). However, care is needed. Because each module is built independently, it's possible to end up with cyclic dependencies.
+
+For example, a v1.0 module might depend upon v1.0 module, so is in a higher "layer" than . However, if a developer creates a new version v1.1 that references v1.0, then the layering Is broken, and we seemingly have the and modules mutually dependent upon each other; a cyclic dependency.
+
+Microservice architectures have their own version of this problem. If and are microservices, then the exact same scenario can play out, also resulting in a cyclic dependency. It now becomes rather difficult to update either service independently of the other. Net result: the worst of all worlds, a distributed monolith.
+
+At least for monoliths, build tools such as Maven can be used to help flag such issues; in part 2 of this article we'll look at this in more detail. If going with a microservices architecture then you'll have to do more work (with fewer tools to help you) if you are going to even identify the problem, let alone solve it.
+
+Mostly what this tells us is that you shouldn't rush to move to option 3 (separate codebases for modules) for a monolith, and any modules that you do pull out should already have stable interfaces. A microservices architecture, on the other hand, forces every microservice to be independent and in its own codebase. Much more care needs to be taken to get the responsibilities, interfaces and dependencies right early on. That's difficult to do if you don't know the business domain well.
+
+In a microservices architecture, it's generally accepted that each service is responsible for its own data. One of the oft--cited benefits of microservices is that each module can choose the most appropriate persistence technology: RDBMS, NoSQL, key store, event store, text search and so on.
+
+If a service needs information that is "owned" by some other service, then either (a) the consuming service will need to ask the other service for the data, or alternatively (b) the data will need to be replicated between the owning and the consuming service. Both have drawbacks. In the former, there is temporal coupling between the services (the owning service needs to be "up"), while the latter takes significant effort and infrastructure to implement correctly. One option that should never be contemplated though: services should never share a common database. That's not a microservices architecture, it's another way to accidentally end up with a distributed monolith.
+
+In a modular monolith, each module should also take responsibility for its own persistent data, and of course each module could also use a different persistence technology, if it so wished. On the other hand, many modules will likely use the same persistence technology to store their entities: relational databases still (rightly) rule the roost for many enterprise systems. If a module needs information that is "owned" by some other module, it can just call that module's API; no need to replicate data or to worry if that module is "up".
+
+With multiple modules using the same persistence technology, this offers a "tactical" opportunity to co-locate those tables on a single RDBMS. Don't assume that an RDBMS won't scale well enough for your domain; context is everything, and RDBMS are far more scalable than some might have us believe (we'll revisit the topic of scalability shortly).
+
+The benefits of co-locating data of modules are many. It means we can support business intelligence/reporting requirements (requiring data from multiple modules) simply by using a regular SELECT with joins (probably deployed as a view or stored procedure). It also simplifies the implementation of batch processing, where for efficiency's sake the business functionality itself is deliberately co-located with the data (e.g. as stored procedures). Co-locating data is also going to simplify some operational tasks such as database backups and database integrity checks.
+
+All of these things are more complicated with a microservices architecture. For example, business intelligence/reporting with microservices in effect requires a "client-side" join, with information between services exchanged through some event bus and then merged and persisted as some sort of materialized view. It's all doable, of course, but it's also a lot more work than a simple view or stored proc.
+
+That said, it is possible – in fact, rather easy – when co-locating modules' data to accidentally create a "big ball of mud" in an RDBMS. If we're not careful we can have foreign keys all over the place (structural coupling) and we also run the risk of developers writing a SELECT in one module that queries data directly from another module (behavioural coupling). In part 2 of this article we'll take a more detailed look at how to address these issues.
+
+There's another major benefit when different modules' data is co-located, and that's to do with transactions. We explore that next.
+
+It's common for a business operation to result in a change of state in two or more modules. For example, if I order a new TV from an online retailer, then all of inventory, order management and shipping will be affected (and probably many more modules besides).
+
+In a microservice architecture, because every service has its own data store, these changes must be made independently, with messages used to ensure that a user doesn't end up being charged for a new TV but never receiving it (or indeed, the opposite, getting a new TV without paying for it). If
+
+something goes wrong, then compensating actions are used to "back out" the change. If the retailer has taken the cash but then cannot ship, it will need to refund the cash in some way.
+
+In some domains – such as online retailing – this asynchronous nature of interactions between various subdomains is commonplace. End-users understand and accept that payment of goods vs their shipment are quite separate and decoupled operations, and that if things do go wrong then partially completed operations will be reversed.
+
+However, consider a different domain, where the end-user of an in-house invoicing application might want to perform an invoice run. This will mostly modify state within the invoicing module. However, if some customers want their invoices to be sent out by email, then it might as a side-effect create documents and communications in their respective modules. So here we have a business operation that could require a state change in several modules.
+
+In a microservices architecture, the documents and communications would need to be created asynchronously. If the end-user wanted to view those out-bound communications, then we would require some sort of notification mechanism for when they are ready to be viewed.
+
+In comparison, in a monolith, if the backing data stores for the invoicing, documents and communications modules are all co-located in the same RDBMS, then we can simply rely on the RDBMS transaction to ensure that all the state is changed atomically. Assuming the actual processing is performant enough, the user can simply wait a couple of seconds for all entities in all modules to be created/updated.
+
+In my mind, this is a better user experience, as well as being a simpler design (so cheaper to support/maintain). If the processing does end up taking longer than a couple of seconds, then we can always refactor to a microservices-style approach and move some of the processing into the background, invoked asynchronously.
+
+Synchronous behaviour can improve the user experience in other ways too. Imagine that each customer has a collection of associated email addresses, and that one of these email addresses is nominated as the one to send invoices to. Suppose now that the end-user wants to delete that particular email address. In this case, we want the invoicing module to veto the deletion, because that email address is "in use". In other words, we want to enforce a referential integrity constraint across modules.
+
+Supporting this use case in a microservice requires a different and more complicated approach. One design is for the customer service to call all the other services that use the data to ask if it can be deleted. But to do that it will need to look those services up somehow and query each in turn; and what should happen if one of them is unavailable? Or, the customer service might just "logically" delete the email address, allowing the invoicing service to resurrect the address later on if necessary: a compensating action, in other words. That might suffice in this case but is potentially confusing. In general, any design based solely on asynchronous communication is liable to result in unpleasant race conditions that need to be thought through carefully.
+
+In contrast, a well-designed monolith can easily handle the requirement. In part 2 of this article we'll look at some designs to handle this, honouring the fact that modules must be decoupled, but exploiting the fact that interactions between modules are in-process.
+
+In a modular monolith, the modules are co-located in the same process space. Thus, to get one module to interact with another is nothing more elaborate than a method call.
+
+The corresponding interaction in a microservices architecture will, however, involve the network:
+
+Whichever style of network interaction is used, a microservices architecture will also require support for aggregated logging, monitoring, also service discovery (to abstract out the actual physical endpoints that services to talk to), load balancing, and routing. The need for this stuff is not to be underestimated: otherwise, when things go wrong you'll have no way of figuring out how n separate processes interact with each other when the end-user tries to checkout their shopping cart, say.
+
+In other words, with a microservices architecture there's an awful lot of technical plumbing, none of which goes towards solving the actual business use case. Granted, it's probably quite enjoyable plumbing, and there are plenty of open source libraries available to help, but even so- it takes a lot of engineering to make it work, and for many applications it is probably over-engineering.
+
+This isn't to say that a monolith doesn't also require a supporting platform. Given that a monolith's sweet spot is to handle more complex domains, it's important that its platform allows the development team to stay focused on the domain, and not have to worry too much about cross-cutting technical concerns. Frameworks that remove boilerplate for transactions, security and persistence are mature and commonplace.
+
+And monoliths do have issues of their own. Most seriously, it can be rather easy over time for the separation of responsibilities between the presentation, domain and persistence layers to erode over time: a different way to create a big ball of mud. The hexagonal architecture is a pattern that emphasises that the presentation layer and persistence layer should depend on the domain layer,
+
+not the other way around. But patterns aren't always followed and so it's also very common with monoliths for business logic to "leak" into adjacent layers, particularly the UI.
+
+In part 2 of this article we'll see that frameworks do exist to prevent such leakage of concerns – principally by also treating the UI/presentation layer as just another cross-cutting concern (the naked objects pattern). It also means that the developer – tackling a complex domain – can focus just on the bit of the app that really matters: the core business logic.
+
+One of the main reasons cited for moving to a microservice architecture is improved scalability.
+
+In any given system (microservices or monolith), certain modules/services are likely to see more traffic than other areas. In a microservices architecture, each service runs as a separate operating system process, so it's true that each of those services can be scaled independently of each other. If the bottleneck is in the invoicing service for example, more instances of that service can be deployed. There are a number of solutions to perform orchestration/load-balancing of Docker containers (e.g. Kubernetes, Docker Swarm, DC/OS and Apache Mesos), and if not fully mature, yet, they are at least getting there; but you will need to invest time learning them and their quirks.
+
+Scaling a monolith requires deploying multiple instances of the entire monolith application, one result being more memory used overall. Even then that may not necessarily solve the issue. For example, the scalability problem might be locking issues in the database and adding more instances of the monolith might actually make things worse. More subtly, you would also need to check that there are no assumptions in the monolith's codebase that there would only ever be one instance of the monolith running. If there are, that's also a show-stopper to scalability, and will need fixing.
+
+On the other hand, when it comes to compute and network resources, microservices are less efficient than monoliths: if nothing else there is all the extra work handling all those network interactions (in a monolith, just in-process method calls). And, in fact, a microservice system might end up using more memory too, because each and every one of those fine-grained microservices might require its own JVM or .NET runtime to host it.
+
+There is also the notion with a monolith of putting all the eggs in one basket. For the most critical module/service, the architect will select an appropriate (perhaps expensive) technology stack to obtain the required availability. With a monolith, all the code must be deployed on that stack, possibly raising costs. With microservices, the architect at least has the choice to deploy less critical services on less expensive hardware.
+
+That said, high availability solutions are becoming less expensive thanks to the rise of Docker containers and the orchestration tools mentioned above (Kubernetes, et al). These benefits apply equally to both microservices architectures and monoliths.
+
+With a monolith, all the modules need to be written in the same language, or at least be able to run on the same platform. But that's not all that limiting.
+
+On the JVM there is large number of languages, in a variety of paradigms: Java, Groovy, Kotlin, Clojure, Scala, Ceylon, and JRuby all have significant communities and are actively developed. It's also possible to build one's own DSLs using Eclipse Xtext or JetBrains MPS.
+
+On the .NET platform, the list of commonly used languages is somewhat smaller, but C# is a great (mostly) object-oriented language, while F# is a superb functional language. Meanwhile JetBrains Nitra targets writing DSLs.
+
+In a microservices architecture, there is of course more flexibility in choosing languages, because each service runs in its own process space so can in theory be written in any language: JVM or .NET, but also Haskell, Go, Rust, Erlang, Elixir or something more esoteric. And because services are intentionally fine-grained, the option exists to re-implement a service in possibly a different language, and throw away the old implementation.
+
+However: is it necessarily wise to have a system implemented in a dozen underlying languages? Perhaps it's justifiable for a small number of services to use one of the more specialized languages if their problem domain fits its paradigm particularly well. But using too many different languages is merely going to make the system more difficult to develop and maintain/support.
+
+In any case, there are likely to be some real-world restrictions. If the services interact synchronously then you will need to ensure that they all play nicely with the circuit breakers and so on that you'll need to provide appropriate resilience; you can use Netflix' open source tools for the JVM, but you might be on your own if using some other platform/language. Or, if the services interact asynchronously, then you'll need to ensure there are appropriate language bindings/adapters for those services to send and receive messages over the event bus.
+
+In practical terms, I suspect that for any given application the number of modules that genuinely become easier to reason about when written in a more "esoteric" programming language will be very few, two or three say. For these, go ahead and write them in that language and then link to them either in-memory (if possible) or over the network (otherwise). For the other modules of the application, implement them in a mainstream JVM or .NET language.
+
+Software is labour-intensive stuff to produce, so the developers writing it need to be productive. Working with microservices should improve productivity, so the thinking goes, because each part of the system is small and light. But that's too much of a simplification.
+
+For a microservice, a developer can indeed load up the code for a microservice in their IDE quickly, and spin up that microservice and run its tests quite quickly. But the developer will need to write substantially more code to make that microservice interact with any other microservice. And, to run up the entire system of microservices (for integration testing purposes) requires a lot of co-ordination. Tools such as Docker Compose or Kubernetes start to become essential.
+
+For a (modular) monolith the developer can also work on a single module within that monolith. Indeed, if that module has been broken out into its own code repo, then new features can be added and tested entirely separately from the application intended to consume the module. The benefits are similar.
+
+If the module hasn't been broken out into a separate repo, then the monolith's architecture should provide the ability for the application developer to bootstrap only selected subsets of the application required by the feature that they are working on; again, the overall developer experience will be similar to that of working on microservices. On the other hand, if there's no capability to run subsets of the monolith, then this can indeed have a serious impact on productivity. It's not unknown for monoliths to get so large that they take many minutes to restart; a problem that can also affect the time to execute its tests.
+
+Throughout part 1 of this article we've been comparing the monolith and microservices architectures, exploring the benefits and weaknesses of both.
+
+In one sense, both a modular monolith and a microservices architecture are similar in that they are both modular at design time. Where they differ is that the former is monolithic at deployment time while microservices take this modularity all the way through to deployment also. And this difference has big implications.
+
+To help decide which architecture to go for, it's worth asking the question: "what is it you are trying to optimise for?" Two of the most important considerations are shown in figure 2.
+
+If your domain is (relatively) simple but you need to achieve "internet-scale" volumes, then a microservices architecture may well suit. But you must be confident enough in the domain to decide up-front the responsibilities and interfaces of each microservice.
+
+If your domain is complex and the expected volumes are bounded (e.g. for use just within an enterprise) then a modular monolith makes more sense. A monolith will let you more easily refactor the responsibilities of the modules as your understanding of the domain deepens over time.
+
+And for the tricky high complexity/high volume quadrant, I would argue that it's wrong to optimize for scalability first. Instead, build a modular monolith to tackle the domain complexity, then refactor to a microservices architecture as and when higher volumes are achieved. This approach also lets you defer the higher implementation costs of a microservices architecture until such time that your volumes (and presumably revenue) justify the business case to spend the extra money. It also lets you adopt a hybrid approach if you wanted: mostly a monolith, with microservices extracted only as and when it makes sense.
+
+If you do want to adopt a "Monolith First" approach, then you should exploit the similarities between the two architectures:
+
+Bear these points in mind and it will be that much easier to convert a modular monolith to an microservices architecture if you find you need to.
+
+Even so, building a modular monolith needs to be tackled thoughtfully. In part 2 of this article, we'll look at some of the implementation patterns for building a modular monolith, and look at a platform and an example monolith that runs on the JVM.
+
+Dan Haywood is an independent consultant most known for his work on domain-driven design and the naked objects pattern. He is a committer for Apache Isis, a Java framework for building backend line-of-business applications, and which implements the naked objects pattern. Dan has a 13+ year ongoing involvement as technical advisor for the Irish Government's strategic Naked Objects system on .NET, now used to administer the majority of the department's social welfare benefits. He also has 5 years ongoing involvement with Eurocommercial Properties co-developing Estatio, an open source estate management application, implemented on Apache Isis. You can follow Dan on Twitter and on his Github profile.|||
+
+In the age of microservices, "monolith" has become a dirty word. Yet, monoliths, designed with an emphasis on modularity, can be a better solution for complex domains, such as enterprise applications. Part 1 of this 2-part series explores the key differences between microservices and monoliths, highlighting the pros and cons of each approach.

@@ -1,0 +1,49 @@
+Slow database queries are a regular thorn in my side. Whether it’s missing indexes, expensive joins, or N+1s, database performance woes have a way of surfacing in a multitude of ways.
+
+That’s why tracking down the source of slow queries is so important. While Postgres can easily log slow queries, there’s no way to track that back to the line-of-code emitting the query. That’s a problem.
+
+We can solve this with the most James Halliday-like tool from the Elixir developer toolbox: metaprogramming. By the end of this article, you’ll wield your metaprogramming powers in a worthwhile pursuit: identifying the source of slow Ecto queries in a Phoenix app.
+
+For every Ecto query greater than 500 ms, we want to log the query execution time, the raw SQL, and a backtrace to the source:
+
+Adding an additional Ecto logger seems like a clear starting point, right? We don’t even need metaprogramming! This give us access to the raw query and its execution time. Here I’m logging all queries that take longer than 500 ms:
+
+Now, we just the need backtrace and we’re done.
+
+But, there’s a problem: the trace back to the app code that generated the query isn’t available inside . If you attempt to fetch the backtrace via inside , it won’t lead back to your custom application code. Instead, you’ll see a backtrace like this — notice there’s no references to a controller, for example:
+
+Let’s override the public Ecto query functions. This is not ideal: we need to ensure we override all of the functions. If the function signatures or names change in later versions, we’ll fail to capture some slow queries and/or possibly break at compile time.
+
+Therein lies the danger of metaprogramming.
+
+When this module is used by , a new module, , is created dynamically. How meta! This module wraps around the Ecto query functions like , , and . We’ll be able to time their execution and grab backtraces.
+
+This is the meat of the implementation. Here’s the module source. Let’s walk through it.
+
+How can we override Ecto functions?
+
+Technically, we can’t. Elixir functions can only be directly overwritten if they are referenced via the keyword. The Ecto functions that run queries —  , , , etc — aren’t listed as overridable.
+
+We can work around this. We’ll dynamically create a new module. This module is included in our module, and we’ll define functions that wrap calls to the module that required it like .
+
+This is called when when the macro is invoked inside . Typically this is done to to inject functions inside the calling module ( ), and in this case, that code creates an entire submodule.
+
+We’ve defined the Ecto functions we wish to trace for slow queries inside a doubly-nested block. The outer block is placed in the calling module via . The inner quote block contains function definitions that are assigned to a variable. The block generates a free-standing piece of code: it isn’t executed immediately.
+
+This does the actual tracing: we record the start_time, call the function, and record the end_time.
+
+This takes the content from the inner block and creates our new module that traces our Repo queries. We’ll use this module vs. to run Ecto queries.
+
+We’ll alias the dynamically created module, , in so our calls to are routed through our tracing:
+
+At this point, we know how to:
+
+We haven’t married them together: seeing both the raw SQL of a slow query and the associated backtrace to its source code location gives the complete picture.
+
+Our wedding band will be Elixir’s Process dictionary. Store the log entry in the Process dictionary and fetch it from our tracing logic.
+
+In our Ecto logger, we’ll put the log entry in the Process dictionary:
+
+5. Add the following line to your file:|||
+
+Slow database queries are a regular thorn in my side. Whether it’s missing indexes, expensive joins, or N+1s, database performance woes have a way of surfacing in a multitude of ways. That’s why…

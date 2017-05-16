@@ -1,0 +1,52 @@
+[Addendum: great comments about this post on Reddit]
+
+This post celebrates an instance of simplicity in action: Dmitry Vyukov’s Multi-Producer Single-Consumer queue (DV-MPSC).
+
+DV-MPSC is one of those rare solutions that addresses essential complexity and no more. The result is something easy to understand and easy to implement. Such clarity is uncommon in the concurrent algorithm space and has no doubt contributed to adoption of DV-MPSC in mainstream concurrent systems like Netty (via JCTools), Akka and Rust .
+
+Such elegance is not without tradeoffs. We’ll investigate two commonly discussed shortcomings–blocking progress guarantee and serializable ordering–and review their impact.
+
+Looking at DV-MPSC from an academic computer-science standpoint one might be a tad disappointed: DV-MPSC lacks properties typically associated with robust concurrent algorithms:
+
+Put another way, on paper DV-MPSC:
+
+But all is not lost…read on.
+
+These qualities make DV-MPSC more approachable than many other concurrent queue algorithms (compare to the familiar M&S queue which has loops and needs at least two compare-and-swaps to enqueue a node ). Developers can lean on prior experience with linked lists to quickly grasp basics and save cognitive heavy-lifting for understand how the atomic operations and corresponding memory orderings work.
+
+Generally DV-MPSC operations are wait-free. Recall that both and have no loops or special cases; they execute straight-through every time.
+
+However there is a corner-case lurking in that knocks DV-MPSC into the blocking category. Let’s examine in more detail and see what is going on:
+
+A new queue starts in this state:
+
+A producer thread executes and the queue now looks like this:
+
+Now a producer begins to execute completing but stopping before . The producer stopped (crashed, preempted, etc) exactly at leaving the queue in this state:
+
+What happens next? Additional calls to will add more unreachable nodes to the list. If were invoked the queue would look like this:
+
+And what about ? The first call will return . However subsequent calls will return as if the list were empty.
+
+Revisiting the above definition of blocking:
+
+Now we see why DV-MPSC taken as a whole is blocking. If this inconsistent condition is encountered the algorithm will make no progress: it will never deliver elements to the consumer again. Individual calls to and will continue to execute in a finite number of steps but the system overall fails to make progress.
+
+For the above to occur the enqueuing thread must halt and never resume precisely after exchanging but before storing the new value of . On x86_64 this window of vulnerability can be as short as a single instruction.
+
+The key is the never resume part. If the enqueuing thread is merely delayed–by garbage collection or OS preemption, for example–then the queue will become consistent again (and enqueued nodes visible to the consumer) once the thread resumes and completes its call.
+
+In most practical uses of DV-MPSC this corner-case will be a non-issue.
+
+Later in program order the consumer executes two sequential operations and retrieves . Intuitively this makes sense: the operations were simultaneous therefore we don’t know which producer “won” the race to enqueue an element first.
+
+We can also accept the two sequential operations could have instead produced without violating our intuition (the empty result case is ignored in this example).
+
+What value will have? Ignoring the empty case, could return , , or but not . In fact, all of the lists below are valid orderings for sequential operations (non-exhaustive):
+
+This is serializable ordering in action: individual producers are FIFO–there is no valid history where is read before –but no ordering between producers exists nor does the ordering need to be consistent with program order.
+
+The potential orderings admitted by serializability may be unintuitive to humans, but per-producer FIFO partial ordering is sufficient to implement powerful concurrent systems such as the actor model. So aside from bending your brain a bit it doesn’t get in the way of utility.
+
+This was a quick take on DV-MPSC and two of the tradeoffs involved in its design. Up for learning more? The footnotes will get you started and you can also take a look at what others have written about DV-MPSC.|||
+

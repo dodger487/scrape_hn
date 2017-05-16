@@ -1,0 +1,124 @@
+
+
+ Overview
+
+ We’d like to introduce a new Zero-Day technique for injecting code and maintaining persistency on a machine (i.e. auto-run) dubbed DoubleAgent.
+
+ DoubleAgent can exploit:
+
+ Every Windows version (Windows XP to Windows 10)
+
+ Every Windows architecture (x86 and x64)
+
+ Every Windows user (SYSTEM/Admin/etc.)
+
+ Every target process, including privileged processes (OS/Antivirus/etc.)
+
+DoubleAgent exploits a 15 years old legitimate feature of Windows and therefore cannot be patched.
+
+ 
+
+ Code Injection
+
+ DoubleAgent gives the attacker the ability to inject any DLL into any process. The code injection occurs extremely early during the victim’s process boot, giving the attacker full control over the process and no way for the process to protect itself. The code injection technique is so unique that it’s not detected or blocked by any antivirus.
+
+Persistency
+
+ DoubleAgent can continue injecting code even after reboot making it a perfect persistence technique to “survive” reboots/updates/reinstalls/patches/etc. Once the attacker decides to inject a DLL into a process, they are forcefully bounded forever. Even if the victim would completely uninstall and reinstall its program, the attacker’s DLL would still be injected every time the process executes.
+
+Technical Deep Dive
+
+ Microsoft Application Verifier Provider
+
+ Microsoft offers a standard way to install runtime verification tools for native code via Microsoft Application Verifier Provider DLLs. A verifier provider DLL is simply a DLL that is loaded into the process and is responsible for performing runtime verifications for the application.
+
+ In order to register a new Application Verifier Provider DLL one needs to create a verifier provider DLL and register it by creating a set of keys in the registry.
+
+ Once a DLL has been registered as a verifier provider DLL for a process, it would permanently be injected by the Windows Loader into the process every time the process starts, even after reboots/updates/reinstalls/patches/etc.
+
+
+
+ Registration
+
+ Application verifier providers are registered per executable name, meaning each DLL is bounded to a specific executable name, and would be injected to every new process that was launched with the registered process name.
+
+ e.g. If one would register DoubleAgentDll.dll to cmd.exe and would launch:
+
+ “C:/cmd.exe” and “C:/Windows/System32/cmd.exe” then DoubleAgentDll.dll would be injected to both processes.
+
+ Once registered, the injection happens automatically by the operating system every time a new process is created with the registered name. The injection would happen consistently regardless of rebootsupdatesreinstallspatches or anything else. Each time a new process is created with the registered name it would be injected with the application verifier provider.
+
+One can register a new application verifier provider by using our publicly available DoubleAgent project.
+
+Or integrate the registration capabilities in an existing project using our verifier module.
+
+Under the hood, the registration process creates two new registry keys under:
+
+The final result should be:
+
+
+
+ Some antiviruses try to protect the keys of their processes under the “Image File Execution Options” by trying to block any attempt to createmodify keys. e.g. an antivirus might try to block any attempt to access “Image File Execution Options/ANTIVIRUS_NAME”.
+
+
+
+ These simple protections can easily be bypassed by slightly modifying the registry path. e.g. Instead of accessing “Image File Execution Options/ANTIVIRUS_NAME” we would first rename “Image File Execution Options” to a temporary new name like “Image File Execution Options Temp”, create the new registry keys under “Image File Execution Options TempANTIVIRUS_NAME” and then rename “Image File Execution Options” back to its original name.
+
+Because the creation of the new keys happened under “Image File Execution Options TempANTIVIRUS_NAME” and not “Image File Execution Options/ANTIVIRUS_NAME” it was enough to bypass the antivirus self-protection technique.
+
+From all the antiviruses we tested only a few tried to protect their registry keys, and all of them were bypassed using the “Rename Technique”.
+
+The “Rename Technique” has been implemented as part of our verifier module can can be used “out-of-the-box”.
+
+/* Creates the VerifierDlls value and sets it to the verifier dll name */ bCreatedVerifierDlls = (ERROR_SUCCESS == RegSetKeyValueW(hIfeoKey, pcwszProcessName, VERIFIER_VERIFIERDLLS_VALUE_NAME, REG_SZ, pcwszVrfDllName, dwVrfDllNameLenInBytes)); /* * Creates the GlobalFlag value and sets it to FLG_APPLICATION_VERIFIER * Read more: https://msdn.microsoft.com/en-us/library/windows/hardware/ff542875(v=vs.85).aspx */ bCreatedGlobalFlag = (ERROR_SUCCESS == RegSetKeyValueW(hIfeoKey, pcwszProcessName, VERIFIER_GLOBALFLAG_VALUE_NAME, REG_DWORD, &dwGlobalFlag, sizeof(dwGlobalFlag))); /* * The key creation might fail because some antiviruses protect the keys of their processes under the IFEO * One possible bypass is to rename the IFEO key name to a temporary name, create the keys, and restores the IFEO key name */ if ((FALSE == bCreatedVerifierDlls) || (FALSE == bCreatedGlobalFlag)) { /* Renames the IFEO key name to a temporary name */ if (ERROR_SUCCESS != RegRenameKey(hIfeoKey, NULL, VERIFIER_IMAGE_FILE_EXECUTION_OPTIONS_NAME_TEMP)) { DOUBLEAGENT_SET(eStatus, DOUBLEAGENT_STATUS_DOUBLEAGENT_VERIFIER_REGISTER_REGRENAMEKEY_FAILED); goto lbl_cleanup; } bKeyRenamed = TRUE; /* * Opens the temporary IFEO key * The key is reopened because some antiviruses continue monitoring and blocking the handle that opened the original IFEO */ if (ERROR_SUCCESS != RegOpenKeyExW(HKEY_LOCAL_MACHINE, VERIFIER_IMAGE_FILE_EXECUTION_OPTIONS_SUB_KEY_TEMP, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hIfeoKeyTemp)) { DOUBLEAGENT_SET(eStatus, DOUBLEAGENT_STATUS_DOUBLEAGENT_VERIFIER_REGISTER_REGOPENKEYEXW_FAILED_TEMP_IFEO); goto lbl_cleanup; } if (FALSE == bCreatedVerifierDlls) { /* Tries again to create the VerifierDlls value */ if (ERROR_SUCCESS != RegSetKeyValueW(hIfeoKeyTemp, pcwszProcessName, VERIFIER_VERIFIERDLLS_VALUE_NAME, REG_SZ, pcwszVrfDllName, dwVrfDllNameLenInBytes)) { DOUBLEAGENT_SET(eStatus, DOUBLEAGENT_STATUS_DOUBLEAGENT_VERIFIER_REGISTER_REGSETKEYVALUEW_FAILED_VERIFIERDLLS); goto lbl_cleanup; } bCreatedVerifierDllsTemp = TRUE; } if (FALSE == bCreatedGlobalFlag) { /* Tries again to create the GlobalFlag value */ if (ERROR_SUCCESS != RegSetKeyValueW(hIfeoKeyTemp, pcwszProcessName, VERIFIER_GLOBALFLAG_VALUE_NAME, REG_DWORD, &dwGlobalFlag, sizeof(dwGlobalFlag))) { DOUBLEAGENT_SET(eStatus, DOUBLEAGENT_STATUS_DOUBLEAGENT_VERIFIER_REGISTER_REGSETKEYVALUEW_FAILED_GLOBALFLAG); goto lbl_cleanup; } bCreatedGlobalFlagTemp = TRUE; } } /* Creates the VerifierDlls value and sets it to the verifier dll name */ * Creates the GlobalFlag value and sets it to FLG_APPLICATION_VERIFIER * The key creation might fail because some antiviruses protect the keys of their processes under the IFEO * One possible bypass is to rename the IFEO key name to a temporary name, create the keys, and restores the IFEO key name /* Renames the IFEO key name to a temporary name */ * The key is reopened because some antiviruses continue monitoring and blocking the handle that opened the original IFEO /* Tries again to create the VerifierDlls value */ /* Tries again to create the GlobalFlag value */
+
+Every process starts when the operating system transfers control from kernel mode to user mode by calling ntdll!LdrInitializeThunk. From this moment ntdll is responsible for initializing the process (initializing globals, loading imports, etc.) and eventually transferring control to the executed program’s main function.
+
+
+
+ The process is in such an infant stage that the only loaded modules are ntdll.dll and the executable (NS.exe).
+
+Ntdll doesn’t waste time and starts initializing the process, when most of the initialization happens in ntdll!LdrpInitializeProcess.
+
+Normally the first DLL that would be loaded would be kernel32.dll.
+
+But if Application Verifier is on, ntdll!LdrpInitializeProcess calls ntdll!AVrfInitializeVerifier which causes our verifier provider DLL to get loaded just before loading kernel32.
+
+Loading at such an early stage, before any other system dll, gives us absolute control over the process.
+
+Once our DLL has been loaded by ntdll, our DllMain would be called and we are free to do as we wish inside the victim process.
+
+Mitigation
+
+ Microsoft has provided a new design concept for antivirus vendors called Protected Processes. The new concept is specially designed for antivirus services. Antivirus processes can be created as “Protected Processes” and the protected process infrastructure only allows trusted, signed code to load and has built-in defense against code injection attacks. This means that even if an attacker found a new Zero-Day technique for injecting code, it could not be used against the antivirus as its code is not signed. Currently no antivirus (except Windows Defender) has implemented this design. Even though Microsoft made this design available more than 3 years ago.
+
+ It’s important to note, that even when the antivirus vendors would block the registration attempts, the code injection technique and the persistency technique would live forever since it’s legitimate part of the OS.
+
+Source Code
+
+ The DoubleAgent source code project can be found on our company’s public Github.
+
+Summary
+
+ Attackers are always evolving and finding new Zero-Day attacks.
+
+ We need to make more efforts to detect and prevent these attacks, and stop blindly trusting traditional security solutions, that as shown here, are not only ineffective against Zero-Days but also open new opportunities for the attacker to create complicated and deadly attacks.
+
+*Update
+
+ – To clarify, of course we haven’t discovered the existence of Application Verifier, it’s part of the OS so users can use it. Application Verifier as a hooking technique was discussed long ago as early as 2011. What we discovered and focused about was that AVRF can be used for:
+
+ 1. Generic code injection technique that is undetected by AV.
+
+ 2. Generic persistence technique that is also undetected by AV.
+
+ 3. And most importantly, injecting code directly into the AV while bypassing its self-protection techniques.
+
+ None of these points where discussed in previous articles. We believe these points are a significant tool that can be used by attackers to help bypass and abuse antivirus software.
+
+ – You do need a privileged account to run DoubleAgent as DoubleAgent is designed as a post-breach attack. Even after a computer is breached, and attacker still needs to hide from the AV, spread its code, maintain persistence and find ways to exfiltrate/steal/encrypt data without being caught. DoubleAgent gives the attacker the ability to control the AV and perform all the operations above without being detected, while keeping the illusion that the AV is working normally.
+
+ – ESET AV do implement “Protected Processes”, however, not over all process so they are still vulnerable.
+
+ – Trend Micro just released a hotfix for the vulnerability, you can find the official hotfix here.|||
+

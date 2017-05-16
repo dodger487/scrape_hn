@@ -1,0 +1,169 @@
+For a long time, I’ve been trying to figure out just how to get the best of both worlds in terms of running Windows and Ubuntu on my desktop PC. I’ve tried the obvious options: I dual-booted Windows and Ubuntu on my laptop for most of my university career, and more recently I’ve tried just running a Windows host with a virtualised Ubuntu in VMWare. Neither of these approaches fully satisfied me.
+
+With dual-booting, the other OS on your system is a full reboot away. If you’re on Ubuntu and want to play a game, or on Windows and want to do some programming, you have to stop, close everything you’re busy with, reboot the computer, choose the other option on your Grub screen, and then log in again. So at best you tend to spend a few weeks in Windows, a few weeks in Linux, and at worst you forget about one of the OSes entirely.
+
+Virtualising Ubuntu on a Windows improved on that by allowing the use of both operating systems simultaneously: I could put full-screen the Ubuntu VM on one of my monitors and use Windows programs on the other with only the occasional Ctrl-Alt breaking the flow. But could never get sound to work on my Ubuntu VMs and I would often accidentally make the storage too small and have to go through the chore of extending s.
+
+This virtualised usage also meant that I couldn’t really use Linux to operate my PC: the VM only got started for programming tasks. And while I enjoy plenty of Windows-only games and programs, I vastly prefer the heavily configurable and less opaque Linux way for doing everything outside of running those games and programs. It’s also incredibly annoying when Windows 10 runs into a :( face BSOD and decides to restart immediately, crashing my poor, innocent Ubuntu VM along with it – if there’s one thing you can say about most mainstream Linux distros, it’s that full system crashes don’t really happen.
+
+GPU passthrough seemed like exactly what I needed. Luckily, I had a spare SSD I wasn’t using for much, so I was able to isolate an experimental passthrough Ubuntu install to that SSD without touching my Windows installation on my PC’s other SSD. Once I was sure that everything worked (a much quicker process than anticipated) I replaced that Windows install with a Windows VM and went full passthrough.
+
+That was a few months ago, and so far I’m very happy with the setup. It wasn’t completely straightforward, and I did experience a couple moments of despair where I thought some tiny but important feature or behaviour was impossibly incompatible with my setup, but ultimately I got everything working, to the point where I’m writing this guide to save others the same despair and frantic googling.
+
+Much of the guide to follow is paraphrased from other sources, to which links have been provided. You’ll probably need to refer to them and others while setting this up, because what worked on my machine may not work on yours. I’ve also got some help and input from a couple friends and colleagues who’ve also set this up and had slightly different experiences with it.
+
+Parts 1 and 2 detail getting passthrough and your VM setup, and are largely similar to the most popular guides already extant. Part 3 is a bit rarer: it contains a number of small, important things you’ll want to do post-setup to get everything working nicely so you can actually use your setup.
+
+This is a long, detailed post, so here’s a table of contents for easy traversal:
+
+GPU passthrough relies on some specific virtualisation technologies, so you’ll need to make sure your hardware supports it. If you have a reasonably new graphics card and your BIOS allows you to set an option named something similar to “VT-d” (Intel) or “AMD Virtualization” (AMD), you should be good to go. If not, put it off till your next upgrade.
+
+Once you’ve determined that your hardware is able to facilitate GPU passthrough, you’ll want to gather some other things that’ll make the setup easier to create and use.
+
+Before you set up your VM, you’re going to want to prepare your system to pass through your GPU. This means freeing it from handling your host’s display, so at this point you’ll want to plug your monitor into your secondary card in preparation (but don’t unplug your primary card just yet). Then we can start following this tutorial (paraphrased and in some places outright copied below).
+
+If you haven’t done so already, enable VT-d/AMD-Vi in your BIOS. You can check it’s enabled with the following command for Intel:
+
+And the following command for AMD:
+
+Once you’ve determined that VT-d/AMD-Vi is working, you can move on to locating the graphics card you want to pass through. Run this command with sudo:
+
+The first one is my integrated Intel graphics, the card I want to use for host graphics, and the second is my R9 280, the card I want to pass through to the VM. So I isolate the R9 280 with the following command:
+
+This gives me the following output:
+
+So we’ve found the graphics card. Take a note of those IDs in the square brackets: in my case 1002:679a (graphics) and 1002:aaa0 (sound). Note that we’ll need to send the graphics card’s integrated sound card along for the passthrough because both devices are in the same IOMMU group.
+
+The next step is to tell the OS to catch it with the drivers on boot so it will be free to attach to the VM. This is imperative: you can’t pass through a graphics card that’s being handled by graphics drivers in order to display graphics on the host. There are a few ways of doing this, but the most common seems to be modifying your Grub boot loader’s . The file should have a line that looks something like the following:
+
+You’ll need to change it to look something like this:
+
+If you have an Nvidia card, check out Part 4 of that tutorial I linked to above. The solution it gives for AMD cards didn’t totally work for me, so you may have to fiddle a bit. I haven’t personally done this with an Nvidia card, so I don’t want to give false solutions. See the Bibliography section at the bottom of this post for more resources.
+
+Once that’s sorted you’ll need to add this line to the bottom of :
+
+Which will actually load the much discussed driver kernel module (shocking!) that’s gonna be be doing the heavy lifting of capturing the graphics card so it can be redirected to the VM.
+
+Then add these additional drivers to :
+
+When that’s all in place, restart your PC and check that everything loaded correctly with these commands:
+
+Your output should look something like this:
+
+Congratulations, your system is ready for graphics passthrough!
+
+There are two ways you can set up your VM. Most of the tutorials I’ve found do it through command line, using a script, but as Alex Williamson has shown, it’s also possible to do most of what’s needed using QEMU/KVM’s GUI. This is the approach I opted for and would recommend , but I’ll be covering both methods.
+
+The first thing to do is install the various Qemu- and KVM-related packages necessary to create and run KVM virtual machines. We’ll also install , which you can use to reserve a chunk of your system’s RAM for your VM.
+
+Then check is installed and working with these commands:
+
+And you should get output like:
+
+Make sure you have a Windows ISO for installing your VM’s operating system. Microsoft provides Windows 10 ISOs for download on this page.
+
+Lastly, grab either the latest or the stable build of the Windows VirtIO drivers to enjoy the sweet, sweet speed of paravirtualised network and disk device drivers in your VM:
+
+You don’t really need to set up to get GPU passthrough working, but as you’ll presumably be using your VM for games and other system-intensive pursuits, you’ll want to do as much optimisation as possible. So it’s a good idea to reserve some RAM for your VM.
+
+You should be doing this with a system that has at least 16GB of RAM. You might be able to get through with 8, but if you’re serious about passthrough, go out and buy another eight.
+
+Under my setup, I give my VM 8GB of RAM: half of my 16. You probably don’t want to give it less than four.
+
+Your huge page size is probably the same as mine, at 2048KB (2MB).
+
+Now you need to figure out how many hugepages to assign. Generally you’ll want to assign your chosen amount of RAM (usually 8GB) plus a small bit of buffer space (between 2% and 10%). Unless you’re rolling in RAM, don’t assign too much buffer space or you’ll start running out of RAM on your main system – due to the nature of , the RAM you reserve is always reserved, even when the VM’s not running.
+
+If you assign more hugepages than your system can handle, your OS will fail to boot.
+
+To reserve 8GB setup, add the following line to :
+
+Obviously, substitute for whatever number you came to for your system.
+
+Would you call yourself a fan of GUIs or of scripts? I’ll admit to appreciating the occasional nice GUI, a description which certainly fits KVM/Qemu’s virtman. But it’s really a matter of personal preference which option you go for, as both will have the same results.
+
+I followed this guide. Setting up a Windows VM with the virtman GUI is mostly a simple process of following instructions and clicking Forward. Following the initial wizard, you’ll be given a freeform interface through which to add hardware – and again, most of what you need to do is pretty intuitive and self explanatory.
+
+Storage: For the VM’s hard disk, I used a raw 512GB SSD: the same drive I’d previously had Windows installed on as a base operating system. If that’s not an option for you, you can create an image file through virtman’s interface, or maybe an LVM volume if that’s more your speed. Just make sure to give a it a few hundred GBs so you have space for games and whatever else you’ll need.
+
+Processor: As the guide linked above details, you should type the non-standard option into the Configuration > Model dropdown in order to get the best possible performance.
+
+GPU passthrough: One of the hardware types you can add to your host is “PCI Host Device”. Make sure to add everything you’re passing through (graphics card and sound card).
+
+Hugepages backing: This is the one thing you need to dip out of the friendly GUI for. Run and add this before the XML tag.
+
+You might also want to configure CPU pinning for extra performance, but I haven’t bothered. Reboot your PC after making this edit and before attempting to boot your VM.
+
+You’ll probably want to keep the default Video, Display and Channel devices on the VM, so that you can use KVM’s SPICE interface (KVM’s builtin desktop viewer) to control the system while you install Windows. You can always remove them later.
+
+Finally, add your Windows ISO and VirtIO ISO as virtual CD ROM drives, and then boot and get to installing.
+
+Doing this gives you finer control over your VM than the virtman GUI and maybe gives you extra coolness points? Anyway, this is the approach taken by this guide and the venerable Arch wiki.
+
+You’ll need to create your VM’s disk first.
+
+The VM script, which you’ll run every time you want to start your VM, should have this general structure:
+
+The first part of the script will look the same for pretty much everyone, but you’ll want to make some changes to the VM initialisation based on your hardware and setup. For example, here’s what that guy I mentioned above whose hardware didn’t support UEFI boot used (note the line that start ):
+
+The great thing about doing this with a script is you can add extra steps to set up all the comforts discussed in part 3 for sound, controls, and so on.
+
+Boot your VM and follow the installation procedure through the SPICE interface. Purchase a Windows licence if you don’t already have one. This should be pretty straight-forward.
+
+You probably won’t see video output from the GPU you’ve passed through during or immediately after the Windows installation. Don’t panic! Use the SPICE interface to download and install the appropriate drivers for your graphics card. Following a reboot, you should start to see video output from your passthrough devices.
+
+Congratulations, you’ve just set up your Windows graphics passthrough VM! Continue to the next section for some advice on actually using this crazy new setup.
+
+While parts one and two were mostly about just following the right tutorials (and thus mostly consisted of my summaries and paraphrasing), this part is going to contain information I had to work a bit harder for. Setting up the passthrough is easy enough, but once that’s accomplished you need to put a few things in place so that actually using your host and VM on a day-to-day basis is simple and hassle-free.
+
+You have a few different options for controlling your newly birthed Windows VM:
+
+The QEMU/KVM SPICE interface: If you followed the last section, you’ll already be familiar with this. Using QEMU/KVM’s SPICE system, you can interact with your VM using an interface not dissimilar to one present in VirtualBox and VMWare Player. Mouse movement is a bit sluggish, so it’s not really something I would recommend, but it’s definitely possible to use your VM and even play games with SPICE.
+
+When it’s enabled, the SPICE interface will act as a extra display. To interact with your VM, just click inside the SPICE window and move your mouse over to the main display you’re using for your graphics passthrough. To go back to your host, press like you would with VMWare Player. It’s not totally elegant, but it seems to basically work (though I haven’t tested it thoroughly, and it’s not what I do).
+
+A physical KVM switch: If you like buying physical hardware, you can get a KVM switch to plug your keyboard and mouse into, and basically toggle a physical switch to change between controlling your host and your VM. Again, not something I do, so I can’t really say too much about how well it works in practice.
+
+Two sets of keyboards and mice: If you don’t happen to have a KVM switch lying around but do have an extra keyboard and mouse, you could plug them in and pass their USB ports through to the VM. I imagine this would get very annoying.
+
+Synergy keyboard and mouse sharing software: This is what I do, and I think it’s the best option. For a once-off fee of $10, you can get access to Symless’s excellent network-based keyboard, mouse sharing software for Windows, Mac and Linux, forever.
+
+This was a no-brainer for me. I have both of my monitors wired to both graphics cards, and Synergy is configured to place the Windows VM above the Linux host. So to switch devices, I just move my mouse up or down and toggle the input on the relevant monitor. It’s far easier than dealing with a SPICE window or a physical switch, and using a KVM virtio network adapter for the connection, I notice no lag at all. Plus, Synergy allows you to share clipboard contents between devices (though I imagine that’s also possible with SPICE).
+
+Setting up Synergy is pretty straightforward: you install it on your host and your VM, and you have the host act as the server and the VM as the client. There are just two important, non-obvious points you have to be aware of.
+
+Point 1: by default, Synergy sends client devices absolute mouse co-ordinates, which makes it impossible to play 3D games where the camera is controlled by the mouse. In order to play these games, you need to do two things:
+
+Point 2: The visual effects of the default Windows UAC settings will interfere with Synergy. When a program tries to run with elevated privileges but gets blocked by UAC, your screen dims and network connectivity seems to get briefly cut off while Windows pops up a dialogue box to ask if the program’s request should be granted. Obviously this is an issue when the mouse you’d use to click either Yes or No is provided by the network via Synergy.
+
+The solution is to slightly reduce UAC to make the popup less dramatic. Search for User Account Control in the Start menu and change this:
+
+As an aside, GPU passthrough is probably not a great thing to set up on systems where security is of a very high priority. Most security benefits of virtualisation are cancelled out once you start passing physical hardware through directly.
+
+The easiest way to get sound working in your VM is just to leave a SPICE window open on the host. Disable the SPICE graphics display if you want. I’ve been doing this because I can’t be bothered to develop any more grey hairs fighting with PulseAudio and ALSA.
+
+The second easiest way to get sound working is to just use your graphics card’s sound card (if it has one) to power HDMI audio. This way, your VM’s sound will be completely separate from your host’s sound (which may be an upside or a downside, depending on what you want). I’m too lazy to unplug and replug my headphones in all the time, so I don’t do this.
+
+The hardest, but probably most elegant way, is to set up KVM to pass sound from your VM to your host, i.e. fight with PulseAudio and ALSA. I fiddled with this for a while before giving up and going with option one. If you get this working, let me know how you did it.
+
+It’s a good idea to set up a Samba share between your host and VM so that you can transfer files. To do this, first make sure is installed and then add something like the following to :
+
+Then give your user an SMB password with:
+
+Then you can connect this share as a Network Drive on Windows, using when prompted for credentials. I share my entire extra storage HDD drive in this way.
+
+If you’d like to plug-and-play with USB devices on your VM, you can pass a PCI USB controller through in much the same way as you did your graphics card.
+
+I’d like to have a section on network bridging here as well (i.e. placing your Windows VM on the same network as the host), but I haven’t had much success getting it to work. The default NAT network setup is sufficient for 99% of cases, but sometimes you need to bridge. Unfortunately, KVM is not VirtualBox where you can just select “bridge network on X physical adapter”.
+
+I’ve heard it’s easier with an ethernet connection than on wifi, but unfortunately the logistics of my living space restrict me to the exclusive use of wifi for network connectivity. I’ve tried a couple of tutorials and things, but none have really worked well. If you have any idea, let me know.
+
+So, passthrough: not a small bit of work, but very, very well worth the effort. I can say without hyperbole that setting this up is one of the best things I’ve ever done with a computer. It’s literally the best of both worlds, and after running this setup for four months, I couldn’t imagine going back to a Windows base. If you’ve ever wanted to use a setup like this, I can 100% recommend putting in the work and just doing it.
+
+Corrections, caveats, suggestions and stories of your experiences with passthrough can be emailed to me at [email protected] or tweeted to me @davidyat_es.
+
+This solution scales. If you’ve got enough hardware, spin up another couple VMs and have a single CPU LAN.
+
+I’ve tried to make this post as comprehensive as possible, but please refer to these resources as well if you actually decide to set this up. Most of them have been linked above as well.|||
+
+blah blah

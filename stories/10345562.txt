@@ -1,0 +1,137 @@
+When addressing the question of what it means for an algorithm to learn, one can imagine many different models, and there are quite a few. This invariably raises the question of which models are “the same” and which are “different,” along with a precise description of how we’re comparing models. We’ve seen one learning model so far, called Probably Approximately Correct (PAC), which espouses the following answer to the learning question:
+
+An algorithm can “solve” a classification task using labeled examples drawn from some distribution if it can achieve accuracy that is arbitrarily close to perfect on the distribution, and it can meet this goal with arbitrarily high probability, where its runtime and the number of examples needed scales efficiently with all the parameters (accuracy, confidence, size of an example). Moreover, the algorithm needs to succeed no matter what distribution generates the examples.
+
+You can think of this as a game between the algorithm designer and an adversary. First, the learning problem is fixed and everyone involved knows what the task is. Then the algorithm designer has to pick an algorithm. Then the adversary, knowing the chosen algorithm, chooses a nasty distribution over examples that are fed to the learning algorithm. The algorithm designer “wins” if the algorithm produces a hypothesis with low error on when given samples from . And our goal is to prove that the algorithm designer can pick a single algorithm that is extremely likely to win no matter what the adversary picks.
+
+We’ll momentarily restate this with a more precise definition, because in this post we will compare it to a slightly different model, which is called the weak PAC-learning model. It’s essentially the same as PAC, except it only requires the algorithm to have accuracy that is slightly better than random guessing. That is, the algorithm will output a classification function which will correctly classify a random label with probability at least for some small, but fixed, . The quantity  (the Greek “eta”) is called the edge as in “the edge over random guessing.” We call an algorithm that produces such a hypothesis a weak learner, and in contrast we’ll call a successful algorithm in the usual PAC model a strong learner.
+
+The amazing fact is that strong learning and weak learning are equivalent! Of course a weak learner is not the same thing as a strong learner. What we mean by “equivalent” is that:
+
+A problem can be weak-learned if and only if it can be strong-learned.
+
+So they are computationally the same. One direction of this equivalence is trivial: if you have a strong learner for a classification task then it’s automatically a weak learner for the same task. The reverse is much harder, and this is the crux: there is an algorithm for transforming a weak learner into a strong learner! Informally, we “boost” the weak learning algorithm by feeding it examples from carefully constructed distributions, and then take a majority vote. This “reduction” from strong to weak learning is where all the magic happens.
+
+In this post we’ll get into the depths of this boosting technique. We’ll review the model of PAC-learning, define what it means to be a weak learner, “organically” come up with the AdaBoost algorithm from some intuitive principles, prove that AdaBoost reduces error on the training data, and then run it on data. It turns out that despite the origin of boosting being a purely theoretical question, boosting algorithms have had a wide impact on practical machine learning as well.
+
+As usual, all of the code and data used in this post is available on this blog’s Github page.
+
+Before we get into the details, here’s a bit of history and context. PAC learning was introduced by Leslie Valiant in 1984, laying the foundation for a flurry of innovation. In 1988 Michael Kearns posed the question of whether one can “boost” a weak learner to a strong learner. Two years later Rob Schapire published his landmark paper “The Strength of Weak Learnability” closing the theoretical question by providing the first “boosting” algorithm. Schapire and Yoav Freund worked together for the next few years to produce a simpler and more versatile algorithm called AdaBoost, and for this they won the Gödel Prize, one of the highest honors in theoretical computer science. AdaBoost is also the standard boosting algorithm used in practice, though there are enough variants to warrant a book on the subject.
+
+I’m going to define and prove that AdaBoost works in this post, and implement it and test it on some data. But first I want to give some high level discussion of the technique, and afterward the goal is to make that wispy intuition rigorous.
+
+The central technique of AdaBoost has been discovered and rediscovered in computer science, and recently it was recognized abstractly in its own right. It is called the Multiplicative Weights Update Algorithm (MWUA), and it has applications in everything from learning theory to combinatorial optimization and game theory. The idea is to
+
+The “something” is usually a black box algorithm like “solve this simple optimization problem.” The output of the “something” is interpreted as a reward or penalty, and the weights are updated according to the severity of the penalty (the details of how this is done differ depending on the goal). In this light one can interpret MWUA as minimizing regret with respect to the best alternative element one could have chosen in hindsight. In fact, this was precisely the technique we used to attack the adversarial bandit learning problem (the Exp3 algorithm is a multiplicative weight scheme). See this lengthy technical survey of Arora and Kale for a research-level discussion of the algorithm and its applications.
+
+Now let’s remind ourselves of the formal definition of PAC. If you’ve read the previous post on the PAC model, this next section will be redundant.
+
+In PAC-learning you are trying to give labels to data from some set . There is a distribution producing data from , and it’s used for everything: to provide data the algorithm uses to learn, to measure your accuracy, and every other time you might get samples from . You as the algorithm designer don’t know what is, and a successful learning algorithm has to work no matter what is. There’s some unknown function called the target concept, which assigns a label to each data point in . The target is the function we’re trying to “learn.” When the algorithm draws an example from , it’s allowed to query the label  and use all of the labels it’s seen to come up with some hypothesis that is used for new examples that the algorithm may not have seen before. The problem is “solved” if  has low error on all of .
+
+To give a concrete example let’s do spam emails. Say that is the set of all emails, and is the distribution over emails that get sent to my personal inbox. A PAC-learning algorithm would take all my emails, along with my classification of which are spam and which are not spam (plus and minus 1). The algorithm would produce a hypothesis that can be used to label new emails, and if the algorithm is truly a PAC-learner, then our guarantee is that with high probability (over the randomness in which emails I receive) the algorithm will produce an that has low error on the entire distribution of emails that get sent to me (relative to my personal spam labeling function).
+
+Of course there are practical issues with this model. I don’t have a consistent function for calling things spam, the distribution of emails I get and my labeling function can change over time, and emails don’t come according to a distribution with independent random draws. But that’s the theoretical model, and we can hope that algorithms we devise for this model happen to work well in practice.
+
+Here’s the formal definition of the error of a hypothesis produced by the learning algorithm:
+
+It’s read “The error of with respect to the concept we’re trying to learn and the distribution is the probability over drawn from that the hypothesis produces the wrong label.” We can now define PAC-learning formally, introducing the parameters for “probably” and for “approximately.” Let me say it informally first:
+
+An algorithm PAC-learns if, for any and any distribution , with probability at least the hypothesis produced by the algorithm has error at most .
+
+To flush out the other things hiding, here’s the full definition.
+
+Definition (PAC): An algorithm is said to PAC-learn the concept class over the set if, for any distribution over and for any and for any target concept  , the probability that produces a hypothesis of error at most is at least . In symbols, . Moreover, must run in time polynomial in and , where is the size of an element  .
+
+The reason we need a class of concepts (instead of just one target concept) is that otherwise we could just have a constant algorithm that outputs the correct labeling function. Indeed, when we get a problem we ask whether there exists an algorithm that can solve it. I.e., a problem is “PAC-learnable” if there is some algorithm that learns it as described above. With just one target concept there can exist an algorithm to solve the problem by hard-coding a description of the concept in the source code. So we need to have some “class of possible answers” that the algorithm is searching through so that the algorithm actually has a job to do.
+
+We call an algorithm that gets this guarantee a strong learner. A weak learner has the same definition, except that we replace by the weak error bound: for some fixed . the error  . So we don’t require the algorithm to achieve any desired accuracy, it just has to get some accuracy slightly better than random guessing, which we don’t get to choose. As we will see, the value of influences the convergence of the boosting algorithm. One important thing to note is that is a constant independent of , the size of an example, and , the number of examples. In particular, we need to avoid the “degenerate” possibility that so that as our learning problem scales the quality of the weak learner degrades toward 1/2. We want it to be bounded away from 1/2.
+
+So just to clarify all the parameters floating around, will always be the “probably” part of PAC, is the error bound (the “approximately” part) for strong learners, and is the error bound for weak learners.
+
+Now before we prove that you can “boost” a weak learner to a strong learner, we should have some idea of what a weak learner is. Informally, it’s just a ‘rule of thumb’ that you can somehow guarantee does a little bit better than random guessing.
+
+In practice, however, people sort of just make things up and they work. It’s kind of funny, but until recently nobody has really studied what makes a “good weak learner.” They just use an example like the one we’re about to show, and as long as they get a good error rate they don’t care if it has any mathematical guarantees. Likewise, they don’t expect the final “boosted” algorithm to do arbitrarily well, they just want low error rates.
+
+The weak learner we’ll use in this post produces “decision stumps.” If you know what a decision tree is, then a decision stump is trivial: it’s a decision tree where the whole tree is just one node. If you don’t know what a decision tree is, a decision stump is a classification rule of the form:
+
+Pick some feature and some value of that feature , and output label if the input example has value for feature , and output label otherwise.
+
+Concretely, a decision stump might mark an email spam if it contains the word “viagra.” Or it might deny a loan applicant a loan if their credit score is less than some number.
+
+Our weak learner produces a decision stump by simply looking through all the features and all the values of the features until it finds a decision stump that has the best error rate. It’s brute force, baby! Actually we’ll do something a little bit different. We’ll make our data numeric and look for a threshold of the feature value to split positive labels from negative labels. Here’s the Python code we’ll use in this post for boosting. This code was part of a collaboration with my two colleagues Adam Lelkes and Ben Fish. As usual, all of the code used in this post is available on Github.
+
+First we make a class for a decision stump. The attributes represent a feature, a threshold value for that feature, and a choice of labels for the two cases. The classify function shows how simple the hypothesis is.
+
+Then for a fixed feature index we’ll define a function that computes the best threshold value for that index.
+
+Here we allow the user to provide a generic error function that the weak learner tries to minimize, but in our case it will just be . In words, our threshold function will label an example as if feature has value greater than the threshold and otherwise. But we might want to do the opposite, labeling above the threshold and below. The function doesn’t care, it just wants to know which threshold value is the best. Then we compute what the right hypothesis is in the next function.
+
+It’s a little bit inefficient but no matter. To illustrate the PAC framework we emphasize that the weak learner needs nothing except the ability to draw from a distribution. It does so, and then it computes the best threshold and creates a new stump reflecting that. The function just picks the most common label of examples in the list. Note that drawing 500 samples is arbitrary, and in general we might increase it to increase the success probability of finding a good hypothesis. In fact, when proving PAC-learning theorems the number of samples drawn often depends on the accuracy and confidence parameters . We omit them here for simplicity.
+
+So suppose we have a weak learner for a concept class  , and for any concept from it can produce with probability at least a hypothesis with error bound  . How can we modify this algorithm to get a strong learner? Here is an idea: we can maintain a large number of separate instances of the weak learner , run them on our dataset, and then combine their hypotheses with a majority vote. In code this might look like the following python snippet. For now examples are binary vectors and the labels are , so the sign of a real number will be its label.
+
+This is a bit too simplistic: what if the majority of the weak learners are wrong? In fact, with an overly naive mindset one might imagine a scenario in which the different instances of have high disagreement, so is the prediction going to depend on which random subset the learner happens to get? We can do better: instead of taking a majority vote we can take a weighted majority vote. That is, give the weak learner a random subset of your data, and then test its hypothesis on the data to get a good estimate of its error. Then you can use this error to say whether the hypothesis is any good, and give good hypotheses high weight and bad hypotheses low weight (proportionally to the error). Then the “boosted” hypothesis would take a weighted majority vote of all your hypotheses on an example. This might look like the following.
+
+This might be better, but we can do something even cleverer. Rather than use the estimated error just to say something about the hypothesis, we can identify the mislabeled examples in a round and somehow encourage to do better at classifying those examples in later rounds. This turns out to be the key insight, and it’s why the algorithm is called AdaBoost (Ada stands for “adaptive”). We’re adaptively modifying the distribution over the training data we feed to based on which data learns “easily” and which it does not. So as the boosting algorithm runs, the distribution given to  has more and more probability weight on the examples that misclassified. And, this is the key,  has the guarantee that it will weak learn no matter what the distribution over the data is. Of course, it’s error is also measured relative to the adaptively chosen distribution, and the crux of the argument will be relating this error to the error on the original distribution we’re trying to strong learn.
+
+To implement this idea in mathematics, we will start with a fixed sample drawn from and assign a weight to each . Call the true label of an example. Initially, set to be 1. Since our dataset can have repetitions, normalizing the to a probability distribution gives an estimate of . Now we’ll pick some “update” parameter (this is intentionally vague). Then we’ll repeat the following procedure for some number of rounds .
+
+At the end our final hypothesis will be a weighted majority vote of all the , where the weights depend on the amount of error in each round. Note that when the weak learner misclassifies an example we increase the weight of that example, which means we’re increasing the likelihood it will be drawn in future rounds. In particular, in order to maintain good accuracy the weak learner will eventually have to produce a hypothesis that fixes its mistakes in previous rounds. Likewise, when examples are correctly classified, we reduce their weights. So examples that are “easy” to learn are given lower emphasis. And that’s it. That’s the prize-winning idea. It’s elegant, powerful, and easy to understand. The rest is working out the values of all the parameters and proving it does what it’s supposed to.
+
+First we pick a data representation. Examples are pairs whose type is the tuple . Our labels will be valued. Since our algorithm is entirely black-box, we don’t need to assume anything about how the examples are represented. Our dataset is just a list of labeled examples, and the weights are floats. So our boosting function prototype looks like this
+
+And a weak learner, as we saw for decision stumps, has the following function prototype.
+
+Assuming we have a weak learner, we can fill in the rest of the boosting algorithm with some mysterious details. First, a helper function to compute the weighted error of a hypothesis on some exmaples. It also returns the correctness of the hypothesis on each example which we’ll use later.
+
+Next we have the main boosting algorithm. Here is a function that accepts as input a list of floats that sum to 1 and picks an index proportional to the weight of the entry at that index.
+
+The code is almost clear. For each round we run the weak learner on our hand-crafted distribution. We compute the error of the resulting hypothesis on that distribution, and then we update the distribution in this mysterious way depending on some alphas and logs and exponentials. In particular, we use the expression  , the product of the true label and predicted label, as computed in . As the comment says, this will either be or depending on whether the predicted label is correct or incorrect, respectively. The choice of those strange logarithms and exponentials are the result of some optimization: they allow us to minimize training error as quickly as possible (we’ll see this in the proof to follow). The rest of this section will prove that this works when the weak learner is correct. One small caveat: in the proof we will assume the error of the hypothesis is not zero (because a weak learner is not supposed to return a perfect hypothesis!), but in practice we want to avoid dividing by zero so we add the small 0.0001 to avoid that. As a quick self-check: why wouldn’t we just stop in the middle and output that “perfect” hypothesis? (What distribution is it “perfect” over? It might not be the original distribution!)
+
+If we wanted to define the algorithm in pseudocode (which helps for the proof) we would write it this way. Given rounds, start with being the uniform distribution over labeled input examples , where has label . Say there are input examples.
+
+Now let’s prove this works. That is, we’ll prove the error on the input dataset (the training set) decreases exponentially quickly in the number of rounds. Then we’ll run it on an example and save generalization error for the next post. Over many years this algorithm and tweaked so that the proof is very straightforward.
+
+Theorem: If AdaBoost is given a weak learner and stopped on round , and the edge over random choice satisfies , then the training error of the AdaBoost is at most .
+
+Proof. Let be the number of examples given to the boosting algorithm. First, we derive a closed-form expression for in terms of the normalization constants . Expanding the recurrence relation gives
+
+Because the starting distribution is uniform, and combining the products into a sum of the exponents, this simplifies to
+
+Next, we show that the training error is bounded by the product of the normalization terms . This part has always seemed strange to me, that the training error of boosting depends on the factors you need to normalize a distribution. But it’s just a different perspective on the multiplicative weights scheme. If we didn’t explicitly normalize the distribution at each step, we’d get nonnegative weights (which we could convert to a distribution just for the sampling step) and the training error would depend on the product of the weight updates in each step. Anyway let’s prove it.
+
+The training error is defined to be . This can be written with an indicator function as follows:
+
+Because the sign of determines its prediction, the product is negative when is incorrect. Now we can do a strange thing, we’re going to upper bound the indicator function (which is either zero or one) by . This works because if predicts correctly then the indicator function is zero while the exponential is greater than zero. On the other hand if is incorrect the exponential is greater than one because when . So we get
+
+and rearranging the formula for from the first part gives
+
+Since the forms a distribution, it sums to 1 and we can factor the out. So the training error is just bounded by the .
+
+The last step is to bound the product of the normalization factors. It’s enough to show that . The normalization constant is just defined as the sum of the numerator of the terms in step D. i.e.
+
+We can split this up into the correct and incorrect terms (that contribute to or in the exponent) to get
+
+But by definition the sum of the incorrect part of is and for the correct part. So we get
+
+Finally, since this is an upper bound we want to pick so as to minimize this expression. With a little calculus you can see the we chose in the algorithm pseudocode achieves the minimum, and this simplifies to . Plug in to get and use the calculus fact that  to get as desired.
+
+This is fine and dandy, it says that if you have a true weak learner then the training error of AdaBoost vanishes exponentially fast in the number of boosting rounds. But what about generalization error? What we really care about is whether the hypothesis produced by boosting has low error on the original distribution as a whole, not just the training sample we started with.
+
+One might expect that if you run boosting for more and more rounds, then it will eventually overfit the training data and its generalization accuracy will degrade. However, in practice this is not the case! The longer you boost, even if you get down to zero training error, the better generalization tends to be. For a long time this was sort of a mystery, and we’ll resolve the mystery in the sequel to this post. For now, we’ll close by showing a run of AdaBoost on some real world data.
+
+The “adult” dataset is a standard dataset taken from the 1994 US census. It tracks a number of demographic and employment features (including gender, age, employment sector, etc.) and the goal is to predict whether an individual makes over $50k per year. Here are the first few lines from the training set.
+
+We perform some preprocessing of the data, so that the categorical examples turn into binary features. You can see the full details in the github repository for this post; here are the first few post-processed lines (my newlines added).
+
+Now we can run boosting on the training data, and compute its error on the test data.
+
+This isn’t too shabby. I’ve tried running boosting for more rounds (a hundred) and the error doesn’t seem to improve by much. This implies that finding the best decision stump is not a weak learner (or at least it fails for this dataset), and we can see that indeed the training errors across rounds roughly tend to 1/2.
+
+Though we have not compared our results above to any baseline, AdaBoost seems to work pretty well. This is kind of a meta point about theoretical computer science research. One spends years trying to devise algorithms that work in theory (and finding conditions under which we can get good algorithms in theory), but when it comes to practice we can’t do anything but hope the algorithms will work well. It’s kind of amazing that something like Boosting works in practice. It’s not clear to me that weak learners should exist at all, even for a given real world problem. But the results speak for themselves.
+
+Next time we’ll get a bit deeper into the theory of boosting. We’ll derive the notion of a “margin” that quantifies the confidence of boosting in its prediction. Then we’ll describe (and maybe prove) a theorem that says if the “minimum margin” of AdaBoost on the training data is large, then the generalization error of AdaBoost on the entire distribution is small. The notion of a margin is actually quite a deep one, and it shows up in another famous machine learning technique called the Support Vector Machine. In fact, it’s part of some recent research I’ve been working on as well. More on that in the future.
+
+If you’re dying to learn more about Boosting, but don’t want to wait for me, check out the book Boosting: Foundations and Algorithms, by Freund and Schapire.|||
+
+When addressing the question of what it means for an algorithm to learn, one can imagine many different models, and there are quite a few. This invariably raises the question of which models are "the same" and which are "different," along with a precise description of how we're comparing models. We've seen one learning model so far, called Probably Approximately…

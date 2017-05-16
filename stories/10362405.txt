@@ -1,0 +1,34 @@
+At Dimagi, we deploy our master branch at least once a day. As our codebase and dependencies grew, the time to complete a deploy increased—almost 45-minutes on some days. During this time, we’d implicitly declare that our site was unstable by letting people know that we were in the middle of a deploy. Even though we took extra steps to mitigate the pain of a deploy (such as deploying during non-peak hours), it became apparent that potentially disrupting our users’ workflow for 45-minutes everyday was unacceptable.
+
+Our previous deploy system relied on two source directories, one called and the other called . Our gunicorn workers were running the Django app deployed to the . On deploy, we would first update our . This served two purposes, we would immediately know if something would break Django, and we could rebuild our couch views in the directory (to avoid rebuilding them in place, which can be very time consuming). Once the preindexing operations completed, we would then update the code in , create the new compressed staticfiles, run the migrations, and various other commands specific to our codebase. Since the code repository was updated in place, while for the most part our Django workers had cached the code in memory, they would arbitrarily pick up the new code changes at different times, potentially causing all sorts of problems, but often not causing any. This is what would mainly cause our users pain.
+
+Deployments are something that have been tackled again and again, so we looked to other systems to draw on inspiration. We were already using fabric to manage our deployments but wanted to achieve a more seamless deploy. The new architecture draws a lot of its ideas from the capistrano deployment system.
+
+We decided on ditching the and directories for a releases directory where we would keep each of our releases. Then our gunicorn workers would run the Django app off a symlink to a release. In our case, we called that symlink . There were a couple of requirements we wanted to make sure to address:
+
+To address the fact that we didn’t want to do a full git clone from github on every deploy, we settled on using cloning from the previous release, reset the origin to the remote repository, and finally git pull the code. This got slightly more complicated when we introduced submodules into the mix. On first attempt the command looked like this:
+
+This was great; however, when recursively fetching the submodules, git would fetch them from the url specified in .gitmodules, which was a remote url and would take a very long time. At time of writing, we have 22 submodules so this was not ideal. We modified the command to use the or option to override the submodule url for the clone:
+
+This did the trick. On initial clone, everything was copied locally and when we would pull, git would look for the code on our github repository.
+
+Deploying everyday without cleaning our releases directory would eventually lead to a lot of extra bloat on our servers. We needed a reliable way to clean any releases we weren’t using, but still keep some around in case we needed to rollback.
+
+To do this we added a file to our server. After every successful deploy, we would write to the file with the path of the successful release. Our release file looks something like this:
+
+Then when we’d clean up the releases directory (after every deploy), we’d keep the 3 most recent releases that were on that list and considered everything else a failed deploy or an out-of-date release.
+
+The hardest problem to solve during this restructuring was the fact that we had to copy our virtualenv from one release to another. Otherwise we’d experience downtime during the pip install. This was challenging since it didn’t seem to have been a solved problem. We eventually settled on using virtualenv-clone. This package, as warned, came with its own set of bugs. In essence the package just copies the virtualenv and does a find and replace on any mention of the old path. Eventually we fixed all of the issues or built workarounds for it. The virtualenv would reside in our release candidate. This had the added benefit that the release would be more easily rolled back to since the virtualenv wouldn’t need to be updated.
+
+Up to this point, our releases were fairly independent of each other. During the process we realized there were a few shared files that could be in a shared directory. For example, Django’s file should be shared across releases so we wouldn’t have to deploy the each time. Instead of using a shared directory and symlinking the settings to a release, we settled on copying the localsettings from the previous release. While this seems a bit more brittle, it helps in terms of isolating each release. If we update our localsettings.py in the current releaese and then decide to rollback, we will rollback to the old .
+
+The new deploy process is definitely a gain for us in terms of limiting errors on deploy, but it still has work if we want a truly seamless deploy. Some things that are blocking us:
+
+In addition, while this was an improvement to the stability of our deployments, our deploy still takes around 30 minutes to complete. We would also like to work on speeding up our deploy in order to get fixes and changes in more quickly.
+
+If you’re interested in connecting with Dimagi to learn more about CommCare, please reach out below!
+
+ 
+
+|||
+

@@ -1,0 +1,53 @@
+We use 2 Prometheus servers in what’s called Federation. Federation allows a Prometheus server to scrape selected metrics from another Prometheus server. So we have one Prometheus server running as a Docker Swarm service on the same virtual network as the cloud services to be able to scrape them. The sole purpose of this Prometheus server is to scrape these services. To avoid confusing the two, let’s call this server “services-prom”. The second Prometheus server scrapes services-prom, along with having the most of the monitoring configuration for our infrastructure. Let’s call this server “main-prom”. Running Prometheus server on the same virtual Swarm network as the services allows us to use Prometheus DNS service discovery to find out which endpoints to scrape:
+
+Here we have a job configured with DNS service discovery inside the services-prom configuration file. With services being created and destroyed all the time, we can’t just hardcode their addresses for Prometheus to scrape. Not only this would be a bad configuration management practice but we also need a more flexible setup for this system’s architecture. In Docker Swarm, while inside the created virtual network, we can run a special DNS query with tasks.myservice and get back all the IP addresses for the running Swarm tasks with that name. This can be tested with command from inside a container running on the virtual network:
+
+The addresses returned and the port specified are then used to build the list of endpoints for Prometheus to scrape. The port number is the one that we expose with Docker which has our application listening inside the container.
+
+When creating the Prometheus server Docker service (services-prom), we use Docker service constraint to only run services-prom on a specified node so we always know its IP address and port. This information is then used by the second (main-prom) server when scraping for the specified metrics. Federation job is then defined in main-prom configuration as follows:
+
+When thinking about services monitoring in the cloud, one can break it up into individual components that are equally important. The main components are system metrics, which we get from EC2 instances and Docker containers. These metrics assure us that the infrastructure is ready to accept the load of the services. The second component is customer facing service state. We need to know that the software we are running actually provides value. Once we have these metrics we use dashboards to graph and easily understand the view of the world. The last component is useful alerting that will let us know when the key metrics have crossed their threshold before they cause any outages.
+
+Prometheus’ Node Exporter, which is deployed with Ansible, runs on each monitored host in EC2 as a system daemon and exposes system metrics at <IP address>:9100/metrics endpoint. Of course it’s not practical to keep a list of IP addresses to monitor so the monitored hosts are automatically discovered by Prometheus EC2 service discovery. This is configured in main-prom configuration as follows:
+
+Note: acccess_key and secret_key contain the keys for a user created in IAM with AWS managed AmazonEC2ReadOnlyAccess policy.
+
+By default, Prometheus will label instances with the private IP addresses. We use the following to relabel the targets to the instance tag:
+
+Note: instance’s unique EC2 Name tag is set in Terraform where the instance is defined.
+
+Once we have these system metrics in Prometheus, we use Grafana to query Prometheus and build dashboards with the data available. We display hosts’ and services’ metrics and their health, also some application-specific numbers from our custom exporter. The dashboards are then accessible to everyone in the company with each team being able to build a dashboard that is the most appropriate to them. We have a lot of TVs hanging on the walls around the office so we use Airtame’s dashboard display function to get some more use out of them.
+
+In a very similar fashion to Host monitoring above, we configure Prometheus to scrape the container’s system metrics exported by cAdvisor on port 8080. cAdvisor is deployed with Ansible and runs inside a Docker container on every monitored host. This time, we only want to monitor those hosts that have containers running on them. Similarly to the ec2_instances job configuration above, we configure a job called ec2_containers to only scrape instances that match the regex specified. The relevant snippet is below:
+
+Not only do we need to know the health of our hosts and containers by monitoring various system metrics but we also need to know the health of the public facing services. The idea is to be able to identify which service components are responsible for the issues we’re seeing. For example, is it the service itself at fault or any of it’s down streams, like a database?
+
+Each service/container exposes its metrics at <IP address>:<port>/metrics endpoint, which are then scraped by services-prom server periodically as explained above.
+
+First and foremost, we need to know the state of a service, its availability. For this, we utilise Prometheus up{job=”myservice”} default time series which is populated after each scrape. The value of is returned when the scrape succeeded and if the scrape failed. Of course we can alert on this, as we’ll see below.
+
+Other service specific metrics we track are requests/second per service function and also endpoint response times. This is the area that needs to be paid more love and attention. More visibility is required into service’s key metrics such as latency, number of clients, and/or response success and errors. Our services are written and instrumented in Golang but there are a number of Prometheus client libraries available that can be used to add code instrumentation depending on the language of the application.
+
+Automated alerts are crucial to any monitoring system setup so Alertmanager is deployed beside main-prom server. It can actually handle alerts sent to it from multiple Prometheus servers and dispatch notifications with automatic de-duplication and grouping. We have standard system alerts configured in Prometheus like high CPU, low disk space etc. But also some alerts specific to Airtame Cloud like the total number of online devices, which should not be below a certain number. If it is, then there is probably a problem. An alert definition in Prometheus can look like this:
+
+Here, we alert on instance’s CPU being over 90% for 20 minutes. Notice the test definition is in Prometheus’ very powerful query language (PromQL). The same query is used when defining alerts as well as in Prometheus’ web interface. The web UI can be useful while coming up with an alert condition.
+
+If an alert has been triggered, Prometheus will dispatch a message to Alertmanager which in turn sends alerts to the configured receivers. An example alert payload may look something like the following. It’s a JSON message that can be sent as a test to Alertmanager receiver’s API with this script using command:
+
+Notice here we set labels manually, where, in practice, Prometheus will gather metrics as metadata from the service discovery method configured with the job. The concept of labels is very powerful as we already saw when we were filtering targets to scrape with a regex.
+
+Slack and Pushover are the two of many different receivers that can be configured in Alertmanager. Pushover is setup on the mobile phones of the engineers who are on-call. Slack channel includes all the engineers, with notifications enabled, who may be interested in the status of the cloud infrastructure. Over are the days of email alert notifications.
+
+The Slack channel receiving alerts includes engineers from different teams, some of which are not cloud infrastructure related. We need to make alerts as clear as possible to make sense to everyone. This is what default Slack alert looks like, not very informative to a person seeing one of these for the first time:
+
+We can see, in the square brackets, that the alert is in the firing state and the number of alerts of that type. Followed by the name of the alert and a bunch of alert labels in brackets. With the knowledge of Prometheus’ labels we can make it more descriptive to an engineer responding to this alert.
+
+This is a snippet from Alertmanager’s alertmanager.yml configuration file showing one of the receivers configuration, in this case Slack:
+
+We customise the message that gets sent to Slack in case of an alert by templating the and attributes. Taking advantage of the templates we can make the alert more readable with relevant information and also point an operator to the documentation associated with the alert. The link to the alert docs, containing instructions and tips, will come in very handy to an engineer that has to deal with this alert at 3am. So with a little tweaking we end up with this:
+
+We’ve seen how to get up and running with a monitoring system that supports dynamic cloud environments. The complex systems that we deal with today have a large number of moving components interacting with each other at will. So the end to end visibility is crucial to operating a resilient web service. Some things to keep in mind going forward:
+
+If you have any thoughts on this post please do let us know! And if it sounds like something you’d like to work with, we’re always on the lookout for talented engineers. Check our our open positions and get in touch.|||
+
+Airtame Cloud is a web service which enables organisations to remotely monitor and administer large deployments of Airtame devices. We take availability and monitoring very seriously to keep helping…

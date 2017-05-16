@@ -1,0 +1,178 @@
+It’s a well understood fact that platform security is an integral part of the security of complex systems. For mobile devices, this statement rings even truer; modern mobile platforms include multiple processing units, all elaborately communicating with one another. While the code running on the application processor (AP) has been the subject of much research, other components have seldom received the same scrutiny.
+
+In this two-part blog series, we’ll explore the exposed attack surface introduced by Broadcom’s Wi-Fi SoC on mobile devices. Specifically, we’ll focus our attention on devices running Android, although a vast amount of this research applies to other systems including the same Wi-Fi SoCs. The first blog post will focus on exploring the Wi-Fi SoC itself; we’ll discover and exploit vulnerabilities which will allow us to remotely gain code execution on the chip. In the second blog post, we’ll further elevate our privileges from the SoC into the the operating system’s kernel. Chaining the two together, we’ll demonstrate full device takeover by Wi-Fi proximity alone, requiring no user interaction.
+
+All that said and done, the introduction of Wi-Fi FullMAC chips does not come without a cost. Introducing these new pieces of hardware, running proprietary and complex code bases, may weaken the overall security of the devices and introduce vulnerabilities which could compromise the entire system.
+
+Specifically, we can see that there’s an ARM Cortex R4 core, which runs all the logic for handling and processing frames. Moreover, the datasheet reveals that the ARM core has 640KB of ROM used to hold the firmware’s code, and 768KB of RAM which is used for data processing (e.g., heap) and to store patches to firmware code.
+
+To start analysing the code running on the ARM core, we’ll need to extract the contents of the ROM, and to locate the data that is loaded into RAM.
+
+Finally, putting all this together, we can acquire the RAM’s contents from the firmware file, dump the ROM using , and combine the two into a single file which we can then start analysing in IDA.
+
+Due to the relatively small size of the available memory (both ROM and RAM), Broadcom went to extreme efforts in order to conserve memory. For starters, they’ve stripped the symbols and most of the strings from the binary. This has the added bonus of making it slightly more cumbersome to reverse-engineer the firmware’s code. They’ve also opted for using the Thumb-2 instruction set exclusively, which allows for better code density. As a result, the ROM image on the BCM4358 is so tightly packed that it contains less than 300 unused bytes.
+
+However, this is still not quite enough... Remember that the RAM has to accommodate the heap, stack and global data structures, as well as all the patches or modifications to ROM functions. Quite a tall order for a measly 768KB. To get around this, Broadcom has decided to place all the functions that are only used during the firmware’s initialisation in two special regions. Once the initialisation is completed, these regions are “reclaimed”, and are thereafter converted into heap chunks.
+
+What’s more, heap chunks are interspersed between code and data structures in RAM - since the latter sometimes have alignment requirements (or are referenced directly from ROM, so they cannot be moved). The end result is that RAM is a jumbled mess of heap chunks, code and data structures.
+
+Now that we have a grasp of the firmware’s structure and have the means to analyse it, we can finally start hunting for bugs. But… Where should we start?
+
+Now we can start cross-referencing locations which call this function, and reverse each of these call-sites. While substantially easier than reversing every part of the firmware, this still takes a considerable amount of time (as the function has more than 110 cross-references, some to other wrapper functions which themselves are called from multiple locations).
+
+Two of the vulnerabilities can be triggered when connecting to networks supporting wireless roaming features; 802.11r ransition (FT), or Cisco’s CCKM roaming. On the one side, these vulnerabilities should be relatively straightforward to exploit - they are simple stack overflows. Moreover, the operating system running on the firmware (HNDRTE) does not use stack cookies, so there’s no additional information leak or bypass required.
+
+Additionally, we’d need to figure out which devices actually support the aforementioned features. Broadcom provides many features which can be licensed by customers -- not all features are present on all devices (in fact, their corresponding patches probably wouldn’t even fit in RAM).
+
+Luckily, Broadcom makes it easy to distinguish which features are actually present in each firmware image. The last few bytes in the RAM contents downloaded to the chip contain the firmware’s “version string”. This string contains the date at which the firmware was compiled, the chip’s revision, the firmware’s version and a list of dash-delimited “tags”. Each tag represents a feature that is supported by the firmware image. For example, here’s the version string from the Nexus 6P:
+
+The presence of the 802.11r FT feature is indicated by the “fbt” tag. Similarly, support for CCKM is indicated by the “ccx” tag. Unfortunately, it seems that the Nexus 6P supports neither of these features. In fact, running a quick search for the “ccx” feature (CCKM support) on my own repository of Android firmware images revealed that this feature is not supported on any Nexus device, but supported on a wide variety of Samsung flagship devices, a very partial list of which includes the Galaxy S7 (G930F, G930V), the Galaxy S7 Edge (G935F, G9350), the Galaxy S6 Edge (G925V) and many more.
+
+Support for TDLS in the firmware is indicated by the “betdls” and “tdls” tags. Searching through my firmware repository I can see that the vast majority of devices do, indeed, support TDLS. This includes all recent Nexus devices (Nexus 5, 6, 6P) and most Samsung flagships.
+
+Lastly, as we’ll see later on, triggering these two vulnerabilities can be done by any peer on the Wi-Fi network, without requiring any action on the part of the device being attacked (and with no indication that such an attack is taking place). This makes these vulnerabilities all the more interesting to explore.
+
+In any case, it seems like we’ve made our mind up! We’re going to exploit the TDLS vulnerabilities. Before we do so, however, let’s take a second to learn a little bit about TDLS, and the vulnerabilities discovered (skip this part it you’re already familiar with TDLS).
+
+There are many use cases where two peers on the same Wi-Fi network wish to transfer large swaths of data between one another. For example, casting a video from your mobile device to your Chromecast would require large amounts of data to be transmitted. In most cases, the Chromecast would be relatively nearby to the caster (after all, you’d probably be watching the screen to which you’re casting). Therefore, it would seem wasteful to pass the entire data stream from the device to the AP, only to then pass it on to the Chromecast.
+
+It’s not just the increased latency of adding an additional hop (the AP) that will degrade the connection’s quality. Passing such large amounts of data to the AP would also put a strain on the AP itself, cause congestion, and would degrade the Wi-Fi connectivity for all peers on the network.
+
+This is where TDLS comes into play. TDLS is meant to provide a means of peer-to-peer communication on a Wi-Fi network that is AP-independant.
+
+Let’s start by familiarising ourselves with the structure of TDLS frames. As you may know, 802.11 frames use the “flags” field in order to indicate the “direction” in which a frame is travelling (from the client to the AP, AP to client, etc.). TDLS traffic co-opts the use of the flag values indicating traffic in an Ad-Hoc (IBSS) network (To-DS=0, From-DS=0).
+
+Before two peers can establish a connection, they must first know about the existence of one another. This is called the “discovery” phase. A Wi-Fi client that wishes to discover TDLS-capable peers on the network, can do so by sending a “TDLS Discovery Request” frame to a peer. A TDLS-capable peer that receives this frame, responds by sending a “TDLS Discovery Response” frame. The request and response are correlated to one another using a 1-byte “dialog token”.
+
+Next, the peers may wish to set up a connection. To do so, they must perform a 3-way handshake. This handshake serves a dual purpose; first, it indicates that a connection is successfully established between the two peers. Second, it’s used to derive the ey (TPK), which secures the TDLS traffic between the peers.
+
+Finally, once the connection is created, the two peers can exchange peer traffic between one another. When one of the peers wishes to tear-down the connection, they may do so by sending a “TDLS Teardown” frame. Upon reception of such a frame, the TDLS-peer will remove the connection and free up all the related resources.
+
+Now that we know enough about TDLS, let’s take a closer look at the vulnerabilities at hand!
+
+In order to ensure the integrity of messages transferred during the setup and teardown phases, the corresponding TDLS frames include odes (MIC). For the setup phase, once the second handshake message (M2) is received, the TPK can be derived by both parties. Using the TPK, the TDLS-initiator can calculate a MIC over the contents of the third handshake frame, which can then be verified by the TDLS-responder.
+
+So how can we find these calculations in the firmware’s code? Well, as luck would have it, some strings referring to TDLS were left-over in the firmware’s ROM, allowing us to quickly home in on the relevant functions.
+
+After reverse-engineering much of the flow leading up to the processing of handling TDLS action frames, we finally reach the function responsible for handling TDLS Setup Confirm (PMK M3) frames. The function first performs some validations to ensure that the request is legitimate. It queries the internal data structures to ensure that a TDLS connection is indeed being set up with the requesting peer. Then, it verifies the Link-ID IE (by checking that its encoded BSSID matches that of the current network), and also verifies the 32-byte initiator nonce (“Snonce”) value (by comparing it to the stored initial nonce).
+
+Once a certain degree of confidence is established that the request may indeed be legitimate, the function moves on to call an internal helper function, tasked with calculating the MIC and ensuring that it matches the one encoded in the frame. Quite helpfully, the firmware also includes the name for this function (“
+
+After reverse-engineering the function, we arrive at the following approximate high-level logic:
+
+As can be seen above, although the function verifies that the RSN IE’s length does not exceed the allocated buffer’s length (line 13), it fails to verify that the subsequent IEs also do not overflow the buffer. As such, setting the RSN IE’s length to a large value (e.g., such that rsn_ie[1] + 2 + (pos - buffer) == 0xFF) will cause the Timeout Interval and Fast Transition IEs to be copied out-of-bounds, overflowing the buffer.
+
+For example, assuming we set the length of the RSN IE (x) to its maximal possible value, 224, we arrive at the following placements of elements:
+
+In this diagram, orange fields are those which are “irrelevant” for the overflow, since they are positioned within the buffer’s bounds. Red fields indicate values that cannot be fully controlled by us, and green fields indicate values which are fully controllable.
+
+For example, the Timeout Interval IE is verified prior to the MIC’s calculation and only has a constrained set of allowed values, making it uncontrollable. Similarly, the FTIE’s tag and length fields are constant, and therefore not controllable. Lastly, the 32-byte “Anonce” value is randomly chosen by the TDLS responder, placing it firmly out of our field of influence.
+
+But the situation isn’t that grim. In fact, several of the fields in the FTIE itself can be arbitrarily chosen - for example, the “Snonce” value is chosen by the TLDS-initiator during the first message in the handshake. Moreover, the “MIC Control” field in the FTIE can be freely chosen, since it is not verified prior to the execution of this function.
+
+In any case, now that we’ve audited the MIC verification for the setup stage, let’s turn our sights towards the MIC verification during the teardown stage. Perhaps the code is similarly broken there? Taking a look at the MIC calculation in the teardown stage (“ ), we arrive at the following high-level logic:
+
+Ah-ha, so once again a straightforward overflow; the FT-IE’s length field is not verified to ensure that it doesn’t exceed the length of the allocated buffer. This means that simply by providing a crafted FT-IE, we can trigger the overflow. Nevertheless, once again there are several verifications prior to triggering the vulnerable code path which limit our control on the overflowing elements. Let’s try and plot the placement of elements during the overflow:
+
+This seems much simpler - we don’t need to worry ourselves about the values stored in the FTIE that are verified prior to the overflow, since they’re all placed neatly within the buffer’s range. Instead, the attacker controlled portion is simply spare data that is not subject to any verification, and can therefore be freely chosen by us. That said, the overflow’s is quite limited - we can only overwrite 25 bytes beyond the range of the buffer.
+
+At long last we have a grasp of the primitives at hand. Now, it’s time to test out whether our hypotheses match reality. To do so, we’ll need a testbed that’ll enable us to send crafted frames, triggering the overflows. Recall that is an open-source portable supplicant that fully supports TDLS. This makes it a prime candidate for our research platform. We could use as a base on top of which we’ll craft our frames. That would save us the need to re-implement all the logic entailed in setting up and maintaining a TDLS connection.
+
+Now we just need to interact with in order to setup and teardown a TDLS connection to our target device. Conveniently, . This command line interface also supports several commands exposing TDLS functionality:
+
+Moving on, we can now send a TDLS_SETUP command, followed by our crafted TDLS_TEARDOWN. If everything adds up correctly, this should trigger the overflow. However, this raises a slightly more subtle question - how will we when the overflow occurs? It may just so happen that the data we’re overflowing is unused. Alternately, it may be the case that when the firmware crashes, it just silently starts up again, leaving us none the wiser.
+
+To answer this fully, we’ll need to understand the logic behind Broadcom’s heap implementation. Digging into the allocator’s logic, we find that it is extremely straightforward; it is a simple “best-fit” allocator, which performs forward and backward coalescing, and keeps a singly linked list of free chunks. When chunks are allocated, they are carved from the end (highest address) of the best-fitting free chunk (smallest chunk that is large enough). Heap chunks have the following structure:
+
+By reverse-engineering the allocator’s implementation, we can also find the location of the pointer to the head of the first free-chunk in RAM. Combining these two facts together, we can create a utility which, given a dump of the firmware’s RAM, can plot the current state of the heap’s freelist. Acquiring a snapshot of the firmware’s RAM can be easily achieved by using
+
+Now, we can send out crafted TDLS_TEARDOWN frame, immediately take a snapshot of the firmware’s RAM, and check the freelist for any signs of corruption:
+
+Ah-ha! Indeed one of the chunks in the freelist suddenly has an exceptionally large size after tearing down the connection. Recall that since the allocator uses “best-fit”, this means that subsequent allocations won’t be placed in this block as long as other large enough free chunks exist. This also means that the firmware did not crash, and in fact continued to function correctly. Had we not visualised the state of the heap, we wouldn’t have been able to determine anything had happened at all.
+
+In any case, now that we’ve confirmed that the overflow does in fact occur, it’s time to move to the next stage of exploitation. We need less crude tools in order to allow us to monitor the state of the heap during the setup and teardown processes. To this end, it would be advantageous to hook the malloc and free functions in the firmware, and to trace their arguments and return values.
+
+Without further ado, let’s take a look at heap activity while establishing a TDLS connection:
+
+The vertical axis denotes time - each line is a new heap state after a operation. The horizontal axis denotes space - lower addresses are on the left, while higher addresses are on the right. Red blocks indicate chunks that are in-use, grey blocks indicate free chunks.
+
+As we can clearly see above, establishing a TDLS connection is a operation. There are many allocations and deallocations, for regions both large and small. This abundance of noise doesn’t bode well for us. Recall that the overflow during the setup stage is highly constrained, both in terms of the data being written, and in terms of the of the overflowing data. Moreover, the overflow occurs during one of the many allocations in the setup phase. This doesn’t allow us much control over the state of the heap prior to triggering the overflow.
+
+Taking a step back, however, we can observe a fairly surprising fact. Apart from the heap activity during the TDLS connection establishment, it seems like there is little to no activity on the heap whatsoever. In fact, it turns out that transmitted and received frames are drawn from a shared pool, instead of the heap. Not only that, but their processing doesn’t incur a heap operation - everything is done “in-place”. Even when trying to intentionally cause allocations by sending random frames containing exotic bit combinations, the firmware’s heap remains largely unaffected.
+
+This is both a blessing and a curse. On the one hand, it means that the heap’s structure is highly consistent. In the seldom events that data structures are allocated, they are immediately freed thereafter, restoring the heap to its original state. On the other hand, it means that our degree of over the heap’s structure is . For the most part, whatever structure the heap has after the firmware’s initialisation, is what we’re going to have to work with (unless, of course, we find some primitive that will allow us to better shape the heap).
+
+Perhaps we should take a look at the teardown stage instead? Indeed, activating the traces during the TDLS teardown stage reveals that there are very few allocations prior to triggering the overflow, so it seems like a much more convenient environment to explore.
+
+While these in-depth traces are useful for getting a high-level view of the heap’s state, they are rather difficult to decipher. In fact, in most cases it’s sufficient to take a single snapshot of the heap and just visualise it, as we did earlier with the graphviz visualiser. In that case, let’s improve our previous heap visualiser by allowing it to produce detailed graphical output, based on a single snapshot of the heap.
+
+Using this visualiser, we can now take a look at the state of the heap setting up a TDLS connection. This will be the state of the heap we need to work with when we trigger the overflow during the teardown stage.
+
+We can see that after setting up the TDLS connection, most of the heap’s used chunks are consecutive, but also two holes are formed; one of size 0x11C, and another of size 0x124. Activating the traces for the teardown stage, we can see that the following allocations occur:
+
+The highlighted line denotes the allocation of the 256-byte buffer for the teardown frame’s MIC calculation, that same one we can overflow using our vulnerability. Moreover, it seems as though the heap activity is quite low prior to sending the overflow frame. Combining the heap snapshot above with the trace file, we can deduce that the best-fitting chunk for the 256-byte buffer is in the 0x11C-byte hole. This means that using our 25-byte overflow we’ll be able to overwrite:
+
+Let’s take a closer look at the next in-use chunk and see whether there’s any interesting information that we’d like to overwrite there:
+
+Ah, so the next chunk is mostly empty, save for a couple of pointers near its head. Are these pointers of any use to us? Perhaps they are written to? Or freed at a later stage? We can find out by manually corrupting these pointers (pointing them at invalid memory addresses, such as 0xCDCDCDCD), and instrumenting the firmware’s exception vector to see whether it crashes. Unfortunately, after many such attempts, it seems as though none of these pointers are in fact used.
+
+This leaves us, therefore, with a single possibility - corrupting the “size” field of the in-use chunk. Recall that once the TDLS connection is torn down, the data structures relating to it are freed. Freeing an in-use chunk whose size we’ve corrupted could have many interesting consequences. For starters, if we reduce the size of the chunk, we can intentionally “leak” the tail end of the buffer, causing it to remain forever un-allocatable. Much more interestingly, however, we could set the chunk’s size to a larger value, thereby causing the next free operation to create a free chunk whose tail end overlaps another heap chunk.
+
+Once a free chunk overlaps another heap chunk, subsequent allocations for which the overlapping free chunk is the best-fit will be carved from the end of the free chunk, thereby corrupting whatever fields reside at its tail. Before we start scheming, however, we need to confirm that we can create such a state (i.e., an overlapping chunk),
+
+Recall that the MIC check is just one of many operations that take place when a TDLS connection is torn down. It may just so happen that by overwriting the next chunk’s size, once it is freed during the collection of the TDLS session’s data structures, it may become the best-fit for subsequent allocations during the teardown process. These allocations may then cause additional unintended corruptions, which will either leave the heap in a non-consistent state or even crash the firmware.
+
+However, the search space for possible sizes isn’t that large - assuming we’re only interested in chunk sizes that are not larger than the RAM itself (for obvious reasons), we can simply enumerate each of the heap states produced by overwriting the “size” field of the next chunk with a given value and tearing down the connection. This can be automated by using a script on the sending (to perform the enumeration), while concurrently acquiring “snapshots” of RAM on the device, and observing their state (whether or not they are consistent, and whether the firmware managed to resume operation after the teardown).
+
+Specifically, it would be highly advantageous if we were able to create a heap state whereby two free chunks overlap one another. In such a condition, allocations taken from one chunk, can be used to corrupt the “next” pointer of the other free chunk. This could be used, perhaps, to control the location of subsequent allocations - an interesting primitive in it’s own right.
+
+In any case, after running through a few chunk sizes, tearing down the TDLS connection and observing the heap state, we come across quite an interesting resulting state! By overwriting the “size” field with the value 72 and tearing down the connection, we achieve the following heap state:
+
+Great! So after tearing down the connection, we are left with a zero-sized free chunk, overlapping a different (larger) free chunk! This means that once an allocation is carved from the large chunk, it will corrupt the “size” and “next” fields of the smaller chunk. This could prove very useful - we could try and point the next free chunk at a memory address whose contents we’d like to modify. As long as the data in that address conforms with the format of a free chunk, we might be able to persuade the heap to overwrite the memory at that address with subsequent allocations.
+
+To start exploring these possibilities, we’ll first need to create a meaning we either control the size of the allocation, or it’s contents, or (ideally) both. Recall that, as we’ve seen previously, it is in fact very to trigger allocations during the normal processing of the firmware - nearly all the processing is done in-place. Moreover, even for cases where data allocated, its lifespan is very short; memory is immediately reclaimed once it’s no longer used.
+
+Be that as it may, we’ve already seen at least one set of data structures whose lifetime controllable, and which contains multiple different pieces of information - the keep all the information pertaining to the TDLS connection as long as its active. Perhaps we could find some data structure relating to TDLS which could act as a good candidate for a controlled allocation?
+
+To search for one, let’s start by looking at the function handling each of the TDLS action frames - . The function starts by reading out the TDLS category and action code. Then, it routes the frame to the appropriate handler function, according to the received action code:
+
+We can see that apart from the regular, specification-defined action codes, the firmware also supports an out-of-spec frame with an action code of 127. Anything out-of-spec is automatically suspect, so that might be as good a place as any to look for our primitive.
+
+However, much more interestingly, we see that the implementation for command #4 seems relevant to our current pursuit. First, it does not require the existence of a TDLS connection in order to be processed! This allows us to send the frame even after tearing down the connection. Second, by activating heap traces during this function’s execution and reverse-engineering its logic, we find that the function triggers the following high-level sequence of events:
+
+Great! So we get an allocation (A) with a controlled lifetime, a controlled size and controlled contents! What more could we possibly ask for?
+
+There is one tiny snag, however. Modifying to send this crafted TDLS frame results in a resounding failure. While allows us to fully control many of the fields in the TDLS frames, it is only a supplicant, not an MLME implementation. This means that the corresponding MLME layer is responsible for composing and sending the actual TDLS frames.
+
+On the setup I’m using for the attack platform, I have a laptop running Ubuntu 16.04, and a TP-Link TL-WN722N dongle. The dongle is a SoftMAC configuration, so the MLME layer in play is the one present in the Linux kernel, namely, the “cfg80211” configuration layer.
+
+To allow for easier control over the vendor frames, I’ve also added support for a new command within ’s CLI - “TDLS_VNDR”. This command allows us to send a crafted TDLS vendor frame with arbitrary data to any MAC address (regardless of whether a TDLS connection is established to that peer).
+
+After creating two overlapping chunks, we can now use our controlled allocation primitive to allocate memory from the tail of the larger chunk, thereby pointing the smaller free chunk at a location of our choosing. Whichever location we choose, however, must have valid values for both the  “size” and “next” fields, otherwise later calls to may fail, possibly crashing the firmware. As a matter of fact, we’ve already seen perfect candidates to stand-in for free chunks - in-use chunks!
+
+Recall that in-use chunks specify their size field at the same location free chunks do theirs. As for the “next” pointer, it is unused in free chunks, but is during the allocation of the chunk. This means that by corrupting the free list to point at an in-use chunk, we can trick the heap into thinking it’s just another free chunk, which is coincidentally also the last chunk in the freelist. That’s comfortable.
+
+Now all we need to do is find an in-use chunk containing information that we’d like to overwrite. If we make that chunk the best-fitting chunk in the free list for a subsequent controlled allocation, we’ll get our own data to be allocated there instead of the in-use chunk’s data, effectively replacing the chunk’s contents. This means we’re able to arbitrarily replace the contents of any in-use chunk.
+
+As we’re interested in achieving full code execution, it would be advantageous to locate and overwrite a function pointer in the heap. But… Where can we expect to find such values on the heap? Well, for starters, there are some events in the Wi-Fi standards that must be handled periodically, such as performing scans for adjacent networks. It would probably be a safe bet to assume that the firmware supports handling such periodic timers by using a common API.
+
+We can see that the timer list is ordered by the timeout value, and most of the timers have a relatively short timeout. Moreover, all the timers are allocated , and are therefore stored at addresses. This is important since, if we’d like to target our free chunk at a timer, we’d need to know it’s exact location in memory.
+
+So all that’s left is to use our two primitives to replace the contents of one of the timers above with our own data, consequently pointing the timer’s function at an address of our choosing.
+
+Here’s the game plan. First, we’ll use the techniques described above to create two overlapping free chunks. Now, we can use the controlled allocation primitive to point the smaller free chunk at one of the timers in the list above. Next, we create another controlled allocation (freeing the old one). This one will be of size 0x3C, for which the timer chunk is the best-fitting. Therefore, at this point, we’ll overwrite the timer’s contents.
+
+But which function do we point our timer to? Well, we can use the same trick to commandeer another in-use chunk on the heap, and overwrite its contents with our own shellcode. After briefly searching the heap, we come across a large chunk which simply contains console data during the chip’s boot sequence, and is then left allocated but unused. Not only is the allocation is fairly large (0x400 bytes), but it is also placed at a constant address (since it is allocated during the firmware’s initialisation sequence) - perfect for our exploit.
+
+By reversing the firmware’s initialisation routines in the binary, we can see that the MPU is indeed being activated during boot. But what are the contents with which it’s configured? We can find out by writing a small assembly stub to dump out the contents of the MPU:
+
+Ah-ha - while the MPU is initialised, it is effectively set to mark all of memory as RWX, making it useless. This saves us some hassle… We can conveniently execute our code directly from the heap.
+
+So, at long last, we have an exploit ready! Putting it all together we can now hijack a code chunk to store our shellcode, then hijack a timer to point it at our stored shellcode. Once the timer expires, our code will be executed on the firmware!
+
+We’ve seen that while the firmware implementation on the Wi-Fi SoC is incredibly complex, it still lags behind in terms of security. Specifically, it lacks all basic exploit mitigations - including stack cookies, safe unlinking and access permission protection (by means of an MPU).
+
+Broadcom have informed me that newer versions of the SoC utilise the MPU, along with several additional hardware security mechanisms. This is an interesting development and a step in the right direction. They are also considering implementing exploit mitigations in future firmware versions.
+
+In the next blog post, we’ll see how we can use our assumed control of the Wi-Fi SoC in order to further escalate our privileges into the application processor, taking over the host’s operating system!|||
+

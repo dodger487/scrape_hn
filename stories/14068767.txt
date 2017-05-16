@@ -1,2 +1,30 @@
-|||
+What’s a distributed cache? A solution that is “deployed” in an application (typically a web application) and that makes sure data is loaded from memory, rather than from disk (which is much slower), in order to improve performance and response time.
+
+That looks easy if the cache is to be used on a single machine – you just load your most active data from the database in memory (e.g. a Guava Cache instance), and serve it from there. It becomes a bit more complicated when this has to work in a cluster – e.g. 5 application nodes serving requests to users in a round-robin fashion.
+
+You have to update the in-memory cache on all machines each time a piece of data is updated by a request to one of the machines. If you just load all the data in memory and don’t invalidate it, the cache won’t be “coherent” – it will have stale values and requests to different application nodes will have different results, which you most certainly want to avoid. Or you can have a single big cache server with tons of memory, but it can die – and that may disrupt the smooth operation, so you’d want to have at least 2 machines in a cluster.
+
+You can get a distributed cache in different ways. To list a few: Infinispan (which I’ve covered previously), Terracotta/Ehcache, Hazelcast, Memcached, Redis, Cassandra, Elasticache(by Amazon). The former three are Java-specific (both JCache compliant), but the rest can be used in any setup. Cassandra wasn’t initially meant to be cache solution, but it can easily be used as such.
+
+All of these have different configurations and different options, even different architectures. For example, you can run Ehcache with a central Terracotta server, or with peer-to-peer gossip protocol. The in-process approach is also applicable for Infinispan and Hazelcast. Alternatively, you can rely on a cloud-provided service, like Elasticache, or you can setup your own cluster of Memcached/Redis/Cassandra servers. Having the cache on the application nodes themselves is slightly faster than having a dedicated memory server (cluster), because of the network overhead.
+
+The cache is structured around keys and values – there’s a cached entry for each key. When you want to load something form the database, you first check whether the cache doesn’t have an entry with that key (based on the ID of your database record, for example). If a key exists in the cache, you don’t do a database query.
+
+But how is the data “distributed”? It wouldn’t make sense to load all the data on all nodes at the same time, as the duplication is a waste of space and keeping the cache coherent would again be a problem. Most of the solutions rely on the so called “consistent hashing”. When you look for a particular key, its hash is calculated and (depending on the number of machines in the cache cluster), the cache solution knows exactly on which machine the corresponding value is located. You can read more details in the wikipedia article, but the approach works even when you add or remove nodes from the cache cluster, i.e. the cluster of machines that hold the cached data.
+
+Then, when you do an update, you also update the cache entry, which the caching solution propagates in order to make the cache coherent. Note that if you do manual updates directly in the database, the cache will have stale data.
+
+On the application level, you’d normally want to abstract the interactions with the cache. You’d end up with something like a generic “get” method that checks the cache and only then goes to the database. This is true for get-by-id queries, but caches can also be applied for other SELECT queries – you just use the query as a key, and the query result as value. For updates it would similarly update the database and the cache.
+
+Some frameworks offer these abstractions out of the box – ORMs like Hibernate have the so-called cache providers, so you just add a configuration option saying “I want to use (2nd level) cache” and your ORM operations automatically consult the configured cache provider before hitting the database. Spring has the annotation which can cache method invocations, using their parameters as keys. Other frameworks and languages usually have something like that as well.
+
+An important side-note – you may need to pre-load the cache. On a fresh startup of a cluster (e.g. after a new deployment in a blue-green deployment scheme/crash/network failure/etc.) the system may be slow to fill the cache. So you may have a batch job run on startup to fetch some pieces of data from the database and put them in the cache.
+
+It all sounds easy and that’s good – the basic setup covers most of the cases. In reality it’s a bit more complicated to tweak the cache configurations. Even when you manage to setup a cluster (which can be challenging in, say, AWS), your cache strategies may not be straightforward. You have to answer a couple of questions that may be important – how much do you want your cache entries to live? How big do you need your cache to be? How should elements expire (cache eviction strategy) – least recently used, least frequently used, first-in-first-out?
+
+These options often sound arbitrary. You normally go with the defaults and don’t bother. But you have to constantly keep on eye on the cache statistics, do performances tests, measure and tweak. Sometimes a single configuration option can have a big impact.
+
+One important note here on the measuring side – you don’t necessarily want to cache everything. You can start that way, but it may turn out that for some types of entries you are actually better off without a cache. Normally these are the ones that are updated too often and read not that often, so constantly updating the cache with them is an overhead that doesn’t pay off. So – measure, tweak, repeat.
+
+Distributed caches are an almost mandatory component of web applications. Yet, I’ve had numerous discussions about how a given system is very big and needs a lot of hardware, where all the data would fit in my laptop’s memory. So, much to my surprise, it turns out it’s not yet a universally known concept. I hope I’ve given a short, but sufficient overview of the concept and the various options.|||
 

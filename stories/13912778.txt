@@ -1,0 +1,53 @@
+In the article Tarantool: the Good, the Bad and the Ugly, I described a simple voting service and provided the working PHP code. You saw how easy it is to use this NoSQL database in your own project. However, one thing has remained unclear — why I picked a NoSQL database in the first place and what performance gains it offers as compared to a traditional database. This article will be about exactly that. To answer this question, I’m going to test one of my servers that hosts a virtual machine with 1 GB of RAM and the following CPU:
+
+My hosting provider claims the virtual server bandwidth is 100 Mbit. Even though some tests I ran showed a higher network speed, let’s assume the 100 Mbit cap is true. A few words about the software I’m using: Nginx 1.6.2, PHP/PHP-FPM, Tarantool 1.7.3.
+
+I’ll do the testing with a utility called wrk. After running wrk several times with different parameters and some tuning of Nginx, the latter ended up having the following configuration:
+
+In the end, wrk generated 50 parallel requests. If the number is lower, it’s impossible to achieve the server’s peak performance. At 100 and higher, the RPS performance does improve a little, but the latency skyrockets; in other words, increasing the number of parallel requests beyond a reasonable limit leads to inevitable losses. Here’s a picture that’s worth a thousand words:
+
+The image is taken from Konstantin Osipov’s article Tips and tricks for queue processing (in Russian)
+
+The round-trip delay time between the server being tested and the traffic generator was 32 ms. After I ran some preliminary tests, I restarted my server, just in case, to obtain a less biased result. I got the following results:
+
+The server received slightly less than 900 RPS with the latency of 54 ms. Is it good or bad? Let’s recall what happens in the script of the voting service on a page hit:
+
+These four steps take about 1 ms on a virtual private server with the lowest configuration possible! Over one million records were inserted into the session table during the testing, and it didn’t affect the server performance at all. Not too bad, right?
+
+You can get some more details by using the top utility. As I mentioned earlier, I restarted my server prior to testing. I made the screenshot below at the beginning of the second (counting from the restart) benchmark.
+
+This image shows how CPU time is distributed across different tasks. About a quarter is consumed by Tarantool. PHP-FPM handlers turned out to be major time consumers, which was to be expected. Nginx holds the third place in terms of resource consumption. As I increased the number of parallel requests in wrk, Nginx required more and more CPU time. As a result, PHP-FPM didn’t get enough resources and the log files featured errors 499 and 502.
+
+It would be a logical next step to rewrite the application and replace Tarantool with some regular SQL database, such as MySQL or PostgreSQL, and compare the results. However, I’m not a big fan of wasting my time, so I came up with another option. Why not test the Nginx + PHP-FPM bundle, but without Tarantool, and see how the performance behaves.
+
+For starters, let me explain why I picked exactly 50 (-c50 parameter) parallel requests for testing my server. When you’re using a single request, the test starts to repeatedly load the page. Due to network latency and non-zero request processing time, it generates a very low workload. That’s why you start increasing the number of requests and monitor test results and the server performance. As the number of parallel requests grows, so does (almost linearly) the CPU time consumed by Nginx. Once the workload is too high, the server’s not getting enough CPU resources, so some test requests lead to errors: they are either aborted by wrk on timeout, or the server throws error 502, Bad Gateway (PHP-FPM in our case).
+
+The main takeaway from the paragraph above is that the test parameters were carefully chosen specifically for my hosting and test server configurations. Testing another bundle, say, over a LAN would require a completely different set of parameters.
+
+Let’s take a look at the bar chart — and then I’ll tell you a couple of really interesting things.
+
+So, calls to Tarantool were replaced with the following graceless stub:
+
+Also, I commented out or removed all the Tarantool references from the script and ran it. As you can see in the diagram above (blue column, nginx+php), with Tarantool removed and 50 requests issued simultaneously, the server received 1,150 RPS, which is a 30% speed gain as compared to the previous 879 RPS. Isn’t that cool? Not really! In fact, this result doesn’t tell you anything, since the test was initially designed in such a way that the site workload reaches 100%. But now that we got rid of one resource-intensive process (consuming about 30% of CPU time), the site’s no longer 100% loaded. Fancy a little test?
+
+The blue bar continues to grow steadily as the server workload increases. With 150 parallel request, the server receives almost 3,000 RPS, which is slightly more than three times the result obtained with Tarantool. Now that’s more like it.
+
+By the way, why did the server performance triple with Tarantool disabled, although it was using only 30% of CPU time? The answer is simple: with Tarantool out of the bundle, the workload on PHP-FPM workers decreased as well. The workload grew, because Nginx was consuming more CPU resources now. This workload was driven by the number of parallel requests that I was increasing until errors started to pop up.
+
+One curious thing I’d like to mention here. What’s Tarantool+Connect in the chart above? As usual, you stumble upon interesting findings purely by chance. It happened when I disabled all the Tarantool procedure calls and ran the test — somehow the Tarantool process was still devouring a huge amount of CPU time. It turned out I’d forgotten to comment out this snippet that initializes a connection:
+
+In the diagram, Tarantool+Connect shows the server performance with a connection initialized, but without any computations performed. As I found out, in the demo application I built, it is connection initialization, and not computations per se, that accounts for a greater part of CPU consumption by the Tarantool process. In my test, Tarantool+Connect alone takes up 20% of CPU time, whereas fully functional Tarantool consumes 28%.
+
+What’s the takeaway here? Perhaps initializing a Tarantool connection is a resource-intensive operation, or PHP driver isn’t optimized properly. What’s important is that a daemon written in C, Java or Go would take four times less CPU resources to initialize such a connection. You need to keep that in mind when building applications.
+
+Finally, the last test that, although pretty simple, is very interesting for developers. As you already know, Tarantool ensures data safety via two mechanisms: snapshotting, which regularly creates and saves memory snapshots, and write-ahead log (WAL), which writes each change to a special change log. Thus, in case of a sudden server failure or shutdown, all the data can be restored at system restart.
+
+When I tested the server with the WAL disabled and 50 requests issued in parallel, the performance went up to 963 RPS, which is to be expected: not saving an extra log file on disk should speed up the system that’s 100% loaded. However, such performance gain is insignificant and not worth the price you have to pay for it. It’s better to be sure your precious data is safe.
+
+An all-too-common idea that used to be thrown around in the web development community was “why create a web frontend in a fast programming language if databases are still slow.” Nowadays, with more powerful hardware, virtualization and NoSQL solutions, databases cease to be an application bottleneck.
+
+I’ve yet to find an answer to one important question: is Tarantool really as reliable as its developers make it seem? What if it’s not? I’d like to find out how good Tarantool is at data loss prevention by “breaking” it. But to achieve it, I need all the help and advice I can get from skeptics, competitors and ordinary haters of Mail.Ru Group, so that I can model really tough conditions! “Plato is my friend, but truth is a better friend,” as the saying goes.
+
+Oh, and don’t forget to vote on my demo site. Otherwise, I’ll be forced to post one and the same racoon from the Top Picks section.|||
+
+In the article Tarantool: the Good, the Bad and the Ugly, I described a simple voting service and provided the working PHP code. You saw how easy it is to use this NoSQL database in your own project…

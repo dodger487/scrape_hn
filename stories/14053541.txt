@@ -1,0 +1,159 @@
+STOKE is a stochastic optimizer and program synthesizer for the x86-64 instruction set. STOKE uses random search to explore the extremely high-dimensional space of all possible program transformations. Although any one random transformation is unlikely to produce a code sequence that is desirable, the repeated application of millions of transformations is sufficient to produce novel and non-obvious code sequences. STOKE can be used in many different scenarios, such as optimizing code for performance or size, synthesizing an implementation from scratch or to trade accuracy of floating point computations for performance. As a superoptimizer, STOKE has been shown to outperform the code produced by general-purpose and domain-specific compilers, and in some cases expert hand-written code.
+
+In addition to searching over programs, STOKE contains verification infrastructure to show the equivalence between x86-64 programs. STOKE can consider test-cases, perform bounded verification all the way to fully formal verification that shows the equivalence for all possible inputs.
+
+STOKE has appeared in a number of publications. For a thorough introduction to the design of STOKE, see:
+
+STOKE will run on modern 64-bit x86 processors. We officially support Haswell processors with AVX2 extensions. STOKE should also run on Sandy Bridge systems (with AVX, but not AVX2). It might run on newer architectures, but we currently don't test these. Running as described next will automatically configure the build for the correct architecture.
+
+STOKE is supported on the latest Ubuntu LTS release; in practice, it will also run on Ubuntu 13.10+ and on debian testing. If you're trying to get STOKE to work on another linux distribution, having the right version of g++ is key. STOKE is supported on 4.9 only. It should also work on later versions, but it will not work with g++ 4.8.x (missing regular expression support), and g++ 4.7.x and older definitely will not work.
+
+IMPORTANT Ubuntu 16.04 shipped with a new gcc that changed the ABI. This is causing us some problems and we're still playing catch-up. If you're on Ubuntu 16.04, the best thing at the present-time is to install gcc-4.9 and use the ubuntu16.04 branch of this repository. After running ./configure.sh you'll want to be sure that CXX=/usr/bin/g++-4.9 and CC=/usr/bin/gcc-4.9 are in the .stoke_config file. Hopefully we'll get everything working for gcc-5.3 soon.
+
+Most of STOKE's software dependencies are available through apt. These can be satisfied by typing:
+
+Note that your distribution might not have g++-4.9 by default. You may consider installing a PPA as described here: https://askubuntu.com/questions/466651/how-do-i-use-the-latest-gcc-4-9-on-ubuntu-14-04
+
+The rest of the dependencies will be fetched automatically as part of the build process.
+
+The entire STOKE code base is available on GitHub under the Apache Software License version 2.0 at github.com/StanfordPL/stoke.
+
+To check it out, type:
+
+This will check out the default branch. Unless you are looking for a specific version or modification of STOKE, this is the branch to use. It contains all the latest changes and is reasonably stable. This branch is supposed to always pass all tests.
+
+See the previous sections on how to download STOKE, a list of dependencies, and to check your hardware support level. The remainder of STOKE's software dependencies are available on GitHub and will be downloaded automatically the first time that STOKE is built. When you build STOKE the first time, run
+
+This will figure out the correct build parameters (such as the platform). To build STOKE, run
+
+To add STOKE and its related components to your path, type:
+
+To run the tests, choose the appropriate command:
+
+The files generated during the build process can be deleted by typing:
+
+To delete STOKE's dependencies as well (this is useful if an error occurs during the first build), type:
+
+The following toy example shows a typical workflow for using STOKE. All of the following code can be found in the directory. As this code is tested using our continuous integration system, the code there will always be up-to-date, but this README can fall behind.
+
+Consider a C++ program that repeatedly counts the number of bits (population count) in the 64-bit representation of an integer. (Keeping track of a running sum prevents from eliminating the calls to altogether.)
+
+STOKE is a compiler and programming language agnostic optimization tool. It can be applied to any x86-64 ELF binary. Although this example uses the GNU toolchain, nothing prevents the use of other tools. To build this code with full optimizations, type:
+
+A profiler will reveal that the runtime of is dominated by calls to the function. STOKE can be used to improve the implementation of this function as follows. The first step is to disassemble the program by typing:
+
+This will produce a directory named that contains the text of every function contained in the binary .
+
+Help for stoke or any of its subcommands can be obtained by typing:
+
+STOKE can accept arguments either through the command line or through a configuration file. The invocation of shown above is equivalent to the following:
+
+Every STOKE subcommand can be used to generate example configuration files by typing:
+
+Because was compiled using , the text of the function will appear under the mangled name in .
+
+The next step is to generate a set of testcases for guiding STOKE's search procedure. These can be obtained by typing:
+
+The resulting file will contain 1024 entires, all of the form:
+
+Each entry corresponds to the hardware state that was observed just prior to an execution of the function. The first 60 rows represent the contents of general purpose, sse, and eflags registers, and the remaining rows represent the contents of memory, both on the stack and the heap. Memory is shown eight bytes at a time, where a block of eight bytes appears only if the target dereferenced at least one of those bytes. Each row contains values and state flags. Bytes are flagged as either (v)alid (the target dereferenced this byte), or (.)invalid (the target did not dereference this byte).
+
+Each of the random transformations performed by STOKE are evaluated with respect to the contents of this file. Rewrites are compiled into a sandbox and executed beginning from the machine state represented by each entry. Rewrites are only permitted to dereference defined locations. This includes registers that are flagged as (see , below), memory locations that are flagged as 'v', or locations that were written previously. Rewrites are permitted to write values to all registers and to any memory location that is flagged as valid.
+
+STOKE will produce optimal code that works on the testcases. The testcases need to be selected to help ensure that STOKE doesn't produce an incorrect rewrite. In our main.cc file in we choose arguments to the function to make sure that it sometimes provides arguments that use more than 32 bits. Otherwise, STOKE will sometimes produce a rewrite using the instruction, which only operates on the bottom half of the register, instead of the instruction, which operates on the whole thing. Alternatively you can use the formal validator in bounded mode with a large bound (over 32). This large bound is tractable because this example doesn't has a small number of cases for memory aliasing (namely, none at all!). If a counterexample is found it can be automatically added to the search so STOKE won't make this mistake again.
+
+The STOKE sandbox will safely halt the execution of rewrites that perform undefined behavior. This includes leaving registers in a state that violates the x86-64 callee-save ABI, dereferencing invalid memory, performing a computation that results in a floating-point exception, or becoming trapped in a loop that performs more than (see , below).
+
+The final step is to use these testcases and the target code contained in to run STOKE search in synthesis mode (i.e., trying to find a program starting from the empty program) by typing:
+
+STOKE search will produce two types of status messages. Progress update messages will be printed whenever STOKE discovers a new lowest cost verified or unverified rewrite. The code shown on the left is not equivalent to the target code; the code shown on the right is with respect to the current set of testcases.
+
+Statistics updates will be printed every proposals. Statistics are shown for the number of proposals that have taken place, elapsed time, proposal throughput, and for each of the transformations specified to have non-zero mass in .
+
+When search has run to completion, STOKE will write the lowest cost verified rewrite that it discovered to . Because this is a particularly simple example, STOKE is almost guaranteed to produce the optimal rewrite:
+
+This result can then be patched back into the original binary by typing:
+
+And runtime can once again be measured by typing:
+
+As expected, the results are close to an order of magnitude faster than the original.
+
+STOKE includes a formal validator. It's design and interface are detailed in the file. To use the formal validator instead of hold out testing, specify for any STOKE binary that you use. For code with loops, all paths will be explored up to a certain depth, specified using the --bound argument, which defaults to 2. There's also which attempts to run the data-driven equivalence checking algorithm; however, the current implementation isn't very robust -- please file bug reports with (target, rewrite) pairs that fail to validate but should.
+
+An example of using the validator can be found in the folder; this example has a Makefile much like the tutorial's and should be easy to follow. The key difference is that the pairity example does not use testcases to guide search. Instead, after producing a candidate rewrite, the validator checks for equivalence. If the codes are not equivalent, a counterexample is found, and this is used as a new testcase to help guide search.
+
+There are some important limitations to keep in mind while using the validator:
+
+In addition to the subcommands described above, STOKE has facilities for debugging and benchmarking the performance of each of its core components. See for an up-to-date list.
+
+STOKE also comes with support for bash and zsh completion. To enable either, type:
+
+STOKE can not only propose instructions when searching for programs, but also propose calls to a list of known functions using the command-line argument. To decide whether these functions read any undefined state (before proposing them), we use a dataflow analysis. Sometimes, the dataflow analysis can be too imprecise, which is why STOKE allows the user to annotate dataflow information in comments. Here is an example of a function that clears the overflow flag. STOKEs dataflow analysis is too imprecise for this code.
+
+Note that it is enough to specify the maybe sets, as STOKE will automatically realize that the must sets need to be contained in the maybe set.
+
+Both use the same core search algorithm, but in synthesis mode, STOKE starts from the empty program and tries to find a rewrite from scratch. This is great for finding implementations that are very different than the target. In optimization mode however, STOKE starts from an initial program, usually the target. This allows STOKE to work on much longer programs (because it already starts with a correct program) and apply optimizations to that program.
+
+Right now, has a limitation where it can only replace a function if the old implementation has at least the size (in bytes) of the new implementation.
+
+If you still want to use , and if you control the compilation of the binary, a workaround is to make the old implementation artificially larger by using the compiler flag for some large enough , say 64. In this case, the compiler will align functions at bytes, which typically requires padding the functions with s. This increases the chance of to succeed.
+
+There is a good explanation in the issue tracker. We also have a script to compare how gcc and the x64asm assembler assemble an instruction.
+
+STOKEs sandbox catches SIGFPEs, and thus running STOKEs search in the sandbox causes gdb to pause very often. To not have it stop for SIGFPEs (they are almost never a problem for STOKE), run this inside gdb:
+
+You can enable this by default by running the following command:
+
+This repository contains a minimal implementation of STOKE as described in the academic papers about STOKE. Most, but not all of the features described in those papers appear here. Developers who are interested in refining these features or adding their own extensions are encouraged to try modifying this implementation as described below.
+
+The STOKE source is organized into modules, each of which correspond to a subdirectory of the directory:
+
+The directory has the code that performs application logic and reads command line arguments.
+
+The stoke codebase is setup in a very modular way. We have components like the , which emulates execution of a rewrite on hardware. Or, we have subclasses of which evaluate the quality of a rewrite. Or, we have an which is used by the formal validator to query a backend like Z3 or CVC4.
+
+Often, several stoke applications will wish to configure one of these modules in the same way, depending on command line arguments. Thus, we have "Gadgets". A "Gadget" is a subclass of the class you wish to configure which takes care of extracting all the appropriate command line arguments. Some Gadgets, like just define a constructor so that modifies the object's configuration. More involved ones, like actually do work to create a new object and define methods that act as a wrapper.
+
+Therefore, if you want to add a command line option to an existing component of stoke, you normally are going to want to modify the gadget for that component in and add the argument in . Once you do that, it should show up uniformly in all of the stoke tools that use that module.
+
+Initial state types are defined in along with an additional type for user-defined extensions.
+
+Initial state is specified using the command line argument which controls the initial values given to the current, lowest cost, and lowest cost correct search states. This value affects the behavior of the method, which dispatches to the family of methods. User-defined extensions should be placed in the method, which can be triggered by specifying .
+
+Transformation types are defined in the directory. Each transform is a subclass of the abstract class . Existing transforms are,
+
+These subclasses each implement to mutate a Cfg. This function returns an object, that contains all the information needed to undo this transformation, and also whether the transform succeeded (transforms are allowed to fail). It's common for this object to be set with indexes of instructions in the code that were modified, for example. The subclass also implements .
+
+Transforms will often want to select from a collection of operands and opcodes, and for this purpose they can access the protected variable of the Transform superclass. This is of type TransformPools and allows access to these collections. This makes it possible to configure the collection of available opcodes and operands independently of the transforms. Also, the Transform gen_` member which is used to produce random numbers with a known seed.
+
+Transformation weights are specified using the family of command line arguments. These values control the distribution of proposals that are made by the WeightedTransform, which is the transform used by the search.
+
+A simple example of how to impelement a transform is in . Note that all transforms must appropriately make a call to recompute any information that needs to be updated and ensure that returns true when done (you can assume it returns true at the beginning of the function).
+
+A cost function is specified using the command line argument. It's an expression composed using standard unsigned arithmetic operators. As variables, you can use several measurements of the current rewrite. The most important of these is . The value is (by default) the number of bits that differ in the outputs of the target versus the rewrite summed across all testcases. There are some tunable options for this, for example, for floating point computations. In all cases, lower cost is better.
+
+Some other important cost-variables you can use are:
+
+In typical usage, you will combine the value of with other values you want to optimize for. A good starting point is or (the latter being default). Improvements might assign an SSE-AVX penalty, like .
+
+To add a new cost function, drop a file into that subclasses . Look at for a simple example. It comes down to overloading the function to return the value you want. Look at for an example of how to use runtime data from the sandbox to generate values. Then, add an entry to the map in so that your new function can be found on the command line.
+
+Live-out error measurement types are defined in along with an additional type for user-defined extensions.
+
+Measurement type is specified using the command line argument. This value controls the behavior of the method, which dispatches to the family of methods, each of which represent a method computing the distance between 64-bit values. User-defined extensions should be placed in the method, which can be triggered by specifying .
+
+The verification strategy specifies what kind of verification to do on the rewrite. It's controlled using the command line argument. Right now, the options are 'hold_out', 'straight_line' or 'bounded'.
+
+Command line arguments can be added to any of the STOKE subcommands using the following syntax. Argument separators which are printed as part of help messages are specified by defining a heading variable:
+
+Command line flags are specified by declaring a .
+
+Any of the built-in c++ primitive types are specified by declaring a .
+
+User-defined types are specified by additionally providing function objects that define I/O methods.
+
+For complex values that are better suited to being read from files, a may be more appropriate than a . The syntax is identical.
+
+Questions and comments are encouraged. Please reach us through the GitHub issue tracker, or alternatively at .|||
+
+stoke - STOKE: A stochastic superoptimizer and program synthesizer

@@ -1,0 +1,150 @@
+This document describes the Sesame algorithm for managing message encryption sessions in an asynchronous and multi-device setting.
+
+Sesame was designed to manage Double Ratchet sessions created with X3DH key agreement [1], [2]. However, Sesame is a generic algorithm that works with any session-based message encryption algorithm that meets certain conditions.
+
+Asynchronous key agreement protocols like X3DH enable one party to create a message encryption session and use that session to encrypt an initial message to a recipient, even if the recipient is offline [1]. The recipient can later retrieve the message and use it to calculate a matching session which is used to decrypt the message.
+
+Ratcheting algorithms like the Double Ratchet allow these two parties to update session keys as they communicate, for forward secrecy [2].
+
+Combining these algorithms in a practical context introduces some new concerns:
+
+Any solutions to the above must consider that messages might be lost or arrive out-of-order, that clock synchronization is not reliable, and that attackers might compromise devices and/or interfere with communication.
+
+The Sesame algorithm manages the creation, deletion, and use of sessions to support these requirements. A central idea is for each device to keep track of an "active" session for each other device it is communicating with, and use the active session when sending to that device. When a message is received on an "inactive" session, that becomes the new active session. By this process each device converges on using a single session for each remote device it communicates with.
+
+Sesame is based on the following assumptions:
+
+The Sesame algorithm defines the state that each device stores, and the algorithms that use this state to send and receive encrypted messages.
+
+Each device stores a set of UserRecords for its correspondents, indexed by UserID.
+
+Each UserRecord contains a set of DeviceRecords, indexed by DeviceID.
+
+Each DeviceRecord may contain an active session and/or an ordered list of inactive sessions.
+
+Each device stores a UserRecord for its own UserID, but does not store a DeviceRecord for its own DeviceID. This UserRecord enables a device to send a copy of each outbound message to the user's other devices.
+
+A UserRecord or DeviceRecord might be marked stale, meaning the record corresponds to a deleted user or device but is being kept around to decrypt delayed messages.
+
+A stale record may be deleted by the sending device at any time (including immediately upon being marked stale). To handle delayed messages, the recommended deletion policy is for a stale record to contain a timestamp recording when it was first marked stale. Once the timestamp is older than MAXLATENCY, the stale record can be safely deleted (without fear of message loss) after the next time the device fetches and processes all messages from its mailbox.
+
+Each device stores an identity key pair (a public key and private key) for cryptographic authentication. A device will always have the same DeviceID and identity key pair (to change these for some physical device the device must be logically deleted and then added with new values).
+
+Sesame supports two different models for key pairs: With per-user identity keys, all devices under a user share the same key pair. With per-device identity keys, each device may have a different key pair.
+
+With per-user identity keys, identity public keys for other devices are stored in UserRecords. With per-device identity keys, identity public keys for other devices are stored in DeviceRecords.
+
+Devices can modify their local state in several ways:
+
+Devices can delete UserRecords, DeviceRecords, and sessions. If the last session in a DeviceRecord is deleted, then the DeviceRecord is deleted. If the last DeviceRecord in a UserRecord is deleted, then the UserRecord is deleted.
+
+Devices can insert new sessions into a DeviceRecord. An inserted session always becomes the DeviceRecord's active session, and the previously active session (if any) is moved to the head of the DeviceRecord's inactive sessions list. If the inactive sessions list grows too large, sessions may be deleted from the tail end.
+
+Devices can activate an inactive session in a DeviceRecord, which moves the inactive session to the DeviceRecord's active session, and moves the previously active session (if any) to the head of the DeviceRecord's inactive sessions list.
+
+Devices can mark UserRecords or DeviceRecords as stale.
+
+Devices can conditionally update their records based on a (UserID, DeviceID, public key) tuple:
+
+Devices can prep for encrypting to a (UserID, DeviceID, public key) tuple:
+
+The input to the Sesame sending process is some plaintext and a set of recipient UserIDs. The recipient set includes the device's own UserID.
+
+The plaintext is encrypted and sent by the sending device using the following process for each recipient UserID:
+
+If any error occurs in encrypting to a particular user (e.g. an invalid server response, or a failure during session creation), then the sending device shall discard any changes to the relevant UserRecord. This avoids leaving records in an inconsistent state. The sending device may choose to continue encrypting and sending to other users, or may terminate the entire sending process.
+
+To avoid excessive looping in case of a malicious or buggy server, devices should impose some limit on the number of times they're willing to repeat the message sending loop for a recipient user.
+
+The input to the Sesame receiving process is an encrypted message and the sender's UserID and DeviceID, all of which were fetched from the server.
+
+How the message is fetched is out of scope for this document. Devices might periodically poll the server, or they might receive some notification when new messages are available to be fetched.
+
+An encrypted message is decrypted by a recipient device using the following process:
+
+If any error occurs in parsing or processing the message, including cryptographic errors in session creation or decrypting the message, then the device shall discard all state changes, discard the encrypted message, and terminate the decryption process.
+
+If the sender or recipient device's state has been rolled back, or the recipient device's state has been deleted, then it is possible for the recipient device to receive a valid message that it can't decrypt.
+
+To handle this without message loss the sending device may store a set of MessageRecords, indexed by some MessageID which is unique for each encrypted message. If a single message is encrypted to several recipient devices the sender will store a separate MessageRecord for each recipient device, each with a unique MessageID. Each MessageRecord stores the following values:
+
+When the recipient device receives an undecryptable message, the recipient device sends an unencrypted retry request message to the original sending device's mailbox, containing the undecryptable message's MessageID.
+
+When the original sending device fetches a retry request along with the relevant UserID and DeviceID of the device that sent the retry request, the original sending device executes the following resending process:
+
+MessageRecords might be deleted after some time has elapsed, or if the plaintext they refer to has been deleted from the sending device by the user. Devices might also send delivery receipts upon successful message decryption. Delivery receipts refer to some MessageID and notify the sender that the MessageRecord may be deleted. Delivery receipts may be encrypted or unencrypted (since they follow every received message, encrypting them doesn't accomplish much).
+
+To avoid excessive resending, devices should impose some limit on the number of times they're willing to resend a message. If any other error occurs, then the resending device shall discard any state changes and terminate the process.
+
+It may be desirable for devices to periodically replace old sessions with new sessions, for security purposes. One approach is to give each session a timestamp. The timestamp is set to the current time when an initiating session is created. When initiation messages are fetched, the server tells the recipient device the time difference between when the message arrived at the mailbox and the current time. The recipient device sets the timestamp for any initiated session to the current time minus this difference.
+
+Time constants MAXSEND and MAXRECV are defined, where MAXRECV must be greater than MAXSEND + 2(MAXLATENCY). At time MAXSEND past its timestamp a session must no longer be used for encryption, and shall be moved to the head of the inactive sessions list if active. Attempts to activate such a session have no effect. At time MAXRECV past a session's timestamp the session may be deleted, after first fetching and processing all mailbox messages.
+
+For simplicity of presentation this document discusses a single server that handles all user and device records, and all messages. In a real system these functions might be distributed across multiple entities.
+
+For example, different servers might handle different groups of users. In this case, Alice would send a message to Bob by contacting Bob's server, and Bob would send a message to Alice by contacting Alice's server.
+
+For another example, the server(s) that handle user and device records might be separate from the server(s) that handle mailboxes.
+
+Other divisions of labor might be possible; analyzing all the possibilities is outside the scope of this document.
+
+Sesame was designed for use with Double Ratchet sessions [2] created via X3DH key agreement [1].
+
+In this instantiation, devices will publish one-time prekeys and signed prekeys to the server, alongside their identity public key.
+
+To create an initiating session, a sending device will contact the server and fetch a prekey bundle containing the recipient device's identity public key, signed prekey, and a one-time prekey (if one is available). These values will be used by the X3DH algorithm to create both a secret key that initializes a Double Ratchet session, and an X3DH initial message.
+
+The X3DH initial message is attached to every initiation message, so that the recipient can use it to create a matching Double Ratchet session. Once a response to an initiation message is received, the original sender ceases attaching the X3DH initial message to future messages, so the devices henceforth communicate using only the Double Ratchet.
+
+Sesame relies on users to authenticate identity public keys with their correspondents. For example, a pair of users might compare public key fingerprints for all their devices manually, or by scanning a QR code. The details of authentication methods are outside the scope of this document.
+
+If authentication is not performed, users receive no cryptographic guarantee as to who they are communicating with.
+
+A Sesame device might encounter a changed identity public key (or keys) for some remote user when sending, receiving, or resending messages.
+
+This might indicate that a new user is using the UserID, that the user re-installed the application, or that the user added new devices (if per-device identity keys are being used). It might also indicate an attempt to impersonate the remote user by a malicious server, or by a malicious user who hijacked the original user's UserID.
+
+Whenever a change in identity keys is detected users must repeat the authentication process or they will receive no cryptographic guarantee as to who they are communicating with. A device may wish to pause (or abort) the sending, receiving, or resending processes if a key change occurs, and only continue (or restart) the process if the user affirmatively acknowledges the key change. In this case, the conditional update operation will pause (or generate an error) on detecting a key change.
+
+Security is catastrophically compromised if an attacker learns a device's secret values, such as the identity private key and session state. Recovery from a device compromise requires the user to replace the compromised device and compromised identity key pair and notify all correspondents of the new public key.
+
+An attacker can leverage a compromise in many ways:
+
+An attacker with a device's identity private key can impersonate the compromised device to other devices. An attacker who can compromise a device may be able to keep persistent backdoor access to the device, or tamper with it to reduce its future security (e.g. weakening the random number generator). An attacker who can steal a device's secret keys can probably also steal the plaintext of locally archived messages, and any plaintext in MessageRecords. An attacker might try to use compromised keys for passive decryption. For example, the attacker might try to retroactively decrypt old communications, or stealthily decrypt future communications. The attacker might also use some cryptanalytic or forensic attack to reveal a device's state at some time in the past, then try to use this state to decrypt as much old traffic as possible. Sesame's resistance to passive decryption is inherited from the session creation and message encryption algorithms it is instantiated with. For example, when Sesame uses X3DH and the Double Ratchet Algorithm, passive decryption of pre-compromise and post-compromise messages is tightly bounded by the use of ephemeral keys, prekeys, and ratcheting ([1], [2]). The only caveat occurs when security is improved by message exchange with matching sessions, as in the Diffie-Hellman ratchet [2]. In that case, and in the rare instance that two parties simultaneously initiate new sessions with each other, then it may take a few exchanged messages before Sesame converges on a single pair of matching sessions. Prior to compromising the target device, an attacker might manipulate communications so as to increase the attacker's ability to decrypt older messages once the compromise occurs. For example, the server could make each message received by the target device use a new X3DH initial message without a one-time prekey (by forging retry requests, or by repeatedly deleting and re-adding devices). In this case, messages sent to the target during the lifetime of a signed prekey's private key would be decryptable if the attacker compromises that private key. An attacker might try to perform key-compromise impersonation, where the attacker impersonates other parties to the compromised party (which is different than impersonating the compromised party to other parties). For example, when Sesame uses X3DH and the Double Ratchet, the server can use a compromised signed prekey with X3DH to create sessions with the target that appear to match arbitrary third parties. This attacker capability would continue until the target deletes their compromised signed prekey private key(s). Following this, the attacker could continue impersonating specific third parties to the target using any sessions the attacker had possession of prior to signed prekey deletion. This attacker capability would continue unless (and until) the target deletes the attacker-controlled sessions through some means such as session expiration.
+
+To mitigate the last two points, Sesame devices using X3DH and the Double Ratchet, or similar algorithms, should delete their signed prekeys on a regular basis, without allowing a malicious server to inhibit deletion. Session expiration (Section 4.2) would help mitigate the final point.
+
+Despite the various mitigations, none of these threats can be eliminated completely. None of the mitigations change the catastrophic nature of a device compromise, or the necessity of completely replacing a compromised device and any compromised keys.
+
+Communication between devices and servers should be encrypted and authenticated. This limits the amount of metadata that is exposed to eavesdroppers, and makes it harder for third-party attackers to perform active or passive attacks on device-to-device communications.
+
+If an attacker is able to impersonate a victim device when authenticating to the server, the attacker could fetch messages being sent to this device. The attacker would not be able to decrypt these messages, but would learn sender UserIDs and DeviceIDs.
+
+This could also occur if the attacker registers with the server using the same UserID, DeviceID, and identity public key that had previously belonged to a victim device. To mitigate this, the server could assign random DeviceIDs, to prevent reuse, or could require the registering user to prove possession of the identity private key (e.g. by signing a nonce during registration).
+
+When a user chooses to delete a plaintext message from their device, any MessageRecords containing copies of that plaintext should also be deleted.
+
+Sesame uses time thresholds to determine when it is safe to delete older sessions (i.e. stale UserRecords and DeviceRecords as in Section 3.1, and session expiration as in Section 4.2). The idea is for a recipient to wait for a MAXLATENCY time period after the last messages might have been sent that require the older sessions, at which point these messages have either arrived in the recipient's mailbox or been lost. After the recipient next fetches and processes all mailbox messages, the recipient is assured there are no more outstanding messages that require the older sessions, so the older sessions may be deleted.
+
+If clock errors result in the recipient deleting the sessions too early, then there is a risk that undecryptable delayed messages may arrive. If clock errors prevent the recipient's clock from advancing, these older sessions might never be deleted.
+
+To mitigate these risks clients should use secure and reliable clocks that cannot be manipulated by an attacker. Clients might also wish to combine time checks with other checks (e.g. counting some number of message round-trips or other events), to provide sanity checks so that brief clock glitches don't delete needed data.
+
+The message sending loop in Section 3.3 will repeatedly attempt to adjust the device's records to match the server's records. The resending process in Section 4.1 could be repeatedly triggered to resend a message to a recipient.
+
+To avoid excessive looping in either case, devices are recommended to use some counter with each process (e.g. stored in memory during sending, and stored in a MessageRecord for resending). Devices would trigger an error after an excessive number of attempts to send, or resend, a message.
+
+A device might also be triggered to create an excessive number of DeviceRecords or sessions for some UserID. A device might choose to set some reasonable limit on the number of DeviceRecords it will store for any UserRecord. A device might also choose to set some limit on the number of sessions it will store for any DeviceRecord. Extra sessions will be deleted from the tail of the inactive sessions list if this limit is exceeded.
+
+Care should be taken that any error in sending, receiving, or resending messages terminates the relevant process, and discards any changes that would leave the device in an inconsistent state.
+
+Errors in message sending or resending might result in a message being delivered to some but not all of its intended recipient mailboxes.
+
+Higher-level protocols built on Sesame must be prepared to handle partial delivery of messages to groups of recipients. One option would be to add transaction semantics so that messages are only committed to mailboxes if sending succeeds for all users, and to mandate support for resending so that messages are likely to be delivered.
+
+This document is hereby placed in the public domain.
+
+Thanks to Katriel Cohn-Gordon, Cas Cremers, Luke Garratt, Douglas Stebila, Nik Kinkel, and Tom Ritter for helpful discussions.
+
+Thanks to Michael Kirk, Lilia Kai, and Tom Ritter for editorial feedback.|||
+

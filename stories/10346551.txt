@@ -1,0 +1,85 @@
+IFTTT is currently in the process of moving our infrastructure to a containerized architecture. We have a large collection of microservices, and containers are the next logical step for us in cleanly managing such a complex system. Before moving our production infrastructure over however, we decided that we wanted to start developing with them locally first. We could shake out any issues with our applications before risking the production environment.
+
+Additionally, our local development environments had already diverged from our existing production environment. We were using Chef and Vagrant to provision local VMs, and it had been working “okay,” but we knew it wasn’t going to last. We needed to act. Rather than waste time trying to bring dev into sync with a deprecated production system, we decided to leapfrog it entirely and go straight to where we want to be.
+
+Here’s how we get engineers up and running with Docker and our development environment.
+
+Engineers at IFTTT currently all use Apple computers, so this is all Mac OS-centric, however it is not so complex that it couldn’t be made cross-platform.
+
+We’ve collected all of the code and open-sourced it under a project called Dash. It’s pretty opinionated, and if you run it blindly you may have a bad time. Take a look at what it’s doing before diving in.
+
+We use Homebrew and Ansible to automate the whole process with a single curlbash:
+
+This bootstrap script installs Homebrew and Ansible, checks out the Dash Developer Environment repo, uses Ansible to install and configure VirtualBox, Docker, Docker Machine, Docker Compose, DNS for .dev domains, then builds a Docker Machine VM.
+
+Normally Ansible is used to provision remote servers, but you can also use it for configuring a local machine. By passing in an “inventory” of 127.0.0.1 you can run tasks locally using the descriptive power of an Ansible playbook.
+
+The comma after the IP address is intentional, as it makes the inventory argument appear as a list instead of the name of a file.
+
+An Ansible playbook is just a YAML file that lists a series of tasks and the resulting states from running the tasks. I’m not going to cover it in depth, but if you’re interested you can take a look at the full file.
+
+Through Ansible, we install Caskroom, which provides binaries that Homebrew does not include, and then install a number of packages and configuration files.
+
+An interesting piece here is the DNS resolution. By creating a file at /etc/resolver/dev with:
+
+all .dev requests are routed to our Docker Machine. We run a simple dnsmasq container that routes all .dev requests back to the VM, and another nginx-proxy container can route requests to their proper containers (more about that later). No more mucking around with /etc/hosts! Requests to domains like ifttt.dev that come from both inside the VM and from your host OS are routed to the proper server.
+
+Inside of the dev command, I’ve aliased several more complicated commands into simple ones. For example, dev machine create is actually an alias for:
+
+The create command is pretty self-explanatory. To get NFS and .dev DNS working, though, we have to copy a script into place inside the VM and then restart the VM.
+
+It unmounts the standard (and very slow) vboxfs mount, starts the NFS client, then mounts the share that was created on the host. The Docker Machine boot process executes this file synchronously if it exists.
+
+I tried a multitude of different ways of running the mount command with very little success. When I finally got it working I became superstitious about it. NFS experts must be wizards.
+
+The rest of the file sets up DNS resolution to go the the dnsmasq container first, then to the 8.8.X.X servers second. This takes care of both .dev domains as well as outbound network requests. If you don’t add the 8.8 nameservers, your Docker Machine will wind up caching your host DNS servers across network changes, and then need to be restarted every time you switch networks.
+
+At this point you should be able to connect to the Docker daemon running inside the VM. You’ll need to open new shell, or you can see how to connect by running docker-machine env dev. You can test whether or not you have a working docker installation with docker ps. If you see:
+
+you have a proper installation and configured environment.
+
+Developing with Containers takes a little bit of a shift in thinking. Most of the time it’s not that different from the way that we used to develop applications. You write code, you run the code, you run tests, and so on. You have a database (or several) running locally, and you may even have mocked out dependencies for things like S3 and DynamoDB.
+
+Before containers, if you developed locally, you probably worked either directly off of your host OS or through a virtual machine. Either way, you installed everything you needed as you needed it, and your system and application configuration grew and evolved over time. It’s probably a bit of a Snowflake Server. Managing dependencies, though, probably started to become a bit of a problem, so things like Bundler, pip, virtualenv, and RVM were thrown into the mix to try to help out. What happens, though, when you need to test out a new version of MySQL? You can do it, but it’s not that easy.
+
+In the containerized world, you don’t necessarily have a development environment that is persistent and evolving. You could do that if you wanted to, but it’s not the recommended flow. Instead of having a “VM” in which to run your code, now you’re creating an even more lightweight virtualization layer called a “container”. (For more on this, check out this great explanation from Docker).
+
+These containers are created from images, which are basically read-only templates for creating an environment for your application. If you remove a container, everything that changed inside it is gone. You can always re-start a new container from the same image, however, and will probably be doing so a lot. This means that you can have different containers for different configurations and not have to worry about them messing with each other. You can have one for your Ruby 2 code and one for your Ruby 1.9 code. Create a container (based on the same base Ruby image you were using before) just for the purpose of messing around with a new gem. When you install that gem and it, for some reason, depends upon Rails 2 and installs a bunch of other gems, you don’t have to worry about those gems being installed to your system!
+
+To get more “official” about defining your application dependencies (think node, mysql-client, etc), you can use a Dockerfile checked in to your application repo to create an image that already includes them so when you run the container everything the application needs to start is already there.
+
+For bigger dependencies that would normally be separate processes, split those out into additional containers. One of our applications, for example, depends upon mysql, redis, and S3. This is where Compose comes in. Compose allows you to define dependencies via a YAML file in the project root. Here’s an example:
+
+Going through this, it’s pretty easy to see what’s going on. We’ve defined a web services built from this directory and from the Dockerfile.development file. We mount this directory as a volume into the container, thus giving it access to the code it needs to run. The separate Dockerfile is mostly because in production we build all of the code into the container as a snapshot, while in development we want to be able to change it without having to rebuild. We override the command defined in the Dockerfile, as well, so that we can load development configuration.
+
+When we start the web container, Docker Compose recognizes that it is dependent on the redis, mysql, and s3 containers, so it starts those as well. Docker additionally writes lines into the /etc/hosts file of the web container pointing those .dev domain names to the right containers. Since these other ones don’t need much configuration, their sections are much simpler. We are able to lock specific versions for MySQL and Redis. MySQL mounts a directory from the host VM to make the data persistent across container removals.
+
+Each project that we have defines the application-level configuration it needs to run in a Dockerfile and the other services it needs to run in a docker-compose.yml file. Using the dev command included in the Dash project, getting started on a new project is as simple as:
+
+You might be thinking, “How do I see what I’ve built?! There’s no localhost!” You’re absolutely right. I haven’t yet covered how requests get routed to your container.
+
+If you were previously developing directly in your operating system and not through any sort of virtual machine, you’re probably used to going to something like http://localhost:8000 to see your app. With Docker and Docker Machine, there are now two additional levels of abstraction! What you trade in abstraction, however, you gain in separation of concerns. By isolating each service into its own container, you can get much better insight into just what that service is up to.
+
+To achieve the same level of simplicity as localhost, we had to do something.
+
+As I mentioned in Part 1, our environment now includes dnsmasq as a small dns server. All requests that end in the .dev TLD will be routed to our Docker Machine VM. We just need to somehow link up those requests to the right containers. Unfortunately, by default container network interfaces are not exposed and containers themselves are assigned random IPs inside the VM. You can bind host ports to container ports, but you would have to be careful about collisions.
+
+That’s where Jason Wilder’s Reverse Nginx Proxy Container comes in. It takes advantage of some of the internals of Docker to watch for containers starting and stopping, and then it rewrites an nginx reverse proxy configuration dynamically. It binds to port 80 on the VM. When a new container starts that includes the VIRTUAL_HOST environment variable, it will route all relevant traffic to that container. Since our environment keeps it running all the time, it’s as easy as adding two lines to the docker-compose.yml file:
+
+Stop the container (dev stop web), delete it (dev rm web) and start everything back up again (dev up). Here is another case where containerized development requires a shift in thinking. Previously I’d be able to just stop my service, change an environment variable, then start again. However, since environment variables are baked into a container on creation, best practices require you to delete the container and start over.
+
+The reverse proxy solves another issue that multi-service developers often face: “How do I define dependencies between two services that I am actively developing?”
+
+You could make it complicated. Make both services define the other in their docker-compose.yml file. They would each build a container of the other, and you’d quickly move yourself into a circular dependency nightmare. With our dnsmasq container, however, all .dev domain requests are routed to nginx. As long as you link your services under the .dev tld and register the virtual hosts, everything can talk to everything else. We have our developer portal set up as developers.ifttt.dev, which can then make requests to our web application at ifttt.dev. If another service is not currently running, nginx will return a 503.
+
+For production code it probably makes sense to include an application package installation step in your Dockerfile. For our Ruby projects, we use Bundler for this. By running bundle install when you build the container image, you are ensuring that if the build succeeds then the packages will be there. No more worrying about bundling in production.
+
+For development, however, it can become very tenuous very fast if you have to run a full bundle install every time you add a gem. Even worse, if you don’t include it in the Dockerfile you’d have to run it every time you started a new container! Fortunately, there’s a better way:
+
+By creating another “service” based off of the same Ruby image as our application (defined in the Dockerfile), we can take advantage of some of the deeper internals of Docker. This bundler-cache container defines a volume that matches the gem installation path for the system, then exits immediately. The web container, however, can mount the volume from the bundler-cache container even when it’s not actively running. When you run bundle install from within the web container, it will install gems onto the data volume from the bundler-cache container. If you delete the web container but keep the bundler-cache container around, the next time you recreate web, it will mount the volume again and all of the gems will still be there! If you want to clear the cache and start fresh, it’s as easy as dev rm bundler-cache.
+
+We use this pattern for each project that uses a package manager, and we’ve found it to be a great way of keeping package installation quick without additional complexity. The biggest issue has been if you accidentally delete bundler-cache, you then have to install all your gems over again.
+
+Containerization and Docker are powerful tools in your infrastructure toolbox. If you have any plans to move to them in the future, I would highly recommend starting off in your developer environment first. Since deploying Dash internally, we’ve seen the onboarding time for new developers go from a couple days or more to a matter of hours. We were able to migrate the entire company over in weeks (including while actually making changes to Dash itself), and engineers have started contributing to it themselves.|||
+
+IFTTT is currently in the process of moving our infrastructure to a containerized architecture. We have a large collection of microservices, and containers are the next logical step for us in cleanly…

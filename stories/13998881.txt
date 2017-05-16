@@ -1,0 +1,56 @@
+I’ve been working recently on Backtalk, a little toy Rust framework for building realtime APIs. Let’s say you’re building a hot new tech startup — Facebook for Cats. You’re going to need a web server to track all these cats. Let’s build one quickly using Backtalk. If you want to follow along, just clone Backtalk with , and run . Examples are numbered 1–7. You can alternatively add
+
+to your if you’re working in your own project.
+
+If we visit 127.0.0.1:3000, we’ll see a 404 error page. We haven’t added any resources to our API! Let’s add one now.
+
+We’ve just mounted a resource at . A resource is just a function that converts a object into a either a (on success) or object. If we visit 127.0.0.1:3000/cats, you can see our error appear! Exciting. You’ll also find that if you visit 127.0.0.1:3000/cats/123, you’ll also see our error. The function mounts our resource at a number of HTTP routes:
+
+Any of these routes will call our resource function. You can try these out with — for instance, if we run , we should see our familiar “we haven’t implemented this yet” error message.
+
+Unfortunately, servers that just return errors are not very useful. Let’s hook up our resource to an actual database.
+
+Welp, that was pretty easy. Our database (in this case, an in-memory store for development) has a function that converts a into a , so all we need to do is return the resulting response and be done. We can test out our resource with curl:
+
+So I lied earlier when I said returns a object. If we actually look at the type signature of the function, it looks like this:
+
+We accept a , but instead of a simple object, we’re returning this crazy thing called a . This means our server is actually asynchronous — instead of blocking until a response from the database comes back, it can return a immediately, which is a sort of placeholder for the response that will exist at some later point. If you’ve used promises, in Javascript, these are the same thing. The server recognizes these Future responses, and knows to not send the HTTP response until the resolves with the information from the database. While it waits, unlike a synchronous server, it can take in and process more requests, making it very efficient for web servers that spend a lot of time waiting on things like databases or other third-party servers to reply.
+
+However, let’s say we wanted to do some additional processing on a future value. Since the response from doesn’t actually have the data yet, we can’t just peek inside the future to see the data. You may be familiar with ’s function — if the is , it maps the value to a new value with a closure. If the was , it leaves it alone. A has the same function, but since the value isn’t known yet, the closure gets run at some point in the future, instead of immediately.
+
+We can use this function on our database to transform the resulting data. If the database returns data, our closure will add the “example” key to the resulting JSON, and then return the modified reply. If the database returns an error, won’t even call our closure.
+
+This closure works after the database handler is called, so the actual database never sees this example data.
+
+objects in Backtalk have a convenience function that works just like the on a future. This lets you take code that looks like this:
+
+and convert it to something that looks like this:
+
+which is much prettier and intuitive, if you ask me. Let’s convert our existing code, both to show the syntax, and to prove a point about futures.
+
+If you try to run the code above, you’ll notice we get an error.
+
+Rust’s error messages for closures can still be a bit confusing, but I think the concept of the issue is pretty intuitive. The closure we pass to is a closure, so the value is owned by this closure. However, the closure we pass to will be run at some indeterminate time in the future, and is owned by the Future. It wouldn’t happen in our specific example, but in an application that creates and deletes servers, it’s possible that the Future, and therefore the closure, could outlive the server! This means when our closure runs, could not exist, which would be pretty bad. So — how do we make sure our adapter lives long enough? With an !
+
+uses reference counting to only delete the adapter when all references to it are gone. When you an , you’re actually creating a new reference to the same object, instead of a new copy of the object. We can use an in the same way as our normal adapter, calling directly on it. You’ll find that this code compiles and works perfectly!
+
+This server is pretty insecure so far. Right now (if we hosted our server publicly) anybody in the entire world could delete precious kittens from our database. We want to make sure anyone can access and create cats, but only authorized administrators with a super-secure admin password can delete cats. Let’s add an clause before the database handler.
+
+This code should be hopefully somewhat straightforward. Before we pass the request to the database, we check for the correct password, and return an error if the password wasn’t provided or was incorrect. Since the database is called in an , it gets skipped if something returns an earlier up in the chain. We return instead of just — the converts the request into a , which is compatible with the returned by . We can test out our super secure system with .
+
+We now have a pretty good understanding of how to build standard APIs. But what if we wanted to build a realtime stream of newly created cats? No problem. We’re going to use a , which is similar to a , but instead of producing a static reply from a database, it produces a streaming reply.
+
+We can run the above code, and run the command to get the stream:
+
+You’ll see…nothing. just hangs. We’re listening for events from our channel, but we aren’t sending any! Let’s fix that.
+
+automatically sends creations, deletions, and updates as messages down the channel. We could have just as easily implemented our own sending code by replacing this line with .
+
+Anyway, if we now run our command:
+
+Still hanging! We need to create something to generate an event. With that command running, in another terminal window, let’s create something:
+
+If we run back to the other window, we can see our subscription:
+
+Success! If we were in a browser, we could subscribe to this stream with EventSource.|||
+

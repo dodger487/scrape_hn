@@ -1,0 +1,54 @@
+Note: I need to rework this page. There are a few improvements to make. Since AVL trees are also generally inferior to Red-black trees, I recommend to you to head over to my Red-black tree implementation page instead.
+
+I set out to make my own 3-pointer AVL tree and found some optimizations that are not typically mentioned in AVL tree tutorials.
+
+To anticipate the results — I did not manage to make a serious Red-black tree contender. My implementation is another data point that AVL trees are inferior. For insertion and retrieval, AVL has a slight edge due to slightly lower tree height. But deletion needs O(log2 n) rebalancing rotations, while in a Red-black tree the number is constant. And it shows in practice.
+
+In a comparison with BSD RB tree.h (by Niels Provos), here's what I could pull off:
+
+(All benchmarks on this page were made on a AMD X2-250. It's a x86_64 machine from ca. 2011. Code is compiled with GCC 6.3, ).
+
+Maybe I will update with more detailed benchmarks. It would be nice to have more AVL and RB trees, and various workloads. There are of course other benchmarks on the net and I invite everyone to include my implementation into their benchmarks. While some nice operations are still missing, I think the implementation is stable enough. If you benchmark the code, please make sure to set NDEBUG.
+
+Here is a nice-looking benchmark that turned up only after a few days of searching. The numbers look quite similar.
+
+As I said the implementation is not a serious contender to RB trees for general use, due to the slowness of the delete operation. I want at least something to take away from this little adventure, so I'll write down the optimizations I applied to get it at least this fast.
+
+But first, for reference here is my implementation: sil_avltree.h. For efficiency it is implemented as a header similar to the RB tree.h code. This way comparison operations can be inlined. It's also more type-safe compared to a generic inferface. The disadvantage is that the usage is a little more involved and confusing.
+
+You can also browse the code on github. The benchmark code is also there, and it is currently the only instruction how to use the header file.
+
+The height of an AVL tree with n nodes is bounded by ~1.44 log2 n. That means that we can conveniently store node heights in 8 bits instead of spending an . That also means that we can store the heights of the left and right children of each node, instead of its own height. This is more cache efficient since for testing the balance we don't need to look at the childs. While that's no win for the one child node that we're just coming from (it's in the CPU cache anyway), the other node needs to be visited only in some cases when a rotation is required.
+
+To get an impression of the effects on performance, here is what happens when my code is switched from using the cached height to getting the height from the children (in ):
+
+The find operation is unaffected since it doesn't check the balance.
+
+Note that there is a minor cost to maintaining the child heights and a minor cost to calculating a node's own height from those. I didn't bother to change the code back to an own-height implementation since that's a pretty big change. So the comparison is not entirely fair. For remedy I've retrieved cache-misses numbers from . The cache-misses overhead from an empty benchmark (that only setups the data) was only 500K and I hope the 36.4 million number is very much like in a fair comparison.
+
+Update: I missed that we can also get away with storing only the balance. That doesn't require the calculation , and only one field instead of two must be updated on rotations. However it's not clear if that's a win. The memory requirements go down from 2 bytes to 3 bits per node, but with a straightforward implementation there are no space savings in practice due to alignment (see the Packing section). We could store the 3 bits in the 8-byte aligned parent pointer to save 4 or 8 bytes in practice. I haven't done that. Still, my balance-version of the code is a little more complex and performance-wise I could not measure any difference.
+
+The link structure shown above contains 3 pointers and 2 bytes, which is 3*8+2 = 26 bytes on 64-bit systems. However the compiler will typically blow that up to 32 bytes for 8-byte alignment of the link pointers contained inside (Relevant read: The Lost Art of C Structure Packing). Now let's assume you only want to store integers in the tree. If you define a tree node in the conventional way:
+
+that is not 36 but 40 bytes, again due to alignment!
+
+We can define the head structure as packed instead:
+
+And now it takes only these 26 bytes, and is 32 bytes (due to 4-byte alignment of the payload).
+
+Packing the head is not safe in the general case. If the payload is only 1 byte, is 27 bytes.
+
+The pointers inside the head (of a node, inside an array of nodes) are misaligned. Which is a problem on some architectures. I have yet to figure out a nice and usable way how to make that safe. The best I can come up with so far is requiring pointer-sized alignment of the head struct at the node definition site:
+
+But requiring the hacky alignment specifier at the node definition site (which is "client code") is dangerous, even if we hide the definition behind a macro. Please write me if you know a better way.
+
+Intrinsic linking of the payload inside the head structure (with a head structure macro) is not an option. For one, generic code that is only interested in the link data (and not the payload) is not cleanly reusable. The other reason is inconvience for clients that want to link elements in more than one tree, so need to put more than one head struct in their nodes.
+
+Here are some measurements, again with an payload.
+
+So that's another demonstration of the importance of cache efficiency.
+
+When the imbalance in a node is 2 there are two cases what needs to be done, described on the GeeksforGeeks page: Single rotation or double rotation (each in left or right direction). But for efficient implementation I've analyzed both cases (w.l.o.g in right direction). Turns out we can get away without height recalculations that involve looking at childs, and the double rotation case can be implemented in one merged step that is less than twice the work of a single rotation. I have a few scribblings to "prove" the optimizations: single rotation, double rotation. Note that the code was slightly adapted when I switched to heights-of-childs values.
+
+Here is the implementation for the two cases:|||
+

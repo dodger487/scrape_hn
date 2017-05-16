@@ -1,0 +1,24 @@
+In this post we'll discuss the second argument on why the is broken. The problem is best described in an LWN comment by Foom:
+
+is broken because it mistakes the "file descriptor" with the underlying kernel object (the "file description"). The issue shows up when relying on the semantics to clean up the epoll subscriptions.
+
+doesn't actually register a file descriptor. Instead it registers a tuple1 of a file descriptor and a pointer to underlying kernel object. Most confusingly the lifetime of an epoll subscription is not tied to the lifetime of a file descriptor. It's tied to the life of the kernel object.
+
+Due to this implementation quirk calling on a file descriptor might or might not trigger epoll unsubscription. If the call removes the last pointer to kernel object and causes the object to be freed, then it will cause epoll subscription cleanup. But if there are more pointers to kernel object, more file descriptors, in any process on the system, then will not cause the epoll subscription cleanup. It is totally possible to receive events on previously closed file descriptors.
+
+The simplest way to show the problem is with . Here's the code:
+
+You may think: the will block forever, since the only registered file descriptor "rfd" was closed. But that's not what will happen. By calling , we kept the reference to the underlying "rfd" kernel object, we prevented it from being cleaned up. The thing is still subscribed to the epoll. will in fact terminate reporting an event on a dead handle "rfd".
+
+To make matters worse, you need a valid file descriptor handle to manage subscriptions on "epfd". After we called , there is no way to unregister it from epfd!
+
+Neither of these will work:
+
+You can't rely on to clean up epoll subscriptions. If you ever called in such bad corner case, you can't fix the "epfd". The only way froward is to trash the old "epfd", create new one and recreate all the valid subscriptions.
+
+Explicitly deregistering file descriptors before is nescesary and works well if you control all the code. In some cases though it may not be possible - for example when writing an epoll wrapper library. Sometimes it's impossible to forbid users from calling themselves. For this reason it's hard to build correct thin abstraction layers on top of epoll.
+
+Hopefully this and the previous blog posts on had shedded some light on the dark corners of the Linux epoll implementation. I can only wonder how closely Microsoft recreated these quirks in the Windows Subsystem for Linux.
+
+Update: Illumos has a custom implementation as well. In the man page they explicitly mention the weirdness and refuse to support Linux's broken semantics.|||
+

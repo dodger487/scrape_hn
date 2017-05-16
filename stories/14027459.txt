@@ -1,0 +1,69 @@
+Regular expressions (or just regex) are commonly used in pattern search algorithms. There are many different regex engines available with different support of expressions, performance constraints and language bindings. Based on the previous work of John Maddock (See his own regex comparison) and the sljit project (See their regex comparison) I want to give an overview of actively developed engines regarding their performance.
+
+The performance is measured only on my Dell notebook. It’s not the newest one, but it doesn’t matter because I used the same hardware for all engines and I’m interested in the performance results compared to each other. But here are some hardware information:
+
+The used software is also not the latest, but newer than the default packages of my installed Ubuntu 16.04:
+
+I want to get the execution time to find a match of each engine for the following regular expression:
+
+The set of expressions is not representative, but is sufficient to get an overview.
+
+To measure the performance I modified the existing benchmark tool of the sljit project. The tool is available on github: regex-performance. The base tool of the sljit project supported already the following regex engines:
+
+I added support for two more engines:
+
+Beside the standard matching algorithm PCRE2 is shipped with an alternative algorithm based on a deterministic finite automate (DFA) which operates in a different way and is not Perl-compatible. A detailed description is provided within the man pages.
+
+A heavyweight optimized variant is shipped too: the just-in-time (JIT) compiling can greatly speed up pattern matching.
+
+To get comparable results, the Unicode support has to be enabled with the configuration option . The JIT feature is optional and has to be enabled with the option .
+
+Hyperscan is a mature library with over 10 years of development. The focus of Hyperscan is the x86 platform and the library uses hardware accelerators such as AVX to optimize the throughput.
+
+By default, Hyperscan does not care about the start of a match. Getting the start of a match requires the set flag for compiling a pattern. The flag costs some performance but is required to get comparable results.
+
+A Rust crate is a synonymous for a ‘library’ or ‘package’. The Rust regex crate provides functions for parsing, compiling, and executing regular expressions:
+
+Except the Rust crate all engines are written in C or C++ including the test tool. It was a requirement to have C-binding of the used engine. So an interface was necessary to call the Rust functions within C. The solution uses the Rusts FFI (foreign function interface) to build a static library which just counts the matches for a given expression. The complete library consists of 3 functions with less than 50 lines of code. The main Rust function to get the matches is:
+
+The function gets a raw pointer to a previously compiled expression ( ), a raw pointer to the input c-string ( ) and the length of the input string ( ). At the first the function gets the compiled expression from the corresponding raw pointer and the input string. The converting from a raw pointer into a type is unsafe, that’s why the code parts have to be wrapped with . After all the number of matches is gathered with a call of . To use the compiled expression in following function calls, the raw pointer from the expression is gathered again. This effects that the lifetime of the expression still remains after returning. At the end the function returns the number of matches as a 64bit value to the caller.
+
+The corresping C function prototype is:
+
+To get the test results of the test tool call within the build directory of the tool:
+
+The tool prints the details and writes the results per test and engine to . At the end a short summary of the results is printed:
+
+On the basis of a CSV-file I do some analytics. At first I summarize the overall execution time per engine. The following chart shows the details:
+
+Hyperscan is the fastest engine with a total execution time of ~300ms (~3x less time than 2nd) and the Rust regex crate gets the 5th place with ~3700ms. It seems that the Rust regex crate is not the fastest solution in place.
+
+But: what happens if one expression is really slow? This test distorts the overall result of the engine. Therefor I implement a simple result scoring. For each test the fastest engine can earn 5 points, the 2nd 4 points and so on. This limits the impact of a single slow expression. The following chart shows the score points per engine:
+
+Hyperscan is still the number one, but the Rust regex crate gets the 2nd place together with PCRE2-JIT. The results look better than the absolute timings, but it seems that one or more expressions are slow in their execution time.
+
+So it’s time to take a look into the results for each expression. The following chart compares the average timings of all engines per expression against the measured value of the Rust regex crate. The secondary y-axis displays the ratio of the Rust value and the average value in percentage.
+
+The red curve has 3 major peeks of expressions for which the regex crate does not perform well. The expressions are:
+
+Especially the execution of the first of those three expression is done very slow.
+
+With the first results of the benchmark I opened the ticket rust-lang/regex/350 to get feedback regarding my findings. Andrew Gallant alias BurntSushi gave me great feedback with some improvement proposals.
+
+One improvement is to use the SIMD feature of the regex crate. This feature is currently available in the Rust nightly built, so I have to install the nightly toolchain too. I adjust the projects cmake scripts to detect whether a nightly compiler is used and the SIMD feature is supported. So the rust toolchain can be switched with and the tool has to be reconfigured and build again to get the new results.
+
+The chart shows that the expressions and benefit by using the SIMD feature, but not the expression . This expression requires backtracking. The Rust regex crates uses a finite state machine based algorithm, which lacks for back-references and backtracking.
+
+Regarding the found matches I found some deviations. At first, the libraries oniguruma and tre do not support Unicode category expressions like . This expression matches all mathematical symbols like or . The Rust regex crate matches additionally the symbol .
+
+Hyperscan returns more matches than other engines, e.g. 977 for the expression whereas all other engines are finding 262 matches. Hyperscan reports all matches. The expression returns the following matches for input :
+
+All other engines report just one match: Sawy (non-greedy semantics) or Sawyer (greedy semantics).
+
+The Rust regex crate is now something about 2 years old, but tends to edge mature engines like PCRE2 and Hyperscan. Depending on the used expressions the Rust regex crate is a good choice for pattern matchings. Thanks to all contributors of the regex crate for their awesome work.
+
+The regex crate contains it’s own benchmark harness with a lot expressions and support for:
+
+This benchmark can be used to get another view on the performance of the engines. Please see the bench subdirectory of the crates repository.|||
+
+A performance comparison of regular expression engines including the Rust regex crate.

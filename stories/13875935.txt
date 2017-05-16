@@ -1,0 +1,83 @@
+TL;DR If you are using go-jose, node-jose, jose2go, Nimbus JOSE+JWT or jose4 with ECDH-ES please update to the latest version. RFC 7516 aka JSON Web Encryption (JWE) and software libraries implementing this specification used to suffer from a classic Invalid Curve Attack. This can allow an attacker to recover the secret key of a party using JWE with Key Agreement with Elliptic Curve Diffie-Hellman Ephemeral Static (ECDH-ES), where the sender could extract receiver’s private key.
+
+In this blog post I assume you are already knowledgeable about elliptic curves and their use in cryptography. If not Nick Sullivan's A (Relatively Easy To Understand) Primer on Elliptic Curve Cryptography or Andrea Corbellini's series Elliptic Curve Cryptography: finite fields and discrete logarithms are great starting points. Then if you further want to climb the elliptic learning curve including the related attacks you might also want to visit https://safecurves.cr.yp.to/. Also the DJB and Tanja talk at 31c3 comes with an explanation of this very attack (see minute 43) or  Juraj Somorovsky et al's research can become handy for learners.
+
+Note that this research was started and inspired by Quan Nguyen from Google and then refined by Antonio Sanso from Adobe.
+
+JSON Web Token (JWT) is a JSON-based open standard (RFC 7519) defined in the OAuth specification family used for creating access tokens. The Javascript Object Signing and Encryption (JOSE) IETF expert group was then formed to formalize a set of signing and encryption methods for JWT that led to the release of  RFC 7515 aka JSON Web Signature (JWS) and RFC 7516 aka JSON Web Encryption (JWE). In this post we are going to focus on JWE.
+
+A typical JWE is dot separated string that contains five parts:
+
+An example of a JWE taken from the specification would look like:
+
+This JWE employs RSA-OAEP for key encryption and A256GCM for content encryption :
+
+This is only one of the many possibilities JWE provides. A separate specification called RFC 7518 aka JSON Web Algorithms (JWA) lists all the possible available algorithms that can be used. The one we are discussing today is the Key Agreement with Elliptic Curve Diffie-Hellman Ephemeral Static (ECDH-ES).  This algorithm allows deriving an ephemeral shared secret (this blog post from Neil Madden shows a concrete example on how to do ephemeral key agreement).
+
+In this case the JWE Protected Header lists as well the used elliptic curve used for  the key agreement:
+
+Once the shared secret is calculated the key agreement result can be used in one of two ways:
+
+This is out of scope for this post but as for the other algorithms the JOSE Cookbook contains example of usage for ECDH-ES in combination with AES-GCM or AES-CBC plus HMAC.
+
+As highlighted by Quan during his talk at RWC 2017:
+
+As we will see thorough this post this simple observation will be enough to recover the receiver’s private key. But first we need to dig a bit into elliptic curve bits and pieces.
+
+An elliptic curve is the set of solutions defined by an equation of the form:
+
+Equations of this type are called Weierstrass equations. An elliptic curve would look like:
+
+In order to apply the theory of elliptic curves to cryptography we need to look at elliptic curves whose points have coordinates in a finite field Fq. The same curve will then look like below over Finite Field of size 191:
+
+For JWE the elliptic curves in scope are the one defined in Suite B and (only recently) DJB's curve. Between those, the curve that so far has reached the higher amount of usage is the famous P-256.
+
+The order of the curve is a really huge number hence there isn't much an attacker can do with this curve (if the software implements ECDH correctly) in order to guess the private key used in the agreement. This brings us to the next section:
+
+The attack described here is really the classical Invalid Curve Attack. The attack is simple and powerful and takes advantage from the mere fact that Weierstrass's formula for scalar multiplication does not take in consideration the coefficient b of the curve equation:
+
+As we mention above, the order of this curve is really big. So we need now to find a more convenient curve for the attacker. Easy peasy with Sage:
+
+As you can see from the image above we just found a nicer curve (from the attacker point of view) that has an order with many small factors. Then we found a point P on the curve that has a really small order (2447 in this example).
+
+Now we can build malicious JWEs (see the Demo Time section below) and extract the value of the secret key modulo 2447 with complexity in constant time.
+
+A crucial part for the attack to succeed is to have the victim to repeat his own contribution to the resulting shared key. In other words this means that the victim should have his private key to be the same for each key agreement. Conveniently enough this is how the Key Agreement with Elliptic Curve Diffie-Hellman Ephemeral Static (ECDH-ES) works. Indeed ES stands for Ephemeral-Static were Static is the contribution of the victim!
+
+At this stage we can repeat these operations (find a new curve, craft malicious JWEs, recover the secret key modulo the small order) many many times and collecting information about the secret key modulo many many small orders.
+
+And finally Chinese Remainder Theorem for the win!
+
+At the end of the day the issue here is that the specification and consequently all the libraries I checked missed validating that the received public key (contained in the JWE Protected Header is on the curve), You can see the Vulnerable Libraries section below to check how the various libraries fixed the issue.
+
+Again you can find details of the attack in the original paper.
+
+In order to show how the attack would work in practice I set up a live demo in Heroku. In https://obscure-everglades-31759.herokuapp.com/ is up and running one Node.js server app that will act as a victim in this case. The assumption is this: in order to communicate with this web application you need to encrypt a token using the Key Agreement with Elliptic Curve Diffie-Hellman Ephemeral Static (ECDH-ES). The static public key from the server needed for the key agreement is in https://obscure-everglades-31759.herokuapp.com/ecdh-es-public.json:
+
+An application that wants to POST data to this server needs first to do a key agreement using the server's public key above and then encrypt the payload using the derived shared key using the JWE format. Once the JWE is in place this can be posted to https://obscure-everglades-31759.herokuapp.com/secret. The web app will respond with a response status 200 if all went well (namely if it can decrypt the payload content) and with a response status 400 if for some reason the received token is missing or invalid. This will act as an oracle for any potential attacker in the way shown in the previous The Attack section.
+
+I set up an attacker application in https://afternoon-fortress-81941.herokuapp.com/.
+
+You can visit it and click the 'Recover Key' button and observe how the attacker is able to recover the secret key from the server piece by piece. Note that this is only a demo application so the recovered secret key is really small in order to reduce the waiting time. In practice the secret key will be significantly larger (hence it will take a bit more to recover the key).
+
+In case you experience problem with the live demo, or simply if  want to see the code under the hood, you can find the demo code in Github:
+
+Here you can find a list of libraries that were vulnerable to this particular attack so far:
+
+Some of the libraries were implemented in a programming language that already protects against this attack checking that the result of the scalar multiplication is on the curve:
+
+* Latest version of Node.js appears to be immune to this attack. It was still possible to be vulnerable when using browsers without web crypto support.
+
+** Affected was the default Java SUN JCA provider that comes with Java prior to version 1.8.0_51. Later Java versions and the BouncyCastle JCA provider do not seem to be affected.
+
+I reported this issue to the JOSE working group via mail to the appropriate mailing list. We all seem to agree that an errata where the problem is listed is at least welcomed. This post is a direct attempt to raise awareness about this specific problem.
+
+The author would like to thanks the maintainers of go-jose, node-jose,jose2go, Nimbus JOSE+JWT and jose4 for the responsiveness on fixing the issue. Francesco Mari for helping out with the development of the demo application. Tommaso Teofili and Simone Tripodi for troubleshooting. Finally as mentioned above I would like to thank Quan Nguyen from Google, indeed this research could not be possible without his initial incipit.
+
+That's all folks. For more crypto goodies, follow me on Twitter.
+
+About Antonio Sanso:
+
+ Antonio works as Senior Software Engineer at Adobe Research Switzerland where he is part of the Adobe Experience Manager security team. Antonio is co-author of "OAuth 2 in Action" book. He found vulnerabilities in popular software such as OpenSSL, Google Chrome, Apple Safari and is included in the Google, Facebook, Microsoft, Paypal and Github security hall of fame. He is an avid open source contributor, being the Vice President (chair) for Apache Oltu and PMC member for Apache Sling. His working interests span from web application security to cryptography. Antonio is also the author of more than a dozen computer security patents and applied cryptography academic papers. He holds an MSc in Computer Science.|||
+
+JSON Web Encryption is vulnerable to a classic Invalid Curve Attack. Learn how this may affect you and what to do about it.

@@ -1,0 +1,50 @@
+In preparing for my session Developing for Drupal 8 with Drupal VM at MidCamp later this month, I wanted to build out an example of a canonical "this is the way I'd do it" Drupal 8 site using nothing but Drupal VM and Composer. And I wanted to build both my local development environment and a production environment on DigitalOcean, all using the Ansible automation playbooks built into Drupal VM.
+
+I also wanted to brush up Drupal VM's production environment management capabilities, so I made a few more tweaks to Drupal VM and the main Ansible role that powers the Drupal deployment and installation, and released Drupal VM 4.4 with some great production environment improvements!
+
+Before you get started, you need to have PHP and Composer installed on your computer. On my Mac, I installed PHP via Homebrew, and Composer using the manual global installation method. But as long as you can run a command and have an up-to-date version of Composer (run to check!), you should be all set!
+
+Also, here's the video of the MidCamp 2017 presentation which gives a high-level overview of everything in this post:
+
+Now that we have a full Drupal 8 codebase, it's time to start committing things to it so we can deploy the site in the future, or roll back changes if we decide we don't need them. So let's set up a git repository:
+
+A Drupal site is pretty boring if it's just a bunch of PHP files! We need a development environment suitable for local development on any Mac, Linux, or Windows PC, so we can add Drupal VM as another dependency (we don't need Drupal VM in our production codebase, just like we shouldn't need Devel or other local development dependencies). Following the documentation on using Drupal VM as a Composer Dependency, the first step is to add Drupal VM via Composer:
+
+Create a new file inside this directory, and add some sane defaults (these will be baseline defaults for extra security hardening and performance—we'll override some things for flexibility and debugging later, in a Vagrant-specific config file): --- # Composer project settings. drupal_build_composer_project: false drupal_build_composer: false drupal_composer_dependencies: [] # Drupal install settings. drupal_site_name: "My Production Website" drupal_core_path: "/var/www/drupal/web" drupal_install_site: true drupalvm_cron_jobs: - name: "Drupal Cron" minute: "*/15" job: "{{ drush_path }} -r {{ drupal_core_path }} core-cron --quiet" # Other overrides. php_version: "7.1" php_sendmail_path: "/usr/sbin/sendmail -t -i" installed_extras: - drush - varnish # Other secure defaults. dashboard_install_dir: '' apache_packages_state: installed # Restrict the firewall to only ports that are required for external services. firewall_allowed_tcp_ports: - "22" - "80" - "443" firewall_log_dropped_packets: true # Set Apache to listen on port 81 (internal only), and Varnish on 80. apache_listen_port: "81" varnish_listen_port: "80" varnish_default_backend_port: "81" Also, since we added in some modules, we can have Drupal VM automatically install them the first time we build the site, by adding them to in (note that you can override any of the config in Drupal VM's in your project-specific ): There are some configuration settings that should be different in the project's local environment, and Drupal VM automatically uses a file when building the local Vagrant VM. So we'll add those local-environment-specific overrides in a alongside the file: --- # Local Vagrant options. vagrant_hostname: local.example.com vagrant_machine_name: local-example vagrant_ip: 192.168.88.22 # Configure the synced folder. vagrant_synced_folders: - local_path: . destination: /var/www/drupal type: nfs # Undo some of the extra-hardened security settings in config.yml. drupal_account_pass: admin drupal_db_password: drupal mysql_root_password: root php_sendmail_path: "/opt/mailhog/mhsendmail" installed_extras: - drush - mailhog - varnish dashboard_install_dir: /var/www/dashboard extra_security_enabled: false firewall_allowed_tcp_ports: - "22" - "25" - "80" - "81" - "443" - "8025" firewall_log_dropped_packets: false # Set Apache to listen on port 80, and Varnish on 81. apache_listen_port: "80" varnish_listen_port: "81" varnish_default_backend_port: "80" Create a 'delegating Vagrantfile', which will be used by Vagrant to connect all the dots and make sure Drupal VM works correctly with your project. Create a inside your project's root directory, with the following contents: # The absolute path to the root directory of the project. ENV['DRUPALVM_PROJECT_ROOT'] = "#{__dir__}" # The relative path from the project root to the VM config directory. ENV['DRUPALVM_CONFIG_DIR'] = "vm" # The relative path from the project root to the Drupal VM directory. ENV['DRUPALVM_DIR'] = "vendor/geerlingguy/drupal-vm" # Load the real Vagrantfile load "#{__dir__}/#{ENV['DRUPALVM_DIR']}/Vagrantfile" Also, to ensure that you don't accidentally commit Vagrant-related files in your project's Git repository, add the following to the file in your project root: At this point, after running through Drupal VM's Quick Start Guide, you should be able to run , and in just a few minutes, you can visit the URL defined in for (in this case, ) to see a fresh new Drupal 8 site! Make sure you commit your changes that added Drupal VM to the project: then
+
+Having a local development environment is well and good... but it would be great if Drupal VM could also manage a production server to match the local environment identically! Luckily, Drupal VM can do this quite easily. Most of the steps below follow the documentation guide for Deploying to a production environment.
+
+After 5-10 minutes (or longer, depending on how many things you're installing!), the playbook should complete, and if you visit your production VM's URL, you should see Drupal 8 installed, yay!
+
+Now the rubber meets the road. It's nice to be able to build a new site, but sites are nothing if they aren't maintained. The first step in maintaining a live Drupal site is to be able to pull the database and files down to your local environment so you can test your changes with production data.
+
+Drush will be our weapon of choice, and using it to pull down the database is very simple, using the command. The first step is to describe two aliases to Drush—we can add them to our project so anyone else working on the site gets the same aliases by creating a file in our project in the path , with the contents:
+
+Then, to make sure Drush uses your project-specific settings and aliases, add a file in the project root with the following contents:
+
+Now, if you run , you should see the live server status information. And if you run , you'll see the local environment's status. To pull the production database down to your local environment, run:
+
+Confirm you want to destroy the local database and replace it with the one from production, then after a minute or so, you should be able to work on your local environment to develop using production content and settings!
+
+For files, you can use Drush's trusty command (e.g. ), but for most sites, I prefer to install Stage File Proxy instead. That way you don't have to fully replicate the (often ginormous) files directory on your local machine just to see the site as it looks on prod.
+
+Once everything's in sync, it's a good idea to:
+
+Load http://local.example.com/ in your browser, and you should now see that your local Drupal VM environment has all the wonderful content from production!
+
+One of the first things I do on a Drupal 8 site is get all the configuration exported and checked into Git so configuration changes can easily be deployed to production. The first thing I'll do is create a folder inside the project root (note that it's outside the project's docroot directory, for security reasons!). Then edit and change the setting, which should be near the bottom of the file:
+
+Then run to export the configuration, and , then all of it to the repository. From this point on, any changes you make to the sites configuration when doing local development—from adding a content type, to removing a field, modifying a view, or even something mundane like changing the site's name—can be exported to code via then deployed to production!
+
+Change something simple, like the site name, or enable or disable a module, then run to export the update configuration. If you run you'll see exactly what changed. After you commit the changes to your Git repository then push them, it's time to deploy to production, yay!
+
+Let Ansible do the hard work:
+
+This is the exact same command we ran earlier (to build the server), with one small addition: . That flag tells Ansible to only run the tasks that are related to the Drupal site configuration and deployment.
+
+After a few minutes, you should see that there were a few changes reported by Ansible: the Drupal codebase was updated, database updates were run automatically, and caches were cleared. As of March 2017, other tasks (like configuration import, features revert, etc.) are not automatically run by Drupal VM, but that may change by the time you do this! My hope is to have this feature added in soon.
+
+Currently the setup outlined above has a few issues—issues which currently block me from using Drupal VM on most of my own Drupal 8 standalone servers. Here are some of the the blockers I'm still working on (and you can help with!):
+
+In the mean time, I often clone Drupal VM, then slightly fork it specifically for certain projects (e.g. the DrupalCamp St. Louis website). This way I still am using a familiar setup, but I can tailor it exactly to the particular deploy setup and strange infrastructure quirks required for a given site.|||
+

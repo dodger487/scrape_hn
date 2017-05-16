@@ -1,0 +1,122 @@
+Let’s write a malloc and see how it works with existing programs!
+
+This tutorial is going to assume that you know what pointers are, and that you know enough C to know that dereferences a pointer, means , that malloc is used to dynamically allocate space, and that you’re familiar with the concept of a linked list. For a basic intro to C, Pointers on C is one of my favorite books. If you want to look at all of this code at once, it’s available here.
+
+It takes as input a number of bytes and returns a pointer to a block of memory of that size.
+
+There are a number of ways we can implement this. We’re going to arbitrarily choose to use the sbrk syscall. The OS reserves stack and heap space for processes and sbrk lets us manipulate the heap. returns a pointer to the current top of the heap. increments the heap size by and returns a pointer to the previous top of the heap.
+
+If we want to implement a really simple malloc, we can do something like
+
+When a program asks malloc for space, malloc asks sbrk to increment the heap size and returns a pointer to the start of the new region on the heap. This is missing a technicality, that should either return or another pointer that can be passed to free without causing havoc, but it basically works.
+
+But speaking of free, how does free work? Free’s prototype is
+
+When free is passed a pointer that was previously returned from malloc, it’s supposed to free the space. But given a pointer to something allocated by our malloc, we have no idea what size block is associated with it. Where do we store that? If we had a working malloc, we could malloc some space and store it there, but we’re going to run into trouble if we need to call malloc to reserve space each time we call malloc to reserve space.
+
+A common trick to work around this is to store meta-information about a memory region in some space that we squirrel away just below the pointer that we return. Say the top of the heap is currently at and we ask for bytes. Our current malloc will request bytes from and return a pointer to . If we instead save, say, bytes to store information about the block, our malloc would request bytes from and return a pointer to , hiding our byte block of meta-information from the code that’s calling malloc.
+
+That lets us free a block, but then what? The heap region we get from the OS has to be contiguous, so we can’t return a block of memory in the middle to the OS. Even if we were willing to copy everything above the newly freed region down to fill the hole, so we could return space at the end, there’s no way to notify all of the code with pointers to the heap that those pointers need to be adjusted.
+
+Instead, we can mark that the block has been freed without returning it to the OS, so that future calls to malloc can use re-use the block. But to do that we’ll need be able to access the meta information for each block. There are a lot of possible solutions to that. We’ll arbitrarily choose to use a single linked list for simplicity.
+
+So, for each block, we’ll want to have something like
+
+We need to know the size of the block, whether or not it’s free, and what the next block is. There’s a magic number here for debugging purposes, but it’s not really necessary; we’ll set it to arbitrary values, which will let us easily see which code modified the struct last.
+
+We’ll also need a head for our linked list:
+
+For our malloc, we’ll want to re-use free space if possible, allocating space when we can’t re-use existing space. Given that we have this linked list structure, checking if we have a free block and returning it is straightforward. When we get a request of some size, we iterate through our linked list to see if there’s a free block that’s large enough.
+
+If we don’t find a free block, we’ll have to request space from the OS using sbrk and add our new block to the end of the linked list.
+
+As with our original implementation, we request space using . But we add a bit of extra space to store our struct, and then set the fields of the struct appropriately.
+
+Now that we have helper functions to check if we have existing free space and to request space, our malloc is simple. If our global base pointer is , we need to request space and set the base pointer to our new block. If it’s not , we check to see if we can re-use any existing space. If we can, then we do; if we can’t, then we request space and use the new space.
+
+For anyone who isn’t familiar with C, we return block+1 because we want to return a pointer to the region after block_meta. Since block is a pointer of type , increments the address by one .
+
+If we just wanted a malloc without a free, we could have used our original, much simpler malloc. So let’s write free! The main thing free needs to do is set .
+
+Because we’ll need to get the address of our struct in multiple places in our code, let’s define this function.
+
+Now that we have that, here’s free:
+
+In addition to setting , it’s valid to call free with a NULL ptr, so we need to check for NULL. Since free shouldn’t be called on arbitrary addresses or on blocks that are already freed, we can assert that those things never happen.
+
+You never really need to assert anything, but it often makes debugging a lot easier. In fact, when I wrote this code, I had a bug that would have resulted in silent data corruption if these asserts weren’t there. Instead, the code failed at the assert, which make it trivial to debug.
+
+Now that we’ve got malloc and free, we can write programs using our custom memory allocator! But before we can drop our allocator into existing code, we’ll need to implement a couple more common functions, realloc and calloc. Calloc is just malloc that initializes the memory to 0, so let’s look at realloc first. Realloc is supposed to adjust the size of a block of memory that we’ve gotten from malloc, calloc, or realloc.
+
+If we pass realloc a NULL pointer, it’s supposed to act just like malloc. If we pass it a previously malloced pointer, it should free up space if the size is smaller than the previous size, and allocate more space and copy the existing data over if the size is larger than the previous size.
+
+Everything will still work if we don’t resize when the size is decreased and we don’t free anything, but we absolutely have to allocate more space if the size is increased, so let’s start with that.
+
+And now for calloc, which just clears the memory before returning a pointer.
+
+Note that this doesn’t check for overflow in , which is actually required by the spec. All of the code here is just enough to get something that kinda sorta works.
+
+Now that we have something that kinda works, we can use our with existing programs (and we don’t even need to recompile the programs)!
+
+First, we need to compile our code. On linux, something like
+
+adds debug symbols, so we can look at our code with or . will help with debugging, by preventing individual variables from getting optimized out. adds extra warnings. will let us dynamically link our code, which is what lets us use our code with existing binaries!
+
+On macs, we’ll want something like
+
+Note that is deprecated on recent versions of OS X. Apple uses an unorthodox definition of deprecated – some deprecated syscalls are badly broken. I didn’t really test this on a Mac, so it’s possible that this will cause weird failures or or just not work on a mac.
+
+Now, to use get a binary to use our malloc on linux, we’ll need to set the environment variable. If you’re using bash, you can do that with
+
+If you’ve got a mac, you’ll want
+
+If everything works, you can run some arbitrary binary and it will run as normal (except that it will be a bit slower).
+
+If there’s a bug, you might get something like
+
+Let’s talk about debugging! If you’re familiar with using a debugger to set breakpoints, inspect memory, and step through code, you can skip this section and go straight to the exercises.
+
+This section assumes you can figure out how to install gdb on your system. If you’re on a mac, you may want to just use lldb and translate the commands appropriately. Since I don’t know what bugs you might run into, I’m going to introduce a couple of bugs and show how I’d track them down.
+
+First, we need to figure out how to run gdb without having it segfault. If ls segfaults, and we try to run , gdb is almost certainly going to segfault, too. We could write a wrapper to do this, but gdb also supports this. If we start gdb and then run before running the program, will work as normal.
+
+As expected, we get a segfault. We can look around with to see the code near the segfault.
+
+And then we can use (for print) to see what’s going on with the variables here:
+
+is , i.e., , which is the cause of the problem: we forgot to check for NULL.
+
+Now that we’ve figured that out, let’s try a slightly harder bug. Let’s say that we decided to replace our struct with
+
+and then return instead of from malloc, with no other changes. This seems pretty similar to what we’re already doing – we just define a member that points to the end of the struct, and return a pointer to that.
+
+But here’s what happens if we try to use our new malloc:
+
+This isn’t as nice as our last error – we can see that one of our asserts failed, but gdb drops us into some print function that’s being called when the assert fails. But that print function uses our buggy malloc and blows up!
+
+One thing we could do from here would be to inspect to see what was trying to print:
+
+That would work fine; we could poke around until we figure out what’s supposed to get printed and figure out the fail that way. Some other solutions would be to write our own custom assert or to use the right hooks to prevent from using our malloc.
+
+But in this case, we know there are only a few asserts in our code. The one in malloc checking that we don’t try to use this in a multithreaded program and the two in free checking that we’re not freeing something we shouldn’t. Let’s look at free first, by setting a breakpoint.
+
+isn’t set yet, but if we use a few times to step forward to after it’s set, we can see what the value is:
+
+I’m using instead of so we can see it in hex. The field is 0, which should be impossible for a valid struct that we’re trying to free. Maybe is returning a bad offset? We have available to us, so we can just inspect different offsets. Since it’s a , we’ll have to cast it so that gdb knows how to interpret the results.
+
+If we back off a bit from the address we’re using, we can see that the correct offset is 24 and not 32. What’s happening here is that structs get padded, so that is 32, even though the last valid member is at . If we want to cut out that extra space, we need to fix .
+
+Personally, this sort of thing never sticks with me unless I work through some exercsies, so I’ll leave a couple exercises here for anyone who’s interested.
+
+I read this tutorial by Marwan Burelle before sitting down and trying to write my own implementation, so it’s pretty similar. The main implementaiton differences are that my version is simpler, but more vulnerable to memory fragmentation. In terms of exposition, my style is a lot more casual. If you want something a bit more formal, Dr. Burelle has you covered.
+
+For more on how Linux deals with memory management, see this post by Gustavo Duarte.
+
+For more on how real-world malloc implementations work, dlmalloc and tcmalloc are both great reading. I haven’t read the code for jemalloc, and I’ve heard that it’s a bit more more difficult to understand, but it’s also the most widely used high-performance malloc implementation around.
+
+For help debugging, Address Sanitizer is amazing. If you want to write a thread-safe version, Thread Sanitizer is also a great tool.
+
+There’s a spanish translation of this post here thanks to Matias Garcia Isaia.
+
+Thanks to Gustavo Duarte for letting me use one of his images to illustrate sbrk, to Ian Whitlock and Danielle Sucher for finding some typos, to Nathan Kurz for suggestions on additional resources, and to “tedu” for catching a bug. Please let me know if you find other bugs in this post (whether they’re in the writing or the code).|||
+

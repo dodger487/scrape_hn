@@ -1,0 +1,71 @@
+A key property of interpreted languages such as JavaScript and Ruby is dynamic typing, wherein variable types are determined and updated at runtime. Dynamic typing has its downsides, but it can make software more flexible, and development faster. Unfortunately, dynamic typing opens the door to an attack vector called Type Manipulation, in which attackers attempt to modify the type of a given variable and trigger unintended behaviour.
+
+This is the first of a series of posts about Type Manipulation, each demonstrating one or more real-world vulnerabilities made exploitable by manipulating types, and explaining how it could have been avoided. The use of real world examples is meant both to make you aware of these specific vulnerabilities in packages you may be using, and to help you learn from these mistakes and avoid them in your own code.
+
+In this post, we’ll focus on using type manipulation to circumvent template-frameworks sandboxes. These templates often hold some built-in protection mechanisms, but—as we’ll soon show—their protection is never perfect. Our examples are based on vulnerabilities in LinkedIn’s Dust.js and Mozilla’s Nunjucks platforms, with a slight mention of Angular.
+
+Our primary example will be a vulnerability in Dust.js, a popular templating framework published and used by LinkedIn. Dust.js is also known to be used by PayPal, which is where a researcher uncovered a remote command execution vulnerability exploited using type manipulation.
+
+The vulnerability was disclosed on January 9th, 2015 and fixed in version 2.6.0, published on September 14, 2016. If you’re using Dust.js, be sure to test if your apps are using the vulnerable version.
+
+Like most templating libraries, Dust.js supports conditions in its templates as shown in the following example, which uses the parameter to choose which HTML to render:
+
+These conditions are later evaluated using the function, an easy way to support highly complex conditions within the template. Here’s a snippet of the function in Dust.js, where you can see the user-provided and the static developer-provided are combined to create the value to be evaluated:
+
+Given the condition may contain user input (e.g. the parameter), Dust.js uses a sanitisation function to prevent malicious parameter values from being evaluated as code. Here’s a snippet of that sanitisation function:
+
+The sanitisation code is clean and sound, and it captured all characters currently known to allow breaking out of the quoted string. Alongside that, you can see the call only runs on strings, likely to avoid errors on undefined values.
+
+While it may avoid errors, this type check is where the door opens for a type manipulation attack. If the attacker can force to be an array (or any non-string object), it would circumvent the check entirely. Later in the code, the array would be implicitly converted to a string when the condition is passed to , enabling remote JavaScript code execution.
+
+The next step for an attacker is to try to manipulate the variable’s type. For API driven applications, attackers can try and manipulate the type by modifying a JSON payload, as we’ve seen in the case of Mongoose’s vulnerability. However, since this is a web templating platform, we’ll focus on manipulating type via .
+
+The package is the most commonly used JavaScript package for parsing query strings, and is used by default in , and other popular packages. converts a query string into a JavaScript object, making them easy to consume. Here are some typical uses of :
+
+As you may notice, derives the type of the created object from the way it showed up in the query string. If the same name appeared multiple times, it will be represented as an array. Similarly, if a parameter explicitly stated it’s an array, it’ll have that type when parsed.
+
+The path from here to triggering the Dust.js vulnerability is short. With the sample template above, which was actually used in PayPal, all an attacker needs to do is provide the argument twice, or provide it as a parameter, and the variable will be passed on as an array, circumventing the sanitisation logic.
+
+While a bit tangential to the Type Manipulation topic, it’s interesting to see how an attacker can leverage this vulnerability, also referred to as the “post-exploit” actions.
+
+First, the attacker needs to get code running. They can do so by providing a URL like this one:
+
+Logging a console message is not very useful for an attacker, so an attacker may provide a more elaborate script, for instance sending some information out. In the case of the paypal exploit, the researcher used a payload like this one:
+
+Which translates to an eval like this:
+
+The post-exploit uses the module to execute a command locally, and send the file to the attacker. With a slightly longer payload, this could have also been done using native Node command, but the use of escalates the vulnerability from remote JS code execution to remote shell command execution, broadening the attacker’s options.
+
+Most type manipulation attacks (and this one is no exception) can be solved by disallowing, normalizing or custom handling the variable type. The three options can be combined, establishing multiple layers of defense.
+
+Disallowing means supporting only specific types. In this case, could have chosen to disallow non-string parameters in its templates. This would mean reducing functionality, and so supporting it depends on the way this framework is used.
+
+Normalizing means converting various input types into one type. In this case, implicitly converted the variables in question into a string when passing them to the function. Instead of converting to string at that point, earlier functions could convert an incoming array, integer or other into a string, and process the rest of the code — including the sanitisation — knowing only strings are allowed.
+
+Lastly, custom handling means writing specific handling for all allowed types. In this case, could have identified this is an array and normalized each character in it, also factoring in dangerous ways in which multiple array items can be combined. This is the most fragile of the three options but also supports more complex inputs.
+
+Dust.js chose a form of custom handling that aimes to capture all objects that have a function. This solution addresses this problem, but leaves a certain fragility in the code, as downstream code may choose to convert an array to user output in a different way. Here’s the relevant snippet from the Dust.js patch:
+
+If you’re using a vulnerable version of Dust.js and cannot upgrade for any reason, you can normalize the types of inputs passed to Dust.js within your code or disallow non-string types, blocking malicious arrays. You can test if you’re using a vulnerable version using Snyk’s CLI or GitHub integration.
+
+Dust.js’s vulnerability is not unique but rather a repeatable pattern. For instance, let’s look at a similar type manipulation opportunity which existed in another templating framework — Mozilla’s Nunjuck’s library. This vulnerability was disclosed on September 6, 2016 by Matt Austin, and fixed in version 2.4.3, published on September 9th, 2016. As with Dust.js, you can test if your apps are using a vulnerable Nunjucks version using Snyk.
+
+Similar to handlebars, mustache, and others, Nunjucks lets you specify variable names within two curly brackets (``) to indicate the value within them should be HTML encoded. Here’s an example of this protection in action:
+
+However, just like Dust.js, Nunjucks’s sanitisation function only escaped string parameters. Here’s a snippet of the sanitisation code:
+
+Following similar logic to the above, a URL such as this (parsed by ):
+
+Will lead to a call and an XSS output such as this:
+
+As you can see, the problem follows the same pattern, not anticipating the attacker’s ability to manipulate the type. As a result, an attacker can circumvent the sanitisation, and inject malicious code.
+
+To remediate, as was the case in Dust.js, Nunjucks could disallow array inputs, normalize them to be a string, or custom handle sanitisation for arrays as well. As this patch shows, Mozilla chose to normalize array inputs using the method.
+
+Type manipulation is a lesser known attack vector, but it presents a very real danger to all dynamically-typed language. In such languages, we need to get used to considering the type another form of input, and either whitelist, normalize or custom handle each version.
+
+In this post, we saw how type manipulation could be used to break out of a template-framework sandbox, a problem many frameworks tripped over. Sandboxing without controlling the runtime is extremely hard, which is the reason Angular gave up on it altogether.
+
+Future posts will show other scenarios where type manipulation can come into play, helping you better understand the risk it presents, and how it may manifest.|||
+
+This is the first of a series of posts about Type Manipulation, each demonstrating one or more real-world vulnerabilities made exploitable by manipulating types, and explaining how it could have been avoided. In this post, we'll focus on using type manipulation to circumvent template-frameworks sandboxes.

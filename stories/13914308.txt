@@ -1,0 +1,50 @@
+D, like many other programming languages in active use today, comes with a garbage collector out of the box. There are many types of software that can be written without worrying at all about the GC, taking full advantage of its benefits. But the GC does have drawbacks, and there are certainly scenarios in which garbage collection is undesirable. For those situations, the language provides the means to temporarily disable it, or even avoid it completely.
+
+In order to maximize the positive impacts of garbage collection and minimize any negative, it’s necessary to have a good grounding in how the GC works in D. A good place to start is the Garbage Collection page at dlang.org, which outlines the rationale for D’s GC and provides some tips on working with it. This post is the first in a series intended to expand on the information provided on that page.
+
+This time, we’ll look at the very basics, focusing on the language features that can trigger GC allocations. Future posts will introduce ways to disable the GC when necessary, as well as idioms useful in dealing with its nondeterministic nature (e.g. managing resources in the destructors of GC-managed objects).
+
+The first thing to understand about D’s garbage collector is that it only runs during allocation, and only if there is no memory available to allocate. It isn’t sitting in the background, periodically scanning the heap and collecting garbage. This knowledge is fundamental to writing code that makes efficient use of GC-managed memory. Take the following example:
+
+This declares a dynamic array of , then uses D’s append operator to append the numbers 0 to 99 in a foreach range loop. What isn’t obvious to the untrained eye is that the append operator makes use of the GC heap to allocate space for the values it adds to the array.
+
+DRuntime’s array implementation isn’t a dumb one. In the example, there aren’t going to be one hundred allocations, one for each value. When more memory is needed, the implementation will allocate more space than is requested. In this particular case, it’s possible to determine how many allocations are actually made by making use of the property of D’s dynamic arrays and slices. This returns the total number of elements the array can hold before an allocation is necessary.
+
+Executing this when compiled with DMD 2.073.2 shows the message is printed six times, meaning there were six total GC allocations in the loop. That means there were six opportunities for the GC to collect garbage. In this small example, it almost certainly didn’t. If this loop were part of a larger program, with GC allocations throughout, it very well might.
+
+On a side note, it’s informative to examine the values of of and . Doing so shows a sequence of 0, 3, 7, 15, 31, 63, and 127. So by the end, contains 100 values and has space for appending 27 more before the next allocation, which, extrapolating from the values in the sequence, should be 255. That’s an implementation detail of DRuntime, though, and could be tweaked or changed in any release. For more details on how arrays and slices are managed by the GC, take a look at Steven Schveighoffer’s excellent article on the topic.
+
+So, six allocations, six opportunities for the GC to initiate one of its pauses of unpredictable length even in that simple little loop. In the general case, that could become an issue depending on if the loop is in a hot part of code and how much total memory is allocated from the GC heap. But even then, it’s not necessarily a reason to disable the GC in that part of the code.
+
+Even with languages that don’t come with a stock GC out of the box, like C and C++, most programmers learn at some point that it’s better for overall performance to allocate as much as possible up front and minimize allocations in the inner loops. It’s one of the many types of premature optimization that are not actually the root of all evil, something we tend to call best practice. Given that D’s GC only runs when memory is allocated, the same strategy can be applied as a simple way to mitigate any potential impact it could have on performance. Here’s one way to rewrite the example:
+
+Now we’ve gone from six allocations down to one. The only opportunity the GC has to run is before the inner loop. This actually allocates space for at least 100 values and initializes them all to 0 before entering the loop. The array will have a length of 100 after , but will almost certainly have additional capacity.
+
+There’s an alternative to for arrays: the function:
+
+This allocates memory for at least 100 values, but the array is still empty (its property will return 0) when it returns, so nothing is default initialized. Given that the loop only appends 100 values, it’s guaranteed not to allocate.
+
+In addition to and , it’s possible to call directly for explicit allocation.
+
+This is also true when an array literal is used.
+
+An exists only at compile time and has no memory address. Its name is a synonym for its value. Everywhere you use one, it’s like copying and pasting its value in place of its name. Both and trigger allocations exactly as if they were declared like so:
+
+Array literals do not allocate when the target is a static array. Also, string literals (strings in D are arrays under the hood) are an exception to the rule.
+
+The concatenate operator will always allocate:
+
+D’s associative arrays have their own allocation strategy, but you can expect them to allocate when items are added and potentially when removed. They also expose two properties, and , which both allocate arrays and fill them with copies of the respective items. When its desirable to modify the underlying associative array during iteration, or when the items need to be sorted or otherwise manipulated independently of the associative array, these properties are just what the doctor ordered. Otherwise, they’re needless allocations that put undue pressure on the GC.
+
+When the GC does run, the total amount of memory it needs to scan is going to determine how long it takes. The smaller, the better. Avoiding unnecessary allocations isn’t going to hurt anyone and is another good mitigation strategy. D’s associative arrays provide three properties that help do just that: , , and . These each return forward ranges that can be iterated lazily. They do not allocate because they actually refer to the items in the associative array, so it should not be modified while iterating them. For more on ranges, see the chapters titled Ranges and More Ranges in Ali Çehreli’s Programming in D.
+
+Closures, which are delegates or function literals that need to carry around a pointer to the local stack frame, may also allocate. The last allocating language feature listed on the Garbage Collection page is the assertion. An assertion will allocate when it fails because it needs to throw an , which is part of D’s class-based exception hierarchy (we’ll look at how classes interact with the GC in a future post).
+
+Then there’s Phobos, D’s standard library. Once upon a time, much of Phobos was implemented with little concern for GC allocations, making it difficult to use in situations where they were undesirable. However, a massive effort was initiated
+
+ to make it more conservative in its GC usage. Some functions were made to work with lazy ranges, others were rewritten to take buffers supplied by the caller, and some were reimplemented to avoid unnecessary allocations internally. The result is a standard library more amenable to GC-free code (though there are still probably some corners of the library that have not yet been renovated — PRs welcome).
+
+Now that we’ve seen the basics of using the GC, the next post in this series will look at the tools the language and the compiler provide for turning the GC off and making sure specific sections of code are GC-free.
+
+Thanks to Guillaume Piolat and Steven Schveighoffer for their help with this article.|||
+

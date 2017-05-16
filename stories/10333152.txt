@@ -1,0 +1,121 @@
+Implementing Secure User Authentication in PHP Applications with Long-Term Persistence (Login with "Remember Me" Cookies)
+
+A common problem in web development is to implement user authentication and access controls, typically accomplished through sign-up and log-in forms. Though these systems are simple enough in theory, engineering one that lives up to application security standards is a daunting undertaking.
+
+Without a great deal of care and sophistication, authentication systems can be as fragile as a cardboard lemonade stand in a category five hurricane. However, for everything that can go wrong, there is an effective (and often simple) way to achieve a higher level of security and resilience.
+
+If you're confused about any of the terms used on this page, please feel free to consult our guide to cryptography terms and concepts first.
+
+The year was 2004. Already, collisions in the MD5 hash function were being circulated, spelling near-certain doom for the future of this (and related) cryptographic hash functions. Five years earlier, Niels Provos presented bcrypt at USENIX 99. The RFC for PBKDF2 had already been published for four years.
+
+Would you believe that there are still web programmers that use fast cryptographic hash functions such as MD5 and SHA1 for password storage in 2015? It has been clear to security experts for a long time that this is a bad idea.
+
+There are only four password hashing algorithms that are currently trusted by professional cryptographers and security researchers to protect users' passwords:
+
+For most PHP developers whom cannot install PECL packages in their production environments, scrypt is not an option. If you can use scrypt, please do.
+
+Given the choice between bcrypt and PBKDF2, developers should choose bcrypt. Furthermore, they should use the existing and API instead of writing their own -based implementation.
+
+Developers should refrain from generating their own salts; let take care of that instead.
+
+Developers in other languages should refer to our guide on how to safely store your users' passwords.
+
+There are two caveats to bcrypt that every developer should be aware of: It truncates passwords to 72 characters and also on bytes. Many developers try to solve the 72 character limit issue by pre-hashing the user's password, which can trigger the second. A dangerous example follows:
+
+There is a nontrivial chance that one of the raw bytes in the hash will be . The sooner this byte appears in the string, the cost of finding a collision becomes exponentially cheaper.
+
+For example, both and produce a SHA-256 hash output that begins with .
+
+The solution, therefore, would be to pass the raw SHA-256 hash outputs through before passing them to bcrypt:
+
+The above example will not truncate at 72 characters and is fully binary-safe, so early null bytes will not lead to security weaknesses. The best of both worlds.
+
+Additionally, you may want to use SHA-384 instead of SHA-256, since SHA-256 is vulnerable to length-extension attacks and SHA-384 is not.
+
+Sometimes, developers come up with the idea of adding another layer of complexity to an otherwise straightforward security feature.
+
+The topic of adding a pepper (a secret key known only to PHP and not to the database) to frustrate brute force attacks rears its head in programmer forums quite frequently.
+
+In the above example, adding a pepper could mean replacing with . We do not recommend this approach.
+
+Peppers do not add any meaningful security above and beyond the salt that generates for you. If your database and web application reside on the same hardware, an attacker who can access the database is probably not far away from accessing your PHP source code and reading the pepper. Finally, relying a static HMAC key means never being able to easily rotate the key in the event of a partial compromise without resetting every user's password or holding onto the old one forever.
+
+A much better solution, which is especially useful if you employ hardware separation, is to encrypt the hashes before you insert them in your database. With this safeguard in place, even if an attacker finds a way to dump all of your database tables, they first have to decrypt the hashes before they can even begin to crack them. With the PHP and the database on separate hardware, this becomes much more secure.
+
+The advantage of encryption over an HMAC key is that an encryption key is agile. You can decrypt the hashes and re-encrypt them with a new key without having to know anyone's password.
+
+However, that being said, please do not roll your own encryption library. We highly recommend Defuse Security's PHP encryption library.
+
+Finally, our team wrote an open source library called PasswordLock that does everything mentioned so far: Bcrypt-SHA2-Base64, encapsulated with the recommended authenticated encryption library we recommend. Usage example:
+
+Password policies (especially shameful ones) are usually a dead give-away that an application doesn't employ proper password hashing. Sometimes the best password policy is to not have one in the first place.
+
+Establishing minimum requirements (e.g. password must be at least 12 characters long) is fine, but dictating which characters are allowed or required or enforcing a maximum password length less than 64 is not. In general, a password policy should not enforce maximums, only enforce minimums (within reason).
+
+A really good way to provide feedback to users about the strength of their passwords is Dropbox's zxcvbn library.
+
+Bonus points go to any web apps that go the extra mile to educate users about the benefits of password managers (e.g. KeePass or KeePassX).
+
+That's it. Don't tell people what their password can or cannot contain. Don't refuse longer passwords. Do stop people from shooting themselves in the foot, but don't interfere beyond what's necessary to prevent foot-bullets.
+
+Short-term user authentication typically employs sessions, while long-term authentication relies on a long-lived cookie being stored on the user's browser, separate from their session identifier. Users typically experience this feature as a checkbox labelled, "Remember me on this computer." Implementing a Remember Me feature without building a trivially exploitable backdoor requires a minor engineering feat.
+
+Any solution for long-term authentication that looks like is wide open for abuse. Since administrator accounts typically have low User IDs, will almost certainly log you into a privileged user account.
+
+Another common strategy, much less susceptible to attack, is to just generate a unique token when a user checks the "Remember Me" box, store the unique token in a cookie, and have a database table that associates tokens with each user's account. There are a number of things that could still go wrong here, but it is unquestionably an improvement over the previous strategy.
+
+Although many developers understand the need for unpredictability in security tokens, many do not know how to actually achieve this goal. A not-too-uncommon code snippet for generating unique tokens looks something like this.
+
+The function is not suitable for security purposes. If you need to generate a random number in PHP, you want one of the following:
+
+Doing it correctly looks like this:
+
+Even if you're using a cryptographically secure random number generator, but your cookie looks like and you're storing these tokens in a database table that looks like this:
+
+Watch out, an esoteric and nontrivial attack still exists.
+
+This may seem fine at first glance, but this actually leaks timing information due to the way strings are compared in database operations.
+
+To clarify: if one changes first byte in the cookie from an to an the comparison will fail slightly faster than if the last character was incremented from to . Anthony Ferrara covered this topic in his blog post, It's All About Time.
+
+On modern hardware, this timing difference is only significant at the nanosecond scale. This is not a simple or easy attack to pull off, but writing an authentication library that takes unnecessary risks does not make sense to us.
+
+Side Note: This timing leak behavior is not any deficit of database server software. Searching a database is not the sort of operation you want to be done in constant time. Doing so would open the door to denial-of-service attacks. The potential to leak meaningful information out of a timing difference also depends on what type of index the database uses internally.
+
+Even if the query doesn't find a valid entry for the supplied remember me token, attackers get unlimited tries. They can keep re-sending a slightly different cookie until they get their desired result. Especially if your application is not tracking and rate-limiting automatic authentications.
+
+To make sure our "remember me" tokens are iron-clad, let's abstract the look-up from the verification and make sure we do so in constant-time. is useful here!
+
+What follows is our proposed strategy for handling "remember me" cookies in a web application without leaking any useful information (even timing information) to an attacker, while still being fast and efficient (to prevent denial of service attacks).
+
+Our proposed strategy deviates from the above simple token-based automatic login system in one crucial way: Instead of only storing a random in a cookie, we store .
+
+is a unique ID to facilitate database look-ups, while preventing the unavoidable timing information from impacting security. (This is preferable to simply using the database field, which leaks the number of active users on the application.)
+
+On the database side of things, the is not stored wholesale; instead, the SHA-256 hash of is stored in the database, while the plaintext is stored (with the ) in the user's cookie. With this fail-safe in place, if somehow the table is leaked, immediate widespread user impersonation is prevented.
+
+The automatic login algorithm looks something like:
+
+After this blog was originally posted, our strategy has been implemented in Gatekeeper, if you need a drop-in solution.
+
+Important: If the user should ever change their password, you should invalidate all existing long-term authentication tokens for that user.
+
+Let's not mince words: Password reset features are a back-door. For many apps and services, they are inappropriate and should not be implemented.
+
+Generally, there are two things wrong with account recovery systems:
+
+The security question problem is pretty self-explanatory, but the second implies that having access to a user's email account or cell phone grants an attacker into every application or service they have an account with. This is very bad.
+
+We recommend the following:
+
+If you find yourself absolutely needing to implement an account recovery back-door (most apps implement them whether they're needed or not) and your users aren't technical enough to use GnuPG, the best you can do is to generate a random token (generated using a cryptographically secure pseudorandom number generator, as above) and email it to the user. When they fulfill this requirement, give them the ability to set a new password. Never send them their old password (which is only possible if you aren't hashing them). If you have access to their old password, you have failed to be a responsible web developer.
+
+Note that sending sensitive information through email forces you to trust STARTTLS, which is a form of opportunistic encryption (great against passive observers, but falls apart in the face of an active attacker). The industry does not currently have a more reliable and widely deployed solution (except, as mentioned above, GnuPG), although some initiatives (e.g. SMIMP) seek to change this deficit. If an email client that supports STARTTLS Everywhere is available for your application, use it.
+
+Even if you implement all of the solutions we offer and follow all of our recommendations, in the end you cannot protect users from their own security mistakes. It's a good idea to log all authentication attempts (even successful ones).
+
+Paragon Initiative Enterprises provides technology consulting services to businesses with attention to security above and beyond compliance. We lead the industry in web application security (as evidenced by, among other things, our model for a proactively secure "remember me" checkbox and cookie system).
+
+We offer secure web-based business solutions, custom-tailored web, mobile, desktop, and server applications, as well as code auditing and penetration testing services.|||
+
+Login forms with a remember me checkbox are a common requirement. We explore the security of login forms and a robust model for remember me checkboxes.

@@ -1,0 +1,175 @@
+Build a Backend for IoT Projects and Set Up a CI/CD Pipeline with Docker
+
+IoT devices are everywhere and available at a ridiculously low cost. For example, you can purchase the new Raspberry PI Zero W, which has some really good specifications, for less than 10 dollars. As IoT projects continue to flourish, we will discuss the details of creating a simple backend that collects data sent by IoT devices. To build this backend, we will use Node.js, Docker, InfluxDB, and Grafana. We will deploy it on DigitalOcean through Docker Cloud.
+
+We will illustrate our backend with temperature data from a simulator. This project can serve as a basis to build IoT applications that use real world devices (e.g. Raspberry Pi, Orange Pi, C.H.I.P) to send almost any kind of timestamped data. iOS or Android applications can also send data to our backend.
+
+We can imagine applications such as:
+
+This backend application is made up of three services:
+
+The API receives data over an HTTP POST request and saves it in the underlying InfluxDB database. A dashboard built with Grafana enables us to visualize data from the database.
+
+Note: real world devices might use a lower level protocol, such as TCP or UDP, to limit the size of the frame.
+
+As the backend collects data, we will first create a simple data simulator in bash. In the next article we will focus on the realization of a device based on the Raspberry PI (or another ARM device) sending real world data.
+
+The steps we will cover:
+
+All the steps we will go through in this article can be found on GitHub in the IoT demo project repository. A Node.js example implementation of the API is in the IoT API repository.
+
+Those GitHub repositories are used as projects to illustrate the Docker In-Depth for Devs and Ops online course.
+
+Note: the current backend version is not production ready, but can be used as a starting point.
+
+In this part, we will create a script that simulates the temperature sent by a specific device at a given timestamp. Below is a sample data that will be sent:
+
+Below is the script we will use for the simulator.
+
+Basically, in each iteration of the loop, the current date is retrieved, a random number between 20 and 34°C is generated and sent to the host provided as a parameter. By default, data are sent to localhost on port 1337. If we need to send data to the host, www.example.com, on port 3000, we would run the simulator like so:
+
+The API, developed in Node.js, will have the following characteristics:
+
+At this stage, the API does not persist data, but we’ll connect it with an InfluxDB database soon.
+
+For the Continuous Integration / Continuous Deployment part, we will define a simple test in the test/functional.js file. When running with , it starts the API, sends a sample of data, and expects to get a 201 HTTP Status Code.
+
+In order to package the API into a container, we will create a Dockerfile at the root of the application code. This Dockerfile contains all the instructions needed to install the application’s dependencies, from bottom to top: Linux libraries and binaries, Node.js runtime, npm modules, and application code.
+
+To limit the size of the image that will be created, we will use mhart/alpine-node, which is a light Alpine Linux that embeds a Node.js runtime. This image is really popular — we can tell by the number of times it’s been downloaded.
+
+ Also, in order to make sure a simple change in the code will not rebuild the entire dependencies, we’ll run the command first, and then copy the application source so it makes use of the cache. The API exposes the port 1337 and is ran with the common command.
+
+Let’s now create a Docker image of the API and tag it with 1.0.
+
+We now have an image of the API — it’s ready to be instantiated into a container with the following command:
+
+In the current version, it does not have any utility as it only prints the data received. In the next steps, we will modify the code so it persists the data into an underlying InfluxDB database.
+
+InfluxDB is a great time series oriented database, and, as we will see, it’s really easy to get started with. The InfluxDB documentation can help you understand the basic concepts very quickly.
+
+Docker Hub provides an official InfluxDB image. From the documentation, we can see that the simplest way to run a container based on InfluxDB is with the following command:
+
+The port 8083 is used to access the administration interface and the port 8086 is used to expose InfluxDB HTTP endpoints. Because these ports are exposed (with the -p option), they are accessible directly from the localhost.
+
+Also, he administration interface is not enabled by default — we need to provide the environment variable for it to be accessible on port 8083.
+
+From the administration interface, we can create the database we will use to persist the data.
+
+At this stage, we can create a container for the API (using the iot-api:1.0 image) and another container for the underlying InfluxDB database. This is great, but the current API does not persist the data —let’s change that.
+
+We need to modify the app.js file so it uses the node-influx npm to connect to InfluxDB and write the data point.
+
+There are two importants things to note here:
+
+Let’s build a new version of the API image to account for those changes.
+
+We now know how to create containers to run InfluxDB and the last version of the API. In order for them to work together in a clean way, we will use Docker Compose to define a multi-containers application.
+
+Docker Compose is a tool, written in Python, that allows applications to run as a list of services. It uses a file to define the application. In our simple example, the file will look like the following:
+
+Two services are defined — both and publish the ports we defined above.
+
+Since we’d like to have a neat interface to visualize the data, we will add another service to the picture before running the application,. We will use the Grafana platform, which enables us to build really fancy dashboards.
+
+Of course, in our example, the dashboard will not look like the screenshot above, but you will find that adding graphs is really easy.
+
+We can use the Grafana image from Docker Hub to create a new service, named , and add it to the above docker-compose.yml file.
+
+Grafana exposes the port 3000 that is mapped to the same port on the local machine. This means the Grafana interface will be available on http://localhost:3000 — we will see that soon.
+
+Now, let’s run the whole application and see how the containers (which are only instances of each service) are able to communicate with each other. The Docker Compose application can be ran with the following command.
+
+A lot of things happened here —a network was created and a container was instantiated for each service and connected to this network. Being on the same network (user-defined bridge in our example), the container of a service can communicate with the container of another service just by using the service name. Sounds confusing? Let’s look at two examples:
+
+Using the InfluxDB administration interface, accessible on localhost port 8083, we will create a database named iot.
+
+Let’s start the simulator against localhost on port 1337 (default values)
+
+The Grafana web interface is available on port 3000, the default credentials are admin / admin. The first things we need to do is to create a data source. As InfluxDB is one of the many possible data sources Grafana knows, we just need to indicate a couple of parameters:
+
+Once the data source has been added, we can create a dashboard. To make things simple, we will go with a graph and modify the default query so it matches the one on the screenshot below:
+
+When the dashboard is created, we can see the data from the simulator displayed.
+
+The image iot-api:2.0 is the last version we created and the one we will need to distribute so it can run in other environments. To do so, we will use Docker Hub, the official Docker online registry. Basically, a registry is a place where the images can be stored.
+
+Once we have created an account on the Docker Hub, we will create a new repository, named iot-api. We will keep the default visibility as public so everybody will be able to use the images stored in this repository.
+
+Once the repository has been created, we are ready to push the iot-api:2.0 into it. This only requires the image to be tagged with the format expected by the Docker Hub: . Let’s do it using the command.
+
+Once the image is ready, we just need to login in the command line
+
+And then push the image
+
+If we check on the Docker Hub, we can see the image is now present.
+
+We will now be able to deploy the whole application easily with Docker Compose on any machine.
+
+When we created the API, we specified a test at the same time. In this part, we will setup the environment to automate the testing and deployment process. The pipeline we will put in place is the following one:
+
+When changes are pushed to GitHub, tests are automatically triggered. If they run fine, a new version of the API image will be created and pushed to Docker Hub. It is then redeployed on the target environment through the Docker Cloud platform — we will use a DigitalOcean droplet in this example.
+
+Now that we have a Docker Compose application, we will refine the testing process a little bit and use a docker-compose.yml-like file to specify how the tests need to be run.
+
+Two services are defined in this file:
+
+Note: as is not present by default in the image, we have added an instruction in the Dockerfile so it will be installed when we build the image. It’s not a big deal because is really light, and it will definitely help us create the database prior to running the tests.
+
+The tests can then be run with the following command
+
+Basically, it runs the first and then build and runs the service. When is ran, the underlying database named is created (issuing a against InfluxDB’s api), and the command is ran. The API will be started and the test data will be sent.
+
+We have ran the tests locally, it’s working, and that’s great! With the things we have put in place already, we will be able to automate the testing process.
+
+Docker Cloud is the CaaS (Container as a Service) platform hosted by Docker. It allows you to manage containerized applications very easily:
+
+We first need to use the “Cloud Settings” menu to connect a source provider (our GitHub account in this case) and a cloud provider (DigitalOcean).
+
+DigitalOcean is a great platform that allows you to spin up virtual machines easily and quickly. It’s obviously not free but a couple of dollars is enough for us to get started and really have some fun.
+
+We will create a node that runs on DigitalOcean — this will be used to deploy the application.
+
+We specified a couple of options, such as the region, the size of the VM, and a tag ( ), that will be used when we deploy the application later on.
+
+In the repository section, we need to select the iot-api repo we previously created in Docker Hub and configure it so that:
+
+The Autotest and Autobuild options are defined at the repository level as shown in the following screenshot.
+
+By default, the test phase will run the service named that we defined in the compose-test.yml file.
+
+As we will see next, the Autoredeploy option is specified at the service level.
+
+Docker Cloud does not create an application directly from a docker-compose.yml file — it uses a slightly different file, which we named compose-cloud.yml. This file contains a limited set of options and is used to define our stack (group of services).
+
+We then copy this file in the Docker Cloud wizard and use it to create a stack..
+
+When the stack is created, we can see the 3 services running and the available endpoints that enable the application to be reached from the outside.
+
+As we did before, we will create the iot database from the InfluxDB interface.
+
+And then configure Grafana, so it connects with InfluxDB, and creates a simple dashboard.
+
+Obviously, there is no data point, as no simulator or real device is sending data to our backend.
+
+Note: in the 3 previous screenshots, we have used the URLs that the stacks exposed as endpoints.
+
+Let’s change something in the code of our application to see the different actions done in our pipeline.
+
+Note: we could also add a tag that matches GitHub’s commit hash. This is documented in the advanced options for autotest and autobuild features.
+
+On Docker Cloud, the API service has automatically been redeployed with the new version of the image.
+
+Our application is deployed on a DigitalOcean node. Every change in the code is automatically tested and deployed if the tests are successful. That looks good.
+
+Using the endpoint provided by the API, let’s run the simulator.
+
+After a couple of seconds, we can verify that the dashboard has received several data points.
+
+This lengthy article shows the steps you can take to start building an IoT project from scratch using some helpful technologies. This project is obviously not production ready, but hopefully it can be used as a starting point for a demo or personal project.
+
+The next article, dealing with the device side of the project, will illustrate how a Raspberry Pi (or other ARM device) can easily collect real-world data and send them to our backend.
+
+Are you building an IoT project? Do you find post helpful? I’d really love to hear your feedback on all of this.|||
+
+The post will cover the details of creating a simple backend that collects data sent by IoT devices. We will use Node.js, Docker, InfluxDB, and Grafana and deploy it on DigitalOcean through Docker Cloud.

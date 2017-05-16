@@ -1,0 +1,70 @@
+So by this point everyone in the Bitcoin community has heard about the collision attack on BU’s short IDs that are used for the propagation of XTreme Thinblocks, as well as Peter R’s rebuttal claiming the infeasibility of such an attack in practice.
+
+Many in the Bitcoin community, including Rizun himself, are requesting that Maxwell release his collision-finding code to the public.   I find this strange; coding such a collision attack is something that’s covered in Security 101 in most places, so there should be no surprises or novelty here unless Maxwell has found some strange new optimization.
+
+So what would such code look like?  Let’s take a look.  I’ve released a full copy of the code here, so be sure to try it on your own machine. Note this is completely unoptimized code – optimizations amounting to several orders of magnitude of improvement are lurking virtually everywhere.  This is only intended to give the general public an idea of what such code would look like.
+
+Much of the code I present here is adapted from these solutions to a set of cryptopuzzles online.
+
+The code for finding collisions is already out there, as I linked earlier in the post.  The only challenge here is defining our the function we want to find a collision in, f(x).  We are looking for an x1, x2, such that sha256(P + x1)[0:k] = sha256(P + x2)[0:k], where P is our common prefix (in the case of Bitcoin, this would be the shared transaction data between the collisions).
+
+So let’s define our function, f(x) as f(x) = sha256(P+x)[0:k], where k is the number of bytes we would like to be identical between the two SHA functions (in this case we’re looking for the first 8 bytes to get a 64-bit collision as described by Maxwell, so in our concrete attack instance k=8).  Then if f(x1) = f(x2),  sha256(P+x1)[0:k] = sha256(P+x2)[0:k] (by definition), which is exactly what we’re looking for.  Simple, right?
+
+So now that we’ve defined f(x), all we need to do is find any collision for any input of f(x), which will give us the SHA256 partial collision in k bytes we’re seeking.  In Python that looks like this:
+
+We’re using the hex values because the previously seen hash values are used in the cycle finding algorithms we described, and ideally we’d like our collisions to be alphanumeric (so they can be encoded flexibly without triggering protocol issues).  Because of this, we need to take twice as many characters as we’re looking for bytes (1 byte = 8 bits = 2 hex characters).  It would likely be much faster to find a collision if we accepted non-alphanumeric values.
+
+The simplest and most common collision attack for a common prefix is referred to as the Birthday Attack.  We call it this because of a surprising fact in probability: while the probability of 2 people having the same birthday is relatively low, the probability that any sizeable group will contain two people with the same birthday is far higher.
+
+How do we do this?  We check a bunch of hashes with the prefix we’re looking for, and store every hash value that we’ve seen thusfar.
+
+Essentially what we’re doing here is going through many different values of y, checking f(y), and storing the value of f(y) in a table.  For every new value of f(y), if it’s already stored in the table, we pull out the y’ that generated it and check whether y = y’.  If it does not we have a collision.
+
+In practice this is slow, because we have to store every value of f(y) and the y that generated it.  This means we’re using a lot of memory: finding a 64-bit collision burned through 32GB on my machine without returning a result.
+
+On the other hand, if you have a lot of RAM or you’re only looking for small collisions, this works great!  Finding a 4 byte collision takes under a second on my machine:
+
+A cool optimization  in finding collisions to a function is to think of the function as a graph.
+
+To keep things from getting confusing, let’s say we’re finding a collision in some hash function g(x).  Take any random string and start applying g(x) to it over and over again.  If the random string is x1, your results will look something like this:
+
+where each arrow represents applying g to the previous element to get the element it’s pointing to (so g(A) = B, g(B) = C, etc.).
+
+Now let’s say g has a collision and g(x1) is the same as g(g(g(g(X1)))).  That means as per the above D = A.  So we can think of our sequence as follows:
+
+or as (because D = A, a collision):
+
+in other words, by just running g over and over again, we’ve found a cycle in the path we’re taking through all its possible values!  Let’s look at A, the first element where we actually see that cycle.  Notice that there are two arrows pointing at A: that means that there are two values that, when run through g, yielded A.  These values are x1 and C, the sources of the arrows pointing at A.  So g(x1) = g(C), and we’ve found a collision!
+
+All we need to do is do the same thing for our carefully crafted f.  Any collision we find in our f is a collision in the first few bits of SHA256, exactly what we’re looking for!
+
+So how do we efficiently find a collision like this, without storing the whole path (the real cycle will be much larger than the 4 elements shown here, and if we’re storing them all we may as well do a Birthday attack)?
+
+There are two algorithms for doing this without using memory that grows with the size of your path.  They’re very clever, and they’re described quite well by Wikipedia for the curious reader.  These algorithms work to find a cycle in any function by building a graph as we did informally above, where the vertices are values and the edges represent application of the function to those values.  Wiki also has a handy picture of what a graph like this would look like if you weren’t satisfied with my explanation.
+
+The way these algorithms work is relatively simple: you have a tortoise and a hare, both crossing the graph that we’ve built at different speeds.  If there is a cycle, at some point the tortoise and the hare will end up pointing to the same value.  In our example:
+
+this would mean something like both the tortoise and the hare have ended up at B at the same time, despite starting from x1 at different speeds.  If this happens, you know there is a cycle that made the hare loop back around somewhere, the only question is where is the cycle (in this case from C to A) and how do we extract it to find a collision.  Those details are provided on the Wikipedia page for each algorithm.
+
+The code for both Floyd’s and Brent’s cycle finding algorithms are included in the code I linked before.  They both take an “initial” value as an argument, in the graph above x1.  Ideally if you are running multiple threads of this algorithm at once, you want to give it different initial values (by searching different graphs you have a higher probability of finding a cycle quickly).
+
+Running a single instance of Floyd’s or Brent’s algorithm on the 4 byte collisions we tested the Birthday attack with takes around a second, longer than the Birthday attack!  Why?  Well, it’s harder to find a cycle than to just check if you’ve already seen a value.  But as the inputs get larger, these cycle finding attacks actually get far more efficient than birthday attacks – because they do not need to store previously seen values in memory (and memory is always slow), their CPU-bound nature outperforms the memory-speed bound birthday attack.
+
+The collisions found by these algorithms look something like this:
+
+So how does this perform in practice?  I spawned 12 threads searching for 64-bit (8 byte) collisions using Floyd’s and Brent’s algorithms (6 processes each on different graphs, as described above, 3 for Floyd’s and 3 for Brent’s) on a relatively high-spec’d i7 workstation (other specs are irrelevant here as both algorithms are fixed memory and use no disk).
+
+The collisions returned as follows, in about 2.5 hours of time:
+
+Interestingly enough, I wrote a multi-threaded variant of this attack first.  Spawning multiple threads actually decreased performance because of the Python GIL locking up in the hash functions.  Weird, eh?
+
+So does this attack work in practice?  Yeah, duh.  Can it be optimized further?  Of course.  This algorithm is also the type that is incredibly simple to design an ASIC for, given that it is fixed memory and relatively simple computationally.  The collisions are both feasible to discover and practical to discover in bulk, given appropriate resources.
+
+The junk nonce can also go anywhere in the f: you can define f to create only valid Bitcoin transactions, and use the rest of this code unmodified to create virtually any kind of Bitcoin-compatible collision.  We’ve stuck with a simple prefix attack, as that’s what Greg Maxwell demonstrated, but the sky is the limit here.
+
+I hope that was informative to a few people, and I hope nobody’s going to be demanding Maxwell publish his attack any time soon.  Not because it’s morally wrong to do so, but only because it’s irrelevant: the attack is trivial, and security through obscurity continues to not be security at all.
+
+Note that I am not saying XThinBlocks are fundamentally flawed here: Peter R. may be correct in his analysis of incentives in concluding the attack does not significantly degrade the advantages of the approach in practice.  I also see it as fairly trivial to add a nonce as Core did in their CompactBlocks proposal.  But the code is simple, and the attack is out there now!
+
+UPDATE: I am now in contact with thezerg1, and we’ve agreed that I will adapt this tool to generate valid Bitcoin transactions which will then be tested against the Bitcoin Unlimited network/testbench to provide statistical evidence about the robustness of XTreme Thinblocks against such a collision attack.  Expect an update in the next few days with that code.|||
+

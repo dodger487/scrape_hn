@@ -1,2 +1,183 @@
-|||
+In part one of this series, we looked at creating a simple microservice and packaging it into a Docker container. We also deployed the container to AWS using Amazon's ECS optimized Linux AMI - which has the Docker engine pre-installed.
 
+In this post, we'll create a Docker Swarm cluster almost entirely from the command line! In the process, we'll deploy multiple services and introduce application and message-based load balancing. We'll continue using Hydra because it has the singular goal of making microservices approachable!
+
+The architecture outlined in this article will be quite scalable - unless of course you're Netflix and have Netflix size problems. In any case, the approach we'll look at here can be further scaled in complexity to accommodate your specific needs.
+
+Our end-goal is to build an eight-node cluster accessible via an Amazon Application Load Balancer (ALB). Our cluster will accept HTTP traffic and load balance between three master nodes which host our service-aware Application API Gateway, HydraRouter. HydraRouter, itself a microservice, will be the only service listening on port 80. It's responsible for routing service calls to individual services within the cluster.
+
+Hydra-router will only run on master nodes 01 - 03, which are accessible via the ALB. Our microservices will run on worker nodes 01-05. Services running on worker nodes will not publish ports for use outside of the network that the container is running in.
+
+Referring to the above diagram, the master nodes in the Ingress network communicate with one another in support of high availability. If one master node dies, another is elected the active master. We can also scale the cluster adding and removing machines as required.
+
+Each Hydra-router running inside of a master node can communicate with microservices running in containers on the service network. Additionally, each service can communicate with the outside world (external API services) and with its internal peers.
+
+Using Docker swarm mode, we'll be able to deploy and scale our services using simple commands. When adding and removing EC2 instances participating in a swarm, Docker will redistribute our services across the cluster.
+
+We're going to use Amazon Web Services. As in the first part of this series, I have to assume that you're somewhat familiar with AWS. You should be comfortable creating EC2 instances and connecting to them using SSH.
+
+Our initial goal with AWS will be to launch machine instances from the command line. In preparation for this, we'll first create a new IAM role for a programmatic user with credentials.
+
+Make sure to grab the Access Key and Secret Key as you'll need those shortly.
+
+To assist with the creation and configuration of EC2 instances, we'll create a shell script called which uses the docker-machine command to create an EC2 instance and install the Docker engine.
+
+In this script, we've defined the AWS Access token key and the Secret token key . Replace the fake values shown with the access key and secret key you copied earlier. Additionally, we define the AWS VPC id and the AWS Region . Provide values which reflect your Amazon setup. As a best practice, use environment variables to define and export those tokens outside of the script. They're shown here for clarity.
+
+The above script also allows you to specify the type of EC2 instance to use. The default is but could be or larger depending on your needs.
+
+Using the script is as easy as:
+
+As a complement to the above script, we'll also create a script.
+
+So we can remove EC2 instances created using :
+
+If you haven't created EC2 instances in this way, then those two scripts will be great takeaways. Read on; there's a whole lot more in store!
+
+As a recap here is the breakdown of the EC2 instances, we'll create.
+
+Using our script we're able to automate the creation and configuration of our EC2 instances.
+
+Once the above commands complete, we can view a list of machines.
+
+After creating your first EC2 node above you should see a security group in the VPC you specified. It's a basic setup suitable for simple uses, but we'll need to update it for use with our swarm.
+
+Here's a summary of the changes we need to make:
+
+Your enhanced security group should include the following.
+
+With these changes in place, we can proceed to configure our swarm.
+
+Because our sample microservices use Hydra, we'll need an accessible instance of Redis. Let's look at two ways to address this requirement.
+
+The first and more production friendly method is to use a hosted Redis cluster, such as Amazon's ElasticCache for Redis or the RedisLabs service. The easiest approach will be to head over to RedisLabs and setup a free trial instance. The process takes a few minutes, and you'll end up with a Redis connection string that you can use with your test cluster.
+
+The connection string will look something like this: and you add that to your service's file.
+
+The second method is the one we saw in the first article in this series. I'll recap the steps here.
+
+First, sign into AWS and navigate over to the . Once there click on the "Launch Instance" button. On the page that loads select the AWS Marketplace tab. You should see a screen like this:
+
+Search for to locate the Amazon ECS-Optimized AMI. Amazon created this image for use with its EC2 Container Service.
+
+For now, select the ECS-Optimized AMI and create an EC2 t2.micro instance.
+
+There are a few things you'll want to do:
+
+You can choose the defaults for the remaining options.
+
+Once the EC2 instance is ready, you can SSH into it to install a Redis container. The following command adds Docker to the ec2-user group and creates a root folder called data, where our Redis data will persist. Finally, we use Docker to pull the Redis 3.0.7 container.
+
+Next we need to edit the /etc/rc.local file:
+
+and append the following lines:
+
+After saving your changes, you can bounce the box: . On restart, your machine should be running a Redis instance.
+
+Now, I know what you're thinking! - "I should have used RedisLabs" . But seriously, it's not too bad. Besides, using the above method, you'll be able to add other resources such as databases. The resources won't live in our Docker cluster but will be accessible within the same VPC. Again, this is an excellent way to test our cluster, but not recommended for production use.
+
+You can test access to your Redis instance by obtaining the remote IP address from the EC2 Dashboard.
+
+If you have installed you can connect to the instance using:
+
+If you don't have redis-cli installed you can use telnet to interact with Redis:
+
+Then type: . If you received an output listing instead of a connection closed message, then Redis is running.
+
+We're now ready to set-up our swarm. This process will involve creating a swarm manager and assigning workers. We begin configuring our swarm by requesting the external IP address of our the master01 node.
+
+We'll use the machine's IP to initialize our swarm.
+
+We have two other master nodes to turn into managers. Sadly, they won't get a pay raise.
+
+From any swarm manager node you can view the status of managers:
+
+Here we see that our master01 node is the leader, but should something happen to it - one of the other managers will be elected the new leader. If our master01 node later recovers from its untimely accident, it won't resume as the leader, however it will be marked as reachable and eligible for promotion should something happen to another master node.
+
+Now we're ready to configure our worker nodes.
+
+From a manager node, we can see the status of our swarm cluster. We see that our master01 node is the leader, with two managers reachable and waiting in the wings for their shot at a promotion. We also see that none of our worker nodes are managers.
+
+At this stage, we have EC2 instances participating in a swarm as either managers or workers. We're now ready to create a network on which each node can communicate. In the containerization world, we call this an overlay network.
+
+You can list available networks with:
+
+Notice that there are two overlay networks, and our newly created - both have a scope of .
+
+Here is how we'll use these two overlay networks:
+
+The network will be used to receive API and message requests to our service aware router. The will only receive traffic from the service router and won't be accessible to the outside world.
+
+Wouldn't it be great if we could visualize the services in our Docker swarm? Such a tool might allow us to see the distribution of our services across machines and perhaps we'd be able to see the status of individual services. Now, wouldn't it be great if such a tool came packaged as a container that we could drop into our swarm? Well, I have some good news! Mano Marks has created a handy docker swarm visualizer that we'll install onto a master node. Again, the reason we selected a master node is that we want this container to be remotely accessible.
+
+To view it, make sure to open port 8080 on the master nodes using an AWS security group that restricts access to your IP address.
+
+Hydra-based applications are initialized using a JavaScript object which contains the service name, description, IP and Port information and the location of the Redis server that Hydra depends on. Most often that information is loaded from a remote config.json file. In the case of a containerized hydra-based application, you have the option of overriding the packaged config.json file with one mapped to a volume using the fragment in the example below:
+
+This can work fine in dockerized deployments which use ECS optimized EC2 images. You simply have to ensure that the config files are present on the machine before running the container.
+
+However, this isn't convenient for use with Docker Swarm since you don't necessarily know what machine your container will run on. And later adding new machines would mean copying over config files. That just won't do!
+
+Starting with hydra 0.15.10 and hydra-express 0.15.11 your hydra service can request its config from your Redis instance. Naturally, that implies that you've loaded the config into Redis in the first place.
+
+To do this, you'll need hydra-cli version 0.5.4 or greater.
+
+You're expected to provide the service name separated by a version string and a local config.json file whose contents will be uploaded.
+
+Later you can retrieve a stored config using:
+
+This is useful when you want to make changes to an existing config file or when you'd like to upload a new config based on an older copy.
+
+It's worth pointing out that you can still build your microservice with a baked-in config file which has hardcoded entries to the resources your service needs. It's really up to you and the level of automation and flexibility you're after.
+
+We can now use the Docker command to push containers into our swarm. In the example below we specify to point to the Redis server the service will use to retrieve its configuration file. In production, the Redis instance would likely be an Amazon Elastic Cache cluster or one at RedisLabs.
+
+Both the hydra-router and hello-service containers above are publicly available - if you'd like to try this yourself.
+
+It's likely that at some point you'll need to use private containers for one or more of your services. To do this, you first sign into a master node and then issue a command.
+
+You can then issue the command with the flag to tell Docker to use the credential you provided during the login.
+
+You can remove services using:
+
+One of the great benefits of using Docker Swarm mode is that you're able to perform other orchestration tasks such as scaling the number of services based on a container type.
+
+Scaling services is a matter of using the Docker command and specifying the service name and the number of required replicas. This allows you to scale a service up or down.
+
+You might be wondering what happens when you need to update a running service. Swarm mode allows you to update a running service using the command:
+
+To view the versions of your running containers you can use the Docker command:
+
+To try all of this out, you'll need to obtain the DNS address of your Amazon ALB from the AWS dashboard.
+
+You can direct traffic to the load balancer doing something like this:
+
+Refreshing the browser page would display different service IDs as the traffic is load balanced to our five hello services. It's worth pointing out the Amazon ALB is load balancing to one of our three HydraRouters which in-turn are load balancing to available hello services.
+
+As one of our part-one readers pointed out, and I'm paraphrasing here: "It's not a microservices party until services are speaking with one another" While that's a matter of opinion - it tends to be somewhat true in real world parties. The callout is an important one and the subject of our next and last example.
+
+In an earlier RisingStack post we looked at a silly little microservices game called Hot Potato. In that post, we looked at inter-service messaging using Hydra. Each microservice instance acted as a single player and communicated with other instances to pass a virtual hot potato (aka JSON object) to other services. In the end, the player left holding the hot potato is declared the loser. Yes, it's slightly different from the classic children's games - tailored for services if you will.
+
+We'll grab the code from the earlier repo and update it for use with Docker Swarm. You can view the resulting code here.
+
+Our new hot potato service has a single endpoint which will cause the service which receives that request to start a new game. Internally, the hpp-service instances will use hydra messaging (built on redis Pub/Sub) to send non-http messages to one another.
+
+After modifying the default config.json file to include the location of our Redis instance we're now ready to upload the config to Redis using the hydra-cli app.
+
+Now we're ready to launch player instances.
+
+We'll launch containers the same way we've done earlier. In this case, we'll specify five instances using the replicas option.
+
+You should then see the new instances appear in the swarm visualizer.
+
+To start a game, we need to access the ALB with the route of our Hot Potato Service. The game runs for about 15 seconds, so we have to wait a bit for a reply. The IDs listed in square brackets are the Hydra service instance IDs for the services which participated in the game. You might be wondering why we only see three here? The reason is that the game is time limited with built-in delays so you'd have to increase the game duration to see more nodes participating. Running the game a second time should reveal new nodes.
+
+To prove that this is actually working we can ask the API Gateway (HydraRouter) for a list of service nodes. Using the returned JSON, we can locate each of the instances which participated in the game.
+
+In this article, we stepped through creating a Docker Swarm cluster on AWS. In the process, we created and deployed microservices built using Hydra - which adds a microservice layer above ExpressJS. We learned how Docker orchestration allows us to create services and easily scale them as needed. We used the Hydra-Router as a service-aware API Gateway to route calls to our microservices without knowing their location within the swarm. And lastly, our Hot Potato game service demonstrated inter-service messaging within the cluster.
+
+This concludes our two-part series. However, this isn't an end - for many of us, this is just the beginning of our journey. Node-based microservices and containerization are a match made in heaven!
+
+Containers used in this article can be found here and here. You can also review the code for the hello-service and hot potato service. If you have questions ping me on twitter - my DM is open!|||
+
+Let's create a Docker Swarm cluster from the command line, and deploy multiple services while introducing application and message-based load balancing.

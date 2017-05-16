@@ -1,0 +1,60 @@
+Interactive Queries are a fairly new feature of Apache Kafka Streams that provides programmatic access to the internal state held by a streaming application. However, the Kafka API only provides access to the state that is held locally by an instance of the application – there is no global state. Source topic partitions are distributed among instances and while each can provide cluster metadata that tells a caller which instances are responsible for a given key or store, developers must provide a custom RPC layer that glues it all together. While playing around with the API while preparing a blog on Interactive Queries, I wondered how such a layer could be written in a generic way. This blog describes how I ended up with KIQR (Kafka Interactive Query Runtime).
+
+Disclaimer: This truly is a hobby project and has not been extensively tested at runtime.
+
+After looking at the default APIs on the KafkaStreams client class, I realized I had to account for two types of queries:
+
+Both types involve querying at least one instance. Any instance of a Kafka Streams application can be used to obtain cluster wide metadata that tell us which instance holds what information. But once we know the “where”, how do we get there? Of course we could just communicate via HTTP, but that doesn’t sound that appealing for “internal” queries.
+
+ After having heard a lot about Eclipse Vert.x from my colleague and Vert.x committer Jochen Mader, I thought it might be a good fit. I started reading the Vert.x documentation, and I really liked what I saw.
+
+Vert.x is an event-driven non-blocking application platform. It enables you to write concurrent code without having to think too much about concurrency itself, so you can focus on your business logic instead of threads and synchronization. A key abstraction is the Verticle, which works similarly to actors in the actor model (it’s not a perfect match, but close enough). As I was familiar with Akka already, making the leap to Vert.x was actually quite easy. There are some other nice features as well – Vert.x is polyglot, so you can write your components in different languages. It also integrates very well with OSGi. And the list is even longer – by now I’m really excited about Vert.x!
+
+Components in a Vert.x application communicate via simple String addresses on an event bus, and this is the killer feature for KIQR’s use case. It is very simple to run Vert.x in cluster mode, turning the event bus into a distributed event bus without having to change any code. After trying it out with very simple hello world example, this looked capable of handling KIQR’s requirements for internal communication. There are actually four libraries that can be used to run Vert.x in cluster mode (as of Vert.x 3.4.0). The two stable ones are Hazelcast and Apache Ignite. Infinispan and Apache Zookeeper are in technical preview. I settled on Hazelcast as it was the only stable option at the time when I started.
+
+ Perfect – transparent communication between the instances is delegated to Vert.x.
+
+The event bus sits in the middle, that much is clear. Now what kinds of components do we attach to the bus? I settled on these logical components:
+
+We definitely need to run the query verticles on every instance that we want to query, so they’ll have to listen to messages on the event bus. But how can we make the correlation between event bus addresses and KafkaStreams metadata? Since Kafka 0.10.1, the Streams API contains a new parameter called that is published among all instances of a streaming application via the Kafka protocol.
+
+ As the Vert.x event bus only uses Strings as addresses, I had the idea that I could use that field not to publish a <host:port> pair as intended, but to use a unique identifier as host and listen to that identifier on the event bus. UUIDs make good identifiers in this case.
+
+The query facades do not actually need to be deployed on every instances as well as they’ll delegate queries to the responsible query verticle, but for simplicity, better load distribution and reduced latency, it won’t hurt to have them run on each instance as well. Facades for the same query type will share the same static address across instances as it really doesn’t matter which instance serves a request. Vert.x will prefer a local one. A query facade asks the KafkaStreams client for metadata, infers the id of the query verticle and issues a request for that verticle on the event bus. The following diagram shows the setup:
+
+That covers the basic blocks. What’s still missing is a component that opens an interface to the outside world. While other options are conceivable, HTTP is a good start. Vert.x makes it very easy to start a HTTP server and provide a REST-API. That API of course only allows GET requests because Interactive Queries are read-only. Let’s look at the communication flow for a key-value query. All communication between component uses the event bus:
+
+As the diagram indicates, this is all as non-blocking as it can be on the server side.
+
+The following diagram shows an overview of all the verticles that are running in a single KIQR instance:
+
+As we’re definitely going to have communication between JVMs and wire transfers both within the Vert.X cluster and in communication with clients, we need to think about serialization.
+
+ In Kafka, messages are little more than key-value pairs of byte arrays. Producers and consumers need to have a contract on the serialization format. This is informal – Kafka Brokers simply do not care about message contents. That’s why the Producer/Consumer-API heavily rely on Serdes (Serializer/Deserializers). As we need those anyway to run Kafka Producers and Streams, we can just go on and use them for all other wire transfers as well – no need to reinvent the wheel. KIQRs runtime will directly serialize any key or value it reads from an interactive query. It will then be encoded as Base64 string. KIQR itself remains as agnostic to message contents as Kafka itself is.
+
+Serialization on the Vert.x event bus is a different topic altogether. For each message sent over the event bus, Vert.x must be aware of a message codec for that type – even if the message is transmitted within the same JVM. This is a safeguard as the sender is not aware if the receiver is running on the same or a different node. If it is JVM internal, it will not be serialized, but if it needs to be serialized after all, Vert.x knows what to do. KIQR uses simple POJOs that can be easily converted to JSON. Problem solved. This probably could be more efficient, but hey, early days.
+
+So how can we deploy a Kafka Streams application in with KIQR? First thing you need is a Vertx object. In the simplest case without distribution, this is created by a simple . The distributed case involves setting up a cluster manager as per the following example using Hazelcast:
+
+In the default, this uses UDP broadcasts as cluster discovery mechanism. If that is not available in your environment (e.g. AWS), please check the docs.
+
+Once we got a Vertx object, we can deploy the KIQR verticles. A streaming topology can be started like this:
+
+This starts the streaming application with a HTTP server listening on port 4711.
+
+KIQR supports all standard store operations available in the High Level Streams DSL as of Kafka 0.10.2.0. This is the mapping of endpoints to methods:
+
+You can use the REST API with any client of course, but its URIs contain Base64 encoded serialized keys and the responses also contain serialized values, so a client that handles all that serialization and deserialization sounded like a good idea. The first draft of KIQR contains a REST client based on Apache HttpComponents. The list of dependencies is intentionally kept simple and is restricted to
+
+Plus transitive dependencies, of course. The clients are blocking for the moment, which marks a bit of a step back from all this non-blocking Vert.x code. But non-blocking clients are definitely on the road map. The clients are written in a way that lets you use the actual types of your keys and values. It will use the provided Serdes to handle wire transfers.
+
+There is a generic client whose parameters map closely to the REST API:
+
+There is also a specific client that let’s you set types, serdes and store name once in the constructor so you don’t have to bother with them each time:
+
+This API is probably more enjoyable to use.
+
+As mentioned earlier, KIQR is a hobby project. It has not been used in any actually real-world scenario so far. Some other caveats and restrictions are:
+
+I had a lot of fun building this proof of concept and learned a lot about Vert.x and Interactive Queries on the way. I’d be very happy for feedback.|||
+

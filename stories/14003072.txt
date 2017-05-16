@@ -1,0 +1,103 @@
+This article discloses the exploitation of CVE-2017-2636, which is a race condition in the Linux kernel driver ( ). The described exploit gains root privileges bypassing Supervisor Mode Execution Protection (SMEP).
+
+This driver provides serial line discipline and comes as a kernel module in many Linux distributions, which have in the kernel config. So RHEL 6/7, Fedora, SUSE, Debian, and Ubuntu were affected by CVE-2017-2636.
+
+Currently the flaw is fixed in the mainline Linux kernel (public disclosure). The bug was introduced quite a long time ago, so the patch is backported to the stable kernel versions too.
+
+I've managed to make the proof-of-concept exploit quite stable and fast. It crashes the kernel very rarely and gains the root shell in less than 20 seconds (at least on my machines). This PoC defeats SMEP, but doesn't cope with Supervisor Mode Access Prevention (SMAP), although it is possible with some additional efforts.
+
+My PoC also doesn't defeat Kernel Address Space Layout Randomization (KASLR) and needs to know the kernel code offset. This offset can be obtained using a kernel pointer leak or the prefetch side-channel attack (see xairy's implementation).
+
+First of all let's watch the demo video!
+
+Initially, line discipline used a self-made singly linked list for data buffers and had pointer for buffer retransmitting after an error. It worked, but the commit added data flushing and introduced racy access to .
+
+After tx error concurrent and both use and can put one buffer to twice. That causes an exploitable double-free error in . The data buffers are represented by and allocated in the slab cache.
+
+For fixing this bug, I used a standard kernel linked list and got rid of racy : in case of tx error the current item is put after the head of .
+
+I started the investigation when got a suspicious kernel crash from syzkaller. It is a really great project, which helped to fix an impressively big list of bugs in Linux kernel.
+
+This article is the only way for me to publish the exploit code. So, please, be patient and prepare to plenty of listings!
+
+Let's look to the code of the main loop: going to race till success.
+
+The counter is incremented every iteration, so and variables are changing too. They are used for making lags in the racing threads, which:
+
+Such a way of colliding threads helps to hit the race condition earlier.
+
+Here we open a pseudoterminal master and slave pair and set the line discipline for it. For more information about that, see , and this great discussion about components.
+
+Setting ldisc for a serial line causes the kernel module autoloading. You can get the same effect using daemon.
+
+Here we suspend the pseudoterminal output (see ) and write one data buffer. The fails to send this buffer and saves its address in .
+
+We are ready for the race. Start two threads, which are allowed to run on all available CPU cores:
+
+In a lucky case, they both put the only written buffer pointed by to .
+
+Now we return to the CPU 0 and trigger possible double-free error:
+
+We close the pseudoterminal master. The goes through items and frees the kernel memory used for data buffers. Here the possible double-free error happens.
+
+This particular bug is successfully detected by the Kernel Address Sanitizer (KASAN), which reports the use-after-free happening just before the second .
+
+The final part of the main loop:
+
+Here we try to exploit the double-free error by overwriting . In case of success, we exit from the main loop and run the root shell in the child process using .
+
+As I mentioned, the doubly freed item is allocated in the slab cache. For exploiting double-free error for this cache, we need some kernel objects with the size a bit less than 8 kB. Actually, we need two types of such objects:
+
+Searching for such kernel objects and experimenting with them was not easy and took me some time. Finally, I've chosen with its in . This approach is not new – consider reading the cool write-up about CVE-2016-2384.
+
+The network-related buffers in Linux kernel are represented by . See these great pictures describing data layout. The most important for us is that the network data and are placed in the same kernel memory block pointed by . So creating a 7500-byte network packet in the userspace will make be allocated in the slab cache. Exactly like we want.
+
+But there is one challenge: frees 13 items straight away. At first I was trying to do the heap spray in parallel with , but didn't manage to inject the corresponding between the needed calls. So I used another way: spraying after can give two items with the pointing to the same memory. That's promising.
+
+So we need to spray hard but keep 8 kB UDP packets allocated to avoid mess in the allocator freelist. Socket queues are limited in size, so I've created a lot of sockets using :
+
+Ok. Now we need another kernel object for overwriting the function pointer in . We can't use for that again, because is placed at the same offset in and we don't control it. I was really happy to find that syscall is able to allocate the controllable data in the too.
+
+But I became upset when encountered key data quotas in owned by root. The default value of is 20000. It means that only 2 syscalls can concurrently store our 8 kB payload in the kernel memory, and that's not enough.
+
+But the happiness returned when I encountered the bright idea at the slides of Di Shen from Keen Security Lab: I can make the heap spray successful even if fails!
+
+So, let's look at the code:
+
+The definition of and is copied to the exploit code from kernel header.
+
+The payload buffer will be passed to as a parameter, and the data which we put there at byte offset will exactly overwrite .
+
+The is called in if has flag set to 1. In our case, item resides in the userspace memory, so dereferencing its pointer in the kernelspace will be detected by SMAP.
+
+Anyway, now the points to , which does the classical . However, this shellcode resides in the userspace too, so executing it in the kernelspace will be detected by SMEP. We are going to bypass it soon.
+
+As I mentioned, frees thirteen items. Our is executed shortly after that. Here we do the actual heap spraying by sending twenty 7500-byte UDP packets. Experiments showed that the packets number 12, 13, 14, and 15 are likely to be exploitable, so they are sent to the dedicated server socket.
+
+Now we are going to perform the use-after-free on :
+
+The exact number of syscalls giving the best results was found empirically by testing the exploit many times. The example of call:
+
+If we won the race and did the heap spraying luckily, then our shellcode is executed when the poisoned packet is received. After that we can invalidate the keys that were successfully allocated in the kernel memory:
+
+Now we need to prepare the heap to the next round of racing. The shows that slab stores only 4 objects, so double-free error has high chances to crash the allocator. But the following trick helps to avoid that and makes the exploit much more stable – send a dozen UDP packets to fill the partially emptied slabs.
+
+As I mentioned, the shellcode resides in the userspace. Executing it in the kernelspace is detected by SMEP (Supervisor Mode Execution Protection). It is an x86 feature, which is enabled by toggling the bit 20 of CR4 register.
+
+There are several approaches to defeat it, for example, Vitaly Nikolenko describes how to switch off SMEP using stack pivoting ROP technique. It works great, but I didn't want to copy it blindly. So I've created another quite funny way to defeat SMEP without ROP. Please inform me if that approach is already known.
+
+It writes its first argument to CR4.
+
+Now let's look at , which executes the hijacked in the Ring 0:
+
+We see that the destructor takes address as the first argument. And we control this address in the exploited .
+
+So I've decided to write the address of to and put item at the mmap'ed userspace address , which is the correct value of CR4 with disabled SMEP.
+
+In that case SMEP is disabled on one CPU core without any ROP. However, now we need to win the race twice: first time to disable SMEP, second time to execute the shellcode. But it's not a problem for this particular exploit since it is fast and reliable.
+
+That SMEP bypass looks witty, but introduces one additional requirement - it needs bit 18 (OSXSAVE) of CR4 set to 1. Otherwise becomes 0 and fails, since mapping the zero page is not allowed.
+
+Investigating of and writing this article was a big fun for me. I want to thank Positive Technologies for giving me the opportunity to work on this research. I would really appreciate feedback. See my contacts below.|||
+
+Intro

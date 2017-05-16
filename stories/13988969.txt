@@ -1,0 +1,53 @@
+This is the second entry in a blog series on using Java cryptography securely. The first entry provided an overview and covered some architectural details, using stronger algorithms and some debugging tips . This entry covers Cryptographically Secure Pseudo-Random Number Generators. This blog series should serve as a one-stop resource for anyone who needs to implement a crypto-system in Java. My goal is for it to be a complimentary, security-focused addition to the JCA Reference Guide.
+
+There are various steps in cryptography that call for the use of random numbers. Generating a nonce, initialization vector or cryptographic keying materials all require a random number. The security of basic cryptographic elements largely depends on the underlying random number generator (RNG) that was used. An RNG that is suitable for cryptographic usage is called a Cryptographically Secure Pseudo-Random Number Generator (CSPRNG). The strength of a cryptographic system depends heavily on the properties of these CSPRNGs. Depending on how the generated pseudo-random data is applied, a CSPRNG might need to exhibit some (or all) of these properties:
+
+In Java 8, the SecureRandom class provides CSPRNG functionality. The most OS-agnostic way to generate pseudo-random data that is suitable for general cryptographic use is to rely on the OS implementation's defaults, and never to explicitly seed it (i.e., don't use the setSeed method before a call to next* methods). This is done as below:
+
+Note: This recommendation has the additional advantage of keeping code portable across operating systems, and will provide a secure randomizer if self-seeded. If you want complete assurance of randomness for a given operating system, I would suggest explicitly using the "Windows-PRNG" algorithm for Windows environments (using the getInstance method) and "NativePRNG" for Unix-like environments. Note that these options carry the downside of making code not easily portable. This is explained in detail later in this post.
+
+On Windows, the default implementation will return the SHA1PRNG algorithm (assuming default configuration of java.security). If explicitly seeded, this provides randomness, directly proportional to the source of entropy provided by the initial seeding. It's most secure to rely on upon OS-specific implementations to provide seeding. Providing a low-entropy predictable source could easily lead to generating predictable pseudo-random data, which is inappropriate for any cryptographic applications.
+
+The following are anti-patterns on a Windows OS and should be strictly avoided:
+
+On a Unix-like OS, the following are anti-patterns and should be strictly avoided:
+
+As a developer, you should be aware of what is going on behind the scenes and make sure your applications always generate cryptographically secure random numbers, regardless of other aspects like OS dependencies, default configurations (in java.security files) and seeding sources. So, while designing any CSPRNG, remember the following:
+
+There is nothing random about Math.random. It doesn't provide cryptographically secure random numbers. It generates random values deterministically, but its output is still considered vastly insecure. Want to see for yourself? This blog post[3], explains how simple it is to crack the linear congruential PRNG from which Math.random derives.
+
+A real-world CSPRNG is composed of three things: 1) a CSPRNG algorithm (such as NativePRNG, Windows-PRNG, SHA1PRNG, etc.), 2) a source of randomness, at least during initial seeding and 3) a pseudo-random output. The task of generating a pseudo-random output from a predictable seed using a given algorithm is fairly straightforward. All of the algorithms provided by the Java providers are cryptographically secure[6] too. Thus, the strength of a CSPRNG is directly proportional to the source of entropy used for seeding it (and re-seeding it). We can safely conclude that the security of a crypto-system depends on configuring the highest level of entropy for seeding a CSPRNG algorithm.
+
+The most practical, unpredictable and nearly computationally continuous source of randomness is attained by letting the underlying operating system pool random events into a system file, which can then be used for seeding. In Unix-like systems, the file://dev/random and file://dev/urandom files are continuously updated with random external OS-dependent events.
+
+In most operating systems, the entropy pool used for seeding a randomizer comes in one of these two forms:
+
+Cryptographers tends to be pessimistic about their entropy sources but for most purposes using a non-blocking source of entropy seeding should suffice[8]. All providers and algorithms the Java provides are cryptographically secured as long as they are initially seeded with the highest-entropy source possible. The recommended code sample above takes care of this by providing a default implementation that is seeded from a non-blocking entropy pool.
+
+However, if you need to use these numbers in an application that requires the absolute highest level of entropy or to avoid a security code review argument, you might need to make some precise configurations.
+
+There are a few ways that you can choose between these two pools in your application:
+
+On Unix-like system, securerandom.strongAlgorithm is configured as:
+
+In Java, the SecureRandom class provides the functionality of a CSPRNG. You can request the default implementation by using its constructor, or ask for a specific algorithm by using its getInstance method. The CSPRNG algorithm chosen and how this algorithm is seeded vary between different operating systems and selected implementations, which are in turn based on the provider order in java.security configuration files. To give you an idea of how complicated this gets, refer to the CheckSecureRandomConfig.java program, which lists observations of various permutations and combinations, all of which play an important role in the strength of your randomizer.
+
+We can see from CheckSecureRandomConfig.java that regardless of which approach you take (constructor or getInstance method), the randomizer object returned will be seeded by the configured securerandom.source in the java.security configuration file, and this source is considered safe. However, there is an exception to this rule. While using SHA1PRNG and explicitly seeding the randomizer object initially, the randomness of the pseudo-random data generated is directly proportional to the explicit source of entropy. On Unix-like operating systems, default implementations, securerandom.source value and provider order will give us self-seeded randomizer objects using the NativePRNG algorithm, which is perfectly safe. However, while on Windows, the default implementation returned is always SHA1PRNG. If it's explicitly seeded, it's dangerously un-random. Thus, on Windows, explicitly ask for the Windows-PRNG algorithm. No matter what, stay away from poorly documented SHA1PRNG algorithms.
+
+Java provides an option for explicitly seeding a secure randomizer. It's used mainly when you need to re-seed a randomizer object (to supplement existing seeding), but never for initial seeding. There are various situations in which a re-seeding is mandatory, for example, generating nonces, Initialization Vectors (IVs) and so on.
+
+On Windows, the most secure way to create a randomizer object would be:
+
+On Unix-like systems, the most secure way would be:
+
+Due to OS dependencies, differences in the way that operating systems gather randomness, and obviously the importance of using the correct entropy source in a CSPRNG algorithm, I would highly encourage everyone to run "CheckSecureRandomConfig.java" on your target systems. This can double-check the algorithm used, and how the randomizer is seeded (file:/dev/urandom or file:/dev/random if needed). Run this code a few times to make sure that the same data is not generated across multiple calls (as would occur with a static explicit seeding). Such output would immediately prove a low entropy source for pseudo-random data.
+
+I only wish that Java would have taken some responsibility for security, as python does at the start of its modules, and alert its users.
+
+A recent incident that illustrates how using a weak random number generator could compromise the security of a system is the attack against the Hacker News website. The attack is explained here,with precise technical details described here. To summarize; account thefts on this site took place due to the use of a CSPRNG seeded with time in milliseconds, a week entropy source.
+
+This SecuredAESUsage code example shows how to use SecureRandom in the most secure manner for generating an Initialization Vector.
+
+In a virtual environment, the entropy pool is being shared between different instances. Situations have been observed[7] in which the co-existence and sharing of entropy pools leads to problems. In the case of a non-blocking pool, the pool can be drained out, leading to low entropy. For blocking pools, if all VM instances are started at the same time, they can block each other, effectively leading to a Denial of Service conditions or at best, longer start times. Such scenarios are observed by bitcoin miners, and AWS tomcat users as well. This situation might become more acute when full snapshots are taken that also clone the randomness pool. It adds to the problem of low entropy, since a virtual machine has limited hardware sources into an OS' randomness pool (for example, no keyboard, mouse, etc.). Currently, however there are no widely popular solutions to such behaviors, and I would recommend continuing with my suggestion above. This should still provide you with computationally secure randomness. Just keep in mind that if you observe this behavior in your applications, you can troubleshoot this further.|||
+
+Skip to the tl;dr

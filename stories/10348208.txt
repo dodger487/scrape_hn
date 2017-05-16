@@ -1,0 +1,33 @@
+Supplemental and ad-hoc logs are helpful for debugging problematic responses, but they aren’t ideal for production logging. For production you need per-request timing ingrained with standard logging output. These enhanced logs help effectively analyze trends over time and diagnose production performance. In this post we’ll look at how to measure the performance of caching during a request and how to shim that into production logging.
+
+All of the examples in this post are written with Readthis in mind, but the technique will work for any instrumented library. In fact, because the event names are standardized as , these techniques will work for any cache.
+
+With standard Rails production logging your request timing is comprised of three values: , , and . For basic applications without any external services or caching the combined and timing is sufficient. Once your application integrates additional databases such as Memcached, ElasticSearch, or Redis the standard log output won’t tell the whole story.
+
+Below is sample output of a log without any additional timing information. Note that it is formatted using Lograge and has been edited for clarity.
+
+All of the render timing is bundled into the view. Any external requests, including cache or search, are included in the timing. That simply won’t do! Let’s get started unpacking those timings.
+
+The linchpin of Rails instrumentation is . If you recall from Instrumenting Your Cache With Notifications, it is the module that enables hooking into any instrumented block to receive timing information. Here is an how you would write out the timing of every cache event:
+
+That example merely writes out the duration to . Instead, we want to forward that event to a module that will aggregate the timing for multiple events.
+
+Remember, the block will be called for every cache event, many of which can trigger during a single request. Aggregated timings can be recorded with a small purpose-built module, so long as you’re mindful of thread safety. For multi-threaded servers such as Puma it is crucial that the recording events is limited to the thread handling the request. Modules are constants, and constants are global, so we need to use to store timing values.
+
+With this module available it is trivial to append new runtimes for cache events. Instead of writing out the event duration within the subscribe block, the method is called with the event.
+
+Augmenting the controller rendering lifecycle isn’t at all invasive. provides a method explicitly for the purpose of fixing erroneous view runtimes. The hook is called around rendering, offering a place to remove cache runtime from the full view runtime.
+
+Another hook, , provides a way to inject additional runtime information into the event payload. Above we do just that, append the and reset it for the next request.
+
+The hook from is the final piece in gluing everything together. We can pass a block that will be executed within after it has finished loading. It is within that block that we include our module and subscribe to cache notifications.
+
+While it is possible to format Rails’ built in logger, we’ll use the compact formatting provided by Lograge. Not only is it compact and easy to read, but it is simple to modify at configuration time through . Lograge uses the same instrumentation subscribers as Rails’ own logging internals. The logging event is passed through with accumulated timings in the payload, which can be accessed directly.
+
+With this addition the log output will look like this now:
+
+I initially underestimated the effort involved in piping instrumentation data into logs. The classes are well documented, cleanly abstracted, and compose well—but it takes a while to understand how to glue everything together. Understanding the tools available is the hard part, once you get past that the effort involved is minimal.
+
+Custom instrumentation and logging should be provided for mature libraries. If it isn’t available, ask for it, or better yet, submit a pull request. Enhanced logging tools will be rolled into Readthis soon, so augmenting logs with cache timings is as simple as requiring a module.|||
+
+Improve and upgrade rails applications

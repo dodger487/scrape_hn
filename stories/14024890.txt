@@ -1,0 +1,49 @@
+When signing your JWTs it is better to use an asymmetric signing algorithm. Doing so will no longer require sharing a private key across many applications. Using an algorithm like RS256 and the JWKS endpoint allows your applications to trust the JWTs signed by Auth0.
+
+The code snippets below have been adapted from Auth0's node-jwks-rsa and express-jwt.
+
+When creating clients and resources servers (APIs) in Auth0, two algorithms are supported for signing JSON Web Tokens (JWTs): RS256 and HS256. HS256 is the default for clients and RS256 is the default for APIs. When building applications, it is important to understand the differences between these two algorithms. To begin, HS256 generates a symmetric MAC and RS256 generates an asymmetric signature. Simply put HS256 must share a secret with any client or API that wants to verify the JWT. Like any other symmetric algorithm, the same secret is used for both signing and verifying the JWT. This means there is no way to fully guarantee Auth0 generated the JWT as any client or API with the secret could generate a validly signed JWT. On the other hand, RS256 generates an asymmetric signature, which means a private key must be used to sign the JWT and a different public key must be used to verify the signature. Unlike symmetric algorithms, using RS256 offers assurances that Auth0 is the signer of a JWT since Auth0 is the only party with the private key.
+
+Due to the symmetric nature of HS256 we favor the use of RS256 for signing your JWTs, especially for APIs with 3rd party clients. However, this decision comes with some extra steps for verifying the signature of your JWTs. Auth0 uses the JWK specification to represent the cryptographic keys used for signing tokens. This spec defines two high level data structures: JWKS and JWK. Here are the definitions directly from the specification:
+
+At the most basic level, the JWKS is a set of keys containing the public keys that should be used to verify any JWT issued by the authorization server. Auth0 exposes a JWKS endpoint for each tenant, which is found at https://your-tenant.auth0.com/.well-known/jwks.json. This endpoint will contain the JWK used to sign all Auth0 issued JWTs for this tenant. Here is an example of the JWKS used by a demo tenant.
+
+Note: At the time of writing, Auth0 only supports a single JWK for signing, however it is important to assume this endpoint could contain multiple JWKs. As an example, multiple keys can be found in the JWKS when rotating signing certificates.
+
+The JWKS above contains a single key. Each property in the key is defined by the JWK specification RFC 7517 Section 4. We will use these properties to determine which key was used to sign the JWT. Here is a quick breakdown of what each property represents:
+
+Now that we understand JWKS and the specific properties of each JWK let's put this together and verify a JWT signed by Auth0 with RS256. In our example we are going to build a first party API for our ficticious company c0der.io. The API will have a single endpoint returning metadata about our API, which requires a valid JWT. Ideally your resource server would also validate necessary scopes, however, that is beyond this topic. We will assume an API and client have been created and we will focus on what happens once our API recieves a request.
+
+Here are the steps for validating the JWT:
+
+Let's jump into some code and see this in action.
+
+The first thing we are going to do is grab the key set from the Auth0 JWKS endpoint. Using we can simply perform a to retrieve the JSON blob.
+
+After grabbing the JWKS we will filter out all the keys that are not intended for signing a JWT. This step may seem unneccessary as the Auth0 JWKS endpoint typically contains a single signing key, however it is good practice to assume multiple keys could be present (i.e. key rotation).
+
+Quick recap, we have retrieved the set of keys (JWKS) from Auth0 and we have filtered out all keys that are not intended for signing a JWT with the keytype of RSA. As an additional measure, we filtered out any key missing a public key and a property. This step is important as later we will need to use the property to find the exact key necessary to verify the JWT.
+
+Continuing with our example, we will add an additional method to called taking a key identifier ( ) as an argument and return the expected key (JWK) used to sign the JWT. If a JWK is not found, then an error must be thrown. This means the JWT supplied with the request was signed with a key that is not supported by Auth0. This should ultimately be treated as a . If a matching key is found, then that key will be passed as an argument to the callback.
+
+So far we have built a client that can be used to retrieve the JWKS and find the signing key using the value of the property. At this point, we have neither verified the JWT nor extracted it from the request.
+
+Before we move on to processing the JWT we want to create a quick wrapper for the that returns a method that will eventually hand off the key we need to verify the JWT. This class is a bit specific to the node async model, however it is necessary for the final step when we tie together the final middleware.
+
+Now we need to move on to extract the JWT from the request. Most APIs expect the JWT is sent as a Bearer Token in the authorization header or as a URL parameter. Now we are going to start building an Express middleware that will extract the JWT, create a signing secret, and verify the token using the module. We will start by creating a file called and extract the JWT from the request.
+
+At this point the middleware is pretty boring. It simply parses the authorization header for the format . If the authorization header doesn't exist, is empty, or does not fit the format the we will throw an which later is treated as a response. If the header does meet the criteria the JWT is pulled from the authorization header.
+
+Now that we have our hands on the JWT we need to decode the token. This will be important later when we want to grab the property to find the key we need to verify the signature. Recall we can decode the JWT as it is simply base 64 url encoded. To do this we will use the node module. If you are interested in learning more about how a JWT is constructed check out our blog post.
+
+Now that we have the decoded token we have all the pieces we need to call get the JWKS and find the signing key. First, we will use the to wrap our calls to and assign it to . Next, using the node module, we will verify the token. Lastly, we will use to call and invoke with the results of . This will ultimately be used to verify the JWT.
+
+Now that we have all the pieces in place to validate an RS256 token, we need to configure the middleware and apply it to the route.
+
+As you can see anytime we call the api's endpoint a token will be verified. This is where all of the pieces are pulled together. Each time a request is made to the JWT will be verified against the appropriate key in the JWKS. Also, if the JWT passes signature verification the audience and issuer will be checked using module.
+
+At this point we have seen an end to end sample for verifying a RS256 signed JWT. This process not overly difficult, however it does add significant complexity as opposed to a symmetric algorithm like HS256. Despite the added complexity it offers significant security benefits over HS256 and will surely pay off in the long run. We highly recommend using RS256 as a means to sign your JWTs.
+
+You can find the full sample on GitHub.|||
+
+Learn how to start using RS256 for signing your JWTs.

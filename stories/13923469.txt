@@ -1,0 +1,111 @@
+Implementing AWS security best practices into your Terraform design is an excellent way of ensuring that you have a streamlined way to achieve your security goals and manage your infrastructure.
+
+In this post, we will talk about the following three areas of AWS security best practices and how to implement them with Terraform:
+
+Just to be clear, this post is not an introduction to Terraform: It’s an introduction to incorporating AWS security best practices into Terraform code.
+
+One of the most valuable design decisions you can make with AWS is using multiple AWS accounts so that Prod, Dev, and QA/Testing each have their own account. Unfortunately, this practice is not widely followed for a number of reasons: Setup involves more work, billing becomes more complicated, and maintenance requires that multiple environments be kept in parity with one another. Also, some people just haven’t thought of segregation by account. I didn’t until I saw it here at Threat Stack. But the idea that Dev, QA, and Prod environments should be kept in sync is a fundamental idea that we accept as important for ensuring reliable systems.
+
+Why are multiple AWS accounts useful?
+
+From an engineering and reliability point of view, if all environments are kept in sync, it means the effects of changes to the environment can be tested in isolation. It’s better for an idea to fail in Dev than it is to fail in Prod. I want a developer to spin up the resources they need to get their work done and destroy them when they’re finished in Dev. I don’t want developers doing that in Prod. You could do this with complex AWS IAM policies, but a simpler and less intensive solution would be to grant wider permissions to engineers in the Dev AWS account and to restrict permissions— or even deny permission — in the Prod AWS account.
+
+Let’s also look at how multiple accounts enhance the environment’s security stance. First, keep in mind that oftentimes, attackers don’t directly breach the most valuable target. They move laterally within the environment until they reach something of value. Second, let’s be honest: Non-production systems are often not treated with the same level of care that production systems are. Sure you have restricted access to your production systems… But there’s an exception so your deploy system running via Jenkins can login to deploy new code. How secure are your Jenkins hosts? Are you confident that they are well secured and that an an attacker couldn’t use them to gain lateral access to a production system? By segregating environments by account, you are limiting the movement an intruder can make in your environment.
+
+So back to the question of why organizations don’t separate environments by account. To handle billing complexity, AWS offers Consolidated Billing and rolling all bills into a single account. AWS now offers AWS Organizations the ability to make the management of multiple accounts even easier. To handle the complexity of environment maintenance and keeping parity across environments, we are turning our AWS setup into Terraform code. We are doing this because setting up new VPCs by hand is complicated and takes considerable time from a number of resources both in initial work and then troubleshooting to figure out why two hosts in different subnets cannot communicate with one another. When making changes after the VPC is up and running, we are running terraform apply across multiple environments instead of making the same change across multiple environments by hand.
+
+So how do you handle multiple environments in Terraform? If you are a regular Terraform user, you have asked yourself this question before. It’s one of the most routine questions with Terraform: “How do I design my Terraform code structure so I can apply changes on a per environment basis?” You want to make a change and have it only affect Dev resources. Then when you’re ready, you want to apply it to your Prod resources. In Terraform terms you ask, “How do I manage a state file per environment?” (Terraform tracks all changes in a state file that can live locally or remotely.) People have solved this in a variety of ways. Some have used multiple directories and usually some symlinks to cut down on common code. Some write wrapper scripts. And many have combined those ideas. Terraform today might remind you of the early days of Puppet and Chef when the best practices hadn’t really been worked out yet. (Remember Puppet before “roles and profiles”?)
+
+By choosing to segregate your environments by AWS account, you inadvertently solve this Terraform question. You actually can’t touch resources in Prod and Dev at the same time because you are only using a single set of AWS credentials when Terraform runs. The AWS SDKs let you set up multiple account credential profiles in a file named “$HOME/.aws/credentials”. The format looks like this:
+
+The profile used is controlled by the $AWS_PROFILE environment variable of the shell. I even go as far as incorporating the current profile into my shell prompt:
+
+Terraform respects all this and lets you override these settings in the AWS provider resource if you prefer to do it that way instead of relying on the shell environment.
+
+So now you have no concept of environment in Terraform — just accounts— and don’t have to worry about changes to one environment affecting another environment when you run terraform apply. Let’s handle different account configurations in Terraform. You want all your environments to look as much the same as possible. However, you don’t want Dev to be a complete replica of the Prod environment. Why pay for thirty hosts in Dev when three would handle all that was needed for the engineering team? What you want is the same environment structure and design between different environments — but resized to meet the needs of those environments. This requires you to separate configuration data from infrastructure logic.
+
+Here is an example of this idea. The repository for it is located here:
+
+The main.tf file contains a resource to create infrastructure using a Terraform module. The module handles AWS infrastructure resources like security groups and auto scaling groups:
+
+The differences between the Dev and Prod Example Service are contained in the tfvars files. They are mostly the same with the exception of the asg_* variables to reflect the difference in ASG size:
+
+The Terraform design discussed above implements an AWS best practice of environment segregation that allows lateral movements to be better contained in the event of a breach. Terraform has also solved the issue of environment segregation in Terraform so that changes applied to one environment cannot concurrently affect another environment.
+
+Setting up CloudTrail logging is one of the simplest things you can do in your environment to create better visibility and auditability. CloudTrail logs all AWS API calls in your account and delivers those logs to an S3 bucket. The logs will include the identity of the caller, time of call, source IP, request parameters, and response elements. This includes both calls made through SDKs or CLI tools and the Console. With these logs, you can use tools to receive alerts on suspicious usage or changes, or to perform analysis after an event.
+
+Setting up CloudTrail logging is easy, but too often it is overlooked. Enabling it will help track down changes in the AWS environment. Here are some of the important CloudTrail configurations that need to be made:
+
+Optionally, these are also useful:
+
+We will discuss all of these with the exception of Encryption, because KMS requires its own indepth dive.
+
+The tf_example_aws_cloudtrail module provides variables for configuring multi-region trails and validation:
+
+The enable_log_file_validation variable ensures that a digitally signed hash will be created so log file contents can be validated. This is useful for ensuring the integrity of CloudWatch. The is_multi_region_trail variable defaults to False. Ensure that a multi-region CloudTrail is setup. Why? Because you want to catch events in any region where you do have resources and in any region where you don’t have anything setup…  Or at least you think you don’t have anything set up.
+
+Looking at the example environments, Prod and Dev are only in us-east-1, so they have multi-region trails enabled:
+
+You want to ensure that the S3 bucket that logs are delivered to isn’t wide open to the world and that access to the logs is recorded. The tf_example_aws_s3 module used by tf_example_aws_cloudtrail does all this by default:
+
+Access to the bucket by CloudTrail is controlled by the bucket policy created in tf_example_aws_cloudtrail:
+
+This is also an example of why I am a strong advocate of providing modules with sane defaults in Terraform (and Puppet, Chef, etc.). Rather than people creating resources in Terraform directly, which usually means copying around boilerplate code, they use modules that provide enough safety and require them to explicitly set unsafe configurations. This makes the code easier to review. Just compare the contents of the tf_example_aws_s3 module with the resource needed in tf_example_aws_cloudtrail to create an S3 bucket:
+
+Finally, CloudTrail logs can be streamed to CloudWatch. With CloudTrail events in CloudWatch, they can now be viewed just like any other log.
+
+This requires creating a CloudWatch logstream and an IAM role with a policy attached to it that allows delivery from the CloudTrail trail to the CloudWatch log stream:
+
+I touched on one reason why people don’t use multiple accounts, and that was the complexity of VPC setup. Good news! Here’s an example Terraform setup for a VPC:
+
+Now let’s take a look at the design decisions made to create a better security posture. The decisions primarily center on the way subnets and security groups are handled. We want to limit hosts so they can only talk to the hosts they need to talk to.
+
+This sort of practice used to be fairly common in the pre-cloud days. If system A had to talk to system B, you put in a ticket to Network Engineering for them to allow traffic. When people started moving to the cloud, there was no Network Engineering team, and the idea of putting in tickets to allow access between systems slowed down the promise of speedy service delivery via the cloud. The result? Many organizations allowed every host in the default security group (which contained every host in their environment) to talk to every other host on every port.
+
+Problem solved! Well, problem solved from a speed of service delivery standpoint — but terrible for security. But now with your AWS infrastructure as code, you can default to denying all traffic and selectively opening traffic up as a part of service delivery.
+
+We are going to approach traffic segmentation through the way we build VPC subnets and security groups. There will be a single VPC with a set of private subnets and a set of public subnets. By default, the security groups will not allow traffic between public and private subnets. Then we will selectively allow traffic where necessary. Finally, we will only allow SSH access to the environment from a bastion host and show how we allow traffic from the bastion host to other areas of the environment.
+
+First a quick note on VPC-based segmentation. I went down that path initially, and if you go through the history of the example repository, you will see where I had a private and a public VPC. I opted not to go that route after I got to AWS Route53 setup. I like to place all hosts in my environment in a global domain space. Typically I use . as a convention. This means that as long as you know the instance ID of the host, you can get to it quickly. When I looked at Route53 Private Hosted Zones, I found that it is possible to share DNS zones across VPCs, but they cannot be in overlapping namespaces. At that point, I reevaluated my design. In the end I felt I could complete what I was looking for with just subnets and security groups. On the downside, I need to get my subnet sizes for public and private subnets correct based on what I think my needs will be. With multiple VPCs there is greater room for over estimation, which is helpful. If you want to understand more about different ways to handle VPCs, have a look here:
+
+Our Terraform design has two types of subnets — public and private — and we create a public and private subnet for each availability zone we use. (In us-east-1, we only use three AZs. As a general rule, sticking to odd numbers is helpful because it makes consensus decisions easier.) In our setup, instances in a public subnet get a publicly routable IP address, while those in the private subnet do not.
+
+Anything that is an edge-facing service should end up in the public VPC. These are hosts and services that we want to be able to account for and restrict movement from. These are hosts that could potentially be breached externally, so you want to make sure attackers can’t make it far in our environment.
+
+Hosts in the public subnets reach the internet via an Internet Gateway associated with the default (0.0.0.0/0) route in the route tables for the public subnets:
+
+Hosts in the private subnets reach the internet via NAT Gateways associated with the default (0.0.0.0/0) route in the route tables for the private subnets:
+
+With hosts segregated by subnets, we can turn to the security groups. Segregating hosts into these multiple subnets would not be useful if we just let them all talk to each other with no restrictions. This is a common setup in AWS environments, but with Terraform, it doesn’t have to be. Being able to programmatically control AWS security groups means we can bring back the network controls of the pre-cloud days that limited movement across the network and retain the speed of service delivery that we have come to expect from the cloud.
+
+In the example VPC setup, there are three “default” security groups: the “default” security group created with the creation of a VPC and additional SGs to be private and public subnet SGs:
+
+When creating a new VPC, AWS creates the “default” security group with rules to facilitate traffic and get you up and running quickly and easily. Terraform immediately removes those rules after creating the VPC. This Terraform module continues that idea. While the “default” SG is defined as a resource, we never add any rules to it. We will not add a rule that affects all hosts in our environment!
+
+The private and public “default” SGs are useful for some basic rules. First they let us define network egress for private and public subnets independently. We use the same egress rule for public and private, but the option is there if we wanted to use it. We also optionally create an ingress rule that allows SSH traffic among the hosts in the same subnet type. Private hosts can SSH to other private hosts. Public hosts can SSH to other public hosts. This rule is optional in the module.
+
+Setting the variable private_subnets_allow_all or public_subnets_allow_all will disable that rule. Different organizations have different feelings about allowing SSH around the environment. For that reason, I made the rule a boolean. The module defaults to disabling the rule, and we explicitly disable it in our environment files. This feature is very useful if you want to allow SSH access in your Dev environment so engineers can work faster but want to disable the rule in the Prod environment where restrictions need to be tighter:
+
+How do you manage such a locked down environment with no SSH access to anything and segregated subnets with no ability to talk to each other? In comes the Bastion Host. This is the host all users must log into first in order to reach any other host in the environment. The Bastion Host service illustrates two things:
+
+Here is a basic Bastion service in Terraform:
+
+It uses a Terraform module called tf_example_svc which defines what a service should look like in the Example environment:
+
+The Bastion Hosts should be the focus point for user access to the AWS environment. In practice that means that this host should have additional security measures in place (for example, requiring 2FA in order to SSH into the host). If you can’t easily monitor the access logs for all your hosts, at least make sure you’re monitoring access to this host. Don’t leave SSH access open to the entire internet even if it is “just your public subnet hosts”. Use a Bastion Host.
+
+What makes this an interesting Terraform example is the SG rules that we create. In terraform-example-bastion, we create an additional security rule that allows access from the Bastion Host to hosts in both the public and private VPCs. We create the security groups in terraform-example-aws-vpc, but the rule to make this service useful is created by terraform-example-bastion. I didn’t really cover this previously, but our Terraform repositories store the state of the resources they manage remotely, in our case in an S3 bucket.
+
+Remote state usage and its advantages (such as infrastructure auditability) is its own in-depth topic. To learn more about it take a look here:
+
+In the tfvars files you list the subnets you want to grant access to and on what port:
+
+In main.tf you query the VPC remote state to get the default security group IDs for the public and private subnets and then create a rule to allow SSH traffic to the hosts in those subnets:
+
+This is actually pretty cool about Terraform! When you deploy the Bastion service to the environment, rules are created to allow access. If you removed the service from the environment, those rules go away! Think of what you can actually do now with this. Rather than requesting access to other services and requiring security group rules to be tracked separately, or just opening up all traffic, a service can define its dependencies and explicitly what it needs to be able to talk to.
+
+Environment segregation by AWS account, CloudTrail logging, and traffic access controls are three AWS best practices that will reinforce your environment’s security stance. Implementing them into your Terraform design following the guidance in this blog is an excellent way to ensure that you have a streamlined way of achieving your security goals and managing your infrastructure.
+
+If you would like to see and use any of the code used this post, please consult the following:|||
+
+Implementing AWS security best practices into your Terraform design is an excellent way to ensure you can achieve your security goals and manage your infrastructure.

@@ -1,0 +1,77 @@
+As part of a series of blog posts on Chaos engineering, this blog post introduces the open source library docker-compose-toolkit. Here, we use this library to define a Chaos experiment (using extensible effects) that illustrates the impact that auto-downing can have when an Akka cluster is subjected to network partitioning. The previous post Can Real World Distributed Systems be Proven Correct? motivates and explains the need for performing fault injection on distributed applications. In future posts, we will consider more realistic use cases than considered here - so please stay tuned!
+
+docker-compose-testkit is an open source library (implemented in Scala) for defining and automatically running Chaos experiments against Dockerised distributed applications.
+
+The library provides the ability to deploy, orchestrate and instrument distributed Dockerised applications to multiple target environments (e.g. local development, AWS, Azure, GCE, etc.). Deployed applications are treated as a black box and may be monitored (via defined sensor probes) or interacted with (via defined data injection points).
+
+As we shall see, Chaos experiments will be defined by composing runtime monitors using extensible effects. This will enable the reuse of Chaos experiments and runtime monitors across projects.
+
+We shall illustrate how docker-compose-testkit might be used by presenting a simple use case scenario. In our example scenario, we will first launch an Akka cluster. Once we are sure the Akka cluster is stable, we shall partition the network that the cluster uses to communicate. Using auto-downing, we will then wait until the Akka cluster split brains. Moreover, we want to do all of this automatically and in realtime!
+
+For an extra bit of spice, we will also risk a split brain by simulating a JVM garbage collection pause. As these are stop the world events, any JVM garbage collection pause that is too long may also cause the cluster to split brain. We will define a runtime monitor that waits until the cluster node engaging in the JVM garabage collection pause is disassociated from the Akka cluster. At this point in time, we will end the JVM garbage collection pause and allow the cluster to heal itself.
+
+Using docker-compose-testkit consists in following at most 4 steps. We define and explain each of these steps in the following subsections.
+
+In order to be able to observe and interact with a deployed system, we need to describe the services it has available, how these services are configured and the networks these services should connect to. Docker Compose provides a convenient medium for expressing these requirements.
+
+For our working example, we will need to describe 4 Akka cluster nodes (we will show how we do this shortly), and 3 networks as follows:
+
+Each Akka node will be configured using environment variables (e.g. to specify actor system ports, hostnames and seeding nodes) and will be connected to 2 networks. All our Akka nodes will be built using a single generic Akka image (see Node.scala) as follows:
+
+Notice that we have introduced the non-standard Docker Compose YAML section. As we shall shortly see, this will be used to define any instrumentation layers that we wish to add to deployed services. Deploying and orchestrating our fleet of Dockerised services can then be achieved using:
+
+Ultimately, all interaction between our Chaos experiment and a deployed application will utilise side effecting code. In future posts, we will want to ensure that Chaos experiments can be code generated. This implies that Chaos experiments will need to be first class data citizens. Hence we will functionally model these side effects using extensible effects. In particular, we will utilise the Eff monad library to achieve our goals here. Broadly, our aim here is to keep all side effecting code at the external code boundaries to our otherwise functionally defined Chaos experiments.
+
+Using extensible effects will boil down to defining a lightweight DSL describing how we observe a sensor or interact with a data injection point. We will then provide an interpreter for that DSL that may utilise side effecting code (e.g. to repeatibly perform a ).
+
+For our working example, we wish to define a Chaos experiment that is able to simulate a JVM GC pause and to perform a network partition. JVM GC pauses will here be simulated by pausing the Docker container and network partitions will be implemented by using the tc command to modify the network attached NICs to drop packets 100% of the time.
+
+For the moment, let us assume that monitors can be implemented using nested partial functions (we will see more of this latter). Then a simple DSL for JVM GC events consists of just starting and stopping the JVM GC pause as follows:
+
+Notice how we encode the return type from a event in the trait.
+
+In order to be able to provide a compositional DSL syntax, we need to provide a convenience constructor for injecting JVM GC actions into the monad as follows:
+
+Finally, we can provide an interpreter implementation for our DSL as follows:
+
+Notice how we pass a context (relating 's to string based identifiers) to the interpreter method. Also notice how this code wraps up our side effecting Docker interactions using an error effect.
+
+Again, as for JVM GC events, we define a simple DSL and convenience constructors as follows:
+
+The network partition DSL being interpreted as follows:
+
+Here we will utilise the Akka JMX console tools to observe the current state of the cluster. It is worth noting that these tools are deprecated and are intended to be replaced by the REST based Cluster Management interface.
+
+As we shall shortly see, we will define runtime monitors using state machines as follows:
+
+Here, these state machines are driven by polling a named Docker container and running the Akka JMX command line tool to observe the nodes current cluster state (these observed events are produced into a Monix Observable). On each transition of the state machine we may optionally emit notification events. Whenever the state machine terminates, then we will always generate a notification event. These notification events are collected into Monix Observables - and so, runtime monitors may be thought of as transforming Observable data types. This leads us to interpret our JMX based cluster sensor DSL as follows:
+
+Having defined extensible effects to implement our sensors and injection points, we still need to ensure that our deployed Docker containers are correctly built with additional features such as JMX command line scripts and libraries. We achieve this here by extending the Docker Compose YAML file with some syntactic sugar that allows us to express what additional code resources should be layered on top of our immutable base Docker container:
+
+Runtime monitors are implemented as state machines which are driven using events observed from our deployed application. On each transition of the state machine we may optionally emit notification events. This leads us to define the following:
+
+It is worth noting that whenever the state machine terminates, then we will always generate a notification event. These notification events are collected into Monix Observables. Additionally, at each monitor state, we may optionally specify a duration for being in that state.
+
+With our working example, we need to be able to determine if a given node has become unreachable (that way we enable recovery from a potential split brain during a long JVM GC pause). We achieve this using the following one state (of type ) state machine:
+
+We also need to be able to detect that a given set of nodes has successully joined the Akka cluster and are associated with the cluster in an state. As we would like this to be the case for some period of time (that way we might then say that the cluster is stable), we use the slightly more complex runtime monitor:
+
+So far we have defined how to instrument and deploy our Dockerised application. We have also described how we can monitor the deployed sensors and interact with data injection points. All we need to do now is to show how we can define experiments that introduce Chaos into the system by injecting faulting behaviour!
+
+Broadly speaking, we can imagine a Chaos experiment as being a state machine with runtime monitors as states. As runtime monitors succeed, then the Chaos experiment transitions into a new monitoring state emiting a data injection event. As sensors and data injection points are implemented as extensible effects in the Eff monad, we can simply combine these effects and so define Chaos experiments as an effect via for-comprehensions.
+
+So, for our working example, we need to monitor:
+
+This leads us to define the following Chaos experiment template:
+
+In order to complete the definition of our Chaos experiment, we just need to define the experiment's data injection (i.e. JVM GC and network partitioning events) as follows:
+
+Finally, in order to run these experiments, we need to specify the collection of monadic effects that we intend to use. The type constraints in the method dictates which effects must be present in the monadic effect stack (i.e. the type ). Having done that, we can then run each effect to (hopefully!) generate a successful outcome for the Chaos experiment:
+
+In this post, we have demonstrated the dangers of auto-downing during network partitioning (see screencast). This has been achieved using docker-compose-testkit to specify, control and monitor fault injection testing scenarios (c.f. a Chaos experiment). Using extensible effects we have shown how we may contain side effecting system interactions within a functional environment. In future posts, we will build upon this work so that we may search for Chaos experiments using formal models of our distributed application.
+
+One limitation with the example that we have presented here is that it makes various closed-world assumptions regarding its knowledge of the system. However, as we outlined in the post Can Real-world Distributed Systems be Proven Correct?, real world examples typically operate in highly dynamic and changing environments, and so such assumptions can not be generally made.
+
+In our next post, we will examine using docker-compose-testkit to investigate and resolve more realistic distributed programming issues. In the meantime, if you would like to learn more, why not attend my talk at the Krakow Scala user group's ScalaCamp #10?|||
+
+Chaos Experiment: Split Braining Akka Clusters

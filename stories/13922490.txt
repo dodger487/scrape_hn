@@ -1,0 +1,87 @@
+The development team at CCBill recently revised some of the core web applications in the company. The aim was to modernize them and better apply microservice architecture in order to enable easier deployment, scaling and resilience. We had applications built with Spring Framework with traditional WAR deployment and our goal was to transform them to Spring Boot applications with embedded servlet container (Tomcat) and jar packaging. We also wanted to take advantage of Servlet 3.0+ API and move entirely to programmatic (Java) configuration.
+
+One of the applications had several dispatcher servlets defined in web.xml file, which means few servlets and their contexts inside the application. Since my task was to create contexts for Spring (Boot) application using Java configuration, I started looking for some helpful resources on the topic. The official documentation for this particular subject was quite scarce and it took a while until I found a solution.
+
+Frustrated with the lack of web articles covering the topic, I decided to write this article and hopefully fill that gap. Also, I created sample applications on GitHub that fully demonstrate examples discussed here.
+
+In most cases, modern Spring (Boot) applications have only one context. Microservice architecture typically reduces the need for complex application structure, but some situations might require additional contexts. In my case there was an existing application with more than one context that had to be transformed. By having multiple contexts, it’s possible to take advantage of providing different configuration and overriding one from parent context if necessary. It’s even possible to have different class or resource loader in order to avoid possible conflicts. For example, if certain beans (configuration) are needed only when processing a request from a certain path (e.g. /foo) and interfering with other beans from the rest of application must be avoided – one can create a servlet, give it a web context and place all required beans and specific configurations there. Further, additional context is required if some functionalities need to be exposed through an additional port. Creating a separate context and adding beans to it can be very handy when building a library that will be a part of existing application(s). Placing beans in separate context will avoid bean overriding:
+
+In case of multiple @Configuration classes, @Bean methods defined in later classes will override those defined in earlier classes.
+
+Contexts can be organized in hierarchy. A context can have only one parent context, but there can be multiple child contexts. Beans from parent context are visible in child context but not vice-versa. That way, a child context can use beans and configuration from parent context and override only what’s necessary. Example of that can be a security defined in parent context and used/overridden in child contexts.
+
+Spring and Spring Boot provide a lot of utilities for integration testing. It is possible to set up a minimal context configuration for a specific test. Instead of triggering entire configuration for context (or multiple contexts), it’s possible to run the tests with the required configuration only. That way, the tests will start faster and you will save few seconds, but this should be avoided. In my opinion, the integration environment should mimic the one from runtime because that helps make the tests more reliable. In addition to this, dedicated build servers and faster disks minimize the impact of test execution duration. There are specific cases when testing contexts in isolation makes sense and it should be applied only when they have nothing in common.
+
+Contexts can be created using Spring Boot's Fluent builder API. SpringApplicationBuilder is a builder for SpringApplication and ApplicationContext instances, providing context hierarchy support.
+
+Here is the example:
+
+ParentCtxConfig, ChildFirstCtxConfig and ChildSecondCtxConfig are classes annotated with @SpringBootApplication which is an annotation for configuration classes that also triggers auto-configuration and component scanning.
+
+Example code will generate three instances of SpringApplication and appropriate application context for every instance. It will produce one parent context (configured with ParentCtxConfig) and two child web contexts (ChildFirstCtxConfig and ChildSecondCtxConfig). Note that parent context is not a web context. It is a type of AnnotationConfigApplicationContext and child contexts are of type AnnotationConfigEmbeddedWebApplicationContext. The former type bootstraps itself using EmbeddedServletContainer implementation, so this example will produce two instances of embedded Tomcat. It should be kept in mind that all application’s contexts (and their Tomcat instances) will run in a single VM.
+
+
+
+ All of the contexts are configured from the same locations. This means that the default configuration file will be used to configure all of them, which is why it is important to make sure that it contains no configurations that can’t be shared among contexts. Example of that is a server port. We need to ensure that two child contexts are using different ports. We can do that with server.port property which has different values for every web context. One way to achieve this is to have dedicated properties file for every context and to import them using @PropertySource in relevant configuration class. Also, there are few other ways to configure context. Please refer to the documentation for that.
+
+A great thing about this approach is that we have separate standalone child contexts. That will give us the opportunity to test them in isolation since they don’t mix up in any way. But we need to have a parent context in place and appropriate hierarchy like in the example.
+
+ We will use @ContextHierarchy and @ContextConfiguration to define configuration classes and set up a hierarchy. Parent context setup will be in separate class that will test classes extend. For the first context from the example we will set up test like this:
+
+Where ParentCtxDefinition sets up parent context as follows:
+
+This configuration will create one parent non-web context (WebEnvironment.NONE) configured with ParentCtxConfig and one child web context started on a random port (WebEnvironment.RANDOM_PORT) and configured with ChildFirstCtxConfig. The parent-child relationship is achieved with @ContextHierarchy. An important thing to note here is that it is critical to have different name in @ContextConfiguration since it determines the hierarchy level. Configurations with same level name will be merged/overridden.
+
+At the moment of writing this post, I was working with Spring Boot 1.4.3 and I couldn’t set up tests in the described way. Soon I realized that @ContextHierarchy (Spring class) is not supported in Spring Boot, so I opened the issue and support is added in few days as a part of 1.5.0 milestone. There are some workarounds proposed on Stack Overflow for those who are stuck with some previous versions. As an alternative, a single context configured with parent and child configuration classes can be used, which will make all the required beans present but without the context hierarchy.
+
+This approach can be used when working on a web application directly, but is unsuitable for libraries. Also, it should be kept in mind that it enforces the creation of separate servlet container instances.
+
+Source code can be found on GitHub.
+
+DispatcherServlet is a central servlet in Spring MVC that dispatches requests to controllers and handlers. It has its own WebApplicationContext that becomes a child of application’s root context when servlet gets registered.
+
+A web application can define any number of DispatcherServlets. Each servlet will operate in its own namespace, loading its own application context with mappings, handlers, etc. Only the root application context as loaded by ContextLoaderListener, if any, will be shared.
+
+ As of Spring 3.1, DispatcherServlet may now be injected with a web application context, rather than creating its own internally. This is useful in Servlet 3.0+ environments, which support programmatic registration of servlet instances. See the DispatcherServlet(WebApplicationContext) javadoc for details.
+
+Inside web.xml servlets were registered with something like this:
+
+For a programmatic configuration, there is a ServletRegistrationBean:
+
+ChildCtxConfig is class annotated with @Configuration and @EnableWebMvc. Annotations like @ComponentScan, @PropertySource etc. might be useful too. It can be annotated also with @EnableAutoConfigurationI, but in that case EmbeddedServletContainerAutoConfiguration and DispatcherServletAutoConfiguration should be excluded. Servlet path in the example above is /child which means that all endpoints in the context will be under that path (e.g. /child/something).  At this point, it’s not required to set root context as a parent for a new context. DispatcherServlet will do that and perform some other initialization like set id, namespace, ServletContext and ServletConfig, initialize property sources, add context listeners, call refresh(), etc.
+
+Obviously, the new context will not bootstrap itself this time. In other words, there will be no new EmbeddedServletContainer instance as the new context is going to run inside the parent's instance of servlet container instead.
+
+Integration test setup in this case is simple since we don’t need to manually create context hierarchy. It will be created when configuration for root context is processed. Tests can be annotated like this:
+
+ParentCtxConfig.class is a configuration class from the example. It can be omitted in case it is in the same package as the test class, for example. Parent and child contexts can’t be tested in isolation since child is always created in ParentCtxConfig and depends on parent.
+
+The following way for creating contexts is tricky. Based on Spring Boot Actuator code and some experimenting, I found out that AnnotationConfigEmbeddedWebApplicationContext can be created in configuration class and added as a bean. This web context will bootstrap itself using a new instance of EmbeddedServletContainer - different from other servlet container instances in the application.
+
+ChildCtxConfig is configuration class annotated with @Configuration (or @SpringBootConfiguration) and other necessary annotations like @EnableWebMvc, @ComponentScan, @PropertySource etc. It also imports some Spring Boot’s auto-configuration classes like: PropertyPlaceholderAutoConfiguration, ServerPropertiesAutoConfiguration, EmbeddedServletContainerAutoConfiguration, DispatcherServletAutoConfiguration, etc. My advice for those who want to experiment more with this approach is to start with some minimal sets of auto-configuration classes (see GitHub example) and add new ones if needed. For example, SecurityAutoConfiguration and SecurityFilterAutoConfiguration will help configuring Spring Security.
+
+When creating AnnotationConfigEmbeddedWebApplicationContext as a bean, there is an option for the new context to become a child of the application's context. In that case, an instance of DispatcherServlet with all setDetectAllXXX methods set on false should be created in the new context. Usually, DispatcherServlet will search for request handlers and adapters from ancestor contexts as well, but we want to prevent this so that parent configuration would not leak down. Also, composite variants of HandlerMapping, HandlerAdapter and HandlerExceptionResolver should be created. They just need to discover existing handlers and delegate calls to them. There might be some other beans that should be created manually depending on an application. Basically, all the ServletContextAware components should be in the child context.
+
+Integration test setup is like in the previous example since hierarchy will be achieved when root context is processed. Like in runtime, whether the new context will be a child of the root context or not depends on the configuration.
+
+
+
+ Specifying WebEnvironment.RANDOM_PORT in this case is cumbersome. If there is a parent-child relation, child’s port has to be discovered manually since TestRestTemplate is aware of root context only (example is on GitHub). If not, a separate context will tend to start on configured port since the environment is not inherited.
+
+If there is no parent-child relation between contexts, the one configured with ChildCtxConfig could be tested in isolation from the rest. The problem is that the context will be configured with default locations, meaning that the default properties file will configure the context. This doesn’t happen in “normal” runtime, so caution is required for isolated tests.
+
+Source code of example can be found on GitHub.
+
+
+
+ The approach with parent-child hierarchy described above can be seen in action in Spring Boot Actuator when it is configured to use a port different from the application itself. The property for that is management.port and its implementation is in the following classes:
+
+In the examples given above, I described three ways to create contexts and set up a hierarchy. The contexts are created in different ways and can have multiple purposes based on that. Depending on use case and requirements, you can choose which one would fit the purpose best.
+
+In addition to the three ways described above, there might be some other ways to create contexts via Spring Boot. They can be created and/or servlets registered using certain context/servlet initializers like ApplicationContextInitializer for example, but that approach requires an initializer to be registered. In the end, however, everything pretty much boils down to some of the described ways.
+
+There is a lot more about contexts in Spring: different context types, context events like ContextRefreshedEvent, ContextStartedEvent etc, ApplicationContextAware interface, Spring TestContext Framework etc. For most of the things, the official Spring/Spring Boot documentation and Getting Started Guides are great resources. Yet in some cases (like the one from this post), you will have do your own research and do some experimenting.
+
+Import Spring source in your favorite IDE and start playing around. Good luck!|||
+
+The development team at CCBill recently revised some of the core web applications in the company.

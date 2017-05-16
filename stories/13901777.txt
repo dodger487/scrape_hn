@@ -1,0 +1,51 @@
+Recently I discovered some slowness in my express app.
+
+A bit background here: in the platform we are building here in Madadata, we are using an external service to provide user authentication and registration. But in order to test against its API without incurring the pain of requesting from California (where our CI servers are) to Shanghai (where our service providers’ servers are), I wrote a simple fake version of their API service using Express and Mongoose.
+
+We didn’t realize the latency of my service until our recently started load testing, where it shows that more than half of requests didn’t return within 1 second and thus failing the load test. As a simple Express app using Mongoose there is hardly any chance of getting it wrong, at least not anywhere near 1 second of latency.
+
+The screenshot above for running mocha test locally revealed that there is indeed some problem with the API service!
+
+From the screenshot I can tell that not all APIs are slow: the one where users log out and also the one showing current profile is reasonably fast. Also, judging from the dev logs that I printed out using morgan, for the slow APIs, their response time collected by Express is indeed showing a consistent level of slowness, (i.e. for the red flagged ones, you are seeing a roughly sum of latency of two requests above them, respectively).
+
+This actually rules out the possibility that the slowness comes from connection, rather than within Express. So my next step is to look at my Express app. (N.B. this is actually something worth ruling out first, and I personally suggest trying one or two other tools rather than , e.g. and even before moving on, because they almost always prove to be more reliable than the test code you wrote).
+
+Express is a great framework when it comes to web server in Node and it has come a long way in terms of speed and reliability. I thought it is more likely due to the plugins and middlewares that I used with Express.
+
+In order to use MongoDB as session store I used connect-mongo for backing my express-session. I also used the same MongoDB instance as my primary credential and profile store (because why not? it is a service for CI testing after all). For that I used Mongoose for ODM.
+
+At first I suspected that it might be because of the built-in Promise library shipped by default in Mongoose. But after changing it with ES6 built-in one the problem wasn’t solved.
+
+Then I figured it is worth to check the schema serialization and validation part. There is only one model and it is fairly simple and straightforward:
+
+Mongoose has this nice feature where you can use and hooks to interact and investigate document validation and saving process.
+
+Using and we can actually measure the time spent during these processes.
+
+and then we are getting this more detailed information in mocha run:
+
+Apparently document validation and saving doesn’t take up large chunks of latency at all. It also rules out the likelihood a) that the slowness comes from connection problem between our Express app and MongoDB server, or b) that the MongoDB server itself is running slow.
+
+Turning my focus away from Mongoose itself, I start to look at the passport plugin that I used: passport-local-mongoose.
+
+The name is a big long but it basically tells what it does. It adapts Mongoose as a local strategy for passport, which does session management and registering and login boilerplate.
+
+The library is fairly small and simple, so I start to directly edit the file within my folder. Since function calls function , i.e. specifically this line, I started to focus on the latter. After adding some more and I confirmed that the latency is mostly due to this function call:
+
+The name itself suggested that it is a call to cryptography library. And a second look at the README show that the library is using iterations.
+
+Like bcrypt, is also a slow hashing algorithm, meaning that it is intended to be slow, and that slowness is adjustable given number of iterations, in order to adapt against ever-increasing computation power. This concept is called key stretching.
+
+As written in the Wiki, the initial proposed iteration number was when it first came out, and some recent updates on this number reached as hight as . So in fact the default was reasonable.
+
+After reducing the iterations to , my mocha test output now looks like:
+
+and finally it is much acceptable in terms of latency and security, for a test application after all! N.B. I did this change for my testing app, it does not mean your production app should decrease the iterations. Also, setting it too high will also render the app vulnerable to DoS attack.
+
+I thought it would be meaningful to share some of my debugging experience on this, and I’m glad that it wasn’t due to an actual bug (right, a feature in disguise).
+
+Another point worth mentioning is that for developers who are not experts on computer security or cryptography, it is usually a good idea not to homemake some code related to session/key/token management. Using good open source libraries like passport to start with is a better idea.
+
+And as always, you’ll never know what kind of rabbit hole you’ll run into while debugging a web server - this is really the fun part of it! 😁|||
+
+Recently I discovered some slowness in my express app.

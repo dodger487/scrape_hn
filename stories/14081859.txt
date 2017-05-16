@@ -1,2 +1,78 @@
-|||
+Whenever I write any sufficiently large Ruby app, I end up writing an expensive computation. I end up calling that computation over and over again even if the result is the same. I realize that’s a silly waste of resources and decide to save the result.
+
+From that experience, I’ve learned a few standard patterns for memoization and used them too many times to ever want to rewrite them again. If you sail along with me on this journey, I’ll take you down memoization river with its many turns and bring you to the DRY land of a general solution.
+
+The journey starts out simple: I write an expensive query.
+
+But alas, I end up calling this method quite a bit all over the place. It takes a while each time, so I wanna keep the results around.
+
+My next step is to memoize the result by saving it to an instance variable. The operator makes this easy for me since if the instance variable is already defined, I’ll get back my value, but, otherwise, I’ll go ahead and do the query.
+
+We take another turn: now I need to do some post-processing for the query. That means it’s not as nice to use the operator for memoization anymore. Ugh. No worries, though: I’ll check if the the instance variable is present manually in the first line, and if not, do the processing and save it away in the last.
+
+I might as well mention now that in the case where our value returns for the previous solutions, I’ll end up doing the re-computation every time. Imagine if we had:
+
+gives back . That means that the operator will set to . Which means that as soon as is called again the operator will find a nil value for and try to set it again. And so the merry-go-round will go.
+
+One of the ways I can solve this is to use a sentinel value in order to signal that we don’t need to do this computation over and over again. If I find that our computation can return , I can intercept the result and set it to , or even , or (if you’re on on the functional train) I could use the Nothing part of the monad. Please do note that I still don’t use my good friend . It swallows in the same way it swallows .
+
+However, using this solution also has a side-effect. While my unmemoized method used to return a , now it’ll be returning the ever more complicated . If I don’t want to randomly change expectations of what this method returns, I’ll have to be more crafty.
+
+The other way I can deal with the presence of nil is by putting it behind a cache. For the purposes of that cache, I’ll be using Ruby’s handy .
+
+The first time we call , it will have its key set. That means that on further calls, regardless if that key was set to or not, I’ll still have the result of the computation directly returned to me. I also end up with the same exact type for our result as when we started.
+
+Let’s say that now I’d like to do the query with some changeable arguments. Does that mean I should stop memoizing? That depends.
+
+If I say yes to both of the above, hope is not yet lost. I can still memoize my results. I just can’t do it the same way as I did above. Since the output of any function like is different depending on , I’d have to take arguments into account.
+
+Getting back to our query, I answer yes to the two questions above and memoization is in the stars. I can re-use the caching solution with a key difference: I will use the arguments as a key.
+
+Now, for every that is passed in, we’ll store its results away for reuse in our hash — making every future call next to instantaneous.
+
+A fair question. Honestly, it’s so that you can both (a) commiserate in the problem that I’ve had to solve like a half bajillion times and (b) wonder why I’m still solving this problem after I’ve solved it like a half bajillion times.
+
+That’s precisely what I’ve been wondering. I’ve been waiting for the day I can just write a on top of my method and forget I ever had to suffer through one of these implementations forever.
+
+Needless to say, that day has come. It is the general, DRY solution I’ve promised you all the way at the start of this post.
+
+I wanted this to be a nice and lazy way of solving my memoization needs. So to prove that it’s exactly that, we’ll (crudely) solve the problem of finding the nth Fibonacci number.
+
+The method is pretty lame. It never stores solutions to its sub-problems and always recalculates them. The method is its cousin that does.
+
+On the surface, it doesn’t seem like there’ll be much of a difference between the two implementations. However, with the power of benchmarking, I will prove to you it is not so.
+
+When we run the above code, here’s the breakdown we receive:
+
+Memoization wins 0.005 seconds to 46.598 seconds. I’d say I got my memoization needs covered. And so can you!
+
+The class contains basically everything from our discussion above: looking at line 11, we can see the hash cache pattern from solution (4) above. Not only that, but we also see a more aggressive version of solution (5) for any arbitrary set of arguments and block. All of that is powered by our original idea to store data in an instance variable from solution (1) in the cache on line 16. 
+
+ The rest of the code is quite a bit of metaprogramming.
+
+Here’s a rundown of what it does: 
+
+ Whenever a method is added after the class method is called, it will create a few new methods — the old unmemoized method will be renamed (line 49) and the new memoized method (line 51) will call a memoizer that was created specifically for it (line 40). That means that this memoization will work on a per instance and per method level.
+
+The and class methods end up working in much the same way that the and methods do — everything underneath them will either be memoized or not up until the next call to either one of them.
+
+Remember the two questions I posed when we were talking about memoizing methods with parameters? Let’s re-examine them again in the context of our new generic memoizer:
+
+One way of reframing this questions is to ask, “Are the methods pure?” In other words, given a set of inputs, we will always get the same outputs. This won’t be true if we’re manipulating the state of our object to make the computation, since the state will need to change in between method calls. That means the output of our method will be different every time. For example: the method is a pure but is not.
+
+So why does this matter? If we were working with the second method and using our memoizer, we’d get the wrong answer any time has changed. That would certainly be unexpected.
+
+Here’s a dirty secret: our beloved method is not pure. The database state is external and can change at any time, so the same inputs will not give me back the same outputs. Then why did I say yes to my question?
+
+In this particular case, I wanted to have a particular set of results to work through. If the state of the database had changed during the time I was manipulating my results, I didn’t want to see them — so I was effectively pretending that my method was pure. If new users with discounts came up during this time, I’d rather process them in a separate job that was running over just these new ones than having the first method call return one set of results and the other method call return another set — causing some changes to be applied to one set of objects but not to another.
+
+It uses a bit of memory to reduce the amount of processing work. So, if you’re storing millions of ActiveRecord records in that computation, remember that your process size will balloon for the duration of your computation. It’s also important to remember that if you end up calling the method with thousands of arguments that you’ll be storing thousands of results sets. In either case, remember to make this memory available for garbage collection with a neat trick: assigning the variable for the object that did the computation to (in some scenarios, running does not necessarily hurt either).
+
+I suffered through many implementations of memoization. You saw me suffer through an example. I hope you don’t have to suffer. That’s why I put together this gem: https://github.com/kklimuk/ruby_memoized.
+
+Just include it into your with and get memoizing today!
+
+Thank you to Justin Worth, Matt Wilde, and Yi Lang Mok for reviewing this article for both form and substance.
+
+This article was originally published here.|||
 

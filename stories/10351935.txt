@@ -1,0 +1,76 @@
+It is no secret that at CloudFlare we put a great effort into accelerating our customers' websites. One way to do it is to reduce the size of the images on the website. This is what our Polish product is for. It takes various images and makes them smaller using open source tools, such as jpegtran, gifsicle and pngcrush.
+
+However those tools are computationally expensive, and making them go faster, makes our servers go faster, and subsequently our customers' websites as well.
+
+Recently, I noticed that we spent ten times as much time "polishing" jpeg images as we do when polishing pngs.
+
+We already improved the performance of pngcrush by using our supercharged version of zlib. So it was time to look what can be done for jpegtran (part of the libjpeg distribution).
+
+To get fast results I usually use the Linux perf utility. It gives a nice, if simple, view of the hotspots in the code. I used this image for my benchmark.
+
+And we get:
+
+Wow. That is 83.5% of the time spent in just two functions! A quick look suggested that both functions deal with Huffman coding of the jpeg image. That is a fairly simple compression technique where frequently occurring characters are replaced with short encodings, and rare characters get longer encodings.
+
+The time elapsed for the tested file was 6 seconds.
+
+First let's look at the most used function, encode_mcu_AC_refine. It is the heaviest function, and therefore optimizing it would benefit us the most.
+
+The function has two loops. The first loop:
+
+This loop iterates over one array (natural_order), reads indices that it uses to read from *block into temp, computes the absolute value of temp, and shifts it to the right by some value. In addition it keeps the EOB variable pointing to the last value of the index for which temp was 1.
+
+Generally looping over an array is the schoolbook exercise for SIMD (Single Instruction Multiple Data) instructions, however in this case we have two problems: 1) Indirect indices are hard for SIMD 2) Keeping the EOB value updated.
+
+The first problem can not be solved on the function level. While Haswell introduced the new Gather instructions, that allow loading data using indices, those instructions are still slow, and more importantly they operate only on 32-bit and 64-bit values. We are dealing with 16-bit values here.
+
+Our only option is therefore to load all the values sequentially. One SIMD XMM register is 128-bits wide and can hold eight 16-bit integers, therefore we will load eight values each iteration of the loop. (Note: we could also choose to use 256-bit wide YMM registers here, but that would only work on the newest CPUs, while gaining little performance).
+
+What you see above are intrinsic functions. Such intrinsics usually map to a specific CPU instruction. By using intrinsics we can integrate high performance code inside a C function, without writing assembly code. Usually they give more than enough flexibility and performance. The __m128i type corresponds to a 128-bit XMM register.
+
+As you can see we only need two instructions to perform the simple transformation on eight values, and no branch is required as a bonus.
+
+The next tricky part is to update EOB, so it points to the last nonzero index. For that we need to find the index of the highest nonzero value inside x1, and if there is one update EOB accordingly.
+
+We can easily compare all the values inside x1 to one:
+
+The result of this operation is a mask. For all equal values all bits are set to 1 and for all non-equal values all bits are cleared to 0. However, how do we find the highest index whose bits are all ones? Well, there is an instruction that extracts the top bit of each byte inside an __m128i value, and puts it into a regular integer. From there we can find the index by finding the top set bit in that integer:
+
+That is it. EOB will be updated correctly.
+
+What does that simple optimization give us? Running jpegtran again shows that the same image now takes 5.2 seconds! That is a 1.15x speedup right there. But no reason to stop now.
+
+Next the loop iterates over the array we just prepared (absvalues). At the beginning of the loop we see:
+
+So it simply skips all the 0 values in the array, until it finds a nonzero value. Is it worth optimizing? Running a quick test, I found out that it is common to have long sequences of zero values. And iterating over them individually can be expensive. Let's try our previous method of finding the top nonzero element in an array here:
+
+What do we get now? Our test image now takes only 3.7 seconds. We are already at 1.62x speedup.
+
+And what does perf show?
+
+We can see that the tables have turned. Now encode_mcu_AC_first is the slower function of the two, and takes almost 50% of the time.
+
+Looking at encode_mcu_AC_first we see one loop, that performs similar operations as the function we already optimized. Why not reuse the optimizations we already know are good?
+
+We shall split the one big loop into two smaller loops, one would perform the required transformations, and store them into auxiliary arrays, the other would read those values skipping the zero entries.
+
+Note that transformations are a little different now:
+
+The equivalent for SIMD would be:
+
+And skipping zero values is performed in the same manner as before.
+
+Measuring the performance now gives as 2.65 seconds for the test image! And that is 2.25X faster than the original jpegtran.
+
+Let's take a final look at the perf output:
+
+We can see that the two functions we optimized still take a significant portion of the execution. But now it is just 67% of the entire program. If you are asking yourself how we got 2.25X speedup with those functions going from 83.5% to 67%, read about the Potato Paradox.
+
+It is definitely worth making further optimizations here. But it might be better looking outside the functions into how the data is arranged and passed around.
+
+The bottom line is: optimizing code is fun, and using SIMD instructions can give you significant boost. Such as in this case.
+
+We at CloudFlare make sure that our servers run at top notch performance, so our customers' websites do as well!.
+
+You can find the final code on our GitHub repository: https://github.com/cloudflare/jpegtran|||
+

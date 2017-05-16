@@ -1,0 +1,48 @@
+A few weeks back, I did a presentation at Forward Swift, the idea of which to explore how the media frameworks reveal some really interesting pain points in using Swift, and what this tells us about the language.
+
+Slides are already up on Slideshare, and can be viewed here:
+
+I’ll be doing this talk again at CocoaConf Chicago and an NDA event that will probably be announced next week. Forward Swift usually posts its videos eventually, and I’ll blog here once mine is available.
+
+But I want to dig into one of the key points of the talk, because it came up again earlier this week…
+
+ 
+
+ As I said, the gist of the talk is to see where Swift either can’t or shouldn’t be used, and great as Swift is for a lot of common types of app development, it does hit some rough spots when we want to use it with Apple’s media APIs.
+
+First off, there are a couple places where you flat out are not allowed to use Swift. For example, the render block of an cannot call Swift, for reasons explained in the WWDC 2015 Audio Unit Extensions session. In short: because rendering occurs on a real-time thread, you cannot perform any action which could block. Obviously this rules out things like file or network I/O, but you also can’t block on a mutex or semaphore. This makes both the Objective-C and Swift runtimes unsafe for use in this context.
+
+Surprisingly, when you write a custom v3 Audio Unit, even if you specify Swift as the language for the app extension target, the subclass created by Xcode will be in Objective-C. I’m not sure why — I asked on the mailing list — but my hypothesis is that since audio units can be loaded into their host process on macOS (but not iOS), this isn’t going to fly in Swift until the ABI is stabilized. But I haven’t gotten an answer either way on that.
+
+So, OK, there are cases where you cannot use Swift. But increasingly, I’m seeing times I don’t want to. Not because I don’t like the language. In fact, it’s because I do like the language that sometimes I choose not to use it. And that obviously deserves an explanation.
+
+For reasons explained in the beginning of the talk, I recently needed to call a Core Media IO function in order to allow to see my Lightning-connected iPad as a video input device. Here’s what the call looks like in C:
+
+As is often the case with the low-level media APIs, this is multiple lines of song-and-dance to set up one call: is the general-purpose setter for properties in Core Media IO. We’re setting a property for the entire system (rather than some individual object), but we still have to send in a struct to indicate the property name, the scope (input/output/global/etc), and an element (or “bus”… this should look really familiar to anyone who survived the audio unit chapters of the Learning Core Audio book, because it’s very analogous). Then the rest of the call is the new value of the property, and mostly -type overhead that comes with APIs that have to take open-ended in-out parameters.
+
+Now, look at the Swift equivalent:
+
+It goes without saying that this isn’t particularly Swift-y. The typical Swift developer may complain that it looks like C.
+
+Ironically, the C developer who’s used the media APIs may complain that it doesn’t look enough like C. For example, (ie, ) is now the very unintuitive . It makes sense, because you’re saying “get the struct for a , get its member, but oh wait, takes instead of Swift (or for that matter), so now we need to construct a from it.” But it takes a while to tease that out, to figure what Swift wants from the C programmer.
+
+Worse perhaps are the strange concessions to Swift type-safety. The first object must be provided as a , and moreover, the three fields of the struct ( , , and ) each have a distinct type (even though they’re all actually just es of ). That’s what produces this rather ridiculous line:
+
+For each member of the struct, we’re basically being made to say the same thing three times (this is most clear with the second and third elements): we have the argument label, the initializer call, and the name of the constant. Scope, scope, scope… element, element, element…
+
+To further draw out the un-Swifty nature of Swift code that calls the lower-level audio frameworks directly, I wrote a sample app, audio-reverser, that has parallel implementations of its core functionality in both C and Swift. My point here is that you usually don’t make one-off calls to the lower-level frameworks; you usually have to do a bunch of things together, like reading in buffers, decoding them, and processing them.
+
+And if you’re going to do that, you’re going to be writing a lot of Swift that doesn’t look or feel like Swift.
+
+So that leads me to an approach I call “Render unto Caesar” (or, and I’m kicking myself for not thinking of this earlier, “Render unto C-sar”)
+
+From the parable of Jesus saying “Render unto Caesar what is Caesar’s, and render unto God what is God’s”, the simple idea here is that if you’re going to be making a bunch of related calls to Core Audio/Video/Media, and if they’re all idiomatically be more pleasant to read and write in C than in Swift, then why not just go ahead and write them in C? You can lash all that code together in one C function, then expose it to Swift via a bridging header. As long as you’re reasonably thoughtful about the types you send across that bridge — and knowing how Core Foundation types like and cast to Swift will help here — you can make the call points from Swift much more pleasant for Swift developers.
+
+Let me just add here that if you can use AV Foundation — and 8 times out of 10 you can — just use that. It works great with Swift. The point of my talk was to think seriously about what to do when you can’t. I also discuss ways to make the Swift calls more pleasant (you can put s on all those Core Media types, after all), but I do find myself thinking that if you suspect that you could do something more easily in C and that Swift is fighting you, fine, go ahead and do it in C.
+
+And when I said this came up earlier in the week, it was @colincornaby who ran into a very similar problem working with Core Video from Swift:
+
+We had parallel threads going on with @jckarter on Twitter, and I made the case that I do above, that maybe just doing it in C is going to be better than hopping through hoops just to satisfy Swift type-safety, especially for things like , which are totally un-idiomatic in Swift (upon reflection, since C arrays are just syntactic sugar over pointers, this is really just , which Colin identified as being exactly what wants, but he was facing a hassle getting his Swift into that type).
+
+In my thread, I made the case that just letting those calls be C and offering the functionality to Swift via a bridging header may in fact be the cleanest way to write that code.|||
+

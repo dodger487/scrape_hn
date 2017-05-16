@@ -1,0 +1,42 @@
+When discussing RCU with mainstream formal-verification researchers, there often comes a time when they ask for RCU's specification. There is of course a specification of a sort, which was first published here, here, and here; it is currently maintained in the Linux-kernel source tree. However, these “specifications” are empirical in nature: As hardware, other parts of the kernel, and workloads change, RCU's specification also changes. This is not what mainstream formal-verification researchers want to hear, so I usually tell them stories of how I learned about various aspects of the RCU specification. This article tells one of those stories.
+
+But first, let's review RCU's grace-period guarantee. This guarantee requires that RCU's synchronous grace-period primitives wait for any pre-existing RCU read-side critical sections. For example, consider the following two in-kernel tasks:
+
+Suppose that 's load from returns zero. This means that some part of 's RCU read-side critical section (delimited by and ) executed prior to 's store to , which in turn means that this critical section started before 's RCU grace period. RCU therefore guarantees that the rest of 's critical section section completes before that grace period ends, which in turn means that the read from will return zero. Similarly, if 's read from returns one, part of 's RCU read-side critical section has executed after 's RCU grace period. RCU therefore guarantees that the entirety of 's critical section executes after the start of the grace period, which in turn means that the read from will return one.
+
+In short, RCU read-side critical sections are not permitted to completely overlap RCU grace periods.
+
+During early boot, it is trivially easy to provide this guarantee because there is only one task and preemption is disabled. This means that the fact that has been called means that all pre-existing readers must have been completed. Therefore, RCU's grace-period primitives can be no-ops during early boot. But early boot ends as soon as the kernel starts spawning kthreads.
+
+At run time, RCU's grace-period guarantee is provided by the run-time RCU machinery, which by that time has been fully initialized. But the run-time RCU machinery cannot operate correctly until after all of RCU's kthreads have been spawned and initialized, which clearly cannot happen until some time after the kernel starts spawning kthreads.
+
+Let's call time period between early boot and run time the mid-boot dead zone. This dead zone starts when the kernel spawns the first kthread, and ends once all of RCU's kthreads have been spawned and are ready. As noted here, RCU's synchronous grace periods might well deadlock during the mid-boot dead zone.
+
+Hoping that nobody calls for a synchronous grace period during the mid-boot phase worked well for some years. However, I made the mistake of accidentally causing , , and to operate correctly during the mid-boot dead zone. The ACPI developers noticed that these primitives worked, and promptly took full advantage of my lapse, perhaps completely unintentionally. Because I didn't make these functions log a warning if used during the dead zone, these developers had absolutely no hint that they were skating on thin ice. Had they built with or booted with the kernel-boot parameter, RCU would have complained bitterly. However is used primarily for deep embedded systems, and is used primarily on realtime systems, so it is not all that surprising that they didn't test them.
+
+However, the ACPI developers did notice once v4.9 came out, because that was the release in which I switched , , and to workqueues. This change eliminated some ugly interactions with POSIX signals, however it also re-introduced the mid-boot dead zone, which had the minor downside of complete and utter failure for the ACPI developers.
+
+Although this could be fixed in ACPI, it is easy to imagine a use case that really needed a real RCU grace period. It is therefore preferable to get RCU's mid-boot dead zone out of ACPI's way. If nothing else, eliminating RCU's mid-boot dead zone should save me considerable time explaining that dead zone to future Linux-kernel developers. As usual, this was easier said than done.
+
+My first thought was to spawn RCU's kthreads much earlier in the boot process, thus narrowing the mid-boot dead zone, so that the ACPI use fell outside of that zone. However, RCU creates different numbers and types of kthreads under different kernel configurations, which complicates the task of creating all these kthreads at one point in the code. This approach therefore did not make it past the design phase, although it did consume at least its share of paper and ink.
+
+My second thought was to introduce kthreads into RCU's expedited grace-period primitives, given that the expedited code can be driven by a single kthread. Once this is in place, non-expedited synchronous grace periods can be forced to use the expedited code path during the dead zone, which would allow full functionality. This is much simpler than the first approach, and resulted in this reasonably simple patch. Borislav Petkov tested this patch and found that it fixed the problem, which was another plus.
+
+However, this patch had the disadvantage of turning RCU into a special kernel subsystem that creates its kthreads before any other kernel subsystem. This might work fine for awhile, but Murphy says that it is only a matter of time before some other kernel subsystem also needs to be the first to spawn its kthreads. In addition, there is still a dead zone, albeit a very short one. But if kthread creation itself ever needed to invoke synchronous RCU grace periods, this approach would be completely broken. It would be much better if RCU grace periods simply worked throughout the entire boot process.
+
+My third thought was to make expedited RCU grace periods go back to their 4.8 behavior, so that the requesting task drives the expedited grace period. In order to avoid the ugliness involving POSIX signals, expedited grace periods would switch back to workqueues as soon as RCU's kthreads had been spawned. This assumes that in-kernel tasks never send each other POSIX signals during the mid-boot dead zone, which seems a safe assumption for the moment, and which can be worked around if needed. In addition, it results in a reasonably small patch.
+
+The great strength of this approach is that there is no longer a mid-boot dead zone: , , , , , and may be invoked throughout the entire boot process. This in turn simplifies RCU's specification, at a price of only about seventy lines of code added to the kernel, and without the addition of any kthreads. In addition, RCU can continue to spawn its kthreads at time, so that RCU need not be the special first subsystem to create kthreads. Finally, the switch to normal run-time operation can happen at time: there is no need to switch to run-time mode immediately after RCU's kthreads have been spawned.
+
+It is still early days for this patch, but current results are quite encouraging.
+
+This experience resulted in several lessons (re)learned:
+
+Last, but by no means least, RCU's specification is empirical, and this is the story of how I learned about yet another new-to-me aspect of that specification.
+
+I own thanks to Lv Zheng, Borislav Petkov, Stan Kain, Ivan (AKA), Emanuel Castelo, Bruno Pesavento, Frederic Bezies, and Rafael J. Wysocki for reporting, reviewing, testing, and otherwise keeping me honest. I also owe thanks to Jim Wasko for his support of this effort.
+
+Quick Quiz: But wouldn't this mid-boot dead zone end when workqueues are initialized, which happens much earlier than the spawning of RCU's kthreads?
+
+Answer: In theory, yes. In practice, the kernel might have been booted with , which would cause the expedited grace periods to use the non-expedited code path. So in this case, the mid-boot dead zone for , , and is exactly the same as that for , , and , which ends after RCU's kthreads has been spawned.|||
+

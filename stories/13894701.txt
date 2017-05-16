@@ -1,0 +1,31 @@
+Omid is a transaction processing service powering web-scale production systems at Yahoo that digest billions of events per day and push them into a real-time index. It’s also been open-sourced and is currently incubating at Apache as the Apache Omid project. What’s interesting about Omid is that it adds transaction processing as a layer on top of an underlying distributed key-value store. In theory the underlying store is pluggable, but in practice it looks pretty tied to Apache HBase (and that’s the implementation you’ll find in Apache Omid). The idea is similar in spirit to the ‘bolt-on’ designs for strengthening consistency guarantees that we’ve looked at in previous editions of The Morning Paper.
+
+Omid is designed for industrial use, leading to two high-level design principles:
+
+That second design point sounds distinctly unfashionable of course, but Omid works hard to restore scalability for throughput-oriented workloads (you won’t be using Omid for any low latency requirements at the moment), and continued availability in the face of failure. Still, it’s interesting to compare the Omid design to the HopFS design that we looked at last week.
+
+Omid scales to hundreds of thousands of transactions per second, over multi-petabyte shared storage. It supports snapshot isolation (not the full strength serializability). This means you can still see write skew under Omid – see “A Critique of ANSI SQL Isolation Levels” for all the gory details.
+
+It’s helpful to understand how Omid is deployed at Yahoo for the Sieve content management system to orient ourselves. Apache HBase is used to store both application data and the commit table (CT, we’ll look at this soon…). HBase, the primary and backup transaction manager nodes, and ZooKeeper are all deployed on separate dedicated machines. HBase tables are sharded into multiple regions (10 for Sieve), managed by region servers (5 for Sieve). HBase is deployed on top of HDFS with 3-fold replication, and petabytes of data under management.
+
+Omid stores all data (and it’s own transaction management data) in an HBase data plane. This provides persistence, scalability and high availability for data out of the box. Omid itself manages the transaction control plane via a centralized transaction manager (TM). The TM performs version (timestamp) allocation, conflict detection, and persistent logging of commits. Transaction metadata is stored in HBase, but conflict management is done entirely in RAM in the TM node (scale-up, rather than scale-out).
+
+The transaction metadata consists of a commit table (CT) with information on committed transactions, and an additional commit field (cf) added to every key-value pair in the data store.
+
+Transactions move through three states: initiated, committed, and completed. Transaction processing is accomplished via a curious dance between clients and the TM. Let’s walkthrough a sample transaction that reads one value, writes one value, and then commits.
+
+A background cleanup process helps old (crashed or otherwise slow) transactions complete. Old versions of data items are also periodically tidied up by a background cleaner using a low water mark. If a transaction with an id smaller than the low water mark attempts to commit it will be aborted.
+
+Let’s now return to the get tentative value procedure to be followed when the client reads a version with a nil commit field value. We need to take care with the window between the transaction being committed and completed. The client checks in the commit table for a row with the corresponding . If it finds one, it knows that the transaction is committed. In this scenario, it helps out by updating the commit-field value of the record using the commit timestamp in the commit table, and then returns this version to the client. Even this protocol is open to yet another race, so we have to re-read the record from the datastore one more time if a version is not found in the CT. See the procedure in the pseudo-code below:
+
+HA is based on a primary-backup scheme with timeouts. The timeout is set relatively low for fast recovery. The tricky part is when the backup performs failover while the primary is still operational – we have two primaries at this point.
+
+Three properties are enforced to ensure that this cannot cause difficulties:
+
+To handle the third scenario, an invalidation mechanism is used.
+
+A lease mechanism is used to ensure that a TM only needs to additionally check for invalidation if a lease expires while a commit record is in flight. See section 6 in the paper for full details of the scheme.
+
+Why does Apache have both Omid and Tephra incubating? From the Omid proposal document: “Very recently, a new incubator proposal for a similar project called Tephra, has been submitted to the ASF. We think this is good for the Apache community, and we believe that there’s room for both proposals as the design of each of them is based on different principles (e.g. Omid does not require to maintain the state of ongoing transactions on the server-side component) and due to the fact that both -Tephra and Omid- have also gained certain traction in the open-source community.” Let all the flowers bloom :).|||
+
+Omid, reloaded: scalable and highly-available transaction processing Shacham et al., FAST '17 Omid is a transaction processing service powering web-scale production systems at Yahoo that digest billions of events per day and push them into a real-time index. It's also been open-sourced and is currently incubating at Apache as the Apache Omid project. What's interesting…

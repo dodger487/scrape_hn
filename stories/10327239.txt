@@ -1,0 +1,31 @@
+I've been meaning to look at this issue for a while now but kept postponing it due to other commitments. When I had an initial look at this vulnerability, I thought it was either a use-after-free issue or some arbitrary memory overwrite due to differences between pppol2tp and udp/inet sockets.
+
+This vulnerability was published in July 2014. The CVE descripton states: "The PPPoL2TP feature in net/l2tp/l2tp_ppp.c in the Linux kernel through 3.15.6 allows local users to gain privileges by leveraging data-structure differences between an l2tp socket and an inet socket." The git repository fix has some additional information:
+
+There's currently a public DoS exploit and a privilege escalation exploit (no source code is available) for 32-bit systems from Immunity. I've had some time to perform an initial analysis of the DoS condition and will describe my findings below. Hopefully, this will provide with some insight into this vulnerability and possibly, its successful exploitation. I haven't figured the privilege escalation part yet and would appreciate any tips or ideas. You can contact me on twitter or directly by email.
+
+Before getting into details, it's worth mentioning that the DoS exploit does not "panic" the kernel as stated by the author but simply deadlocks the kernel. There's no kernel oops and the kernel control flow gets stuck in :
+
+The PoC code creates and connects two sockets which is not necessary for this deadlock condition. The simplified PoC that deadlocks the kernel is shown below:
+
+The vulnerability is in handling (set|get)sockopt operations for sockets:
+
+In [1], if the level is not , is called even though the socket is not a UDP socket! The implementation of the is shown below:
+
+As shown in [2], if the socket is set to , the is called on the socket. The then calls a helper function shown below:
+
+In [3], our socket is typecasted to an socket with . The struct is 656 bytes in size and struct includes the struct (as the first element) and is 824 bytes. By setting elements, we operate on 824 - 656 = 168 bytes that are specific. Since our socket is not an , we are changing elements belonging to an adjacent data structure. This adjacent data structure happens to be , i.e., we have a struct dynamic allocation followed by .
+
+The PoC code uses the setsockopt optname which does the following in :
+
+In [4], an struct is allocated and then in [5], is set to point to this newly allocated struct. The pointer is aligned with . Hence, setting the pointer overwrites with a valid kernel pointer to struct .
+
+Finally, when closing the PPPOL2TP socket, the function is called:
+
+In [6], our overwritten value is checked. Since it's pointing to a valid allocated memory region within the kernel space, some locking is followed. This is where the deadlock happens.
+
+I haven't explored the option yet. However, I couldn't find any function or data pointers that can be overwritten with to redirect the control flow to user space.
+
+A possible exploitation vector is to take advantage of the struct adjacency by forcing structs containing function pointers to be allocated close to the PPPOL2TP socket struct. As mentioned above, there's a 32-bit exploit and it looks like this exploit is taking advantage of some race condition. I haven't verified this on a 32-bit system and it's possible that function or data pointers are aligned differently and are easier to exploit.|||
+
+CVE-2014-4943 PPPoL2TP vulnerability DoS analysis - exploiting differences between PPPoL2TP and UDP sockets

@@ -1,0 +1,58 @@
+(written by lawrence krubner, however indented passages are often quotes). You can contact lawrence at: lawrence@krubner.com
+
+I have a client. Let’s say they run some scripts that scrape the web for data, then they run some NLP scripts to pull out the facts they need, then they need to insert that into their MySQL database. When they gather facts, they need to know if the facts are about an organization that is already in the database. So they asked me to create an API that could take their new facts, and try to match those facts with something in the database.
+
+If I had the choice of technology I would have used Clojure, because I feel the JVM offers a lot of what is needed here: concurrency to handle massive load, lots of tools to handle backpressure, and Clojure to make the concurrency less painful than in something like plain Java. Also I hate Java. Also I love Clojure.
+
+But this client had no software that ran on the JVM. They used PHP and NodeJS. (The NLP guy used Python.) They’d already used NodeJS for a read-only API that delivered certain kinds of data to paying customers. So, okay, I should use NodeJS.
+
+I took their existing NodeJS API (built with HapiJS) and modified it. The import/NLP scripts would now call this new API I was creating. The import/NLP scripts would send in some strings, and then I would do some fuzzy matching, and generate a score about how likely it was that the new facts being imported were about an organization that was already in the database.
+
+I’m running the NodeJS API behind a reverse proxy via Nginx. I don’t think this should effect anything I observe.
+
+Just to avoid any confusion, I want you to understand that this code is deterministic. Given the same input, you should get the same score every time (that is, at any given point in time. Obviously if you run the script a year from now you might get a different score, since the data in the database might have changed).
+
+I created the API such that most of its parameters could be set by the caller. So for instance, how many points should be given when a Jaro-Winkler match was made? The default is 16 points, but the caller could vary that. And how many points should be given for an exact match?
+
+Since there were so many parameters, and they could all be tuned, it seemed wise to test all possible combinations to see what gave the best F1 Score. There were 11 parameters and I tested 3 possibilities each, so there are a total of 177,147 possible combinations. I wrote the test app in Clojure, and made it very multi-threaded so I could pound the API. One of my goals was to stress test the API.
+
+The Clojure test app starts up and grabs our real data from the database, then pounds the API with that. This gives us the True Positives and False Negatives. Then the app mangles the text slightly, inserting some characters randomly. Then we pound the API with the mangled data. This gives us the True Negatives and False Positives.
+
+A few years back I read Matt Ranney’s very good essay “Backpressure and Unbounded Concurrency in Node.js“. He wrote:
+
+With that in mind, I thought I understood the ways my NodeJS app could fail. But NodeJS still managed to surprise me.
+
+When I started the Clojure test app, it pounded the API with several thousand HTTP calls every minute. The API is a bit slow and could barely handle 100 requests a minute (the fuzzy matching is slow and I’ve done nothing to optimize it — and none of that matters).
+
+Here is what I expected: the API would respond to 5% of the requests, but 95% of the time I would get a SocketTimeout Exception. And that would be fine. After all, part of my aim was to overwhelm the API and see where it might break.
+
+At first, everything happened the way I expected. Sometimes a request went through and came back with the correct answer. Other times I got a SocketTimeout Exception.
+
+But then I started to see something that really surprised me: the API would respond with a 200 OK HTTP status, and the JSON shell of a response, but it would claim there was no match, for a string that should have matched. I tested this from the Terminal on my Mac, using curl, and I was amazed to see that, for exactly the same input, I sometimes got the right answer, sometimes got a SocketTimeout Exception, and sometimes got the wrong answer! My deterministic code had become probabilistic.
+
+So I might run a request such as this:
+
+And I get back some JSON with 26 matches in the “records” field. I’ve shrunk this down, but this gives you the general idea of what the correct answer is:
+
+Then I run the request several more times. 5 times in a row I get a SocketTimeout Exception. And that’s fine, I expect that. But then I get this, which is simply the wrong answer:
+
+You’ll notice that this is empty:
+
+It should have 26 records!
+
+There is nothing in my API code that would give rise to a probabilistic answer. The exact matching and the Jaro-Winkler matching are all deterministic. But under load, my app has become probabilistic!
+
+And if I keep running the curl call, over and over again, I keep getting some mix of these 3 responses. Mostly I get SocketTimeout Exceptions. Sometimes I get the right answer. And, very rarely, I get the wrong answer.
+
+This is a surprising difference, from the correct and incorrect attempts:
+
+Yet, given the same input, the same documents should be matched against each time.
+
+I did not know that NodeJs had this failure mode. I assume I’m dealing with some kind of race condition, but it is not the obvious one you might expect: a callback from the database. In fact, the API does not call the database while it is running. It calls the database and startup, and then it stores 4 gigs of data in memory, breaking the data up into various indexes, to help with fast lookup. There are no callbacks in the code, other than the one that matches an incoming request to an endpoint.
+
+Possibly this is some kind of resource contention in NodeJS, but I’m not sure how to instrument for this. It would be tough to recreate this bug reliably.
+
+Sadly, this undermines my attempt to get an accurate F1 Score. While I can easily filter out the SocketTimeout Exceptions, I have no way to distinguish the wrong answers from correct True Negatives.
+
+I’m not feeling great about NodeJS right now, but I am open to constructive suggestions.|||
+

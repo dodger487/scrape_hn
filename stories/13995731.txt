@@ -1,0 +1,69 @@
+On using dotNetify-React to do universal/isomorphic routing of React app on cross-platform .NET Core back-end — with little fuss.
+
+A few weeks ago, I published a beta release of dotNetify-React, an open source project that makes it quite simple to develop a React app on a .NET Core back-end. It comes with an optional feature to declare SPA routing inside C# view models on the back-end, for those who wish to keep their client-side components clear of routing concerns.
+
+This client-side router works well with deep links, as long as you set the server to always return the top page for any page request. The router will traverse the path to dynamically load components and resolve nested routes until the path is fully routed.
+
+However, as many has pointed out, client-side routing has some drawbacks, such as longer initial load time, flash of no content, and less SEO-friendly. Yet with React, there is a promise of universal rendering that would eliminate these issues, so I was eager to find out whether it could be integrated into this router and still keep it simple to use.
+
+But first, let me start with an overview on how the client-side router works.
+
+With dotNetify, the React root component is paired with a back-end view model, written in plain C#. If we start with an component that has routes to component and a plain HTML file , here’s how these routes are defined in the view model:
+
+The routing APIs are documented in the project’s website so I won’t elaborate it here, but essentially the routing information is built during the class instantiation, serialized, and sent to the client-side as part of the initial state to the React component. Here’s what the component looks like:
+
+After the React component connects to the back-end, the routing state will become part of the component’s state and is used to render components, which are just thin wrappers of anchor tags. When the user navigates by clicking the link, the router works behind the scene to load the component (if it’s not already bundled) or the HTML file from the server, mount it to the target DOM node, and update the browser history state so that the browser’s back and forward buttons work too.
+
+We can continue to define nested routes inside the view model associated with . The router supports patterns like and has the mechanism to pass the matching URL to the view model so it can generate the correct view. As stated earlier, deep links formed by these nested routes can be handled by the router as long as the server returns the top page for every page request.
+
+Let us now examine how we can add the server-side routing into the mix.
+
+Given that the client-side routing has to start from the root and works its way down to render deep links, there will always be a lag between the time the initial page is delivered to the time the final page is presented to the user. And so, the main goal is to eliminate the lag by having the initial page to be the final page, completely rendered by the server and sent along with the client-side scripts that will then seamlessly take over to use client-side routing for the rest of the interaction.
+
+The other goal is to make it minimally intrusive to the code-base; that we don’t have to introduce a lot of changes to our React components or put many constraints on them just so they are server-rendered-capable. Because otherwise, it would probably defeat the purpose of universal/isomorphic rendering.
+
+Finding a way to render Javascript on a .NET server would have been a big problem if not for a set of libraries named JavascriptServices that Microsoft released earlier this year. One of the library called provides an interface for any .NET code to run arbitrary Javascript on a Node.js instance. Exactly what we need!
+
+With the means in place, we can create a Javascript file that we will name which takes the main page and render the React root component on it. Upon receiving a page request, our .NET code will pass the request URL path and the components’ initial states to the function within the file, and get the HTML string back for the response:
+
+Server rendering of a deep link wouldn’t have worked without the ability to traverse the link’s path and gather all the states required by the components to render the final page. Fortunately, dotNetify’s approach of keeping all the routing information and component states in the back-end lend itself well to solving this problem.
+
+By using the provided APIs, we can write .NET code to trace the path, resolve all the components within the path, and finally return all the states as a serialized JSON object, ready to be passed as the argument to the server-side render function above.
+
+The next problem to tackle is to set up the execution context inside Node.js so that our React app will render the same way as in the client-side. The most glaring difference is that there is no DOM inside Node, therefore any script that relies on or simply won’t work.
+
+Although it’s good practice for the React components to avoid having direct reference to DOM, in practice this could be too restricting. Mocking up with fake objects or adding type check is another alternative, but will run into problem, especially when the app itself or any third-party library it uses will be doing something non-trivial with them.
+
+In my opinion, the simplest, least intrusive solution is to use a headless browser library that emulates the DOM. This approach is already common with automated testing. For this, I use a popular library called jsDOM. The caveats are that the emulation probably won’t be perfect that we still need to do hacks in some cases, and performance may be a concern, depending on how optimized the library is.
+
+The next challenge is to ensure that all the imported library modules are available inside the server context. With client-side routing, all the required libraries is bundled with WebPack into a file called and attached to the HTML with a script tag. Keep in mind, though, that Node.js doesn’t yet support ES6 modules, so any used by WebPack to build this bundle won’t work there.
+
+To overcome this without having to replace all the calls with , I updated my WebPack configuration to output the bundle into a global variable inside the scope. This variable will contain all the imported modules, so in Node.js, I included in jsDOM as a script to be executed, then copied the objects in the variable into the scope, along with the and variables themselves.
+
+This ensures that the components and any other Javascript will have the same access to the objects as they do on the client-side.
+
+As stated before, as the client-side router traverses the URL path, it checks the routing states of the current component for the next component to load, and then performs asynchronous loading from the server. This behavior clearly must be overridden on server-side render, so dotNetify provides an API hook to intercept the component’s URL, correct its path for Node.js and use to load the component into the scope.
+
+The same also applies for loading plain HTML file. Once the deep link is fully routed, an internal event will be raised and through the API hook, we provide a callback to return the to the .NET code as the response to the initial page request.
+
+The initial states that were passed by the .NET code to the server function is made into an object and added into the scope. We will have to do a small change to our components that use the states so that they try to find their states first before falling back to default:
+
+The API will try to find the initial states through an established naming convention, and prevent reuse of the states when the components are repeatedly mounted during user navigation.
+
+The final problem is on how to prevent React on the browser from rendering everything again. Normally this is already handled internally by React, which does its own check to update DOM nodes only if they have changed. Unfortunately, this doesn’t work well when things are asynchronously loaded by the client-side router. The target DOM node, where a nested component will be mounted, will always be empty initially, and so React will just wipe away the server-rendered content.
+
+I’ve looked at the React APIs but there’s nothing that would prevent the initial rendering, so the solution I came up with is to make the component that renders the target DOM node to pre-populate it with the server-rendered content right before it is rendered.
+
+To keep things simple, dotNetify provides a component called to be used in lieu of the target DOM node. Before it’s mounted, the component will find the existing DOM node of the same ID, grab the inner HTML into its local state, and use it to render itself so that the output won’t be different.
+
+After all the dust has settled, here’s what looks like:
+
+And the ASP.NET Core code that calls it:
+
+You can clone the demo running on Visual Studio 2017 from https://github.com/dsuryd/dotnetify-react-demo-vs2017. To compare with pure client-side rendering, append  to the URL.
+
+This router library is part of dotNetify-React distribution package on npm. Please visit the project’s website for installation, more details and other live demo. Source code is on the project’s Github site.
+
+It is by no means perfect, and probably has a few use cases it doesn’t cover. But hopefully this is a good start; I am open to pull requests, and even if you don’t use it, that you get some educational value out of this article. Till next time!|||
+
+On using dotNetify-React to do universal/isomorphic routing of React app on cross-platform .NET Core back-end — with little fuss. A few weeks ago, I published a beta release of dotNetify-React, an…

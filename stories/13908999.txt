@@ -1,0 +1,71 @@
+In this post we'll look at options for scheduling a one-shot container on Docker Swarm. We'll look at some use-cases, a comparison to legacy Swarm (prior to 1.12) and then move onto some working examples of short-lived containers with Swarm Services.
+
+Here are some use-cases for short-lived containers on a cluster:
+
+All of the above was possible with the previous generation of Docker Swarm which used the Docker Remote API to make a set of daemons (hosts) look like a single one.
+
+An issue was opened on docker/docker on June 23rd 2016 discussing ad-hoc / one-shot tasks on Swarm which provides some additional background. Issue 23880
+
+I will outline a couple of strategies for running containers which will eventually terminate while leveraging the benefits of Swarm Services.
+
+I've created a small program as an examples which you can use in this tutorial. Given a URL it will fetch a HTML page and provide the count of anchor tags to the internal site (self-referring) or external sites. This could used to create a rudimentary SEO score for a webpage. It's self-contained and doesn't maintain state and could be run sporadically.
+
+Using the remote API you could do things like this:
+
+Providing that at least one of the hosts in the Swarm had alexellis2/href-counter available then it would execute and show up on etc.
+
+In the legacy version of Swarm containers were scheduled via or and we pointed our CLI to a swarm manager. The way we ran containers can be referred to as imperative or ad-hoc This is still a viable option for running the one-shot workloads listed above.
+
+Swarm Mode introduced the concept of Services - these are defined declaratively either through a CLI entry or API request. Instead of asking the daemon to a container - we set the final state we want the Swarm to achieve:
+
+The net effect is a long running web-server daemon via nginx, but there are some key differences such as the way the port 80 is published. In legacy Swarm you would have needed to have known which node had the container scheduled onto it - but with Swarm Mode you can point to any host on port 80 to access the server.
+
+So there are two primary approaches that can utilise Docker to provide this experience:
+
+Another option is to create a long running service and to have it receive work via a queue or to host a HTTP server within it. The options below allow you make use of existing container images without alterations.
+
+While declaring the Swarm service there are many different options available. These can be specified in a command line or in a file to be used via the stack feature.
+
+Swarm is designed primarily to apply and maintain a desired state for long-running services. This means that if your container exits a new container will be scheduled with all the same options - we clearly don't want this for a one-shot task.
+
+The option we're looking for is :
+
+So by setting a restart policy of 0, the container will be scheduled somewhere in the swarm as a (task). The container will execute and then when ready - it will exit. If the container fails to start for a valid reason then the restart policy will mean the application code never executes. It would also be ideal if we could immediately return the exit code (if non-zero) and the accompanying log output, too. It does not provide a good user experience. The other question is about the service which is now "cluttering" our list of services on .
+
+Running one-shot tasks with a specific name is also going to scale - we would be better off using a UUID.
+
+Some bash scripting could probably improve on the experience, but since the Docker project maintains a first-class Golang API it may be a better choice.
+
+I wrote a small Golang application (Job as a Service / JaaS) which does the same thing as the CLI, but with some added functionality.
+
+The JaaS binary can be invoked by from a Swarm manager. Since we are still creating a regular service we have the opportunity to specify essential options:
+
+If we import the following packages it gives us what we need:
+
+This is the simplest way to create a Docker client to talk to the Docker API. Only a manager can create services on a Swarm.
+
+From here we can interact with the API representing the local Docker node in a similar way to or . JaaS makes use of the and methods which are attached to .
+
+I won't go into depth here, but here is the general program flow:
+
+We create a spec which is Swarm's terminology for a Service declaration.
+
+These lines build up the request setting the restart policy mentioned above:
+
+We then check that the service was created properly and fetch its ID. After that we poll the task until it results in a completion and then fetch its logs.
+
+Running JaaS looks a bit like this:
+
+I didn't want to take the name of the CLI too seriously here and you have to be careful not to infringe on trademarks by including 'swarm' or 'docker' in the name. My main goal here is to show that tasks can be orchestrated through the Docker API.
+
+When Swarm emits an event stream it will no longer be necessary to poll the API via the endpoint.
+
+It's also worth thinking about house-keeping and what to do with all the Swarm services after their single task has executed. One approach could be to apply a label and to prune the completed services back based on this criteria.
+
+I'll leave you with a couple of related blog posts. If you have further suggestions for JaaS or one-shot containers get in touch @alexellisuk on Twitter:
+
+Functions as a Service is the next in the evolution and pinning down of what the term serverless means. Find out more about FaaS in this blog post:
+
+Attachable networks can allow regular containers to access Swarm services via . For more information on this approach read my blog-post:|||
+
+We explore use-cases for short-lived containers and one-shot tasks on a Swarm cluster including blueprints to build your own CLI leveraging the Golang API

@@ -1,0 +1,123 @@
+How We Engineered CMS Airship to be Simply Secure
+
+CMS Airship is a Free Software content management system (available on Github) that we introduced to the world last year.
+
+We chose to build CMS Airship for two reasons:
+
+Although we have tried for years (and will continue to try) to improve the security posture of other open source CMS platforms, we believe that truly democratized publishing is only possible if a secure-by-default option is available today.
+
+The rest of this post is dedicated to answering this question in detail. There is one thing we want you to keep in mind as you read this blog: If you're an Airship user, these are problems you'll likely never have to solve. The work is all done for you.
+
+If you're not an Airship user, you may want to take notes and contrast our solutions with the platform you develop for.
+
+This section addresses the absolute basics of application security.
+
+CMS Airship's strategy to prevent SQL injection is to use prepared statements, with an API that encourages its usage.
+
+We don't bother with error-prone strategies that involve escaping input and inserting escaped data directly into the query string, and we don't burden Airship developers with these complicated steps. Prepared statements allow us to have database-interactive code that is:
+
+Furthermore, we disable emulated prepared statements (the PDO default) to side-step corner-case attacks.
+
+Unlike other CMS platforms, we don't perform XSS escaping on input, we perform it while rendering the page (and cache the results). Escaping on output prevents clever tricks like column truncation from enabling stored XSS vulnerabilities which plague systems that escape on input.
+
+Additionally, by storing the unaltered version of user data in our database, it becomes possible for us to detect, reproduce, and prevent any hypothetical filter bypass vulnerabilities that would become obfuscated if we escaped data before saving rather than after loading.
+
+To prevent stored XSS vulnerabilities from uploaded files, Airship sends headers to disable MIME Type sniffing and download any files whose MIME type is not whitelisted as an attachment (instead of loading it in the browser). (Related: SVG can contain JavaScript and your browser will execute it if you view an SVG file directly. Standards are often terrible for security.)
+
+CMS Airship also sends a header (see the security headers section).
+
+CMS Airship stores strict Same-Site cookies in your users' browsers (in particular, for the session cookie). For browsers that support Same-Site cookies, this would be enough to mitigate CSRF exploits. Not all browsers currently support Same-Site cookies.
+
+CMS Airship also employs a challenge-response authentication mechanism that is resistant to both timing attacks and replay attacks. Additionally, CSRF mitigation tokens can be bound to a particular request URI.
+
+The interface for managing tokens is straightforward:
+
+We've explained the technical details of our automatic update mechanism here and covered secure automatic updates in general here.
+
+CMS Airship is the only open source CMS in the PHP ecosystem that offers cryptographically secure automatic updates.
+
+Airship's Gears feature allows you to change the behavior of the core without your changes being obliterated by automatic updates. This allows you a greater degree of freedom to develop powerful extensions for CMS Airship.
+
+For example, if you wanted to replace the behavior of the router to use Nikita Popov's FastRoute instead, you could do something like this:
+
+In the Engine, instead of creating a new class at runtime, it instantiates the gear designated "AutoPilot".
+
+We don't just use simple inheritance because you may want to use two different extensions that upgrade two different pieces of functionality in the same class, and if both classes were to simply extend our base class, it wouldn't be possible to use both extensions.
+
+In sum, the Gears API allows you to:
+
+Access controls allow you to designate some capabilities to some users. There are a lot of different ways to solve that problem. We designed our solution with these goals in mind:
+
+This is what the API looks like for Airship developers:
+
+From a Twig template, it looks like this:
+
+Airship uses a white-list access controls system based on three concepts:
+
+A particular permissions request ( ) can match many contexts, especially if there are overlapping patterns. When this happens, every context is validated and the permission request is only granted if they all succeed. If there are no contexts matching a particular request, the request is refused (unless the user is an admin).
+
+Each application has its own set of possible actions (e.g. 'create', 'read', 'update', and 'delete').
+
+Rules grant a particular user or group the ability to perform a particular action within a particular context. Rules can only be used to allow access, not deny access. (That's what white-list means.)
+
+Group inheritance is baked in: If you set a rule to allow a group to perform an action within a given context, then all of that group's descendants will also be allowed.
+
+If you're accessing a particular context, and there are no matching contexts, then (unless you're an administrator) will return FALSE by default. This decision was made to prevent Missing Function Level Access Controls vulnerabilities if an attacker managed to find a valid request URI for your application, but that didn't match any contexts in the database.
+
+When a user attempts to login with an incorrect passphrase or reset their password, a tally is maintained by Airship. The more bad attempts are registered, the longer it will take Airship to respond to subsequent requests (up to a configurable maximum timeout).
+
+The goal of this feature is to stop brute-force attacks, not denial-of-service attacks, so we default to client-side enforcement. You can configure this by clicking a checkbox in the admininstrative control panel.
+
+To put it bluntly, account recovery (a.k.a. "I forgot my password") mechanisms are a backdoor. If a hacker can break into your email account, they usually gain immediate access to any third-party websites that allow password resets (which is most websites that enforce logins).
+
+Our account recovery implementation is the most secure in the industry because your users can opt out of it entirely.
+
+Alternatively, if a user supplies their GnuPG public key, these emails will be encrypted with their public key. In order to attack this setup, you would need to:
+
+Furthermore, we use split tokens, so any attempt to exploit a timing side-channel in the database lookup to find a valid password reset token will end in failure.
+
+In traditional PHP applications, HTTP POST data is accessed via , which can be a multi-dimensional array. For example, these are all valid HTTP POST queries:
+
+These queries will result in vastly different structures:
+
+This can be problematic if you're expecting to be a string, but you're given an array. This will either throw a or raise an and cast the input to the useless string .
+
+To prevent this, we use an input filter system which is implemented alongside CSRF mitigation, so if a CSRF attack occurs or a user sends invalid input, the application will treat the request as if no POST data was present at all:
+
+Our input filter system contains two components:
+
+The input filter system is best illustrated by real-world example.
+
+The filters are named after the type they enforce. ensures the input is a string. ensures the input is a one-dimensional array of strings. Callbacks are supported; just ensures that the string has a non-empty value.
+
+The filter is exactly what it says on the label: One of the given values must be selected, or else it will revert to the default value. It's like a switch-case that you don't have to retype (nor do you have to remain cognizant over statements).
+
+By default, CMS Airship sends the following HTTP headers on every request:
+
+If you're behind HTTPS, CMS Airship will also send a header, instructing your browser to never connect to that domain over insecure HTTP.
+
+Additionally, CMS Airship sends a header that is configurable from the web interface.
+
+If you decide you want to protect your Airship against rogue certificate authorities, you can also configure an header.
+
+You can learn more about security headers here.
+
+We follow the steps outlined in this blog post. In particular:
+
+If the file type is known to contain executable code or could be used to facilitate phishing (e.g. HTML files), it will instead be served as a text file (MIME type: ).
+
+Additionally, if a file's real MIME type isn't included in a very lean whitelist, accessing it forces it to be downloaded as an attachment rather than opened in the user's web browser. This helps protect against stored XSS attacks.
+
+CMS Airship includes static page caching as a first-class feature. To use it, simply invoke instead of from within a Controller.
+
+Static page caching is a defense against the slashdot effect and helps mitigate the impact of layer 7 DDoS attacks.
+
+A typical response time for an Airship page load on modest hardware is 30 ms. With static page caching, it's 0.3 ms.
+
+CMS Airship uses the Halite cryptography library, whose underlying cryptography is powered by libsodium. If you're familiar with these tools, no further explanation is necessary. Otherwise, learn about Halite and libsodium.
+
+We hope that reading this post gives everyone a greater appreciation for the security engineering work that went into our free software CMS. A lot of care went into ensuring that Airship would be secure, and that it would be easy to make any third-party extensions developed for Airship be secure.
+
+If you need a team that can carefully construct a secure application for your business, get in touch. We consult.|||
+
+A deep dive into the security engineering decisions that went into CMS Airship. A lot of the decisions we made are subtle.

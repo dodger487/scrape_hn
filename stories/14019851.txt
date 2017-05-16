@@ -1,0 +1,56 @@
+This is a tale of two attitudes.
+
+Working on a project for a client recently, I needed to speak the SSH protocol in Golang code. So I started with the x/crypto/ssh package, part of the suite of libraries from the Golang developers which is not part of the standard library and not part of their usual compatibility guarantees, but more along the lines of “useful stuff which might graduate to the standard library”.
+
+There I am, happy with a great API with clean representations of the underlying concepts and generally clean use, until I get to “okay, we need to verify the remote server’s hostkey … how do I do that?” and I quickly realized that this seemed to involve some grotty work at a lower level of abstraction than the rest of the API seemed to require of the programmer.
+
+Rather than reinvent the wheel, I turned to my favorite search engine to see how other projects managed this and started reading the results. Then panicking a little and searching other projects. I then turned to the projects of a well-known vendor of Golang-based tooling in the DevOps space and checked them, and panicked a little more.
+
+I’ve yet to find a project which actually bothered implementing hostkey verification in SSH client code. None.
+
+I sent off two bug-reports. Both PGP encrypted messages, one to the vendor of the tooling whose products were dangerously buggy and one to the Golang maintainers.
+
+The tooling vendor decided that this is Not A Bug. They’re updating their documentation to reflect this:
+
+Other responses included that they got into console parsing (to extract host-keys from those printed by at startup) with a previous product and it was too hard, so they don’t want to ever do it again, and that the benefits of TOFU (Trust On First Use) for them are minimal. Also that the exploitability of the trust paths is low.
+
+To me, this is deeply concerning. They’re saying that people should securely operate their tools, at the same time as making it hard to securely operate their tools. They’re not warning people to not invoke the tools talking across the open Internet. They’ve shown that they’re unaware of tools such as which perform exactly this sort of attack, while purveying tools designed to improve security and, oh yes, manage SSH keys on hosts too.
+
+The only way to securely use such tools is to absolutely trust the network between the machine invoking the tool and the resources being talked to. At which point, why bother with cryptography at all?
+
+Sure, TOFU doesn’t help if you never cache the results, so that every use is effectively “first” use. That’s not TOFU, that’s trust on every use. Unverified. Further, when their tooling is creating resources and seeing them soon after boot, they’re in a good position to see logged hostkeys. They can be compatible-by-default with the most common tooling and decline to work without override if people try to work without making those keys available for verification.
+
+The parsing is pretty easy to do with systems such as AWS EC2, I’ve done it: use , look for the markers, extract the hostkeys between them. This can be written in such a way as to be extensible to other output formats. But it’s incredibly immature to decide “it’s too hard and too much work, so we won’t bother and we’ll leave people vulnerable and tell them it’s their fault if they use our tool in the way that most guides and documentation suggests”.
+
+So they could verify hostkey identity absolutely; with less work, they could just get the usual TOFU semantics by caching the observed SSH hostkeys. Instead, they have no verification and the tools are thus unfit to use when they connect via SSH across the public Internet.
+
+I used to respect this vendor and recommend their tools to others. I am having to rethink this a lot. I am no longer happy to recommend Hashicorp products to others.
+
+I am bemused by an approach to accepting security reports which is to go through the motions of having PGP public keys available for people to use to report issues but upon receiving such a request ask for it to be submitted without PGP because digging out the keys is too much of a hassle.
+
+Mind, we are overdue for some nice convenient tooling to have a PGP-decrypting-and-reencrypt-to-subscribers mailing-list software tool for use for such public contact points. I can see the point, even as I face-palm at the attitude and the cargo-cult approach to public contact points for security reports.
+
+(Thus last week was a little depressing for looking at the state of the industry).
+
+But things got much better after that.
+
+Golang issue 19767 was filed; the Golang maintainers decided to go public immediately. They decided to make a breaking change to their API, as they allow themselves to do for packages in the namespace.
+
+They quickly fixed the library such that leaving the field of client configs unset would result in all calls failing. They provided a function which could be explicitly assigned to get the old behavior and to verify against one key, then provided an example function which comes closer to classic SSH behavior by providing a simplistic parse of the file (first match only, ignoring algorithm in selection, etc) – it works.
+
+Despite breaking changes being allowed here, they’re still discouraged and fairly rare. They did take the opportunity to be very explicit in the package documentation, adding:
+
+Every software package using x/crypto/ssh for implementing an SSH client which is not already doing hostkey verification will need to be updated to handle this.
+
+Anyone who complains and says “this is why we need to vendor library dependencies” should need to explain why it would be better for their product to keep a security flaw in it and not be pressed to update. A bunch of Google engineers recently volunteered a large amount of time and work to fixing a similar issue which turned out to be vendored deeply into the Java ecosystem, in the “Mad Gadget” vulnerability fix. Vendoring protects engineering time at the expense of embedding vulnerabilities deeper and making it harder to fix them all.
+
+Anyone using SSH as a client in Golang who wants to keep being insecure will need to explicitly mark it as such in their codebase and face public ridicule.
+
+PS: I ran a Twitter poll about what most vendors would do, poll lasting one week:
+
+ 
+
+ Across 185 votes, only 27% felt that software vendors would actually fix the security problems in their software.
+
+Whether this cynicism is undue, or merely resigned realism, I leave to your analysis. Fortunately, time will give us real answers: we can revisit this a year from now and see what has changed.|||
+

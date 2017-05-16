@@ -1,0 +1,102 @@
+In this post I want to talk about improper implementation of session tokens and how one XSS vulnerability can result in full compromise of a web application. The following analysis is based on an existing real-life web application. I cover the step-by-step process that lead to administrator's account take over and I share my thoughts on what could have been done to better secure the application.
+
+Recently, I've performed a penetration test of a web application developed by an accounting company that handles my accounting. I figured that my own financial data is as secure as the application itself, so I decided to poke around and see what flaws I was able to find.
+
+The accounting application, that I will be talking about, allows to check unpaid invoices, see urgent messages from accounting staff and keeps the user up to date on how much needs to be paid to various financial institutions.
+
+One of the first things I do, when starting a new web penetration test, is finding out how session tokens are generated and handled. This often gives me quick insight into what I may be up against.
+
+As I found out, the application relies heavily on providing functionality via REST API and site content is generated dynamically using AngularJS with asynchronous requests.
+
+I started by signing into my account. The sign-in packet sent to the REST backend looked as follows:
+
+The response to my sign-in attempt with valid credentials looked like this:
+
+The server replied with what looked like a session token and information about my account. The whole JSON reply, as I found out, was later saved into cookie, presumably to be accessible by the AngularJS client-side scripts. I learned that cookie was saved without or flags set.
+
+Without flag, the cookie is accessible from javascript running under same domain, which I assumed was intended behaviour, as the client-side scripts could retrieve its data to populate website contents and use the session token with AJAX requests to REST backend. For cookies, without flag set, it often ends badly once a single XSS vulnerability is discovered.
+
+The lack of flag in the cookie, allows for its theft via man-in-the-middle attack. The attacker can just inject into browsed HTTP traffic and intercept the HTTP request including the session token cookie, which will be sent over unencrypted HTTP channel. It also doesn't help that the application doesn't have HTTP Strict Transport Policy enabled in response headers.
+
+Lets focus on the session token itself, which reads:
+
+During the web application penetration test I often sign-out and sign-in multiple times to see if the newly generated session token, provided by the server, differs much from the previous one. In this situation, it was apparent the token was in the JSON Web Token format.
+
+In short, JSON Web Token aka JWT is a combination of user data and a hash signature. The hash prevents anyone who doesn't know the secret key, used in the hashing process, from crafting their own tokens. The token is divided into three sections and each is encoded with base64.
+
+Dissecting this application's token we get:
+
+The server will re-calculate the signature hash of with the secret key only known to the server. If the re-calculated hash differs from the one supplied with the token, it will not be accepted.
+
+We can see that the token contains timestamp information of when it is supposed to expire (in this scenario tokens were valid for one day) and the ID of the user, who should be authorized. It is evident that if we were able to change the value inside the token, it would allow us to be authorized as any registered user of the application. Issue is, we would have to re-calculate the signature hash using the secret key we don't know.
+
+It is possible to brute-force the secret key using an offline dictionary attack and a powerful PC, but if the secret key is longer than 12 characters and uses also special characters, this will be a waste of time and more importantly a waste of CPU or GPU cycles.
+
+There have already been many articles written on why using JWT is bad, so I'll try to keep my list short and stick to two major flaws:
+
+Let's leave the fact that the application is using JWT as a session token and focus on the implications of allowing the session token to be accessible from javascript.
+
+The sample request to REST backend, that includes the session token, looks as follows:
+
+As we can see, the session token is sent in a custom HTTP header . Sending session tokens in custom HTTP headers, protect applications from Cross-site Request Forgery (CSRF) attacks. Unfortunately, the fact that cookie, storing the token, must be available from javascript, in order to be included with a request, makes the application exceptionally vulnerable to token theft. All the attacker needs is one XSS vulnerability in the application, in order to capture the token cookie with injected javascript code.
+
+With that in mind, I proceeded to look for vulnerabilities that would allow me to inject javascript code.
+
+I found a messaging feature, in the application, that immediately caught my attention. Basically, it allowed all users to send any message to application's administrators and initiate a conversation. If vulnerable, it would make the perfect channel to send stored XSS straight to site admininstrators.
+
+I put a blank message with one carriage return character, clicked Send and looked at the request:
+
+When I saw in the JSON request body, I knew I was right at home. The application swallowed and spit out the contents of the message back without any filtering at all. All supplied HTML tags were preserved.
+
+I confirmed presence of XSS vulnerability by sending as a replacement for my message content, using the Edit feature and intercepting the request in Burp Proxy. After reloading, the page greeted me valiantly with javascript alert box.
+
+Seeing that the request contained recipient information as well, it would be wise to test for ability to send messages to other users of the application, by tampering with the recipient data. This would let the attacker launch phishing attacks against other users. At this point I didn't bother as I had everything to set up an attack that would hopefully grant me administrator privileges.
+
+In order to intercept administrator's cookies, I decided to make my script create a new Image and append it to document's body. User's cookies would be sent to attacker's controlled server via GET parameters, embedded in the URL to fake image on attacker's web server.
+
+Injected HTML code would look like this:
+
+The moment, the browser will render this image, all of the visitor's cookies (for current domain) will be sent to attacker's server.
+
+In order to dynamically inject the image into document's body, I required a javascript oneliner that will act as XSS payload. Here it was:
+
+To make it less obvious and to obfuscate our payload a bit, I converted it to use base64 encoding:
+
+My payload was ready, but I also needed a server backend at that would wait for stolen cookies and log them for later retrieval. Here is a simple script in PHP that I used to do the job. Just remember to create the secretcookielog9977.txt file in advance and give it R/W permissions:
+
+With all that prepared, I returned to the application and edited my message for the last time. I have intercepted the edit HTTP request and replaced the content data with:
+
+I reloaded the page and checked the secretcookielog9977.txt on my web server to confirm that I've managed to steal my own cookies. All worked perfectly.
+
+Now, all I had to do is wait for the site administrator to sign in and read my malicious message. Shortly after...
+
+I had administrator's session token that was valid for 1 full day. Due to the token being JSON Web Token, there was no way for the administrator to invalidate it, even if it was found to be compromised.
+
+With the administrator's token captured, the real attacker could have done significant damage. For me it was enough to demonstrate the risk and report my findings.
+
+As demonstrated, the application had an evident stored XSS vulnerability that allowed the attacker to steal administrator user's cookies, including the session token. The XSS would have much less impact if the cookie was stored with flag, thus making it inaccessible from javascript. Session token was made to be sent in every request to REST API in a custom header, so making it accessible from javascript was mandatory.
+
+Here are my two cents on how the security of the pentested application could be improved:
+
+In my opinion, cookies that include the session token or other critical data, should never be set without the flag. Session token should be stored in a separate cookie flagged with and REST API backend should reply with following HTTP headers:
+
+Then if the request to REST API, made from javascript, is done with property , the cookie with the session token will be automatically attached and securely sent to the backend server in a header. Furthermore, cookie will only be attached if the request is made from origin URL, protecting the users from possible CSRF attacks. There is no need to use custom headers for transporting session tokens and it is always better to use standard cookies, which receive better protection from modern web browsers.
+
+Using JSON Web Token as session tokens is rather secure if you use a strong secret key, but keep in mind that if your encryption key ever gets leaked or stolen and the attackers get a hold of it, they will be able to forge their own session tokens, allowing them to impersonate every registered user in the application.
+
+It is imperative for every web application to use randomly generated session tokens that can be invalidated at any time. Sessions should be invalidated every time the user signs in, signs out or resets their password. Such session handling will also protect users from session fixation attacks.
+
+In the pentested application, the additional session token could be embedded inside the JWT itself, inside the data section, like so:
+
+It is important to note here, that the application also used JWT as a verification token inside the reset password link. Password resetting functionality should always be handled using one-time tokens. Once the password is reset, the reset token should be invalidated to prevent anyone from using it again. Using JWT makes it possible to re-use the token for as long as the expiration timestamp allows.
+
+If the application is served only via HTTPS (and it should), setting a flag on cookies, will allow them to be sent only over secure HTTPS connection. That way, the application's session tokens will never be sent in plain-text, making them protected against man-in-the-middle attacks.
+
+I hope you found this little case study useful. Although I'm aware I haven't exhausted the subject of improper session handling or launching XSS attacks, I wanted to present a sample real-life scenario of a web application penetration test. If you are a web developer, you may look differently, from now on, into implementation of session tokens and maybe you will put more effort into filtering those nasty HTML tags in the output of user supplied data.
+
+If you are looking for a web application penetration tester or reverse engineer, I will be more than happy to hear about your project and how I can help you.
+
+I am always available on Twitter @mrgretzky or directly via email kuba@breakdev.org.
+
+Have a nice day and see you in my next post!|||
+

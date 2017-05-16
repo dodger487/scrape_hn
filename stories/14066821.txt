@@ -1,0 +1,104 @@
+To demonstrate the impact of the issue, I created an exploit that, when executed in one 64-bit PV guest with root privileges, will execute a shell command as root in all other 64-bit PV guests (including dom0) on the same physical machine.
+
+On x86-64, Xen PV guests share the virtual address space with the hypervisor. The coarse memory layout looks as follows:
+
+Xen allows the guest kernel to perform hypercalls, which are essentially normal system calls from the guest kernel to the hypervisor using the System V AMD64 ABI. They are performed using the instruction, with up to six arguments passed in registers. Like normal syscalls, Xen hypercalls often take guest pointers as arguments. Because the hypervisor shares its address space, it makes sense for guests to simply pass in guest-virtual pointers.
+
+Like any kernel, Xen has to ensure that guest-virtual pointers don't actually point to hypervisor-owned memory before dereferencing them. It does this using userspace accessors that are similar to those in the Linux kernel; for example:
+
+In the Linux kernel, the macro checks whether the whole memory range from is safe to access, using any memory access pattern. However, Xen's
+
+* Valid if in +ve half of 48-bit address space, or above Xen-reserved area.
+
+* This is also valid for range checks (addr, addr+size). As long as the
+
+* start address is outside the Xen-reserved area then we will access a
+
+* non-canonical address (and thus fault) before ever reaching VIRT_START.
+
+Xen normally only checks that points into the userspace area or the kernel area without checking . If the actual guest memory access starts roughly at , proceeds linearly without skipping gigantic amounts of memory and bails out as soon as a guest memory access fails, only checking is sufficient because of the large range of non-canonical addresses, which serve as a large guard area. However, if a hypercall wants to access a guest buffer starting at a 64-bit offset, it needs to ensure that the check is performed using the correct offset - checking the whole userspace buffer is unsafe!
+
+for accessing arrays in guest memory. If you want to check whether it's safe to access an array starting at element 0, you can use . However, if you want to check whether it's safe to access an array starting at a different element, you need to use
+
+When I saw the definition of , the lack of security guarantees actually provided by seemed rather unintuitive to me, so I started searching for its callers, wondering whether anyone might be using it in an unsafe way.
+
+When e.g. a scheduler tick happens, Xen needs to be able to quickly switch from the currently executing vCPU to another VM's vCPU. However, simply interrupting the execution of a hypercall won't work (e.g. because the hypercall could be holding a spinlock), so Xen (like other operating systems) needs some mechanism to delay the vCPU switch until it's safe to do so.
+
+In Xen, hypercalls are preempted using voluntary preemption: Any long-running hypercall code is expected to regularly call to check whether the scheduler wants to schedule to another vCPU. If this happens, the hypercall code exits to the guest, thereby signalling to the scheduler that it's safe to preempt the currently-running task, after adjusting the hypercall arguments (in guest registers or guest memory) so that as soon as the current vCPU is scheduled again, it will re-enter the hypercall and perform the remaining work. Hypercalls don't distinguish between normal hypercall entry and hypercall re-entry after preemption.
+
+This hypercall re-entry mechanism is used in Xen because Xen does not have one hypervisor stack per vCPU; it only has one hypervisor stack per physical core. This means that while other operating systems (e.g. Linux) can simply leave the state of an interrupted syscall on the kernel stack, Xen can't do that as easily.
+
+This design means that for some hypercalls, to allow them to properly resume their work, additional data is stored in guest memory that could potentially be manipulated by the guest to attack the hypervisor.
+
+in xen/common/memory.c. This function allows a guest to "trade in" a list of physical pages that are currently assigned to the guest in exchange for new physical pages with different restrictions on their physical contiguity. This is useful for guests that want to perform DMA because DMA requires physically contiguous buffers.
+
+as argument, which is defined as follows:
+
+/* Number of extents, and size/alignment of each (2^extent_order pages). */
+
+* Domain whose reservation is being changed.
+
+* Unprivileged domains can specify only DOMID_SELF.
+
+* [IN] Details of memory extents to be exchanged (GMFN bases).
+
+* Note that @in.address_bits is ignored and unused.
+
+*  3. @in.extent_start and @out.extent_start lists must not overlap
+
+* [OUT] Number of input extents that were successfully exchanged:
+
+*  1. The first @nr_exchanged input extents were successfully
+
+*  2. The corresponding first entries in the output extent list correctly
+
+*     indicate the GMFNs that were successfully exchanged.
+
+*  3. All other input and output extents are untouched.
+
+*  4. If not all input exents are exchanged then the return code of this
+
+THIS FIELD MUST BE INITIALISED TO ZERO BY THE CALLER!
+
+The fields that are relevant for the bug are
+
+is documented as always being initialized to zero by the guest - this is because it is not only used to return a result value, but also for hypercall preemption. When is preempted, it stores its progress in , and the next execution of uses the value of to decide at which point in the input arrays
+
+As can be seen in the following code snippet, the 64-bit resumption offset , which can be controlled by the guest because of Xen's hypercall resumption scheme, can be used by the guest to choose an offset from at which the hypervisor should write:
+
+/* Assign each output page to the domain. */
+
+check only checks whether it would be safe to access the guest array would have been correct. This means that an attacker can write an 8-byte value to an arbitrary address in hypervisor memory by choosing:
+
+The value that is written to the attacker-controlled address is a physical page number (physical address divided by the page size).
+
+Especially on a busy system, controlling the page numbers that are written by the kernel might be difficult. Therefore, for reliable exploitation, it makes sense to treat the bug as a primitive that permits repeatedly writing 8-byte values at controlled addresses, with the most significant bits being zeroes (because of the limited amount of physical memory) and the least significant bits being more or less random. For my exploit, I decided to treat this primitive as one that writes an essentially random byte followed by seven bytes of garbage.
+
+It turns out that for an x86-64 PV guest, such a primitive is sufficient for reliably exploiting the hypervisor for the following reasons:
+
+The goal of the attack is to point an entry in a live level 3 pagetable (which I'll call "victim pagetable") to a page to which the guest has write access (which I'll call "fake pagetable"). This means that the attacker has to write an 8-byte value, containing the physical page number of the fake pagetable and some flags, into an entry in the victim pagetable, and ensure that the following 8-byte pagetable entry stays disabled (e.g. by setting the first byte of the following entry to zero). Essentially, the attacker has to write 9 controlled bytes followed by 7 bytes that don't matter.
+
+Because the physical page numbers of all relevant pages and the address of the writable mapping of all physical memory are known to the guest, figuring out where to write and what value to write is easy, so the only remaining problem is how to use the primitive to actually write data.
+
+Because the attacker wants to use the primitive to write to a readable page, the "write one random byte followed by 7 bytes of garbage" primitive can easily be converted to a "write one controlled byte followed by 7 bytes of garbage" primitive by repeatedly writing a random byte and reading it back until the value is right. Then, the "write one controlled byte followed by 7 bytes of garbage" primitive can be converted to a "write controlled data followed by 7 bytes of garbage" primitive by writing bytes to consecutive addresses - and that's exactly the primitive needed for the attack.
+
+At this point, the attacker can control a live pagetable, which allows the attacker to map arbitrary physical memory into the guest's virtual address space. This means that the attacker can reliably read from and write to the memory, both code and data, of the hypervisor and all other VMs on the system.
+
+At this point, the attacker has full control over the machine, equivalent to the privilege level of the hypervisor, and can easily steal secrets by searching through physical memory; and a realistic attacker probably wouldn't want to inject code into VMs, considering how much more detectable that makes an attack.
+
+But running an arbitrary shell command in other VMs makes the severity more obvious (and it looks cooler), so for fun, I decided to continue my exploit so that it injects a shell command into all other 64-bit PV domains.
+
+Then, in hypervisor context, it is possible to hook the syscall entry point by reading and writing the MSR. The syscall entry point is used both for syscalls from guest userspace and for hypercalls from guest kernels. By mapping an attacker-controlled page into guest-user-accessible memory, changing the register state and invoking , it is possible to divert the execution of guest userspace code to arbitrary guest user shellcode, independent of the hypervisor or the guest operating system.
+
+My exploit injects shellcode into all guest userspace processes that is invoked on every syscall. Whenever the shellcode runs, it checks whether it is running with root privileges and whether a lockfile doesn't exist in the guest's filesystem yet. If these conditions are fulfilled, it uses the syscall to create a child process that runs an arbitrary shell command.
+
+I believe that the root cause of this issue were the weak security guarantees made by was committed in 2005, two years after the first public release of Xen and long before the first XSA was released. It seems like old code tends to contain relatively straightforward weaknesses more often than newer code because it was committed with less scrutiny regarding security issues, and such old code is then often left alone.
+
+While there have been several Xen vulnerabilities that only affected PV guests because the issues were in code that is unnecessary when dealing with HVM guests, I believe that this isn't one of them. Accessing guest virtual memory is much more straightforward for PV guests than for HVM guests: For PV guests, , which basically just does a bounds check followed by a memcpy with pagefault fixup - the same thing normal operating system kernels do when accessing userspace memory. For HVM guests, , which has to do a page-wise copy (because the memory area might be physically non-contiguous and the hypervisor doesn't have a contiguous virtual mapping of it) with guest pagetable walks (to translate guest virtual addresses to guest physical addresses) and guest frame lookups for every page, including reference counting, mapping guest pages into hypervisor memory and various checks to e.g. prevent HVM guests from writing to readonly grant mappings. So for HVM, the complexity of handling guest memory accesses is actually higher than for PV.
+
+For security researchers, I think that a lesson from this is that paravirtualization is not much harder to understand than normal kernels. If you've audited kernel code before, the hypercall entry path (
+
+in xen/arch/x86/x86_64/entry.S) and the basic design of hypercall handlers (for x86 PV: listed in the
+
+in xen/arch/x86/pv/hypercall.c) should look more or less like normal syscalls.|||
+

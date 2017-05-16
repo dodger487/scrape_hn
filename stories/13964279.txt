@@ -1,0 +1,35 @@
+Hi all! I wanted to describe an issue that occurred recently that really threw several of us for a loop. I work at a university and this is what happened…
+
+This past Friday, 3/24/2017, several of our Windows 10 machines on campus started reporting incorrect time. Not all machines were off by the same amount, but by completely random intervals. My machine was showing 31 hours in the past. Other machines were off by 6 hours, 20 hours, etc. All affected machines were showing a time that was in the past. Our environment is as follows:
+
+Going through a bunch of troubleshooting steps I learned that:
+
+Things I tried to pinpoint the cause of the problem:
+
+My machine's time was correct for the rest of the workday...
+
+After I went home and remoted into my machine, I noticed that the time was still correct. I started doing some work while watching Netflix on my other screen... and about 2 hours into doing work, I noticed that the time jumped to being wrong again. I was no longer running Wireshark or Procmon at that time... I smacked myself for that.
+
+After the time change occurred again, I corrected the time and opened up Procmon (but not Wireshark because I’m dumb and bad) and just let it run. I started logging at 10:30pm last night, and around 1:15am I noticed that the time was off again. Thankfully I had Procmon running. I quickly paused Procmon and saved the log. It was 19 GB in size with 49 million entries.
+
+After applying some filters to the log to make it slightly more manageable, I found the exact moment when the time change happened and saw where svchost.exe was accessing a bunch of Registry Keys which correlated to the time change. The interesting Reg Keys were inside of HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\W32Time\SecureTimeLimits.
+
+This finally gave me a solid lead to resume my Googling (previous attempts at finding ANYTHING about this issue were pretty fruitless) and finding out about a new feature that was introduced in Windows 10 called Secure Time. Here are some corresponding threads and posts about the issue and underlying mechanisms:
+
+"The SSL connections made from the client are randomly interspersed in time and the metadata they provide follows suit as well. Our algorithms corroborate the data and determine reliable range for the current time. The information from ServerUnixTime and OCSP validity periods are merged to produce the smallest possible reliable time range value along with a confidence score. When the confidence score is sufficiently high, this data becomes information. We are calling this as Secure Time Seed of High Confidence (STSHC)."
+
+Although now I know how to bypass this Secure Time voodoo with a registry tweak (set UtilizeSslTimeData to 0 inside of HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\w32time\Config), we now think that there may be something going on with our SSL traffic that is causing Windows to break its time. The reason I think something is happening with SSL is because not only is Windows flipping its lid about the time, but some people have been reporting not being able to get to our University’s website properly (from their personal machines, from off campus) due to what appear to be SSL cert issues, even though are SSL certs are nowhere near expired. And these two problems started occurring on the very same day. Seems a bit unlikely that it is a coincidence.
+
+So those were my fun adventures in time. Has anyone else come across this issue?
+
+TLDR: Windows 10 has a feature called Secure Time which is on by default. It correlates time stamp metadata from SSL packets and matches them against time from the DCs. It processes these various times by means of black magic and sets the system clock accordingly. This feature has the potential to flip out and set the system time to a random time in the past. The flip out MIGHT be caused by issues with SSL traffic.
+
+EDIT: I didn't mention that I wrote a few scripts prior to finding out about the reg key. One of the scripts checks the current system time against the time on the DC and then corrects it if it's off by more than 5 minutes in each direction. The other script parses the event logs on a machine and looks for any time correction of more than 5 minutes which is NOT within 5 minutes of a Wake from Sleep event or Power On event, and then dumps a log file onto a share. I'll post these once I'm next at a computer since someone else might find them useful.
+
+EDIT: Link to the haphazardly put together script I was talking about: https://pastebin.com/MBZLHaSg. Use at your own risk!
+
+EDIT: We do use a load balancer which touches our SSL traffic. We brought this particular device online about a month ago. We are now investigating if we can spot any sort of ongoing issues with it. I'll update again if we discover anything. Thanks for all the responses guys! I didn't expect this to get as much attention as it did. I'd LOVE to figure out which exact packets Secure Time looks at for the OCSP data. Curious if there is a way to turn on logging for that. w32tm /debug does have an entry for "starting Secure Time" (or something along those lines), but it isn't descriptive in the least bit.
+
+EDIT 3/29/2017: We contacted several people who started having problems accessing our website at the same time that the time issues began to occur. The common link between all those machines was that they were all running ESET NOD32 Antivirus. We installed ESET NOD32 version 9 on a test system, and were able to recreate the issues with being unable to access our website. As a test, we turned OCSP Stapling OFF on our KEMP load balancer, and the issue was immediately resolved. Once we turned OCSP Stapling back on, the issue did NOT return. It appears that something happened with the load balancer that temporarily broke OCSP Stapling. We're still investigating as to what that could have been, but toggling the OCSP Stapling service off and on appears to have resolved the issue for now.|||
+
+TLDR at the end. Hi all! I wanted to describe an issue that occurred recently that really threw several of us for a loop. I work at a university...

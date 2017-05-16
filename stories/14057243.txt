@@ -1,0 +1,46 @@
+The shortcomings of TCP connection termination have been described many times. If you are not familiar with those problems here's an example of an article that focuses on the problem.
+
+However, there's one special use case that is rarely, if ever, discussed.
+
+Imagine a TCP client wanting to shut down its TCP connection to server cleanly. It wants to send the last request to the server, read any responses it may produce and exit.
+
+Given that it has no idea how many responses are about to arrive it can't just close the socket (it would miss the responses) but, at the same time, it cannot just go on reading responses forever (that would make it hang after the last response is received). What it needs is some way to let server know that it is shutting down. The server should then send back all the pending responses and subsequently acknowledge the shut down.
+
+This is what TCP half-close mechanism is for. Client sends a request and shuts down outbound part of the connection (see shutdown() function). Afterwards, it can't send more data but it can still receive data from the server. When server realizes the client has half-closed the connection, it will close the other half of the connection.
+
+Technically, this works by sending FIN packets, the TCP's equivalent of EOF. Client sends data, then sends FIN. Server receives the data, processes it, sends the responses, receives the FIN, then sends FIN back to the client. Client receives the responses, processes them, receives the FIN and at that point it knows that everything went OK and no data was lost.
+
+So, what can go possibly wrong?
+
+Well, imagine that server wants to do clean shut down as well. It doesn't have to do that as often as client does, but it may still happen that request for clean shut down from client coincides with request for clean shut down from server. That's where the things can go awry.
+
+Look at the server side: Server does half-close, then receives a request. It can process it, but it can't send the responses! The outbound half of the TCP connection was already closed by shutdown() function.
+
+What it can do is to close the socket which will result in sending FIN to the client.
+
+But look at the client now: It's waiting for responses and considers incoming FIN to mean "no more responses". But, actually, there were responses! It was just the server was unable to send them. This scenario breaks the reliability guarantees of the half-close mechanism.
+
+OK, so maybe we can fix the problem by making the simultaneous shutdown an error rather than a success. It would require no change to TCP protocol, just to TCP API. When endpoint sends a FIN and then receives a FIN from the peer without first receiving an ACK for the former FIN, it would return an error to the user.
+
+Well, consider a protocol on top of TCP. It has its own terminal handshake and once that is done both peers close the underlying TCP connection. But that terminal handshake gets the peers in sync! They will attempt to do TCP shutdown simultaneously and will almost inevitably fail with the error we've introduced above.
+
+So that's not going to work. What about server sending RST instead of FIN then? Yes, that would work, but it's not a clean shut down. It means that server, when shutting down, forcefully breaks all the connections to the clients without giving them any grace interval to finish their stuff.
+
+That, finally, brings me to my main point: Terminal handshake, to be fully reliable, has to be asymmetric. If both peers are using the same algorithm they are going to run into race conditions such as those described in this article. And, by the way, this observation is not specific to TCP. It applies to any protocol with symmetric shutdown procedure.
+
+In other words, client has to know it's the client and server has to know it's the server. If so, they can act a bit differently when shutting down and thus solve the problem. Actually, client can be left unchanged and use the standard half-close mechanism. Server, on the other hand, has to send an additional termination request before starting the half-close procedure:
+
+Note how sending the "I am shutting down!" message does nothing to the underlying TCP connection. The server is still able to both send and receive data. It can continue working as normal, thus giving the client a grace period to shut down. The client, on the other hand, is expected to finish whatever it is doing at the moment and do the classic connection half-close.
+
+This, of course, gives client a chance to misbehave a block server's shutdown by simply going on as normal and not doing the half-close. In that case though, it's perfectly reasonable for server to forcefully close the connection after the grace period expires.
+
+That's all from the technical standpoint.
+
+Now let me say few words about why I consider this topic important.
+
+First, there's this not widely known theoretical result: If you want your protocol to be fully reliable in the face of either peer shutting down, the terminal handshake has to be asymmetric. As we've seen above, TCP protocol has symmetric termination algorithm and thus can't, by itself, guarantee full reliability.
+
+Second, I am currently working on BSD socket API revamp and it's not clear how to address this issue. On one hand, the problem is so obscure that we can't really count on the protocol user to get everything right. So, the API could force the protocol developer to implement the termination mechanism correctly. That way the user wouldn't have to care.
+
+On the other hand the API should support the existing, not fully reliable, protocols, most importantly, TCP. But that raises an API design problem: Given that there are so many ways to terminate a connection (forceful termination, single-step TCP-like close, two-step TCP-like termination with half-closes, full-blown three step termination as secribed above) how many shutdown APIs should there be? If there's close1(), close2(), close3() and close4(), it's going to get super confusing pretty quickly. If there's a single API, it can't give the same reliability guarantees for every protocol.|||
+

@@ -1,0 +1,334 @@
+In this series of articles we’ll follow the process of creating a scalable, real-time chat service.
+
+ The objective is to learn more about practical usage of the emerging language Rust and to cover the basic problems of using system programming interfaces, going step by step.
+
+Part 1 covers the project setup and the implementation of a bare bones WebSocket server. You don’t need to know Rust to follow, but some prior knowledge of POSIX API or C/C++ would certainly help. And what would help you even more is a good cup of coffee — beware that this article is fairly long and very low-level.
+
+I became interested in Rust because I’ve always liked systems programming. But while the area of low-level development is joyfully challenging and fulfilling, there’s a common belief that it’s very hard to do it correctly — and it’s not surprising at all, considering how many non-obvious pitfalls awaiting neophytes and seasoned developers alike.
+
+But arguably the most common pitfall is the memory safety. It is the root cause for a class of bugs such as buffer overflows, memory leaks, double deallocations, and dangling pointers. And these bugs can be really nasty: well known issues like the infamous OpenSSL Heartbleed bug is caused by nothing more than the incorrect management of memory — and nobody knows how much more of these severe bugs are lurking around.
+
+However, there are several good practice approaches in C++ such as smart pointers[1] and on-stack allocation[2] to mitigate these common issues. But, unfortunately, it’s still too easy to “shoot yourself in the foot” by overflowing a buffer or by incorrectly using one of the low-level memory management functions because these practices and constraints aren’t enforced on the language level.
+
+Instead, it’s believed that all well-grounded developers would do good and make no mistakes whatsoever. Conversely, I do believe that these critical issues have nothing to do with the level of skill of a developer because it’s a machine’s task to check for errors — human beings just don’t have that much attention to find all weaknesses in large codebases.
+
+That’s the major reason of existence for a common way to automatically handle the memory management: the garbage collection. It’s a complex topic and a vast field of knowledge in itself. Almost all modern languages and VMs use some form of GC, and while it’s suitable in most cases, it has its own shortcomings — it’s complex[3], it introduces an overhead of a pause to reclaim unused memory[4], and generally requires intricate tuning tricks for high-performance applications to reduce the pause time.
+
+Rust takes a slightly different approach — basically, a middle ground: automatic memory and resources reclamation without a significant overhead and without the requirement of a tiresome and error-prone manual memory management. It’s achieved by employing ownership and borrowing concepts.
+
+The language itself is built upon the assumption that every value has exactly one owner. It means that there could be only one mutable variable pointing to the same memory region:
+
+And, because values bind to exactly one place, resources that they hold (memory, file handles, sockets, etc.) can be automatically freed when the variable goes out of a scope (defined by code blocks within curly braces, and ).
+
+This may sound unnecessarily complicated, but, if you think about it, this concept is very pragmatic. Essentially, it’s Rust’s killer feature — these restrictions provide the memory safety that makes Rust feel like a convenient high-level language, while at the same time it retains the efficiency of pure C/C++ code.
+
+Despite all these interesting features, until recently Rust has had some significant disadvantages such as an unstable API, but after almost 10 years[5] the stable version 1.0 has finally landed, and the language has matured to the point when we’re finally ready to put it into a practical usage.
+
+I prefer to learn new languages and concepts by doing relatively simple projects with a real-world application — this way language features can be learned along the way when they’re needed in practice at hand.
+
+As a project to learn Rust I’ve chosen an anonymous text chat service similar to Chat Roulette. In my opinion chat is a good choice because chat services require fast responses from a server and an ability to handle many connections at once (we’ll strive for many thousands — that will be a good test for the Rust’s raw performance and memory footprint).
+
+Ultimately, the practical end result should be a binary executable and a bunch of deployment scripts to run the service in various cloud environments.
+
+But before we’ll start writing the actual code, we need to take a detour to understand the input & output operations, which are essential and crucial for such network services.
+
+To function properly, our service needs to send and receive data through the network sockets.
+
+It may sound like a simple task, but there are several ways of varying complexity to handle the input and output operations efficiently. The major difference between the approaches lies in the treatment of blocking: the default is to prevent all CPU operations while we’re waiting for data to arrive to a network socket.
+
+Since we can’t allow one user of our chat service to block others, we need to isolate them somehow.
+
+A common way is to create a separate thread for an each user so that blocking would take effect only in the context of a single thread. But while the concept is simple and such code is easy to write, each thread requires memory for its stack[6] and has an overhead of context switches — modern server CPUs usually have about 8 or 16 cores, and spawning many more threads requires an OS kernel scheduler to work hard to switch execution between them with an adequate speed. For this reason it’s hard to scale multithreading to many connections — in our case it’s barely practical (though certainly possible) to spawn several thousands of system threads, because we want to handle that many users without significant costs — think about the front pages of TechCrunch, HN, and Reddit linking our cool app at once!
+
+So, instead we’ll use efficient I/O multiplexing system APIs that employ an event loop — that’s epoll on Linux[7] and kqueue on FreeBSD and OS X[8].
+
+These different APIs work similarly in a straightforward way: bytes are coming over the network, arriving at the sockets, and instead of waiting when the data becomes available for a read, we’re telling a socket to notify us when new data arrives.
+
+Notifications come in a form of events that end up in the event loop. And that’s where the blocking happens in this case: instead of periodic checks for thousands of sockets, we’re just waiting for new events to arrive. That’s an important distinction because particularly in WebSocket applications it’s very common to have many idle clients just waiting for some activity. With asynchronous I/O we’ll have a very little overhead of a socket handle and hundreds of bytes at most for an each client.
+
+Interestingly enough, it works great not only for network communications but for disk I/O as well, as the event loop accepts all kinds of file handles (and sockets in the *nix world are just file handles too).
+
+Rust ships with a convenient tool called that’s similar to Maven/Composer/npm/rake. It manages library dependencies, handles the build process, runs test suites, and simplifies the process of creating a new project.
+
+That’s what we need to do now, so let’s open a terminal app, and execute the following command:
+
+The part tells Cargo to create a program instead of a library.
+
+As a result, we get two files:
+
+contains a description and dependencies of the project (similar to JavaScript’s ).
+
+ is the main source file of our project.
+
+We need nothing more to start, and now we can compile and execute the program with a single command . Also, it will show us compilation errors if we’d have any.
+
+Now we’re ready to put the theory into practice — let’s start with creating a simple event loop that will wait for new events. Fortunately, we don’t need to wire up all system calls to work with the according APIs ourselves — there’s a Rust library, Metal IO (or mio for short), that does it for us.
+
+As you remember, library dependencies are managed by Cargo. It gets libraries from crates.io, the Rust packages repository, but allows to retrieve dependencies straight from Git repositories as well. This feature can be useful when we need to use the latest version of a library that hasn’t been packaged yet.
+
+At the moment of this writing has a package only for the version 0.4, while v.0.5 has some new useful features and breaking API changes, so for now let’s use the bleeding edge version by adding the reference to the library to :
+
+After we’ve added the dependency we need to import it in our code, so let’s put it into as well:
+
+Usage of is pretty simple: first, we need to create the event loop by calling function, and, as the bare event loop isn’t useful, we need to make it aware of our chat service. To do that we should define a structure with functions that should conform to a interface.
+
+Though Rust doesn’t support object-oriented programming in a “traditional” way, structures (or structs) are analogous in many ways to classes from the classic OOP, and they can implement interfaces that are enforced by a special language construct called traits.
+
+Here’s how we define the struct:
+
+Implement the trait for it:
+
+That’s our first encounter with borrows: notice the usage of on the last line.
+
+It tells that we’re temporary moving the ownership of the value to another binding, with an option to mutate (change) the value.
+
+To simplify matters, you can imagine that the borrowing works like this (in pseudocode):
+
+That code is roughly equal to this:
+
+There could be only one mutable borrow of a value per scope. In fact, even the owner from which the value has been borrowed can’t read or change it until the borrow will fall out of a scope.
+
+However, there exists another, more simple way of borrowing that allows to read the value but doesn’t allow to modify it — the immutable borrowing. In contrast with , there’s no limit on count of read-only borrows for a single variable, but as with it imposes a limit on modifications: as long as there are immutable borrows of a variable in a scope, the value can’t be changed or borrowed mutably.
+
+Hopefully, that was a clear enough description. If it’s not, bear with me — the borrows are everywhere in Rust, so soon we’ll get a chance to practice more. Now, let’s get back to the project.
+
+Run “ ” and Cargo will download all prerequisite dependencies, compile the program (showing some warnings that we can ignore at the moment), and run it.
+
+As a result, we’ll get the terminal with just a blinking cursor. Not too encouraging, but actually that’s a sign of correct execution — we’ve started the event loop successfully, although at the moment it does nothing useful for us. Let’s fix that.
+
+To start a TCP server that will be accepting WebSocket connections we’ll use a special struct from the namespace, , and follow the standard workflow of establishing a server-side TCP socket: binding to an address, listening, and accepting connections.
+
+Look at the code:
+
+And let’s go over it, line by line.
+
+First we need to add TCP namespace and socket address structure imports to the top of the file:
+
+Parse the string to an address structure and bind the socket to it:
+
+Notice how the compiler infers types for us: because expects an argument of the type , the Rust compiler can figure out the appropriate type of the for itself, so we don’t need to clutter the code with explicit types information.
+
+Also, you might be wondering why we call almost on every line — we’ll get to that soon.
+
+For now we need to register the socket within the event loop:
+
+Arguments for are slightly more complicated:
+
+Now, if we’ll run the resulting program with and check the output, we will see that it’s indeed listening on the port number 10000:
+
+All WebSocket connections start with a handshake — a special sequence of HTTP requests and responses to negotiate the protocol. Hence, we need to teach the server to talk HTTP/1.1 to successfully implement WebSocket.
+
+We’ll need only a subset of HTTP, though: a client wanting to negotiate a WebSocket connection just sends a request with and headers, and we need to reply in a predefined manner. And that’s all: we won’t need a full-blown web server to serve static content, etc. — there are plenty of other tools that will do this for us.
+
+But before we start to implement HTTP, we need to properly handle client connections, accepting them and subscribing to the socket events.
+
+There is a lot more code now, so let’s look at it in more detail.
+
+First thing we need to do is to make the server struct stateful: it needs to contain the listening socket and store connected clients.
+
+We’re using from the standard collections library, , to store client connections. As a key for the hash map we’re using a unique, non-overlapping token that we should generate for an each connection to identify it.
+
+To provide reasonable uniqueness, we’ll just use a simple counter to generate new tokens sequentially. That’s why variable is there.
+
+Next, the trait from becomes useful again:
+
+Here we need to override a callback function within the trait implementation. Overriding means that the trait already contains a dummy implementation (besides other default stubs for several callback functions as well). It does nothing useful, so we need to write our own version to handle events:
+
+This function gets called each time a socket becomes available for a read or write (depending on our subscription), and we’re provided with some useful info about the event through the call arguments: the event loop instance, the token linked to the event source (socket), and , a set of flags that provide details about the occurred event that could be either readable or writable.
+
+The listening socket generate readable events when a new client arrives into the acception queue and when we’re ready to connect with it. And that’s what we do next, but first we need to make sure that the event has sourced from the listening socket by doing pattern matching on a token:
+
+What does it mean? Well, the syntax resembles the standard switch construct you can find in “traditional” imperative languages, but it has a lot more power to it. While in e.g. Java can match only on numbers, strings, and enums, Rust’s works on ranges, multiple values, and structures as well, and more than that — it can capture values from patterns, similar to capturing groups from the regular expressions.
+
+In this case we’re matching on a token to determine what socket has generated the event — and, as you remember, corresponds to the listening socket on our server. In fact, we’ve made it a constant to be more descriptive:
+
+So the above expression is equivalent to .
+
+Now that we know that we’re dealing with the server socket, we can proceed to accepting a client’s connection:
+
+Here we’re doing the matching again, now over an outcome of the function call that returns the result typed as . is a special type fundamental to errors handling in Rust. It wraps around uncertain results such as errors, timeouts, etc., and we might decide what to do with them in each individual case.
+
+But we don’t have to — remember that strange function that we were calling all the time? It has a standard implementation that terminates the program execution in case if the result is an error and returns it unwrapped if it’s normal. So basically by using we’re telling that we’re interested in the immediate result only, and it’s OK to shut down the program if an error has happened.
+
+That’s an acceptable behavior in some places. However, in case of it’s not wise to use because it may accidentally shut down our entire service, effectively disconnecting all users, and we don’t want that. Instead, we’re just logging the fact of an error and continuing the execution:
+
+is another similar wrapper type that simply denotes that we either have some result or we don’t. If we have no result, the type has a value of , and the actual result is wrapped by . As you might suggest, the type itself can be compared to null or None values that can be found in many programming languages, but actually is much safer — you’ll never get the very common error unless you want to, as it works the same way as the type: when you the it shuts down the process if the result is .
+
+So, let’s unwrap the return value:
+
+In this case, there’s simply no way for the result to be  —  would return such value only if we’ll try to accept a connection on a non-listening socket. But as we’re pretty sure that we’re dealing with the server socket, it’s safe to crash the program using if has returned an unexpected value.
+
+So we’re just continuing to do the matching:
+
+That’s the most interesting part. Besides matching the pattern, this line captures the value that’s wrapped inside the type. This way we can effectively unwrap the value and return it as a result of an expression. That means that operation acts as a kind of “function” — we can return a matching result to a variable.
+
+That’s what we do here, binding the unwrapped value to the variable. Next we’re going to store it in the clients hash table, while increasing the token counter:
+
+And finally we should subscribe to events from the newly accepted client’s socket by registering it within the event loop, in the very same fashion as with registration of the listening server socket, but providing another token & socket this time:
+
+You might have noticed another difference in the provided arguments: there is a option along with the familiar . It tells that we want the triggered event to temporarily unregister from the event loop. It helps us make the code more simple and straightforward because in the other case we would have needed to track the current state of a particular socket — i.e., maintain flags that we can write or read now, etc. Instead, we just simply reregister the event with a desired event set whenever it has been triggered.
+
+Oh, and besides that, now that we’ve got more detailed struct we must modify the event loop registration code in the main function a bit. Modifications mostly concern the struct initialization and are pretty simple:
+
+Afterwards, when we’ve accepted the client socket, by the protocol we should parse the incoming HTTP request to upgrade the connection to WebSocket protocol.
+
+We won’t do it by hand, because it’s quite a boring task — instead, we’ll add another dependency to the project, the crate that wraps the Node.js’s HTTP parser and adapts it for Rust. It allows to parse HTTP requests in a streaming mode that is very useful with TCP connections.
+
+Let’s add it to the file:
+
+We won’t review the API and just proceed to parsing HTTP:
+
+And we have some changes in the ’s function:
+
+Now let’s review the new code line-by-line again.
+
+First, we import the HTTP parser library and define a handling struct for it:
+
+We need the trait because it contains callback functions, the same way as the mio’s for the . These callbacks get called whenever the parser has some new info — HTTP headers, the request body, etc. But as for now we need only to determine whether the request asks for a WebSocket protocol upgrade, and the parser struct itself has a handy function to check that, so we’ll stick to the stub callbacks implementation.
+
+There’s a detail: the HTTP parser is stateful, which means that we should create a new instance of it for each new client. Considering each client will contain its own parser state, we need to create a new struct to hold it:
+
+This struct will effectively replace the declaration with , so we’ve added the client’s socket to the state as well.
+
+Also, we can use the same to hold code to manage data coming from a client. It’d be too inconvenient to put all the code in the function — it would quickly become messy and unreadable. So we’re just adding a separate handler that will manage each client:
+
+It doesn’t need to take any arguments because we already have the required state in the containing struct itself.
+
+Now we can read the incoming data:
+
+Here’s what’s going on: we’re starting an infinite loop, allocate some buffer space to hold the data, and trying to read it to the buffer.
+
+As the call may result in an error, we’re matching the type to check for errors:
+
+Then we check if the read call has resulted in actual bytes:
+
+It returns in case if we’ve read all the data that the client has sent us. When that happens we go to wait for new events.
+
+And, finally, here’s the case when the has written bytes to the buffer:
+
+Here we’re providing a slice of the data to the parser, and then check if we have a request to “upgrade” the connection (which means that a user has provided the header).
+
+The final part is the method to conveniently create new instances:
+
+This is an associated function which is analogous to static methods in the conventional OOP systems, and this particular function can be compared to a constructor. In this function we’re just creating a new instance of struct, but in fact we can perfectly do the job without the “constructor” function — it’s just a shorthand, because without it the code would quickly become repetitive. After all, the principle exists for a reason.
+
+There are few more details. First, notice that we don’t use an explicit statement to return the function result. Rust allows to return the result implicitly from a last expression of a function.
+
+Second, this line deserves more elaboration:
+
+Here we’re creating a new instance of the by using an associated function , and we’re creating and passing a new instance of the previously defined struct as an argument.
+
+Let’s get back to the server code.
+
+To finish up, we’re making changes in the server socket handler:
+
+We’ve added a new match expression that captures all tokens besides , that is the client socket events.
+
+After we’ve got the token, we can borrow a mutable reference to the corresponding client struct instance from the clients hash map:
+
+And let’s call the function that we’ve written above:
+
+In the end, we’ve got to reregister the client, because of :
+
+As you can see, it doesn’t differ much from a client registration routine; in essence, we’re just calling instead of .
+
+Now we know about a client’s intent to initiate a WebSocket connection, and we should think about how to reply to such requests.
+
+Basically, we could send back just these headers:
+
+Except there’s one more important thing — the WebSocket protocol requires us to send a properly crafted header as well. According to the RFC, there are certain rules: we need to get the header from a client, we need to append a long string to the key ( ), then hash the resulting string with the SHA-1 algorithm, and in the end encode the result in base64.
+
+Rust doesn’t have SHA-1 and base64 in the standard library, but sure it does have them as separate libraries on crates.io, so let’s include them to our :
+
+contains functions to encode binary data in base64, and , obviously, is for SHA-1.
+
+The actual function to encode the key is straightforward:
+
+We’re getting a reference to the key string as an argument for the function, creating a new SHA-1 hash, appending the key to it, then appending the constant as required by the RFC, and return the base64-encoded string as a result.
+
+But to make use of this function we should capture the header first. To do that, let’s get back to the HTTP parser from the previous section. As you might remember, the trait allows us to define callbacks that get called whenever we receive new headers. Now is the right time to use this feature, so let’s improve the parser struct implementation:
+
+The piece of code is simple, but it introduces a new important concept: shared ownership.
+
+As you already know, in Rust we can have only one owner of a certain value, but sometimes we might need to share the ownership. For instance, in this case we need to scan a set of headers for a key while at the same time we’re collecting the headers in the parser handler. That means that we need to have 2 owners of the variable: in and .
+
+That’s where comes to help: it’s a value wrapper with a reference counter, and in effect we’re moving the ownership of a value to the container, so the itself can be safely shared between many owners with the help of a special language trickery — we just the value when we need to share it, and the wrapper safely manages memory for us.
+
+But here’s a caveat: the value contains is immutable, i.e. because of the compiler constraints we can’t change it. In fact, it’s a natural consequence of Rust’s rules about mutability — it allows to have as many borrows of a variable as you want, but you can change the value only within a single borrow.
+
+That’s not too convenient because we need to modify the list of headers as new data becomes available, and we’re pretty sure that we’re doing that only in one place, so no violations of Rust’s rules here — yet the container wouldn’t allow us to modify its content.
+
+Fortunately, fixes that — this is another special container type that allows us to overcome this limit with a mechanism called interior mutability. It simply means that we’re deferring all compiler checks to the run time as opposed to checking borrows statically, at compile time. So all that we need to do is to double-wrap our value in a (quite monstrous looking) container.
+
+It corresponds to borrow with the only difference that all checks for constrained number of mutatable borrows are performed dynamically, so it’s up to us to make sure that we’re borrowing the value only once.
+
+Now, the actual owner of the variable would be the struct, so let’s define the according properties there and write a new constructor function:
+
+Now can get access to parsed headers, and, consequently, we can read the header that interests us most, . Considering we have the key from a client, the response routine boils down to just sending an HTTP string that we combine out of several parts.
+
+But as we can’t just send the data in the non-blocking environment, we need to switch the event loop to notify us when a client’s socket becomes available for a write.
+
+The solution is to switch our event set to when we reregister the client’s socket.
+
+ Remember this line?
+
+We just need to store the set of events that interests us with the other client’s state, so let’s rewrite it this way:
+
+And, accordingly, let’s modify the “reregister” procedure:
+
+The only thing left to do is to change the client’s interest value at certain places.
+
+To make it more straightforward, let’s formalize the process of tracking the connection states:
+
+Here we define an enumeration that will describe all possible states for a WebSocket client. These three are simple: first, means that we’re waiting for a handshake request in HTTP, represents the state when we’re replying to the handshake (again, talking in HTTP), and, after that, indicates that we’ve started to communicate using the WebSocket protocol.
+
+Let’s add the client state variable to the client struct:
+
+And modify the constructor, providing the initial state and interest:
+
+Now we can actually change the state in the function. Remember these lines?
+
+Finally we can replace the placeholder in the condition block with the state change code:
+
+After we’ve changed our interest to , let’s add the required routines to reply to the handshake.
+
+We’ll modify the function in our handler implementation. The writing handler itself is simple, and we only need to separate incoming events.
+
+The remaining part is most simple — we need to build and send the response string:
+
+Let’s test it by connecting to the WebSocket server from a browser. Open the dev console in your favorite web browser (press ) and put this code there:
+
+Looks like we’ve made it — the connection is successfully established!
+
+Whew. That was a whirlwind tour of language features and concepts, but that’s just a start — be prepared for sequels to this article (of course, as lengthy and as boringly detailed as this one!). We have a lot more to cover: secure WebSockets, multithreaded event loop, benchmarking, and, of course, we still have to implement the communication protocol and write the actual application.
+
+But before we get to the app, we might do further refactoring, separating the library code from the application, likely following with eventual publication of the resulting library to crates.io.
+
+I suggest you to proceed to the next part.
+
+All code for the part 1 is available on GitHub.
+
+Interestingly enough, Rust actually brings smart pointers to the language level: borrowing is based around ideas akin to C++’s and . ↑
+
+For instance, NASA JPL C Programming Coding Standard and C standard explicitly forbid dynamic memory allocation with and implies local variables allocation on the stack and usage of pre-allocated memory instead. ↑
+
+While basic garbage collection algos are relatively easy to implement, more smart approaches like concurrent GCs are very non-trivial. In fact, a sign of complexity is that Go getting concurrent GC only in version 1.5 — almost 3 years since the 1.0 release. ↑
+
+Strictly speaking, many implementations of and functions suffer from a similar overhead as well becase of fragmentation. More on that topic can be found in “Dynamic Memory Allocation and Fragmentation in C and C++” by Colin Walls. ↑
+
+“Graydon Hoare […] started working on a new programming language called Rust in 2006.” — InfoQ: “Interview On Rust” ↑
+
+According to manual page, it defaults to 2 MB on 32-bit Linux systems. ↑
+
+For comparison of epoll to other system APIs, refer to “Comparing and Evaluating epoll, select, and poll Event Mechanisms” by Louay Gammo, Tim Brecht, et al., University of Waterloo, 2004. ↑
+
+“Inside Nginx: How We Designed For Performance Scale” by Owen Garrett. ↑
+
+General description on LinuxJournal.com. If you’re interested in more details, read “How TCP backlog works in Linux” by Andreas Veithen. ↑
+
+Many thanks to:
+
+ Andrey Baksalyar for providing illustrations.
+
+ Vga for reading drafts and providing corrections.|||
+

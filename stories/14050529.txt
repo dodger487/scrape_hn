@@ -1,0 +1,58 @@
+Last week we had a Rust + GNOME hackfest in Mexico City (wiki page), kindly hosted by the Red Hat office there, in its very new and very cool office in the 22nd floor of a building and with a fantastic view of the northern part of the city. Allow me to recount the event briefly.
+
+Inexplicably, in GNOME's 20 years of existence, there has never been a hackfest or event in Mexico. This was the perfect chance to remedy that and introduce people to the wonders of Mexican food.
+
+My friend Joaquín Rosales, also from Xalapa, joined us as he is working on a very cool Rust-based monitoring system for small-scale spirulina farms using microcontrollers.
+
+Alberto Ruiz started getting people together around last November, with a couple of video chats with Rust maintainers to talk about making it possible to write GObject implementations in Rust. Niko Matsakis helped along with the gnarly details of making GObject's and Rust's memory management play nicely with each other.
+
+During the hackfest, I had the privilege of sitting next to Niko to do an intensive session of pair programming to function as a halfway-reliable GObject reference while I fixed my non-working laptop (intermission: kids, never update all your laptop's software right before traveling. It will not work once you reach your destination.).
+
+The first thing was to actually derive a new class from GObject, but in Rust. In C there is a lot of boilerplate code to do this, starting with the my_object_get_type() function. Civilized C code now defines all that boilerplate with the G_DEFINE_TYPE() macro. You can see a bit of the expanded code here.
+
+What G_DEFINE_TYPE() does is to define a few functions that tell the GType system about your new class. You then write a function where you define your table of virtual methods (just function pointers in C), you register signals which your class can emit (like "clicked" for a GtkButton), and you can also define object properties (like "text" for the textual contents of a GtkEntry) and whether they are readable/writable/etc.
+
+You also define an function which is responsible for initializing the memory allocated to instances of your class. In C this is quite normal: you allocate some memory, and then you are responsible for initializing it. In Rust things are different: you cannot have uninitialized memory unless you jump through some hoops; you create fully-initialized objects in a single shot.
+
+Finally, you define a function which is responsible for freeing your instance's data and chaining to the method in your superclass.
+
+In principle, Rust lets you do all of this in the same way that you would in C, by calling functions in . In practice it is quite cumbersome. All the magic macros we have to define the GObject implementation boilerplate in are there precisely because doing it in "plain C" is quite a drag. Rust makes this no different, but you can't use the C macros there.
+
+The first task was to write an actual GObject-derived class in Rust by hand, just to see how it could be done. Niko took care of this. You can see this mock object here. For example, here are some bits:
+
+Here, and look very similar to the GObject boilerplate you would write in C. Both structs have and as their first fields, so when doing C casts they will have the proper size and fields within those sub-structures.
+
+is what you would declare as the private structure with the actual fields for your object. Here, we have an field, used to hold an int which we will mutate, and a , an utility struct which we will use to assert that our Rust objects get dropped only once from the C-like implementation of the function.
+
+Also, note how we are declaring two virtual methods in the struct, and . In C code that defines GObjects, that is how you can have overridable methods: by exposing them in the class vtable. Since GObject allows "abstract" methods by setting their vtable entries to , we use an around a function pointer.
+
+The following code is the magic that registers our new type with the GObject machinery. It is what would go in the function if it were implemented in C:
+
+If you squint a bit, this looks pretty much like the corresponding code in G_DEFINE_TYPE(). That means, "run this only once, no matter how many times it is called"; it is similar to . Here, and are the direct Rust bindings to the corresponding C functions; they come from the low-level gobject-sys module in gtk-rs.
+
+Here is the equivalent to :
+
+Again, this is pretty much identical to the C implementation of a function. We even set the standard g_object_class.finalize field to point to our finalizer, written in Rust. We add a private structure with the size of our ...
+
+... which we later are able to fetch like this:
+
+I.e. we call , just like C code would, to get the private structure. Then we cast it to our and return that.
+
+Yeah, pretty much. But don't worry! Niko made it possible to get rid of it in a comfortable way! But first, let's look at the non-boilerplate part of our object. Here are its two interesting methods:
+
+These should be familar to people who implement GObjects in C. You first get the private structure for your instance, and then frob it as needed.
+
+Niko spent the following two days writing a plugin for the Rust compiler so that we can have a mini-language to write GObject implementations comfortably. Instead of all the gunk above, you can simply write this:
+
+This call to gets expanded to the the necessary boilerplate code. That code knows how to register the , how to create the and functions, how to register the private structure and the utility to get it, and how to define . It will fill the vtable as appropriate with the methods you create.
+
+We figured out that this looks pretty much like Vala, except that it generates GObjects in Rust, callable by Rust itself or by any other language, once the GObject Introspection machinery around this is written. That is, just like Vala, but for Rust.
+
+And this is pretty good! We are taking an object system in C, which we must keep around for compatibility reasons and for language bindings, and making an easy way to write objects for it in a safe, maintained language. Vala is safer than plain C, but it doesn't have all the machinery to guarantee correctness that Rust has. Finally, Rust is definitely better maintained than Vala.
+
+There is still a lot of work to do. We have to support registering and emitting signals, registering and notifying GObject properties, and probably some other GType arcana as well. Vala already provides nice syntax to do this, and we can probably use it with only a few changes.
+
+Finally, the ideal situation would be for this compiler plugin, or an associated " " step, to emit the necessary GObject Introspection information so that these GObjects can be called from other languages automatically. We could also spit C header files to consume the Rust GObjects from C.
+
+I'll tell you in the next blog post!|||
+

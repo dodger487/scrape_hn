@@ -1,0 +1,57 @@
+We’ve been looking at Control Groups in Red Hat Enterprise Linux 7. In my previous blog, we learned how to investigate the current state of active cgroups, including poking into the virtual filesystem at /sys/fs/cgroup/. We also played around with changing CPU shares and CPU quota and learned how that controller behaves both within and across slices. Today, we’re going to start with looking at the Memory controller.
+
+The CPU controller gives us two ways to balance processor time. We can use the CPUShares setting for relative weighting or we can use CPUQuota to cap a user, service or VM to a total percentage of CPU time. And yes, the two will work together...if a user is capped at 50% of a CPU, he will still factor into the relative cpu shares until he hits that CPU quota number.
+
+With memory, systemd exposes only one setting - the amount of RAM a user or service is allowed to consume. In our example, we’re going to cap mrichter to 200MB of RAM. You may remember him from last time, his user ID (UID) is 1000, so this is the command I issued to cap him:
+
+Now mrichter spins up stress to test the limits of his powers. He fires up some workers and they start to gobble RAM. Shortly thereafter, stress reports a failure. Tears are shed!
+
+Looking at the system journal, we can see that the Out Of Memory killer jumped in and terminated stress. And it probably chuckled evilly while doing so.
+
+Now one thing I want to point out. The memory limit, by default, is resident memory. If the process can get away with using swap space that takes it above that limit, then it will do so. In our case, stress broke the resident memory threshold and got itself terminated.
+
+“Wait a second! What if I don’t WANT a program to tap into the swap file?”
+
+Well, that’s actually pretty easy. Mmmm...well, relatively easy. Ok. It actually requires poking around in places that can be scary.
+
+Not all of the cgroup settings are exposed via the systemctl command nor can they be set in a unit file. However, those settings can still be changed on the fly from within the /sys/fs/cgroup filesystem. In the case of memory for mrichter, let’s look at his cgroup:
+
+The file that controls how much swapping to disk is allowed is, funny enough, memory.swappiness. Let’s take a look at it.
+
+If you’ve played around with kernel settings and the swap subsystem, you’ll recognize that as the system default value for swappiness. If we change it to zero, mrichter’s memory controller will *not* allow the use of swap memory at all.
+
+Just for giggles, we can check out some of mrichter’s memory stats while we’re here.
+
+The value hierarchical_memory_limit is what MemoryLimit sets via the command we gave. The hierarchical_memsw_limit gives the total limit based on resident memory + swap. Because we’ve disabled swapping for mrichter, that value is irrelevant.
+
+Now, there are two immediate problems with this approach:
+
+Tackling this could be tricky, but I’m thinking a script using pam_exec would probably get us down the right path. This is covered in https://access.redhat.com/solutions/46199 so let’s give it a go.
+
+We create the script in /usr/local/bin:
+
+We then add an entry on the last line in /etc/pam.d/sshd. This script should fire every time a user logs in via ssh. That’s why we actually check to see if it’s really mrichter before we change the setting.
+
+Now when mrichter logs in, his ability to use our precious swap file is gone. <evil cackle>
+
+We also could start getting our hands dirty and start modifying the actual cgroup configuration files, but that’s something that can get pretty scary. Maybe later. But now you at least have a method for changing user settings.
+
+Services are much more straightforward. Inside of the unit file of a service, you can use the ExecStartPost= directive to execute scripts to change settings. For instance, if I wanted to turn off swapping for the foo service, I would change the unit file to look like so:
+
+We start foo and things look great! No ability to swap.
+
+Before we go, I want to share the location of the cgroup kernel documentation. This is where you can find information on the non-exposed settings for all of the controllers. You can install the kernel-doc package on your development system; on my lab machine it was available from the repo “rhel-7-server-rpms”.
+
+Once installed, navigate to the /usr/share/docs subdirectory that matches your kernel. Inside of the cgroups directory, you’ll find the most current information on each of the controllers.
+
+In my next installment, I promise we’ll get around to talking about I/O. And we’re almost to the point where I want to tell all of you about how cgroups helped lead to containers (and are, in fact, a key component of containers on Red Hat Enterprise Linux and Red Hat OpenShift Container Platform) but that’s a tale for another time.
+
+
+
+ Marc Richter (RHCE) is a Technical Account Manager (TAM) in the US Northeast region. He has expertise in Red Hat Enterprise Linux (going all the way back to the glory days of Red Hat Enterprise Linux 4) as well as Red Hat Satellite. Marc has been a professional Linux nerd for 15 years, having spent time in the pharma industry prior to landing at Red Hat. Find more posts by Marc at https://www.redhat.com/en/about/blog/authors/marc-richter
+
+Innovation is only possible because of the people behind it. Join us at Red Hat Summit, May 2-4, to hear from TAMs and other Red Hat experts in person! Register now for only US$1,000 using code CEE17.
+
+A Red Hat Technical Account Manager (TAM) is a specialized product expert who works collaboratively with IT organizations to strategically plan for successful deployments and help realize optimal performance and growth. The TAM is part of Red Hat’s world-class Customer Experience and Engagement organization and provides proactive advice and guidance to help you identify and address potential problems before they occur. Should a problem arise, your TAM will own the issue and engage the best resources to resolve it as quickly as possible with minimal disruption to your business.|||
+
+The Story So Far We’ve been looking at Control Groups in Red Hat Enterprise Linux 7. In my previous blog, we learned how to investigate the current state of active cgroups, including poking into the virtual filesystem at /sys/fs/cgroup/. We also played around with changing CPU shares and CPU quota and learned how that controller behaves both within and across slices. Today, we’re going to start with looking at the Memory controller.

@@ -1,0 +1,66 @@
+Every once in a while I run into an obscure computer technology that is a hidden gem, which over the years has become mostly forgotten. This is exactly how I feel about the tool and its kernel counterpart the packet filter interface.
+
+For example, say you run:
+
+For most of us this command is pure magic, almost nobody understands what happens behind the scenes. This is understandable, there is little need to know how it works: the tool does its job very well, it's descriptive and very fast.
+
+In this article I'll try to explain how works and how we use its spinoffs to help fight the packet floods that hit us every day.
+
+But first, we need a bit of history.
+
+Since workstations became interconnected, network administrators had a need to "see" what is flowing on the wires. The ability to sniff the network traffic is necessary when things go wrong, even for the most basic debugging.
+
+For this reason operating systems developed APIs for packet sniffing. But, as there wasn't any real standard for it every OS had to invent a different API: Sun’s STREAMS NIT, DEC's Ultrix Packet Filter, SGI’s Snoop and Xerox Alto had CMU/Stanford Packet Filter. This led to many complications. The simpler APIs just copied all the packets to the user space sniffer, which on a busy system resulted in a flood of useless work. The more complex APIs were able to filter packets before passing them to userspace, but it was often cumbersome and slow.
+
+All this changed in 1993 when Steven McCanne and Van Jacobson published the paper introducing a better way of filtering packets in the kernel, they called it "The BSD Packet Filter" (BPF).
+
+Since then the BPF has taken the world by a storm and along with and become the de-facto standard in network debugging.
+
+Tcpdump is composed of three logical parts:
+
+Given a packet filtering expression, tcpdump produces a short program in the BPF bytecode. The easiest way to see the parser in action is to pass a flag, which will produce a readable assembly-like program:
+
+This program reads like this:
+
+Here you can find the full documentation of the assembly syntax.
+
+Less readable compiled bytecode is printed with option:
+
+Tcpdump can open a network tap by requesting a socket and after a few magical calls a filter can be set with option:
+
+From now on the BPF filter will be run against all received packets on a network interface and only packets matching that filter will be passed to that network tap file descriptor.
+
+All the gritty details are described in the file. For the best performance one can use a zero-copy / interface, though most people should probably stick to the high level API.
+
+In essence Tcpdump asks the kernel to execute a BPF program within the kernel context. This might sound risky, but actually isn't. Before executing the BPF bytecode kernel ensures that it's safe:
+
+All this guarantees that the BPF programs executed within kernel context will run fast and will never infinitely loop. That means the BPF programs are not Turing complete, but in practice they are expressive enough for the job and deal with packet filtering very well.
+
+The original concepts underlying the BPF were described in a 1993 and didn't require updates for many years. The Linux implementation on the other hand is steadily evolving: recently a new and shiny just-in-time BPF compiler was introduced, and a few months ago an attempt was made to upgrade the BPF assembly to a 64-bit form.
+
+BPF is an absolutely marvelous and flexible way of filtering packets. For years it got reused in more places and now Linux uses BPF filters for:
+
+CloudFlare deals with massive packet floods on a daily basis. It's very important for us to be able to drop malicious traffic fast, long before it hits the application.
+
+Unfortunately matching before the application is not easy. Basic iptables filtering, for example looking just at the source IP, doesn't work as floods get more sophisticated. The iptables module closest to our needs is "xt_u32", but it's hard to understand and somewhat limited. Though it's generally pretty useful, and to make it easier people wrote rule generators.
+
+But what works for us best is the "xp_bpf" iptables module by Willem de Bruijn. With it we can match an iptable rule based on any BPF expression.
+
+Unfortunately, our BPF bytecode became pretty complex and it can't be written as a usual tcpdump expression any more. Instead we rely on a custom crafted BPF bytecode, for example, this is an "xt_bpf" bytecode that matches a DNS query for "www.example.com":
+
+To compile it we use the tools from the directory:
+
+Finally you can apply the rule like so:
+
+This is a fairly simple rule just looking for a particular bytes in the packet. The same could be achieved using "u32" or "string" modules. But "xt_bpf" gives us more flexibility. For example we can make the rule case insensitive:
+
+Or match all the subdomains of "example.com":
+
+These kind of rules are very useful, they allow us to pinpoint the malicious traffic and drop it early. Just in the last couple of weeks we dropped 870,213,889,941 packets with few BPF rules. Recently during a flood we saw 41 billion packets dropped throughout a night due to a single well placed rule.
+
+Just as intended by Steven McCanne and Van Jacobson, the BPF is still very useful and extremely fast. Even without enabling the BPF JIT we don't see any performance hit of applying complex BPF rules.
+
+I'm sure we'll use more BPF filters in the future to shield ourselves from malicious traffic and to have more CPU to deal with legitimate requests.
+
+Does generating BPF assembly sound like fun? We're hiring talented developers, including to our elite office in London.|||
+

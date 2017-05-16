@@ -1,0 +1,68 @@
+We all know that the empty struct consumes no storage, right ? Here is a curious case where this turns out to not be true.
+
+This is a story about trying to speed up the Go compiler. Since Go 1.5 we’ve had the great concurrent GC, which reduces the cost of garbage collection, but no matter how efficient a garbage collector is, it doesn’t make allocations free of cost.
+
+The specific allocation I was targeting was the structure which represents a quasi machine code instruction late in the compile cycle. As you can see, for this compilation (which was ) values constitute 34.72% of the total allocations for this program—reducing the size of will pay off in real terms.
+
+itself contains a field of type , which is what this blog post will focus on today. Here is the definition for
+
+How much space will values of this type consume ? TL;DR, here is a table of the results:
+
+Go 1.4 32 bit says the value is 28 bytes large, but Go 1.4 64 bit says it’s 32 bytes large. Worse, Go 1.5 32 bit says the value is 32 bytes, and Go 1.5 64 bit says it’s 40 bytes! This type uses fixed sized integer types, but its total size changes every time we compile it. What the heck is going on here ?
+
+The reason for the difference between the 32 bit and 64 bit answers is alignment. The Go spec says the address of a struct’s fields must be naturally aligned. So on a 64 bit machine, the address of any field must be a multiple of 8 bytes. In effect the compiler sees this:
+
+On 32 bit machines, word boundaries occur every 4 bytes, so there is no requirement to pad for alignment. Note that operations on 64 bit quantities may still require the value to be properly aligned, this is the infamous issue 599.
+
+So, that explains the difference in results between 32 bit and 64 bit machines, (4 bytes) + (8 bytes) + (8 bytes) + (8 bytes) == 28 bytes on 32 bit machines, plus another 4 bytes for padding for 64 bit machines.
+
+Well, except that Go 1.5 seems to be consuming another word over and above the Go 1.4 requirements, where is this memory going ?
+
+To give you a hint, I’ll rearrange the definition slightly:
+
+Now the results are:
+
+Hmm, so some progress. We’ve managed to reduce the storage in the Go 1.5 64 bit case, but the others appear unchanged, especially Go 1.5’s 32 bit case.
+
+For the Go 1.5 64 bit case, the padding that we saw above is still there, but it has moved. Effectively what the compiler is seeing is this:
+
+The reason this padding is still present is to preserve the alignment of the other fields in this structure. Remember that fields always have to be naturally aligned, every 4 bytes on 32 bit platforms, and every 8 bytes on 64 bit platforms. Consider this small fragment:
+
+The compiler adds padding at the end of the structure to bring its size up to a multiple of the largest element in the structure.
+
+So, that explains everything except for the Go 1.5 32 bit result. For 32 bit platforms, the structure needs to be aligned on a 4 byte boundary, not 8, so no padding should be required. The size under both Go 1.4 and Go 1.5 should be 28 bytes, not 32 bytes … what is going on ?
+
+You’ve probably figured out by now that the only place the additional storage could come from is the unnamed field. What is it about the presence of an empty struct at the bottom of the type that causes it to increase the size of the struct ?
+
+The answer is that while empty struct{} values consume no storage, you can take their address. That is, if you have a type
+
+It is perfectly valid to take the address of , and as such, the address of would point beyond the end of the struct!1
+
+Now, Go code cannot do anything useful with this invalid pointer, but as it is a pointer, the garbage collector has to follow it, and that may lead it to access unmapped memory or dereference an invalid pointer.
+
+The fix for this is detailed in issue 9401 and delivered in Go 1.5. In summary, zero sized values, like and  occurring at the end of a structure are assumed to have a size of one byte2. With this knowledge, we can now explain the behaviour of the compiler for the rearranged type.
+
+For a 64 bit compiler, it would observe that the largest field inside is 8 bytes, so it would add three additional bytes of padding after the to round up to 32 bytes. This is fine, it was already planning to add 4 bytes after .
+
+For a 32 bit compiler, it would observe the largest field inside is 8 bytes, however the natural alignment of 32 bit machines is 4 bytes and the sum of the fields inside the type is 28 bytes, which is what Go 1.4 reported. However because the final field is of zero length, the compiler has replaced it with a , causing the total size of the structure to be 29 bytes, forcing the compiler to add three more bytes of padding to round up to the next word boundary, 32 bytes.
+
+Fortunately this last issue can be corrected by moving the zero field to the top of the structure, restoring the original sizes we observed in Go 1.4.
+
+Do Go programmers need to care about this minutiae ? Probably not. This is the stuff of brain teasers.
+
+Certainly if you are looking to optimise the memory usage of your program, you need to be looking closely at the definitions of all your data structures, but it is unlikely that you’ll encounter the perfect storm of all these factors.
+
+Not to be outdone by this morning’s excitement, Matthew Dempsky put together a quick tool to spot this inefficiency, and has found two other candidates.
+
+At the start of this piece I mentioned that CL 15522 resulted in a saving of 32 bytes, yet the biggest saving demonstrated above was 8 bytes. How did CL 15522 achieve such a reduction ? The answer is a thing known inside the runtime as size classes.
+
+For small allocations, that is, less than a few kilobytes, the overhead of tracking the allocation becomes a significant percentage of the object itself. Imagine if every allocation had one word of overhead, every time you put an into an 3 value, you’d incur 100% overhead!
+
+To reduce this overhead, rather than tracking every object on the heap individually, the runtime allocates things of the same size together. This leads to lower overhead—one bit per object of a certain size, and excellent space efficiency—all objects are of the same size, eliminating fragmentation.
+
+However, as Go types can be any size, potentially the runtime would have to allocate a pool for every possible size (obviously not until they are actually allocated), and this would undo the efficiency of the mechanism as each pool is a number of machine pages, yet most pools would be largely unused.
+
+The solution to this problem is to not create pools for every possible size, but to start to round up the allocation to the next largest size class, for example an allocation of 40 bytes may be rounded up to 48 bytes. The details of this mechanism are left to the curiosity of the reader4, but suffice to say, as allocations get larger, the distance between size classes increases.
+
+Hence, by shaving 8 bytes from , the size of the enclosing type decreased from 296 bytes to 288 bytes, bringing it down to from the previous 320 byte size class, to the 288 byte size class, a saving of 32 bytes on 64 bit platforms.|||
+

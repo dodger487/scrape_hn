@@ -1,0 +1,83 @@
+Using Encryption and Authentication Correctly (for PHP developers)
+
+"Encryption is not authentication" is common wisdom among cryptography experts, but it is only rarely whispered among developers whom aren't also cryptography experts. This is unfortunate; a lot of design mistakes could be avoided if this information were more widely known and deeply understood. (These mistakes are painfully common in home-grown PHP cryptography classes and functions, as many of the posts on Crypto Fails demonstrates.)
+
+The concept itself is not difficult, but there is a rich supply of detail and nuance to be found beneath the surface.
+
+Encryption is the process of rendering a message such that it becomes unreadable without possessing the correct key. In the simple case of symmetric cryptography, the same key is used for encryption as is used for decryption. In asymmetric cryptography, it is possible to encrypt a message with a user's public key such that only possessing their private key can read it. Our white paper on PHP cryptography covers anonymous public-key encryption.
+
+Authentication is the process of rendering a message tamper-resistant (typically within a certain very low probability, typically less than 1 divided by the number of particles in the known universe) while also proving it originated from the expected sender.
+
+Note: When we say authenticity, we mean specifically message authenticity, not identity authenticity. That is a PKI and key management problem, which we may address in a future blog post.
+
+In respect to the CIA triad: Encryption provides confidentiality. Authentication provides integrity.
+
+Encryption does not provide integrity; a tampered message can (usually) still decrypt, but the result will usually be garbage. Encryption alone also does not inhibit malicious third parties from sending encrypted messages.
+
+Authentication does not provide confidentiality; it is possible to provide tamper-resistance to a plaintext message.
+
+A common mistake among programmers is to confuse the two. It is not uncommon to find a PHP library or framework that encrypts cookie data and then trusts it wholesale after merely decrypting it.
+
+Message encryption without message authentication is a bad idea. Cryptography expert Moxie Marlinspike wrote about why message authentication matters (as well as the correct order of operations) in what he dubbed, The Cryptographic Doom Principle.
+
+We previously defined encryption and specified that it provides confidentiality but not integrity or authenticity. You can tamper with an encrypted message and give the recipient garbage. But what if you could use this garbage-generating mechanism to bypass a security control? Consider the case of encrypted cookies.
+
+The above code provides AES encryption in Cipher-Block-Chaining mode. If you pass a 32-byte string for , you can even claim to provide 256-bit AES encryption for your cookies and people might be misled into believing it's secure.
+
+Let's say that, after logging into this application, you see that you receive a session cookie that looks like .
+
+Let's change a byte in the first block (the initialization vector) and iteratively sending our new cookie until something changes. It should take a total of 4096 HTTP requests to attempt all possible one-byte changes to the IV. In our example above, after 2405 requests, we get a string that looks like this:
+
+For comparison, only one character differs in the base64-encoded cookie ( vs ):
+
+The original data we stored in this cookie was an array that looked like this:
+
+But after merely altering a single byte in the initialization vector, we were able to rewrite our message to read:
+
+Depending on how the underlying app is set up, you might be able to flip one bit and become and administrator. Even though your cookies are encrypted.
+
+If you would like to reproduce our results, our encryption key was (convert from hexadecimal to raw binary).
+
+As stated above, authentication aims to provide both integrity (by which we mean significant tamper-resistance) to a message, while proving that it came from the expected source (authenticity). The typical way this is done is to calculate a keyed-Hash Message Authentication Code (HMAC for short) for the message and concatenate it with the message.
+
+It is important that an appropriate cryptographic tool such as HMAC is used here and not just a simple hash function.
+
+These two functions are prefixed with unsafe because they are vulnerable to a number of flaws:
+
+To authenticate a message, you always want some sort of keyed Message Authentication Code rather than just a hash with a key.
+
+Using a hash without a key is even worse. While a hash function can provide simple message integrity, any attacker can calculate a simple checksum or non-keyed hash of their forged message. Well-designed MACs require the attacker to know the authentication key to forge a message.
+
+Simple integrity without authenticity (e.g. a checksum or a simple unkeyed hash) is insufficient for providing secure communications.
+
+In cryptography, if a message is not authenticated, it offers no integrity guarantees either. Message Authentication gives you Message Integrity for free.
+
+The only surefire way to prevent bit-rewriting attacks is to make sure that, after encrypting your information, you authenticate the encrypted message. This detail is very important! Encrypt then authenticate. Verify before decryption.
+
+Let's revisit our encrypted cookie example, but make it a little safer. Let's also switch to CTR mode, in accordance with industry recommended best practices. Note that the encryption key and authentication key are different.
+
+Now we're a little closer to our goal of robust symmetric authenticated encryption. There are still a few more questions left to answer, such as:
+
+Fortunately, these questions are already answered in existing cryptography libraries. We highly recommend using an existing library instead of writing your own encryption features. For PHP developers, you should use defuse/php-encryption (or libsodium if it's available for you). If you still believe you should write your own, consider using openssl, not mcrypt.
+
+Note: There is a narrow band of use-cases where authenticated encryption is either impractical (e.g. software-driven full disk encryption) or unnecessary (i.e. the data is never sent over the network, even by folder synchronization services such as Dropbox). If you suspect your problems or goals permit unauthenticated ciphertext, consult a professional cryptographer, because this is not a typical use-case.
+
+If you wish to implement encrypted cookies in one of your projects, check out Halite. It has a cookie class dedicated to this use case.
+
+If you want to reinvent this wheel yourself, you can always do something like this:
+
+For developers without access to libsodium (i.e. you aren't allowed to install PHP extensions through PECL in production), one of our blog readers offered an example secure cookie implementation that uses (the PHP library we recommend).
+
+In our previous examples, we focused on building the encryption and authentication as separate components that must be used with care to avoid cryptographic doom. Specifically, we focused on AES in Cipher Block-Chaining mode (and more recently in Counter mode).
+
+However, cryptographers have developed newer, more resilient modes of encryption that encrypt and authenticate a message in the same operation. These modes are called AEAD modes (Authenticated Encryption with Associated Data). Associated Data means whatever your application needs to authenticate, but not to encrypt.
+
+AEAD modes are typically intended for stateful purposes, e.g. network communications where a nonce can be managed easily.
+
+Two reliable implementations of AEAD are AES-GCM and ChaCha20-Poly1305.
+
+In a few years, we anticipate the CAESAR competition will produce a next-generation authenticated encryption mode that we can recommend over these two.
+
+And most importantly: Use a library with a proven record of resilience under the scrutiny of cryptography experts rather than hacking something together on your own. You'll be much better off for it.|||
+
+A developer's short guide to encryption, authentication, and authenticated encryption with examples in PHP

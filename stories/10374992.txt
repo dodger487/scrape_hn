@@ -1,0 +1,66 @@
+A program I’ve been working on involves reading and writing different kinds of C structs to/from disk, and I’ve been trying to find a good way to reduce the code complexity and maintenance work involved in this task. In the course of these experiments, I created a somewhat interesting partial solution I thought would be worth sharing.
+
+At this stage, the structs only consist of primitive elements (int, float, char, etc). Handling nested structs, unions, bitfields and pointers would require additional work (that may be the subject of a future post.)
+
+My first approach involved writing separate serializing and deserializing functions for each struct type. The serialize (pack) function would convert the struct into a buffer of bytes. This buffer could then be written to disk. Later on, those bytes could be read back from the disk, and the deserialize (unpack) routine could convert the raw bytes back into a useful struct. This approach works, but is brittle to change. The functions will need to be updated whenever the struct definition is changed (say by adding or deleting a member, or changing a member’s name).
+
+An example would be something like this: (Error checking has been omitted for clarity.)
+
+These functions need to be defined for every struct, involve repetitive code, and are a pain to update when the structure definition changes. Wouldn’t it be great if we had a single function that was able to handle any kind of struct with any number of members?
+
+One of the most obvious ways to accomplish this is by writing the memory representation of the struct directly to disk.
+
+The problem with this approach is that compilers add padding between the struct’s fields to align the data which increases performance. However, the amount of padding added is implementation defined, so the in-memory representation of structs could differ between different architectures, or different compilers. A struct written from one build of the program might not be readable to a different build of the same program.
+
+Instead, we should only write out the non-padding bytes, which should be compatible between compilers (assuming proper endian compensation). This is equivalent to writing out the data from all the members of the struct. However, doing this in a programmatic fashion would require iterating over all the members of the struct, an ability that is not built in to the C language. We could expand the iterations for each different kind of struct by hand, but then we’d be right back to the same kind of brittle functions we were originally trying to get rid of.
+
+However, there is a (somewhat awkward) way that iteration over a struct’s elements can be accomplished in C. As the title suggests, it involves the C preprocessor.
+
+In order to do this, I’ve used some tricks that may not be particularly well known, so I will take some time to explain them first before presenting the code. If you are already familiar with these techniques, you can skip to the code.
+
+X-Macros are a technique that uses the C preprocessor to cut down on the amount of repetitive typing. The X-Macro has two parts: a list and a function. You define a list of invocations of a macro (X for example).
+
+Then, whenever you want to do something involving a,b,c,d you can to your operation, and the list will call your macro on every value in the list. When the operation is done, make sure you so the compiler won’t complain about redefining a macro the next time you do an X operation on the list.
+
+For example this can be used for things like declarations:
+
+Or even counting the elements in the list:
+
+Ordinarily, C macro arguments are not evaluated when used in stringification (#), or concatenation (##).
+
+So having something like:
+
+Would produce , not the we wanted. However, this can be bypassed, as the C preprocessor expands a macros arguments before it passes them to a macro. So, to get the result we want, we must create 2 functions: One to expand the macro term, and another to perform the stringification or concatenation.
+
+Will produce like we wanted.
+
+Compound literals look like a cast and an initializer. We use them here to store the address of our array literals into pointers. Unlike C++, initializers in C are not temporary objects, so it is safe to keep a pointer pointing to them.
+
+Designated initializers are a C99 feature that lets you initialize structs by referring to each element by name.
+
+is a standard macro that will determine the offset of a member of a struct in bytes from the 0th byte of that struct type.
+
+Notice that only definition of the struct_def struct is the only thing in guards. That is because we actually do want the remainder of the header file to be included multiple time. Each time it is it will declare a new struct_def.
+
+In order to use this, the “caller” must set up the parameters appropriately. This is done by to be the name of the struct, and to be an X-Macro list of the fields of that struct. Currently, as you can see the macro only accepts a type and a name. This could be expanded in the future. The struct is then generated by “calling” the header by it. This will cause the C preprocessor to execute it and will generate the structures we need.
+
+Note that the is a macro, so we must use the trick listed above to stringify and concatenate the to make the name for the struct_fmt and to store the name of the struct as a string.
+
+The code is generated using the X-Macros technique. The X-Macros list is the fields of the struct and their types, and the implementations will generate the actual struct for you, and generate the struct_def by counting the number of elements, summing the sizes of each element, storing the size of each element, storing the offset of each element, and storing the names of each element. The information in the struct_fmt will be used in the serializing function. The other information is good for debugging.
+
+Note how the compound literals allow us to assign the generated data directly to the pointers in the struct_fmt struct without having to create an unneeded array, or having to specify the pointer as an array with a size instead.
+
+At the end, we all the macros used during this file. Because the file will be included more than once, we need to be careful about what it will leave in the global namespace.
+
+An example of the use of the code is as follows:
+
+In this example usage, we show how easy it becomes to serialize any struct with a struct_fmt. We can change our structs, but the pack/unpack functions remain the same. Any changes to the struct will be dealt with automatically by the code generation in the header file.
+
+With the offsets and sizes of each element from the struct_def, we can easily skip all the padding bytes, and only iterate over the actual member data of the struct.
+
+In this post, I specified that we are only working with structs consisting of primitive values at the moment. It would be interesting to see if this approach could be expanded to deal with members that are structs, unions, or pointers.
+
+It would also be interesting to see if there were any other uses for this technique. In the demo code, I showed a function that could print out information about the struct. Perhaps this could be extended further to allow more runtime introspection into the structure of the struct itself.
+
+Finally, the use the the C Preprocessor is attractive in that it does not introduce any additional dependencies, but it might be better to create a custom tool to generate the structs instead (something like Protocol Buffers does).|||
+

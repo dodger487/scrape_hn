@@ -1,0 +1,54 @@
+One of the key tenets of snaps is that they bundle their dependencies. The fact that they're self-contained helps their transactional-ness: upgrading or rolling back is essentially just a matter of unmounting one snap and mounting the other. However, historically this was also one of their key downsides: every snap must be standalone. Fortunately, snapd v2.0.10 saw the addition of a content interface that could be used by a producer snap to make its content available for use by a consumer snap. However, that interface was very difficult to utilize when it came to ROS due to ROS's use of workspaces for both building and running. At long last, support is landing in Snapcraft for building a ROS system that is distributed among multiple snaps, and I wanted to give you a preview of what that will look like.
+
+Like I said, snaps bundling their dependencies is typically a good thing, and this applies to ROS-based snaps as well. Having an entire ROS system in a single snap that updates transactionally is awesome, and useful for most deployment cases. However, there are some use-cases where this breaks down.
+
+For example, say I'm manufacturing an unmanned aerial vehicle. I want to sell it in such a state that it's only capable of being piloted via remote control. This is done with a ROS system, which in a simple world would be made up of:
+
+You get the idea. In addition to that basic platform, I want my users to be able to buy add-on packs. For example, perhaps the vehicle includes a GPS sensor (as well as basic pose sensors). I'd like to sell an add-on pack that adds a very basic "fly here" autopilot, or perhaps a "follow me" mode. That's another ROS system, perhaps something like:
+
+If we build both of these snaps to be standalone, we quickly run into issues:
+
+Using content sharing, we can actually make the autopilot snap depend upon and utilize the base behavior snap.
+
+Let's simplify our previous example into two snaps: a "ros-base" snap that includes the typical stuff: roscore, roslaunch, etc., and a "ros-app" snap that includes packages that actually do something, specifically the classic talker/listener example. A quick reminder: this will only be possible in Snapcraft v2.28 or later. Also note that the example I'm about to walk through is a demo in Snapcraft, in case you want to look at the whole thing.
+
+
+
+To create the base snap, create a snap/snapcraft.yaml file with the following contents:
+
+That's it. Run snapcraft on it, and after a little time you'll have your base snap (the "provider" snap regarding content sharing). This particular example doesn't do a whole lot by itself, so let's move on to our ros-app snap (the "consumer" snap regarding content sharing).
+
+The starting point for ros-app is the current standalone ROS demo. We'll use the exact same ROS workspace, but we'll add a few more things and tweak the YAML a bit.
+
+The recommended way to build a "consumer" snap (assuming it has a build-time dependency on the content shared from the "producer" snap, which ros-app does indeed have on ros-base) is to create a tarball of the producer's staging area, and use it as a part to build the consumer.
+
+Concretely, we can tar up the staging area of ros-base and use it to build ros-app, but then filter it out of the final ros-app snap (so as to not duplicate the contents of ros-base).
+
+So let's do that now. cd into the directory containing the now-built ros-base snap, tar up its staging area, then move it off into the ros-app area:
+
+Now, in /path/to/ros-app alter the snap/snapcraft.yaml to look something like this:
+
+Other than the ROS workspace in src/ (which remains unchanged from the other demo so we won't discuss it here), we need to create a bin/run-system executable that looks something like this:
+
+Why is this needed? Because the Catkin plugin can only do so much for you. The ros-base snap includes various python modules and libs outside of its ROS workspace that ros-app needs, so we extend the PYTHONPATH and LD_LIBRARY_PATH to utilize them.
+
+From there, it's as easy as running roslaunch (which by the way is contained in ros-base).
+
+Run snapcraft on this, and after a few minutes (fairly quick since it's re-using the base's staging area to build) you'll have a ros-app snap
+
+You now have your ROS system split between multiple snaps. The first step is to install both snaps:
+
+Now take a look at snap interfaces:
+
+You'll see that ros-base:ros-base is an available slot, and ros-app:ros-base is an available plug. This interface is currently not connected, so content sharing is not yet taking place. Let's connect them:
+
+Taking another look at snap interfaces you can see they're now connected:
+
+And now you can launch this ROS system you now have distributed between two snaps:
+
+Multiple ROS users have mentioned that the fact that a ROS snap must be completely self-contained is a problem. Typically it either interferes with their workflow or their business plan. We've heard you! We can't pretend that the snap world of isolated blobs and the ROS world of workspaces merge perfectly, but the content interface takes a big step toward blending these two worlds, and the new features in Snapcraft's Catkin plugin hopefully makes it as easy as possible to utilize.
+
+I personally look forward to seeing what you do with this!
+
+|||
+

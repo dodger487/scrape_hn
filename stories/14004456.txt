@@ -1,2 +1,45 @@
-|||
+The World Wide Web offers a bunch of information on SQL Server index defragmentation or SQL Server  index rebuild. However, most of the recommendations refer to databases that have minimum load time (mostly, at night).
 
+And what about databases that are used for both, data modification, and retrieving information on a 24/7 basis?
+
+In this article, I will provide a mechanism for automating SQL Server index defragmentation implemented in a database used in the company I work for. This mechanism allows defragmenting required indexes on a regular basis since index fragmentation takes place constantly in the 24/7 system. Often, this is not enough to perform index defragmentation once a day.
+
+Firstly, let’s take a look at the general approach:
+
+And now, let’s take a look at the implementation:
+
+1. Creating a view showing which indexes have been fragmented and the percentage of the fragmented indexes:
+
+USE [Database_Name] GO SET ANSI_NULLS ON GO SET QUOTED_IDENTIFIER ON GO CREATE view [srv].[vIndexDefrag] as with info as (SELECT [object_id], database_id, index_id, index_type_desc, index_level, fragment_count, avg_fragmentation_in_percent, avg_fragment_size_in_pages, page_count, record_count, ghost_record_count FROM sys.dm_db_index_physical_stats (DB_ID(N'Database_Name') , NULL, NULL, NULL , N'DETAILED') where index_level = 0 ) SELECT b.name as db, s.name as shema, t.name as tb, i.index_id as idx, i.database_id, idx.name as index_name, i.index_type_desc,i.index_level as [level], i.[object_id], i.fragment_count as frag_num, round(i.avg_fragmentation_in_percent,2) as frag, round(i.avg_fragment_size_in_pages,2) as frag_page, i.page_count as [page], i.record_count as rec, i.ghost_record_count as ghost, round(i.avg_fragmentation_in_percent*i.page_count,0) as func FROM Info as i inner join [sys].[databases] as b on i.database_id = b.database_id inner join [sys].[all_objects] as t on i.object_id = t.object_id inner join [sys].[schemas] as s on t.[schema_id] = s.[schema_id] inner join [sys].[indexes] as idx on t.object_id = idx.object_id and idx.index_id = i.index_id where i.avg_fragmentation_in_percent >= 30 and i.index_type_desc <> 'HEAP'; GO
+
+This view shows only indexes with the fragmentation percentage greater than 30, i.e. indexes that require defragmentation. It shows only indexes that are not heaps, since the latter ones may lead to negative effects, like blocking of such a heap, or further index fragmentation.
+
+The view uses the important system view sys.dm_db_index_physical_stats.
+
+The most important thing about this table is keeping data deletion in mind (for instance, data that is older than 1 month).
+
+Table fields will become understandable from the next point.
+
+3. Creating a stored procedure for analyzing and defragmenting the selected index:
+
+USE [Database_Name] GO SET ANSI_NULLS ON GO SET QUOTED_IDENTIFIER ON GO CREATE PROCEDURE [srv].[AutoDefragIndex] AS BEGIN SET NOCOUNT ON; --declaring required variables declare @IndexName nvarchar(100) --index name ,@db nvarchar(100) --database name ,@Shema nvarchar(100) --schema name ,@Table nvarchar(100) --table name ,@SQL_Str nvarchar (2000) --string for command generation ,@frag decimal(6,2) --fragmentation percentage before defragmentation ,@frag_after decimal(6,2) --fragmentation percentage after defragmentation --Number of fragments at the final level of the IN_ROW_DATA allocation unit ,@frag_num int ,@func int --round(i.avg_fragmentation_in_percent*i.page_count,0) ,@page int --number of index pages ,@rec int --total number of records ,@ts datetime --date and time of defragmentation start ,@tf datetime --date and time of defragmenation finish --Table or view object ID for which the index was created ,@object_id int ,@idx int; --index ID --getting current date and time set @ts = getdate(); --getting next index for defragmenation --Here the important index is selected. At that, a situation when one index is defragmented regularly, while other indexes are not selected for defragmentation is unlikely. select top 1 @IndexName = index_name, @db=db, @Shema = shema, @Table = tb, @frag = frag, @frag_num = frag_num, @func=func, @page =[page], @rec = rec, @object_id = [object_id], @idx = idx from [srv].[vIndexDefrag] order by func*power((1.0- convert(float,(select count(*) from SRV.[srv].[Defrag] vid where vid.db=db and vid.shema = shema and vid.[table] = tb and vid.IndexName = index_name)) / convert(float, case when (exists (select top 1 1 from SRV.[srv].[Defrag] vid1 where vid1.db=db)) then (select count(*) from SRV.[srv].[Defrag] vid1 where vid1.db=db) else 1.0 end)) ,3) desc --if we get such index if(@db is not null) begin --index reorganization set @SQL_Str = 'alter index ['+@IndexName+'] on ['+@Shema+'].['+@Table+'] Reorganize'; execute sp_executesql @SQL_Str; --getting current date and time set @tf = getdate() --getting fragmentation percentage after defragmentation SELECT @frag_after = avg_fragmentation_in_percent FROM sys.dm_db_index_physical_stats (DB_ID(@db), @object_id, @idx, NULL , N'DETAILED') where index_level = 0; --writing the result of work insert into SRV.srv.Defrag( [db], [shema], [table], [IndexName], [frag_num], [frag], [page], [rec], ts, tf, frag_after, object_id, idx ) select @db, @shema, @table, @IndexName, @frag_num, @frag, @page, @rec, @ts, @tf, @frag_after, @object_id, @idx; --upating statistics for index set @SQL_Str = 'UPDATE STATISTICS ['+@Shema+'].['+@Table+'] ['+@IndexName+']'; execute sp_executesql @SQL_Str; end END
+
+4. Creating a view for viewing the statistics of the index defragmentation results:
+
+This view can be used to notify administrators daily about the results of the index defragmentation automation.
+
+5. Creating a task in Agent for running the implemented stored procedure
+
+Here, we need to pick the time in an experimental way. In my case, somewhere I got 5 minutes, somewhere – 1 hour.
+
+This algorithm can be expanded on several databases, but in this case, we need an additional point 6:
+
+Gathering all the statistics of the index defragmentation automation in one place for subsequent sending to administrators.
+
+And now, I would like to dwell on the already provided recommendations for index support:
+
+This method is not optimal, but it can successfully cope with ensuring that indexes are properly defragmented (not exceeding 30-40% of fragmentation) for their subsequent usage by the optimizer for building execution plans.
+
+I will be grateful for your comments with reasoned pros and cons of this approach, as well as for the tested alternate suggestions.|||
+
+Considering mechanism for automating index defragmentation implemented in SQL Server database.

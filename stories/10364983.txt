@@ -1,0 +1,77 @@
+Earlier this year, I decided I would try to create my own toy language. I'd been reading about language design, compilers, interpreters, and seriously geeking out over it. Sometimes I can really get excited by an idea that just won't leave me alone, and I'll devour everything I can find that's related. When my interest hadn't dissipated for a few months I decided the best way to get it out would be to bite the bullet and actually do something — write my own language. I wanted to create a grammar for a language and an interpreter that could take in some source code in that language and execute it. In the end, I called it Braid — feel free to check out the source on GitHub.
+
+I went into this project with a keen interest, some vague ideas from my research, but no academic background in language design and pretty much NO IDEA WHAT I WAS DOING!
+
+In this first part I'll talk about the tools I've picked and the lexing and parsing steps. In the second follow-up post I'll talk about bytecode, interpreters, and RPython pitfalls.
+
+RPython is a statically typed, compiled subset of Python. It powers Pypy, the "Python interpreter written in Python", and includes a GC and a JIT you can use yourself.
+
+RPython's subset is fiddly to use, and the authors recommend you don't use it to write your everyday Python projects. However, as a means to write a compiler and interpreter it looks attractive on paper — being almost as fully-featured as Python means you get a heap of high-level concepts for free, and in the end, it all compiles via C to a single binary executable! Because of my Python background I decided this was a good choice of language in which to implement my own.
+
+To handle lexing and parsing I picked RPly. (RPython has its own EBNF-based lexer and parser, but the docs are sparse and I got stuck very quickly, so I moved on.) RPly is an RPython-compatible fork of PLY, and PLY in turn is an implementation of lexx and yacc in Python (Python Lexx Yacc = PLY). Whew! Lexx and yacc are a venerable, well-respected lexing and parsing combo, so we're cloning on the codebases of giants and so on.
+
+Lexing is the process of turning a string (of source code) into a set of tokens which can be parsed by the parser, based on rules we define about what constitutes a valid token, and what we'll ignore. Here's a sample of my language's final set of rules, defined by regular expressions:
+
+This step is fairly fun and straightforward. Define pretty basic regular expressions, and receive a list of tokens! It seems like we're halfway there, right?! Not even close. But it's handy that this is where we start, because it's a gentle introduction and we'll need to hold onto that feeling of accomplishment to make it through the next step.
+
+It seems like standard practice to ignore whitespace, because this means you don't need to think about where whitespace is valid when it comes time to write your parser, and the parsing step becomes much more simple. So I ignored whitespace too. However, I've kept newlines as significant, because that's what I'm into.
+
+An issue I ran into at the lexing stage was with identifiers (i.e. variable names) that started with other keywords. Because lexing works by moving through the string a letter at a time until it finds a match, and because whitespace is ignored, any identifier starting with a keyword will be matched as that keyword, with the lexer then resetting and trying to match the next token. To combat this, you can see I've added at the end of all my keywords, so they don't match if other characters appear afterwards. This feels like a terrible solution to me, but it's all I came up with.
+
+You can't see it in that code snippet, but I'm also just stripping out comments manually at this stage, because they caused a frightful mess when I couldn't get the lexer to ignore them properly.
+
+At the end of this stage, we can pass our object some source code and get back a stream of RPly's objects. Exciting!
+
+Parsing is the process of turning a list of tokens into an Abstract Syntax Tree (AST). We combine our linear lists of single tokens into nested objects representing sets of tokens as expressions and statements. This is done by defining rules (AKA our previously-mentioned grammar) on how things go together. Or as I tend to think of it, "what goes into what".
+
+First we tell our parser about all the valid tokens we'll accept from the lexing stage. Then we list them in order of precedence so that in an ambiguous situation, the parser knows in which order to handle rules.
+
+But next we get to define the rules of our grammar. This is both massively rewarding and an exercise in frustration.
+
+Here I'm using RPly's nifty decorator syntax to tell the parser that anything we call an 'expression' is also a valid 'statement'. This rule does nothing but return the expression.
+
+Aha, this is more interesting. This rule declares that one valid type of statement is this set of "terminals" and "nonterminals". A terminal is in caps (or just a symbol, like the equals sign), so you know that it doesn't need to be expanded further — whatever token the parser put here is our final result. You can see that is lower-case, because its result can be anything matching any other rule that defines an expression.
+
+So we return an object which contains a (whose first argument is the literal identifier we've been passed), and the tree representing the expression. It could be a object, i.e. the result of a function call, which would also contain things like a list of arguments, themselves maybe other expressions too. You can see why it's called a Syntax Tree.
+
+Here's a single-line if expression (not a statement, because it can return a value). In my toy language, if we wrote something like , it would be parsed by this rule. And because I've designated that this is an expression that returns a value, I could hook it up with my earlier assignment rule like so:
+
+The grammar can get complicated as we define overlapping rules that the parser cannot apply cleanly. I received plenty of warnings along the way. These can have varying effects, from throwing exceptions to infinite loops. Keeping the entire web of connected rules in my head was one of the hardest parts of the project so far. The solution here, of course, is to make sure our rules do not conflict, but without more enlightening error messages we'll need to test everything to find the source of the issue.
+
+Remember that our grammar's rules return nodes which are objects, like and . Each is an instance of a class that extends RPly's , as RPython requires a common superclass. Node definitions can be quite simple:
+
+A takes its identifier as an argument, as we saw in the earlier example. It can also hold a value, which isn't determined until we evaluate it. Each of our nodes also has a method which we use when printing the AST for debugging.
+
+At this point we can actually "interpret" our code and get an answer. We do this by calling on each of our nodes, traversing the tree as required until we end up back at the root node (which is called Program) with a single result.
+
+Looking at our above, we can see that finding its value requires looking it up in our dict, which is where we're keeping the global state. When we get it, we evaluate it too for good measure. Our calls traverse down the tree as needed, evaluating if-expressions and variables and function calls and combining these until we end up with a literal, for example a .
+
+The class is essentially a wrapper for a Python .
+
+So at this stage you can combine your lexing, parsing, and "interpreting" steps like so:
+
+Why the scare quotes around "interpreting"? Well, this isn't how we're meant to do it, and in fact I got stuck trying to travel too far down this road. Why? The short answer is that you can't really handle state in this simple way with one big dict. Real languages have more than one big global bag of state, otherwise anything you defined within a function would leak out into the global state too, for example. However, when making a start this is a great way to make easy wins. You can try out syntax quickly, and many different language constructs, like branches and loops — so long as you can deal with a single global state.
+
+The point of writing in RPython, not just regular Python, was that I could compile my interpreter to a binary.
+
+The RPython authors recommend your development process looks like this:
+
+I stopped and attempted to compile my code with the RPython interpreter every few commits — any more frequently would have been just too frustrating. RPython's errors are fairly verbose, and always told me where the issue was, but the source of frustration was the fact that it couldn't explain why.
+
+So here I'm trying to evaluate a AST node. I do this by returning a type where its value is the result of evaluating its inner node ( ). But RPython is having none of it, because it's decided it's possible that the type of could be a as well as being a instance (remember this is our AST node base class). How could this be? Well, figuring out the answer to that is the tricky part.
+
+In most cases, I solved these errors by either:
+
+RPython will use and checks as part of its own type annotations, and this will resolve the majority of typing errors. Still, I wasted many hours in this step.
+
+We can compile our with RPython like so:
+
+If RPython is happy, we'll get a lot of compiler output, and finally, a binary called ... We did it!
+
+At this stage of the project, it only operates as a REPL, but of course we can turn this into a traditional interpreter later.
+
+Again, if you're interested you can view and play with the Braid source code on GitHub. In part two, I'll cover bytecode compiling and interpreting, bringing us up to date with the current progress in the Git repo.
+
+Without these references I would have been very stuck. May they also aid you on your journey:|||
+
+Josh Sharp's blog

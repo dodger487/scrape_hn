@@ -1,0 +1,51 @@
+Docker (and now runC) abstract the grit of working with Linux containers from users. Containers are implemented in Linux with a series of resource namespaces and other isolation tools. The relevant part of this story is that Docker shipped without meaningful use of the User namespace.
+
+It wasn’t like they forgot. There is an obvious need for adoption of the namespace. The situation is complicated and developing. It is an open source project, so adoption of the namespace is easy enough to follow:
+
+Regardless of what is going on over on GitHub, the impact of this gap has been felt in the image community since the beginning. This article is about dealing with the images that are available today, building your own images, working around issues that come up with permissions on volumes, and how to avoid mistakes when building tenant systems.
+
+Names inside of containers are just names that live in /etc/passwd on the container’s file system. When you create a user or group name inside of a container, you’ve only created a name or an alias for a user ID (UID) or group ID (GID). The UID and GID that the names are assigned to are not namespaced. UID 1000 in container A is the same as UID 1000 in container B, or UID 1000 on the host machine.
+
+The majority of the time that isn’t a problem because the resources that can be managed through Kernel calls are subject to namespaces, and chroot jails. A user with UID 1000 in container A can never reference resources that can be reference by container B. Interactions are limited. This is a problem in one specific case.
+
+Root (UID 0) inside of a container is a jailed root (UID 0) on the host. Don’t run as root inside of a container. It is just that simple. Every container breakout that has surfaced requires root access inside of a container. Again, don’t run as root inside of a container. There are a few cases when you’ve got no choice (system services or code running in kernel space), but in those instances you’d need elevated privileges either way and you should not expect a container to save you. The vast bulk of the code out there is application level. Containers running application level code never need root access. Don’t run them as root inside of a container. Capisce?
+
+Setting the run-as user is trivial. The docker run command provides a -u flag that takes usernames or UIDs with optional group or GID components. Alternatively, image authors can set the run-as user at build time. Security isn’t the only issue here. But the situation is more complex than it seems at first and current practices fall short IMO.
+
+The official Dockerfile Best Practices note appropriately that, “If a service can run without privileges, use USER to change to a non-root user. Start by creating the user and group in the Dockerfile…” This has become the prevalent pattern and can be see noted in popular appliance images like the official Postgres repository. In the Dockerfile for that repository you will find lines like:
+
+Some other images contain software that deescalates permissions as part of the startup routine. Example of such approaches include the official Nginx and Httpd repositories.
+
+This is — unfortunately — crap. In an effort to protect users from themselves these images are almost unusable in both multi-tenant and shared data situations. All of the applications mentioned manage or serve data that is not part of the image. It lives in volumes.
+
+Reading “The majority of the time” in the last section should have been a big hint. Containers that share volumes or use bind-mount volumes share a file system with permissions based on UID and GID. Docker does not magically layer a new set of file permissions over volumes. Owner and group ID’s as well as permissions and attributes set on a file are all injected as-is.
+
+Remembering the lack of a User namespace, you might anticipate the issue. Any containers that share a volume and use the same internal UID or GID will be able to access the same files on a volume. Conversely, containers that run with different UID and GID may not be able to access the same files.
+
+It is good to have the flexibility that this feature gap provides. However, when images that serve or manage state eliminate that flexibility by fixating on a particular embedded UID or GID you suffer the worst of both worlds.
+
+You can neither change the UID on a per-container basis in multi-tenant scenarios, nor set the UID or anticipate the UID when you’re serving content that exists outside of the container.
+
+I don’t want to give you the impression that I’m trying to pick on the best practices or these Dockerfiles in particular. They are serving a particular audience and set of use-cases. But those use-cases do not include multi-tenant deployments or composed environments.
+
+Instead of dictating and fixating on particular a UID/GID I’d like to see a version of these images that use the run-as UID/GID as set by the runtime environment. This will give the power back to the user.
+
+In order to accomplish this the image authors are going to need to abandon any “bootstrap” procedures that require root access. These are typically included to help setup new environments. They could instead package those procedures and let the use invoke them with non-default commands to the container.
+
+If these images would respect the user argument for the container then we could move on to a better best-practice. Docker users should always specify a run-as user/group. Always. Just do it. It is a simple habit to get into. In fact, you can start today and fall back to omitting the setting if the image has an issue with it (I’m looking at you Postgres).
+
+But just specifying a user/group isn’t enough. It is a pain to try to discover the users and groups that have been registered in an image. If you’ve tried in the past, you may have seen an error message like this on startup:
+
+This is a bit of a funny error. The problem is that the specified username or group has not been registered. I say this is silly, because it is all about names, and in this system names really don’t mean anything. Rather than worry about the users and groups that have been registered in a given image use UID/GID. Abandon names.
+
+UID/GID can be used that have no associated /etc/passwd or /etc/group entries. At the end of the day this is all about file permissions.
+
+UID/GID ranges are easy to partition for groups of customers or distinct systems. So suppose I’m running a multi-tenant system with some subset of shared hardware, like a NAS. If I have three customers, and I partition my UID/GID namespace such that the ID range [5000–6000) is reserved for customer 1, [6000–7000) is for customer 2, and [7000–8000) is reserved for customer 3, then I can be more confident that even in the event of a volume misconfiguration no running container for a particular customer can access the other customer’s files.
+
+Mapping host users and groups to specific IDs in a new container would be ideal. You can’t just cut container users and groups off from the host because you’ll always need to deal with the shared file system use-cases. A good default implementation may segregate the ID namespace into blocks for you and rewrite a container’s /etc/hosts file appropriately.
+
+Until that beautiful day when we can start being explicit about mapping users on a host to users in a container we’ll have to due with some simple rules and careful ID accounting.
+
+You can find more information like this in my book, Docker in Action available through Manning’s Early Access Program.|||
+
+Docker (and now runC) abstract the grit of working with Linux containers from users. Containers are implemented in Linux with a series of resource namespaces and other isolation tools. The relevant…

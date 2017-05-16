@@ -1,0 +1,155 @@
+In my previous post I (re)introduced you to my main personal project, siplasplas, a library and tool to implement static and dynamic reflection with C++14. Also runtime C++ compilation on top of it, I’m a bit masochist…
+
+As I told in the intro of my previous post, after Meeting C++ conference my main work has been to port the reflection parser from Python to a reusable C++ API.
+
+One of the core aspects of the API is to be able to parse all the dependencies of header files, if changed. Basically:
+
+Of course there are some extra details involved, like checking if headers have been processed by this parsing job itself (Maybe as a dependency of another header), ignoring system and out-of-sourcetree includes in general, etc.
+
+I want to parallelize the parsing process as much as possible, since it may involve parsing (And, later, metadata processing and code generation) of tens to hundreds of files depending on the target project.
+
+ Despite the usual advises like “Never write your own task engine”, a task engine is something I didn’t have written myself before, so I thought this will be a great time to read this awesome job stealing series again
+
+Disclaimer: This post is highly based on the Job System 2.0 series on Molecular Matters blog, you may notice a lot of similarities between this post snippets and explanations and the original molecular posts. All the code shown here is real working code, the result from my work following that great post series.
+
+Job stealing is a scheduling strategy where instead of having a common work pool for n workers, we have per-worker pools, and workers have the chance to steal work from others pool if there is no stuff left in their own pool. It’s basically like me eating pasta with the family.
+
+From the programming perspective, this translates to having n worker threads with one m jobs pool each. By default each worker picks work from its own pool, but if there’s no work left they try to find more work by randomly choosing another working and getting work from its pool. This strategy works very well since it reduces pool access contention and also helps to auto-balance work by aiding busy threads to complete their assigned work.
+
+But, what is a job? I’ve used the word “job” at least 7 times and we still don’t know what the f… a job is or how it is modeled.
+
+A job is basically a unit of work, in its very basic form a plain free function that has to be run in order to complete a task. To keep things simple and fast, a job can be represented by a POD type as follows:
+
+Here, objects encapsulate a function pointer, a pointer to a parent job, and an atomic counter. The pointer points to the function to execute when the job is processed, and the parent pointer and the counter keep track of parent-child relationships of jobs.
+
+A job is run by calling , which is defined as follows:
+
+First the job function is called with the job itself as parameter, and then the job executes its “teardown” code, by calling :
+
+In the description of the class we said that and the parent pointer keep track of parent-child relationships. What this means is that a given job is considered finished if and only if its job function has been run (its method has been called by the scheduler) and if all its children jobs are finished. During job initialization, the unfinished jobs counter of the parent (if any) is incremented, and decremented when one of its children finishes.
+
+Note I don’t care about memory ordering in the counter, because there are no memory operations areound related to the counter. This could be a use case for .
+
+This relationship makes possible to write fork-join parallelism patterns by simply spawning multiple isolated jobs linked to a common parent job, and make the current thread wait until the parent is finished. Something like:
+
+Finally, is defined as not having any unfinished job left, i.e.:
+
+We can allocate jobs by simply calling and , but that would not be an specially “fast” implementation, we can improve things a bit. One alternative could be to use a pool allocator of jobs, but a simpler (but limited) and faster alternative could be to have a preallocated array of jobs, with an increasing counter of the number of jobs that have been allocated. In other words, a linear allocator:
+
+The interface is very simple: One function to allocate a new job, a getter to check if the pool is full (All the storage has been used), and a function to clear the pool.
+
+First we pre-allocate the storage:
+
+To allocate a job, we simply return the address of the next available storage element, if any:
+
+Note that there are no atomics involved in . The system uses per-worker pools, which means Job allocations will be done from the worker thread only. If this were not the case, would have to follow a CAS strategy to increment the allocated jobs object similar to what and doo (See bellow).
+
+Clearing the storage (for situations such as restarting the job system for the next frame of your game engine) is as simple as setting the counter to 0, since jobs are POD objects and no destructor calls are needed. We simply reuse the job objects from the previous iteration:
+
+All the functions are basically calls to followed by a constructor call:
+
+One optimization you could apply to the type is to align it to the cache line boundary to prevent false sharing. You can do so by using C++11 , but we can explicitly declare the padding bytes and use them for our convenience:
+
+I have to confess in my real code I have a plain 64 there… But since using cool C++17 stuff works better for blog posts (This does not strictly have to compile, right?), let me take my C++ DeLorean and use .
+
+Now we have a bunch of unused bytes where we can put user defined POD data:
+
+Again, since bound data is of POD types no destructor calls are needed, so we are ok binding data, running the job, and forgetting about job data after that.
+
+Using PODs by default makes 99% of the simple cases fast, but there are situations where binding non-POD data could be useful. Consider a lambda:
+
+This works since non capturing lambdas are implicitly convertible to a function pointer. But what happens if we want to use a capturing lambda in a job?
+
+This no longer works since the lambda is capturing the string. When a lambda captures something (A variable, , etc) it cannot be converted to a function anymore since the lambda object could be stateful.
+
+Obviously this approach does not work because is not a POD type. We cannot it into the job padding storage, and also its destructor must be called once the job goes out of scope.
+
+There’s another option: Our job allocator uses a preallocated array of objects, an array that is not going to be re-allocated again during its lifetime. This means our jobs will not be “moved” nor copied along the use of the engine, which make their padding bytes perfect candidates for raw object storage:
+
+Now we can use to bind a non-POD object into a job by constructing it in the job padding. Let’s wrap everything into a function:
+
+Tah dah! Well… not exactly. We were finally able to bind a non-POD object to a job, but non-POD objects have an associated destructor that must be called at the end of their lifetime. Since we used placement new to initialize an object on the job storage, we have to explicitly call the object destructor ourselves. We can change implementation to do that:
+
+Now, what happens with child jobs? Our implementation above assumes that nobody will use the bound closure after the job is run, but that may not be true if a child job depends on data from its parent:
+
+The code above may look right, but nobody guarantees that child jobs will be scheduled before the job run finishes. In the worst case, all jobs are scheduled after job has been run, resulting in dangling references to the variable captured by .
+
+We can patch and to fix the issue: First, allow users to install a callback during the execution of a job, callback that will be executed when the job is finished:
+
+Remember a job is considered as finished not after the job is run only but when all its child jobs are considered finished too.
+
+where can reuse the job function pointer:
+
+Now rewrite to track changes in the job function during the execution of a job:
+
+finally, execute the user defined callback when the job is finished:
+
+*This technique assumes all non-POD data is passed as a captured variable by the job function. I like it because passing extra job data requires no special syntax, just capturing variables in a lambda. Also, manually registering a on-finished callback works with POD resources too, such as an OpenGL resource that must be released after all the job tree is processed.
+
+Also, my real implementation of is a bit more complex, using an static if to dynamically allocate/deallocate closures if they not fit into the job padding storage*.
+
+At the beginning of the post I’ve explained that our job system would consist in a set of N workers. A worker is basically a thread and a job pool associated with it:
+
+Workers can be run in two modes, and , which means the worker executes jobs in its own owned thread or if it only runs work on the caller thread (Without fetching work in the background). This is done to have N-1 spawned worker threads, and one worker running on the main thread.
+
+A worker also has an associated work queue where the user submits jobs:
+
+Background workers fetch work in an infinite loop run by the worker thread:
+
+while foreground workers use to run jobs in the caller thread waiting until an specific job is finished:
+
+All the magic behind job stealing is implemented in :
+
+A worker first tries to get a job from its work queue. If there are no jobs left in its own queue, the worker asks the engine to pick a random worker. Then the worker proceeds to steal work from that worker queue, taking care to not steal work from itself first (It could be that the engine returned this same worker).
+
+In case neither our worker or the worker returned by the engine have more work to do, we yield the worker and return no job.
+
+One of the most interesting posts in the molecular series is the implementation of a lock-free job queue. The job queue is basically a double-ended queue implemented as a pre-allocated vector, where:
+
+increments the of the queue:
+
+Here we use acquire-release semantics to make sure the compiler will not reorder the assignment to the array with the bottom increment. As the molecular post notes, this could lead to concurrent calls returning jobs that are not in their queue slots yet, actually returning garbage pointers.
+
+Besides the array asignment order, has no more race problems with its (potential) concurrent enemy, , since the only thing that could happen is that a call is executed before the increment is done, making steal to fail if there are no jobs in the queue from its point of view, besides a new job was actually inserted by .
+
+has to decrement , and make sure no concurrent calls are trying to return the same job:
+
+First, decrements and then reads the current value of , this ordering in the reads protects against concurrent calls to in the meantime ( works only if there are jobs to steal left in the range . If you decrement first you reduce the chance of concurrent s to return jobs).
+
+The most important part of is the initialization of : and access to different ends of the queue, so the only case where they could be fighting for the same job is when only one job is left in the queue. In that case, both and point to the same queue slot, and we have to make sure only one thread is returning this last job.
+
+ensures this doing a nice trick: Before returning the job, it checks if a concurrent call to happened after we read , by doing a CAS to increment top. If the CAS fails, it means has lost a race against a concurrent call, returning nullptr in that case. If the CAS succeeds, won and incremented preventing further calls to extract the last job again.
+
+is a custom container implementing a simple pre-allocated array where elements can be added and initialized in place. This is not possible with directly since it requires value types to be moveable at least, which is not the case with or our for example.
+
+As you can see the (Or , , , whatever generic and non-meaningful name you choose) owns a set of n workers, m jobs pool each. It also exposes a function to return the worker associated with the calling thread (if any) and a function that randomly returns one of the workers.
+
+The main difference from molecule is that I have a class representing the job system that can be instantiated on demand, instead of having a global engine API. The global approach makes more sense in the molecule use case since the whole engine pipeline would be based on running MxN jobs in parallel per frame. Here the parallelism is not inherent to the parsing system but an opt-in feature.
+
+When initializing the engine, we allocate all the workers and start them:
+
+Note that the first worker is initialized in mode while the rest are initialized in mode. This is done so the thread initializing the engine (For example, the main application thread) could contribute to the work too by waiting for jobs using . For a system of N cores, initializing an with N threads is fine, because already cares about the initializer thread and assigns it a worker.
+
+function searches for the engine that is running on the given thread:
+
+so could be as simple as:
+
+On the other hand, uses a normal distribution to return one of the currently active workers:
+
+Only the currently active because it could happen that a worker continues running and asking for worker where to stole jobs, while the other workers are being stopped. This is the case during engine destruction.
+
+Noe that we have completed the API, let’s write a parallel-for hello world example to compare our results with molecular:
+
+Running this example on an Intel Core i7 6560U (2.2GHz, 4 cores, no hyperthreading) takes 25ms approx, which is 40 times slower than the molecular example In my deffense, I’m running this on a linux VM…
+
+This could not be performance-ready at all for a 60 fps game engine, but I’m glad it works ok after three weeks of segfaults and gdb sessions. It was my first take on true lock-free stuff and I’m really happy with what I’ve learned.
+
+Let me show a simple example of the use case I have in mind:
+
+Three weeks to write a lock-free job system and now you put mutexes everywhere? Please don’t judge me, is just a 20 loc example…
+
+This is a toy proof of concept of the parsing pipeline I’m working on. The example shows a class that recursively parses all the included headers of a given header file, spawning one parallel job for each file parsed. It runs damnly fast compared to doing all the work in one thread, as we all known parsing a C++ file could take ages…
+
+I would like to continue working on the engine, adding continuations and parallel programming primitives. Also, integrating boost.coroutine to be able to yield jobs could be really interesting.|||
+
+In my previous post I (re)introduced you to my main personal project,siplasplas, a library and toolto implement static and dynamic reflection with C++14. Als...

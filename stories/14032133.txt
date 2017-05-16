@@ -1,0 +1,445 @@
+In this article, we will discuss typical errors that newbie developers may face with while designing T-SQL code. In addition, we will have a look at the best practices and some useful tips that may help you when working with SQL Server, as well as workarounds to improve performance.
+
+1. Data Types
+
+ 2. *
+
+ 3. Alias
+
+ 4. Column order
+
+ 5. NOT IN vs NULL
+
+ 6. Date format
+
+ 7. Date filter
+
+ 8. Сalculation
+
+ 9. Convert implicit
+
+ 10. LIKE & Suppressed index
+
+ 11. Unicode vs ANSI
+
+ 12. COLLATE
+
+ 13. BINARY COLLATE
+
+ 14. Code style
+
+ 15. [var]char
+
+ 16. Data length
+
+ 17. ISNULL vs COALESCE
+
+ 18. Math
+
+ 19. UNION vs UNION ALL
+
+ 20. Re-read
+
+ 21. SubQuery
+
+ 22. CASE WHEN
+
+ 23. Scalar func
+
+ 24. VIEWs
+
+ 25. CURSORs
+
+ 26. STRING_CONCAT
+
+ 27. SQL Injection
+
+The main issue we face when working with SQL Server is an incorrect choice of data types.
+
+Assume we have two identical tables:
+
+Let’s execute a query to check what the difference is:
+
+In the first case, the data types are more redundant than it might be. Why should we store a bit value as the YES/NO row? Why should we store a date as a row? Why should we use BIGINT for employees in the table, rather than INT?
+
+It leads to the following drawbacks:
+
+I have faced the situation when developers retrieve all the data from a table, and then on the client-side, use DataReader to select required fields only. I do not recommend using this approach:
+
+There will be a significant difference in the query execution time. In addition, the covering index may reduce a number of logical reads.
+
+Assume we have a query that returns the amount of identical rows in both tables:
+
+Everything will be working as expected, until someone renames a column in the Sales.UserCurrency table:
+
+Next, we will execute a query and see that we get all the rows in the Sales.Currency table, instead of 1 row. When building an execution plan, on the binding stage, SQL Server would check the columns of Sales.UserCurrency, it will not find CurrencyCode there and decides that this column belongs to the Sales.Currency table. After that, an optimizer will drop the CurrencyCode = CurrencyCode condition.
+
+We always insert data there based on the information about the column order.
+
+Assume someone changes the order of columns:
+
+Data will be inserted in a different order. In this case, it is a good idea to explicitly specify columns in the INSERT statement:
+
+Here is another example:
+
+On what column are we going to order data? It will depend on the column order in a table. In case one changes the order we get wrong results.
+
+Let’s talk about the NOT IN statement.
+
+For example, you need to write a couple of queries: return the records from the first table, which do not exist in the second table and visa verse. Usually, junior developers use IN and NOT IN:
+
+The first query returned 2, the second one – 1. Further, we will add another value in the second table – NULL:
+
+When executing the query with NOT IN, we will not get any results. Why IN works and NOT In not? The reason is that SQL Server uses TRUE, FALSE, and UNKNOWN logic when comparing data.
+
+When executing a query, SQL Server interprets the IN condition in the following manner:
+
+When comparing any value with NULL, SQL Server returns UNKNOWN. Either 1=NULL or NULL=NULL – both result in UNKNOWN. As far as we have AND in the expression, both sides return UNKNOWN.
+
+I would like to point out that this case is not rare. For example, you mark a column as NOT NULL. After a while, another developer decides to permit NULLs for that column. This may lead to the situation, when a client report stops working once any NULL-value is inserted in the table.
+
+In this case, I would recommend excluding NULL values:
+
+In addition, it is possible to use EXCEPT:
+
+Alternatively, you may use NOT EXISTS:
+
+Which option is more preferable? The latter option with NOT EXISTS seems to be the most productive as it generates the more optimal predicate pushdown operator to access data from the second table.
+
+Actually, the NULL values may return an unexpected result.
+
+Consider it on this particular example:
+
+As you can see, you have not got the expected result for the reason that NULL values have separate comparison operators:
+
+Here is another example with CHECK constraints:
+
+We create a table with a permission to insert only white and black colors:
+
+Why the CHECK constraint passed the NULL value? Well, the reason is that there is enough the NOT FALSE condition to make a record. The workaround is to explicitly define a column as NOT NULL or use NULL in the constraint.
+
+Very often, you may have difficulties with data types.
+
+For example, you need to get the current date. To do this, you can use the GETDATE function:
+
+Then just copy the returned result in a required query, and delete the time:
+
+The date is specified by a string constant:
+
+It will not cause any issues until the query with this business logic is executed on another server where settings may differ:
+
+Though, these options may lead to an incorrect interpretation of the date:
+
+Furthermore, this code may lead both to a visible and latent bug.
+
+Consider the following example. We need to insert data to a test table. On a test server everything works perfect:
+
+Still, on a client side this query will have issues as our server settings differ:
+
+Thus, what format should we use to declare date constants? To answer this question, execute this query:
+
+The interpretation of constants may differ depending on the installed language:
+
+Thus, it is better to use the last two options. Also, I would like to add that to explicitly specify the date is not a good idea:
+
+Therefore, if you want constants with the dates to be interpreted correctly, then you need to specify them in the following format YYYYMMDD.
+
+In addition, I would like to draw your attention to the behavior of some data types:
+
+Unlike DATETIME, the DATE type is interpreted correctly with various settings on a server:
+
+To move on, we will consider how to filter data effectively.  Let’s start from them DATETIME/DATE:
+
+Now, we will try to find out how many rows the query returns for a specified day:
+
+The query will return 0. When building an execution plan, SQL server is trying to cast a string constant to the data type of the column which we need to filter out:
+
+There are correct and incorrect options to output data. For example, you need to delete the time column:
+
+Or we need to specify a range:
+
+Taking into account optimization, I can say that these two queries are the most correct ones. The point is that all conversion and calculations of index columns that are being filtered out may decrease performance drastically and raise time of logic readings:
+
+The PostTime field had not been included in the index before, and we could not see any efficiency in using this correct approach in filtering. Another thing is when we need to output data for a month:
+
+Again, the latter option is more preferable:
+
+In addition, you can always create an index based on a calculated field:
+
+In comparison with the previous query, the difference in logical readings may be significant (if large tables are in question):
+
+As it has been already discussed, any calculations on index columns decrease performance and raise time of logic reads:
+
+If we look at the execution plans, then in the first one, SQL Server executes IndexScan:
+
+Then, when there are no calculations on the index columns, we will see IndexSeek:
+
+Let’s have a look at these two queries that filter by the same value:
+
+The execution plans provide the following information:
+
+The NationalIDNumber column has the NVARCHAR(15) data type. The constant we use to filter data out is set as INT which leads us to an implicit data type conversion. In its turn, it may decrease performance. You can monitor it when someone modifies the data type in the column, however, the queries are not changed.
+
+It is important to understand that an implicit data type conversion may lead to errors at runtime. For example, before the PostalCode field was numeric, it turned out that a postal code could contain letters. Thus, the data type was updated. Still, if we insert an alphabetic postal code, then the old query will no longer work:
+
+Another example is when you need to use EntityFramework on the project, which by default interprets all row fields as Unicode:
+
+To solve this issue, make sure that data types match.
+
+In fact, having a covering index does not mean that you will use it effectively.
+
+Let’s check it on this particular example. Assume we need to output all the rows that start with…
+
+We will get the following logic readings and execution plans:
+
+Thus, if there is an index, it should not contain any calculations or conversion of types, functions, etc.
+
+But what do you do if you need to find the occurrence of a substring in a string?
+
+We will come back to this question later.
+
+It is important to remember that there are the UNICODE and ANSI strings. The UNICODE type includes NVARCHAR/NCHAR (2 bytes to one symbol). To store ANSI strings, it is possible to use VARCHAR/CHAR (1 byte to 1 symbol). There is also TEXT/NTEXT, but I do not recommend using them as they may decrease performance.
+
+If you specify a Unicode constant in a query, then it is necessary to precede it with the N symbol. To check it, execute the following query:
+
+If N does not precede the constant, then SQL Server will try to find a suitable symbol in the ANSI coding. If it fails to find, then it will show a question mark.
+
+Very often, when being interviewed to the position Middle/Senior DB Developer, an interviewer often asks the following question: Will this query return the data?
+
+It depends. Firstly, the N symbol does not precede a string constant, thus, it will be interpreted as ANSI. Secondly, a lot depends on the current COLLATE value, which is a set of rules, when selecting and comparing string data.
+
+This COLLATE statement will return question marks as their symbols are equal:
+
+If we change the COLLATE statement for another statement:
+
+In this case, the query will return nothing, as Cyrillic characters will be interpreted correctly.
+
+Therefore, if a string constant takes up UNICODE, then it is necessary to set N preceding a string constant. Still, I would not recommend setting it everywhere for the reasons we have discussed above.
+
+Another question to be asked on the interview refers to rows comparison.
+
+Consider the following example:
+
+Are these rows equal? To check this, we need to explicitly specify COLLATE:
+
+As there are the case-sensitive (CS) and case-insensitive (CI) COLLATEs when comparing and selecting rows, we cannot say for sure if they are equal. In addition, there are various COLLATEs both on a test server and a client side.
+
+There is a case when COLLATEs of a target base and tempdb do not match.
+
+When creating a table, it inherits COLLATE from a database. The only difference for the first temporary table, for which we determine a structure explicitly without COLLATE, is that it inherits COLLATE from the tempdb database.
+
+I will describe the case when COLLATEs do not match on the particular example with #t1.
+
+For example, data is not filtered out correctly, as COLLATE may not take into account a case:
+
+Alternatively, we may have a conflict to connect tables with different COLLATEs:
+
+Everything seems to be working perfect on a test server, whereas on a client server we get an error:
+
+To work around it, we have to set hacks everywhere:
+
+Now, we will find out how to use COLLATE for your benefit.
+
+Consider the example with the occurrence of a substring in a string:
+
+It is possible to optimize this query and reduce its execution time.
+
+At first, we need to generate a large table:
+
+As you can see, this query returns the following result:
+
+The point is that filter based on the binary comparison takes less time. Thus, if you need to filter occurrence of strings frequently and quickly, then it is possible to store data with COLLATE ending with BIN. Though, it should be noted that all binary COLLATEs are case sensitive.
+
+A style of coding is strictly individual. Still, this code should be simply maintained by other developers and match certain rules.
+
+Now, change COLLATE to any case-sensitive one:
+
+Then, try to execute the query again:
+
+An optimizer uses rules for the current COLLATE at the binding step when it checks for tables, columns and other objects as well as it compares each object of the syntax tree with a real object of a system catalog.
+
+If you want to generate queries manually, then you need to always use the correct case in object names.
+
+As for variables, COLLATEs are inherited from the master database. Thus, you need to use the correct case to work with them as well:
+
+In this case, you will not get an error:
+
+Still, a case error may appear on another server:
+
+As you know, there are fixed (CHAR, NCHAR) and variable (VARCHAR, NVARCHAR) data types:
+
+If a row has a fixed length, say 20 symbols, but you have written only 4 symbols, then SQL Server will add 16 blanks on the right by default:
+
+In addition, it is important to understand that when comparing rows with =, blanks on the right are not taken into account:
+
+As for the LIKE operator, blanks will be always inserted.
+
+It is always necessary to specify type length.
+
+Consider the following example:
+
+As you can see, the type length was not specified explicitly. Thus, the query returned an integer instead of a decimal value:
+
+As for rows, if you do not specify a row length explicitly, then its length will contain only 1 symbol:
+
+In addition, if you do not need to specify a length for CAST/CONVERT, then only 30 symbols will be used.
+
+There are two functions: ISNULL and COALESCE. On the one hand, everything seems to be simple. If the first operator is NULL, then it will return the second or the next operator, if we talk about COALESCE. On the other hand, there is a difference – what will these functions return?
+
+The answer is not obvious, as the ISNULL function converts to the smallest type of two operands, whereas COALESCE converts to the largest type.
+
+As for performance, ISNULL will process a query faster, COALESCE is split into the CASE WHEN operator.
+
+Math seems to be a trivial thing in SQL Server.
+
+However, it is not. Everything depends on the fact what data is used in a query. If it is an integer, then it returns the integer result.
+
+Also, let’s consider this particular example:
+
+This query COUNT(*)/COUNT(1) will return the total amount of rows. COUNT on the column will return the amount of non-NULL rows. If we add DISTINCT, then it will return the amount of non-NULL unique values.
+
+The AVG operation is divided into SUM and COUNT. Thus, when calculating an average value, NULL is not applicable.
+
+When the data is not overridden, then it is better to use UNION ALL to improve performance. In order to avoid replication, you may use UNION.
+
+Still, if there is no replication, it is preferable to use UNION ALL:
+
+Also, I would like to point out the difference of these operators: the UNION operator is executed in a parallel way, the UNION ALL operator – in a sequential way.
+
+Assume, we need to retrieve 1 row on the following conditions:
+
+As we have OR in the statement, we will receive IndexScan:
+
+Now, we will re-write the query using UNION ALL:
+
+When the first subquery had been executed, it returned 1 row. Thus, we have received the required result, and SQL Server stopped looking for, using the second subquery:
+
+Very often, I faced the situation when the data can be retrieved with one JOIN. In addition, a lot of subqueries are created in this query:
+
+The fewer there are unnecessary table lookups, the fewer logical readings we have:
+
+The previous example works only if there is a one-to-one connection between tables.
+
+Assume tables Person.Person and Sales.SalesPersonQuotaHistory were directly connected. Thus, one employee had only one record for a share size.
+
+However, as settings on the client server may differ, this query may lead to the following error:
+
+It is possible to solve such issues by adding TOP(1) and ORDER BY. Using the TOP operation makes an optimizer force using IndexSeek. The same refers to using OUTER/CROSS APPLY with TOP:
+
+When executing these queries, we will get the same issue – multiple IndexSeek operators:
+
+We get the following result:
+
+Since this operator is used very often, I would like to specify its features. Regardless, how we wrote the CASE WHEN operator:
+
+SQL Server will decompose the statement to the following:
+
+Thus, this will lead to the main issue: each condition will be executed in a sequential order until one of them returns TRUE or ELSE.
+
+Consider this issue on a particular example. To do this, we will create a scalar-valued function which will return the right part of a postal code:
+
+Then, configure SQL Profiler to build SQL events: StmtStarting / SP:StmtCompleted (if you want to do this with XEvents: sp_statement_starting / sp_statement_completed).
+
+The function will be executed for 10 times. Now, delete a comment from the condition:
+
+In this case, the function will be executed for 20 times. The thing is that it is not necessary for a statement to be a must function in CASE. It may be a complicated calculation. As it is possible to decompose CASE, it may lead to multiple calculations of the same operators.
+
+You may avoid it by using subqueries:
+
+In this case, the function will be executed 10 times.
+
+In addition, we need to avoid replication in the CASE operator:
+
+Though statements in CASE are executed in a sequential order, in some cases, SQL Server may execute this operator with aggregate functions:
+
+It is not recommended to use scalar functions in T-SQL queries.
+
+Consider the following example:
+
+However, as each call of the scalar function is a resource-intensive process, we can monitor this difference:
+
+In addition, when using a scalar function, it is not possible for SQL Server to build parallel execution plans, which may lead to poor performance in a huge volume of data.
+
+Sometimes scalar functions may have a positive effect. For example, when we have SCHEMABINDING in the statement:
+
+In this case, the function will be considered as deterministic and executed 1 time.
+
+Here I would like to talk about features of views.
+
+Create a test table and view on its base:
+
+As you can see, we get the correct result:
+
+Now, add a new column in the table and retrieve data from the view:
+
+We receive the same result:
+
+Thus, we need either to explicitly set columns or recompile a script object to get the correct result:
+
+When you directly refer to the table, this issue will not take place.
+
+Now, I would like to discuss a situation when all the data is combined in one query as well as wrapped in one view. I will do it on this particular example:
+
+What should you do if you need to get only a part of information? For example, you need to get Fist Name and Last Name of employees:
+
+Look at the execution plan in the case of using a view:
+
+Now, we will compare it with the query we have written manually:
+
+When creating an execution plan, an optimizer in SQL Server drops unused connections.
+
+However, sometimes when there is no valid foreign key between tables, it is not possible to check whether a connection will impact the sample result. It may also be applied to the situation when tables are connecteCURSORs
+
+I recommend that you do not use cursors for iteration data modification.
+
+You can see the following code with a cursor:
+
+Though, it is possible to re-write the code by dropping the cursor:
+
+In this case, it will improve performance and decrease the time to execute a query.
+
+To concatenate rows, the STRING_CONCAT could be used. However, as there is no such a function in the SQL Server, we will do this by assigning a value to the variable.
+
+To do this, create a test table:
+
+Then, assign values to the variable:
+
+Everything seems to be working fine. However, MS hints that this way is not documented and you may get this result:
+
+Alternatively, it is a good idea to use XML as a workaround:
+
+It should be noted that it is necessary to concatenate rows per each data, rather than into a single set of data:
+
+In addition, it is recommended that you should avoid using the XML method for parsing as it is a high-runner process:
+
+Alternatively, it is possible to do this less time-consuming:
+
+But, it does not change the main point.
+
+Now, execute the query without using the value method:
+
+This option would work perfect. However, it may fail. If you want to check it, execute the following query:
+
+If there are special symbols in rows, such as tabulation, line break, etc., then we will get incorrect results.
+
+Thus, if there are no special symbols, you can create a query without the value method, otherwise, use value(‘(./text())[1]’….
+
+If we add any additional value to the property,
+
+Then our query will be changed to the following construction:
+
+This is called SQL injection when it is possible to execute a query with any additional information.
+
+If the query is formed with String.Format (or manually) in the code, then you may get SQL injection:
+
+When you use sp_executesql and properties as shown in this code:
+
+It is not possible to add some information to the property.
+
+In the code, you may see the following interpretation of the code:
+
+Working with databases is not as simple as it may seem. There are a lot of points you should keep in mind when writing T-SQL queries.
+
+Of course, it is not the whole list of pitfalls when working with SQL Server. Still, I hope that this article will be useful for newbies.|||
+
+This article describes useful tips that may help newbies when working with SQL Server, as well as workarounds to improve performance

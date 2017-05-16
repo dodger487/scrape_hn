@@ -1,0 +1,55 @@
+Now that we've got the basics of microservices, what happens when we take into production? It's time to make sure your message reaches its intended targets.
+
+Everything looks good so far in the microservice we set up in Part 1, but what happens when we release this to production, and our application is consumed by multiple customers? Routing problems and message-correlation issues begin to rear their ugly heads. Our current example is simplistic. Consider a deployed application that performs work that is much more complex than our example.
+
+Now we are faced with a problem: how to ensure that any given message is received by its intended recipient only. Consider the process flow in Figure 1.
+
+It is possible that outbound messages published from the SimpleMath microservice may not arrive at the ASP.NET application in the same order in which the ASP.NET application initially published the corresponding request to the SimpleMath microservice.
+
+RabbitMQ has built-in safeguards against this scenario in the form of Correlation IDs. A Correlation ID is essentially a unique value assigned by the ASP.NET application to inbound messages, and retained throughout the entire process flow. Once processed by the SimpleMath microservice, the Correlation ID is inserted into the associated response message, and published to the response Queue.
+
+Upon receipt of any given message, the ASP.NET inspects the message contents, extracts the Correlation ID and compares it to the original Correlation ID. See Listing 1.
+
+It's possible that any given message may be bounced around indefinitely, without ever reaching its intended recipient. Such a scenario is unlikely, but possible. Regardless, it is likely, given multiple microservices, that messages will regularly be consumed by microservices to whom the message was not intended to be delivered. This is an obvious inefficiency, and very difficult to control from a performance perspective, and impossible to predict in terms of scaling.
+
+But this is the generally accepted solution. What else can we do?
+
+An alternative -- but discouraged -- solution is to invoke a dedicated Queue for each request, as shown in the process flow in Figure 2.
+
+Whoa! Are you suggesting that we create a new queue for each request?!?
+
+Yes, so let's park that idea right there -- it's essentially a solution that won't scale. We would place an unnecessary amount of pressure on RabbitMQ in order to fulfil this design. One new Queue for every inbound HTTP request is simply unmanageable.
+
+Or is it?
+
+So, what if we could manage this? Imagine a dedicated pool of queues, made available to inbound requests, such that each Queue was returned to the pool upon request completion. This might sound far fetched, but this is essentially the way that database connection-pooling works. Figure 3 shows the new flow.
+
+Let's walk through the code in Listing 2, starting with the QueuePool itself.
+
+QueuePool is a static class that retains a reference to a synchronized collection of Queue objects. The most important aspect of this is that the collection is synchronized, and therefore thread-safe. Under the hood, incoming HTTP requests obtain mutually exclusive locks in order to extract a Queue from the collection. In other words, any given request that extracts a Queue is guaranteed to have exclusive access to that Queue.
+
+Note the private constructor. Upon start-up (QueuePool will be initialized by the first inbound HTTP request) and will invoke a call to the RabbitMQ HTTP API, returning a list of all active Queues. You can mimic this call as follows:
+
+The list of returned Queue objects is filtered by name, such that only those Queues that are named in GUID-format are returned. QueuePool expects that all underlying Queues implement this convention in order to separate them from other Queues leveraged by the application.
+
+Now we have a list of Queues that our QueuePool can distribute. Let's take a look at our updated Math Controller, shown in Listing 3.
+
+Let's step through what's the application is doing here:
+
+Notice the Get method. An attempt is made to retrieve the next available Queue. If all Queues are currently in use, QueuePool will create a new Queue.
+
+Leveraging QueuePool offers greater reliability in terms of message delivery, as well as consistent throughput speeds, given that we no longer need rely on consuming components to re-queue messages that were intended for other consumers.
+
+It offers a degree of predictable scale -– performance testing will reveal the optimal number of Queues that the QueuePool should retain in order to achieve sufficient response times.
+
+It is advisable to determine the optimal number of Queues required by your application, so that QueuePool can avoid creating new Queues in the event of pool-exhaustion, reducing overhead.
+
+Queue Pool Sizing
+
+ Queue-pooling is a feature of the Daishi.AMQP library that allows AMQP Queues to be shared among clients in a concurrent capacity, such that each Queue will have 0...1 consumers only. The concept is not unlike database connection-pooling.
+
+We've built a small application that leverages a simple downstream Microservice, implements the AMQP protocol over RabbitMQ, and operates a QueuePool mechanism. We have seen how the QueuePool can retrieve the next available Queue:
+
+and how Queues can be returned to the QueuePool:|||
+
+Now that we've got the basics of microservices, what happens when we take into production? It's time to make sure your message reaches its intended targets.

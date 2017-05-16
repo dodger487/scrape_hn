@@ -1,0 +1,51 @@
+This article is a case study for integrating Magento with other systems when web services are not suitable, and we will go through some real life examples.
+
+By default, Magento implements two types of web services: SOAP and REST. This does not require that you know how Magento is built, how it works internally. You can perform almost any operation that Magento can do by default (create orders, add customers, get list of products, etc.) just by consuming web services.
+
+However, this approach is not always suitable, because things can get messy. You may need an intermediary software to achieve the results you want.
+
+Note: in this case the term “Middleware” does not refer to the design pattern used in microframeworks (although this could help in the implementation), it refers to a piece of software that stands between two systems helping them communicate.
+
+I once worked on a project which had, as part of its multichannel selling strategy, integrated a chain store and an online shop. Nothing fancy, the usual business scheme for this context. However, the challenge came with the request that the stock of the products (common for all the selling points) had to be updated in real time in Magento and consequently shown on the storefront.
+
+The beauty was that the chain store did not have a dedicated warehouse. They had approximately 100 physical stores and each of these stores shared the stock with the online store (half / half). Each time products were sold in the physical store, the stock needed to be updated in Magento. This could have turned messy if all 100 stores started to update the stock at the same time, with the Magento API.
+
+So we built a Middleware which centralizes the data and updates the stock in Magento (SOAP) in a transaction safe manner. Below you can see a simplified version of the Middleware’s flow diagram.
+
+Some notes about the Middleware we created in this case:
+
+When you should use this approach:
+
+When you should NOT use this approach:
+
+So how was this application built?
+
+I used Zend Framework 2 for implementing this middleware along with Doctrine DBAL. I implemented a SOAP server in Zend, which is similar to Magento’s SOAP implementation: it is WSI compliant, and you need to have a valid session ID to access any of the methods. You can get the session ID by accessing the “login” method of the SOAP server, where you need to provide a valid user and password.
+
+The stores (ERP) are accessing this SOAP interface whenever a stock update is needed. An SKU of a product, and a number - telling how many items should the Middleware add to the stock - is sent to the middleware. This number can be positive (if new products have been added to the store) or negative (if products have been sold in the store). The ERP is quite limited, it doesn’t allow many things when it comes to updating products. At first, I wanted to put all incoming requests in a queue, update each of them and notify the ERP. This unfortunately was not possible, I had to send a success or failure message on each request. So as a response, I return a success or failure message on every call, depending on the update status. If the response was a failure, the ERP tries the update later.
+
+On the Middleware side, I store the stock in a MySql server, using the INNODB storage engine for the stock database table. This is essential, because it supports transactions and row level locking. So whenever a request comes, the row of the SKU is locked, so no other request can update it, and this lock is kept until the stock is successfully updated in Middleware and Magento. Since on Magento only the stock is updated and all caching is enabled for WSDL, this works quite fast, under a second. In case two requests are trying to update the same SKU product, the first one locks the row and the second, if it cannot update the stock, it waits a few microseconds, and then retries the update. It keeps doing this for a limited period and if it still cannot update the stock, it returns an error message to the ERP system. This kind of fails are quite rare, they occur sometimes during mass updates.
+
+Obviously, this application is more complex, but I will not get into further details, because this is enough to understand the big picture.
+
+The second time I put this same decoupling principle into practice was for a commissioning application for an MLM (multi-level marketing) business. With a lot of work and creativity, Magento has been customised so that it could handle the extremely complex MLM business model, which had some quite difficult formulas and rules to assign commissions and bonuses for the users on all levels of the MLM hierarchy tree. Because these calculations were very time consuming, but could be totally set apart from the online shop, we’ve decided to build a separate application for this, whose purpose was to fetch data from Magento, make the calculations and send results back to Magento. This application was able to run on a separate environment, with optimized settings and without affecting Magento’s flows and logic in any negative way.
+
+This is how the high level flow diagram looked like:
+
+When you should use this approach:
+
+When you should NOT use this approach:
+
+Besides Middleware there are other alternatives for integrating Magento with third-parties. There are cases when Magento web services can be quite slow, especially when we want to transfer large amounts of data.
+
+For example, we had to create some Business Intelligence reports for a project and the software that we were using for data centralization did not support the complex SOAP implementation that Magento has. On top of that, performance was also an issue. So we decided to use MySql views. Mind you, this requires a bit of understanding of how Magneto stores data, and some advanced query writing skills. But done properly, views can make miracles in terms of speed.
+
+Example of fetching customer related information from attributes without hardcoding the attribute IDs:
+
+You should use this approach:
+
+You should NOT use this approach:
+
+Sometimes you have to add another layer or remove the layers you don’t need, when the tools Magento offers do not meet your needs. When you have a business logic that can be set apart from Magento, it is a good idea to do so - web services will make your life easier in this regard.|||
+
+Integration alternatives for third party applications in Magento from real ecommerce case studies.

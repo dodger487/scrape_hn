@@ -1,0 +1,40 @@
+We had an issue a while ago where one of our Mongo instances had run out of available space on the root disk. This was concerning because we use a large separate volume mounted at that is dedicated entirely to Mongo:
+
+Asking which sub-directory was using the most data did not help:
+
+All together, those values add up to 4938600 1k blocks (du's default unit), or 4.7G.
+
+Note: using means that du will not traverse other file systems. is mounted from a separate volume (as seen in the output), and it was the root disk I cared about.
+
+But, the root disk said that it was out of space, and this meant that 32G worth of files had to be present. So - what's using all the disk space?
+
+The only place left to look was "under" the mount point - on the root disk, not the separate volume. This can be accomplished by using a bind mount of root:
+
+Navigating to would then go to the root disk's , not the separate volume. Very quickly, I found what was consuming the disk space:
+
+First of all, this is an insane size for a log file.
+
+Second of all, why was it using the root disk's ?
+
+At Vena, we use AMIs as base images, which we then customize for specific deployments - different datacenters, attached volume sizes, and so on. When we bring up a Mongo instance base image, we perform the following steps:
+
+It makes sense then that there would be two mongod process IDs (one from before step 1, and one from after step 5):
+
+What didn't make sense was that the root disk's PID corresponded to the running mongod:
+
+but (the separate volume) was where mongod was storing 989G of data, according to .
+
+Apart from the log file, the timestamps of other files in both directories also seemed suspiciously similar:
+
+One way to free up the root disk is to force a log rotate - afterwards, can be deleted:
+
+It looks like the following happened:
+
+This would explain how after the logRotate occurred both mongod.log files had very similar timestamps.
+
+The only theory that really fits is that mongod never stopped in the first place. This means that it never stopped using mongod.log from when it started the first time (under the mount). Mounting over would be transparent to mongod - it would still have open FILE pointers to files under the mount, and new files would be written to the separate volume.
+
+Unfortunately this does not explain why other files like mongod.lock and mongod.pid had similar timestamps under both and . It also doesn't explain how there were two different PIDs.
+
+Even if we can't explain why this bizarre scenario happened, these two changes prevent the conditions that caused it:|||
+

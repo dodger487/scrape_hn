@@ -1,0 +1,126 @@
+In this post, we start exploring CPU exceptions. Exceptions occur in various erroneous situations, for example when accessing an invalid memory address or when dividing by zero. To catch them, we have to set up an interrupt descriptor table that provides handler functions. At the end of this post, our kernel will be able to catch breakpoint exceptions and to resume normal execution afterwards.
+
+As always, the complete source code is available on Github. Please file issues for any problems, questions, or improvement suggestions. There is also a comment section at the end of this page.
+
+An exception signals that something is wrong with the current instruction. For example, the CPU issues an exception if the current instruction tries to divide by 0. When an exception occurs, the CPU interrupts its current work and immediately calls a specific exception handler function, depending on the exception type.
+
+We’ve already seen several types of exceptions in our kernel:
+
+For the full list of exceptions check out the OSDev wiki.
+
+In order to catch and handle exceptions, we have to set up a so-called Interrupt Descriptor Table (IDT). In this table we can specify a handler function for each CPU exception. The hardware uses this table directly, so we need to follow a predefined format. Each entry must have the following 16-byte structure:
+
+The options field has the following format:
+
+Each exception has a predefined IDT index. For example the invalid opcode exception has table index 6 and the page fault exception has table index 14. Thus, the hardware can automatically load the corresponding IDT entry for each exception. The Exception Table in the OSDev wiki shows the IDT indexes of all exceptions in the “Vector nr.” column.
+
+When an exception occurs, the CPU roughly does the following:
+
+Instead of creating our own IDT type, we will use the struct of the crate, which looks like this:
+
+The fields have the type , which is a struct that represents the fields of an IDT entry (see the table above). The type parameter defines the expected handler function type. We see that some entries require a and some entries require a . The page fault even has its own special type: .
+
+Let’s look at the type first:
+
+It’s a type alias for an type. The keyword defines a function with a foreign calling convention and is often used to communicate with C code ( ). But what is the calling convention?
+
+Exceptions are quite similar to function calls: The CPU jumps to the first instruction of the called function and executes it. Afterwards, if the function is not diverging, the CPU jumps to the return address and continues the execution of the parent function.
+
+However, there is a major difference between exceptions and function calls: A function call is invoked voluntary by a compiler inserted instruction, while an exception might occur at any instruction. In order to understand the consequences of this difference, we need to examine function calls in more detail.
+
+Calling conventions specify the details of a function call. For example, they specify where function parameters are placed (e.g. in registers or on the stack) and how results are returned. On x86_64 Linux, the following rules apply for C functions (specified in the System V ABI):
+
+Note that Rust does not follow the C ABI (in fact, there isn’t even a Rust ABI yet). So these rules apply only to functions declared as .
+
+The calling convention divides the registers in two parts: preserved and scratch registers.
+
+The values of preserved registers must remain unchanged across function calls. So a called function (the “callee”) is only allowed to overwrite these registers if it restores their original values before returning. Therefore these registers are called “callee-saved”. A common pattern is to save these registers to the stack at the function’s beginning and restore them just before returning.
+
+In contrast, a called function is allowed to overwrite scratch registers without restrictions. If the caller wants to preserve the value of a scratch register across a function call, it needs to backup and restore it before the function call (e.g. by pushing it to the stack). So the scratch registers are caller-saved.
+
+On x86_64, the C calling convention specifies the following preserved and scratch registers:
+
+The compiler knows these rules, so it generates the code accordingly. For example, most functions begin with a , which backups on the stack (because it’s a callee-saved register).
+
+In contrast to function calls, exceptions can occur on any instruction. In most cases we don’t even know at compile time if the generated code will cause an exception. For example, the compiler can’t know if an instruction causes a stack overflow or a page fault.
+
+Since we don’t know when an exception occurs, we can’t backup any registers before. This means that we can’t use a calling convention that relies on caller-saved registers for exception handlers. Instead, we need a calling convention means that preserves all registers. The calling convention is such a calling convention, so it guarantees that all register values are restored to their original values on function return.
+
+On a normal function call (using the instruction), the CPU pushes the return address before jumping to the target function. On function return (using the instruction), the CPU pops this return address and jumps to it. So the stack frame of a normal function call looks like this:
+
+For exception and interrupt handlers, however, pushing a return address would not suffice, since interrupt handlers often run in a different context (stack pointer, CPU flags, etc.). Instead, the CPU performs the following steps when an interrupt occurs:
+
+So the exception stack frame looks like this:
+
+In the crate, the exception stack frame is represented by the struct. It is passed to interrupt handlers as and can be used to retrieve additional information about the exception’s cause. The struct contains no error code field, since only some few exceptions push an error code. These exceptions use the separate function type, which has an additional argument.
+
+The calling convention is a powerful abstraction that hides almost all of the messy details of the exception handling process. However, sometimes it’s useful to know what’s happening behind the curtain. Here is a short overview of the things that the calling convention takes care of:
+
+If you are interested in more details: We also have a series of posts that explains exception handling using naked functions linked at the end of this post.
+
+Now that we’ve understood the theory, it’s time to handle CPU exceptions in our kernel. We start by creating a new module:
+
+In the new module, we create an function, that creates a new :
+
+Now we can add handler functions. We start by adding a handler for the breakpoint exception. The breakpoint exception is the perfect exception to test exception handling. Its only purpose is to temporary pause a program when the breakpoint instruction is executed.
+
+The breakpoint exception is commonly used in debuggers: When the user sets a breakpoint, the debugger overwrites the corresponding instruction with the instruction so that the CPU throws the breakpoint exception when it reaches that line. When the user wants to continue the program, the debugger replaces the instruction with the original instruction again and continues the program. For more details, see the “How debuggers work“ series.
+
+For our use case, we don’t need to overwrite any instructions (it wouldn’t even be possible since we set the page table flags to read-only). Instead, we just want to print a message when the breakpoint instruction is executed and then continue the program.
+
+So let’s create a simple function and add it to our IDT:
+
+Our handler just outputs a message and pretty-prints the exception stack frame.
+
+When we try to compile it, the following error occurs:
+
+This error occurs because the calling convention is still unstable. To use it anyway, we have to explicitly enable it by adding on the top of our .
+
+In order that the CPU uses our new interrupt descriptor table, we need to load it using the instruction. The struct of the provides a method function for that. Let’s try to use it:
+
+When we try to compile it now, the following error occurs:
+
+So the methods expects a , that is a reference that is valid for the complete runtime of the program. The reason is that the CPU will access this table on every interrupt until we load a different IDT. So using a shorter lifetime than could lead to use-after-free bugs.
+
+In fact, this is exactly what happens here. Our is created on the stack, so it is only valid inside the function. Afterwards the stack memory is reused for other functions, so the CPU would interpret random stack memory as IDT. Luckily, the method encodes this lifetime requirement in its function definition, so that the Rust compiler is able to prevent this possible bug at compile time.
+
+In order to fix this problem, we need to store our at a place where it has a lifetime. To achieve this, we could either allocate our IDT on the heap using and then convert it to a reference or we can store the IDT as a . Let’s try the latter:
+
+There are two problems with this. First, statics are immutable, so we can’t modify the breakpoint entry from our function. Second, the function is not a function, so it can’t be used to initialize a . We could solve this problem by using a of type :
+
+This variant compiles without errors but it’s far from idiomatic. s are very prone to data races, so we need an block on each access. Also, we need to explicitly the on each use, since might be .
+
+The one-time initialization of statics with non-const functions is a common problem in Rust. Fortunately, there already exists a good solution in a crate named lazy_static. This crate provides a macro that defines a lazily initialized . Instead of computing its value at compile time, the laziliy initializes itself when it’s accessed the first time. Thus, the initialization happens at runtime so that arbitrarily complex initialization code is possible.
+
+Let’s add the crate to our project:
+
+We need the feature, since we don’t link the standard library. We also need the attribute on the line to import the macro.
+
+Now we can create our static IDT using :
+
+Note how this solution requires no blocks or calls.
+
+Now we should be able to handle breakpoint exceptions! Let’s try it in our :
+
+When we run it in QEMU now (using ), we see the following:
+
+It works! The CPU successfully invokes our breakpoint handler, which prints the message, and then returns back to the function, where the It did not crash! message is printed.
+
+We see that the exception stack frame tells us the instruction and stack pointers at the time when the exception occured. This information is very useful when debugging unexpected exceptions. For example, we can look at the corresponding assembly line using :
+
+The flags disassembles the section and flag makes function names more readable by demangling them. The flag of specifies the number of preceding lines that should be shown (5 in our case).
+
+We clearly see the exception that caused the breakpoint exception at address . Wait… the stored instruction pointer was , which is a normal operation. What’s happening here?
+
+The answer is that the stored instruction pointer only points to the causing instruction for fault type exceptions, but not for trap or abort type exceptions. The difference between these types is the following:
+
+The reason for the diffent instruction pointer values is that the stored value is also the return address. So for faults, the instruction that caused the exception is restarted and might cause the same exception again if it’s not resolved. This would not make much sense for traps, since invoking the breakpoint exception again would just cause another breakpoint exception . Thus the instruction pointer points to the next instruction for these exceptions.
+
+In some cases, the distinction between faults and traps is vague. For example, the debug exception behaves like a fault in some cases, but like a trap in others. So to find out the meaning of the saved instruction pointer, it is a good idea to read the official documentation for the exception, which can be found in the AMD64 manual in Section 8.2. For example, for the breakpoint exception it says:
+
+The documentation of the struct and the OSDev Wiki also contain this information.
+
+The calling convention and the type made the exception handling process relatively straightforward and painless. If this was too much magic for you and you like to learn all the gory details of exception handling, we got you covered: Our “Handling Exceptions with Naked Functions” series shows how to handle exceptions without the calling convention and also creates its own type. Historically, these posts were the main exception handling posts before the calling convention and the crate existed.
+
+We’ve successfully caught our first exception and returned from it! The next step is to add handlers for other common exceptions such as page faults. We also need to make sure that we never cause a triple fault, since it causes a complete system reset. The next post explains how we can avoid this by correctly catching double faults.|||
+

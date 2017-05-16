@@ -1,0 +1,80 @@
+In this second entry in our new "Mongo Metrics" series, we'll take a look at using the MongoDB aggregations pipeline to compute the MEDIAN of a set of data. Following up on our previous article on calculating the MEAN, we'll take a look at how computing the MEDIAN can help us reduce the effect of outliers on the metrics we gather from our data and get a sense of how much our MEAN is misleading us.
+
+One of the main weaknesses with the MEAN, or average, is its susceptibility to being skewed by a few values that lie far outside of where most of the other values are. These outliers on either the high or low side of our data can cause the MEAN to skew greatly in the direction of the outlier. To get a more accurate view of our data, we'll want to reduce the impact of these outliers.
+
+There are a few ways to compute the MEDIAN, and all of them require your data to be in a ordered set. In this article, we'll start by removing all non-conforming data (e.g. NULL or empty values) and then sorting the remaining data in ascending order. By sorting the data, our outliers will be pushed to the edges of our data set, making the center elements more representative of what a typical data point might look like, so our MEDIAN calculation will return those elements.
+
+Since the MEDIAN calculation requires us to sort our data set, it's not going to be as fast or efficient as the MEAN calculation. Also, as is the case with many database systems, MongoDB does not have a $median operator so we'll have to compute the MEDIAN ourselves. While many developers choose to compute the MEDIAN on the application layer, the aggregation pipeline in MongoDB can be used to perform this sort of calculation in the data layer as well.
+
+Before we get started, make sure you have a foundational understanding of the and operators in the MongoDB aggregation pipeline. If you need some background, you can check out our previous article on MongoDB aggregations by example.
+
+In the general sense, there are a few different ways to compute the MEDIAN value of an ordered data set. For our purposes, we'll compute the MEDIAN by using the following steps:
+
+Let's take a look at an example using the transactions data from a fictitious pet supply company used in our previous article on MEAN:
+
+That data will be contained in MongoDB as an array of documents that looks like the following:
+
+Now that we have some data to work with, we can begin analyzing that data. Analyzing data starts with figuring out what questions we're trying to answer. In this case, we'd like to know what the MEDIAN order value across all of our transactions.
+
+First, we'll need to clean up our data. Looking at our transaction table, we'll see that one of our orders contains no items and has an orderValue of . In MongoDB, this corresponds to a missing order_value field. We can start our aggregation pipeline by matching only the documents that have a value in the order_value field:
+
+Note that you can use matching to filter out all kinds of information - feel free to use multiple matches if it makes sense to filter data out of your calculations.
+
+Now that we've filtered out the documents we don't want to include, let's count the number of transactions that we do want to include. We can do this by using the group aggregation and creating a sum calculation, adding 1 for each document we encounter:
+
+Notice the values part of the document. This allows us to create an array called "values" which contains one entry for each transaction document we encounter. In particular, it pushes the order_value field from each transaction into the values array. We'll use the values array to pass the order values along the aggregation pipeline.
+
+Running the aggregation at this stage results in something like this:
+
+Our next step is to sort the values in order, but we have a problem. MongoDB comes built-in with a very handy operator that we can use to sort data. However, that operator can only be used on documents in a result set, not on values inside of an array. Basically, we need to turn our current single-document result into an array of documents, one for each value. Luckily for us, MongoDB has the operator which lets us do exactly that. Using , we can take the values in an array and create one document from each of them:
+
+Unwinding will reverse the grouping instruction by expanding our array out into multiple results, but it will also preserve our new count field by including it in every new document.
+
+BEFORE the unwind, our data looks like the following:
+
+After unwinding, it has the following format:
+
+This allows us to go back to using the MongoDB aggregations operators on our data.
+
+Now that we have our data back in a usable format, let's sort the data across all documents using the field:
+
+Sorting using MongoDB aggregations is pretty straight-forward - we pass the name of the field as the key to the $sort operator, along with a positive value for a ascending sort and a negative value for a descending sort.
+
+At this point, we now have a count of our documents and have them in sorted order, which are the first and second steps of our MEDIAN calculation. Now, we're on to the third step which is computing the high and low midpoints, retrieving the elements there, and averaging them together.
+
+At this stage, we're going to use a new operator that we haven't seen yet in this series: $project. The $project operator creates a projection, which is a custom data structure that can be passed down the aggregation pipeline. These projections are very versatile: they can contain data computed using aggregation operators, results from previous stages in the pipeline, and individual data fields from a collection. We'll use $project to gradually build up the information we'll need to compute our MEDIAN.
+
+The first projection will calculate the midpoint of the data set using the $divide operator:
+
+The first two keys have a value of 1, which has the effect of preserving the count and values fields from the previous step. Next, the midpoint is calculated by dividing the count by 2 using the operator.
+
+The next projection step will compute those two indices by using the $floor operator for the low-side index and the $ceil operator for the high-side index. This will return two different numbers if our original count was odd, but a single number (the MEDIAN index) if the count was even.
+
+Running the aggregation so far will give us results that look like the following:
+
+We now know what the midpoint, as well as the high and low indices of our MEDIAN items will be. However, the high, low, and midpoint are scattered throughout multiple documents. To move onto the next step, we'd like to condense all of these into a single document containing the high-side index, the low-side index, and the values. Since we have those items already, we no longer need to preserve the midpoint.
+
+We can bring all of these values into a single document using the $group operator.
+
+The $avg operator on the high and low values aren't meant to do anything productive at this point - it just allows us to collapse our high and low indices across all documents into a single result once the grouping is done. You can see that by taking a peek at the data after this operation is added to the pipeline:
+
+Notice that the high and low indices contain just a single value now.
+
+We're almost there - just a couple more steps.
+
+Now that we have the high and low indices for the MEDIAN values, as well as a sorted array containing those values, we can retrieve the middle items out of the array. We'll do this by creating a projection for the two middle values, calling them beginValue and endValue:
+
+Now we finally have our MEDIAN values:
+
+We don't really need to provide any conditional logic here; this will retrieve two different elements if our original data set count was odd or the same element if our original data set was even. If the elements are different, we can average them together to get the MEDIAN value and if the elements are the same, the average acts as an identity function that ends up returning the correct value anyway:
+
+Our final MEDIAN value has now been computed, and since we're no longer interested in preserving any of the original data in this query, we return only the median in our projection.
+
+After everything is all said and done, the final MongoDB aggregation looks like the following:
+
+You can use this solution on a data set with either odd or even counts and it will return the correct MEDIAN values.
+
+The MEDIAN calculation is a tricky one that requires more steps than the MEAN to compute, but MEDIAN provides a valuable benchmark upon which we can measure the accuracy of our MEAN. The MongoDB aggregations pipeline proves its power and versatility by making the MEDIAN calculation possible. There's still one more classic metric we can use, MODE, and in the next article in this series, we'll explore how to use the MongoDB aggregations pipeline to compute it.
+
+If you have any feedback about this or any other Compose article, drop the Compose Articles team a line at articles@compose.com. We're happy to hear from you.|||
+

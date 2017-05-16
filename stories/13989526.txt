@@ -1,0 +1,51 @@
+Reader-level: Intermediate — this article assumes you have some basic familiarity with Go and its concurrency model and are at least a little familiar with data synchronization in the form of locking and channel communication.
+
+Reader Note: A dear friend of mine has inspired this post. As I’ve helped him troubleshoot some data races and have tried my best to give him some decent advice around the art of data synchronization I realized that this advice could benefit others. Should you find yourself inheriting a code-base where certain design decisions have already been made or if you just want to understand Go’s more traditional synchronization primitives than this article might be fore you.
+
+When I first started working with the Go programming language I immediately bought into Go’s slogan of “Don’t communicate by sharing memory; share memory by communicating.” For me, this meant writing all concurrent-based code the “proper” way, by always-always using channels. My thought being that if you leverage channels, you are sure to avoid the pitfalls of contention, locking, deadlocks, etc.
+
+As I progressed with Go, learning to write idiomatic Go and learning about best-practices; I would stumble upon fairly large code-bases, where quite often you would find people using Go’s sync/mutex primitive, sync/atomic as well as a few other “lower-level” and perhaps “old-school” synchronization primitives. My first thought was, well they’re doing it wrong and they clearly haven’t watched any of Rob Pike’s talks regarding the merits of channel-based concurrency where he often references the design influence from Communicating Sequential Processes by Tony Hoare.
+
+The reality was harsh. The Go community recites the slogan above over and over but peeking into many open source projects, mutexes are abound and plenty. I struggled with this conundrum for awhile but ultimately saw the light as it was time to get my hands dirty and push channels aside for a change. Now let’s fast-forward to 2015 where I’ve now been writing Go for around 2.5 years, and since have had a an epiphany or two in regards to the more traditional based synchronization approaches such as mutex-based locking. Go ahead, ask me again now in 2015? Hey @deckarep, do you still only write concurrent applications using channels only? Today I answer no, and here’s why.
+
+First, let’s not forget the importance of being pragmatic. When it comes to protecting shared state with either traditional locking or channel based synchronization; let’s start with the following question: “So which approach should you use”? And it turns out there is a nice little write up that summarizes the answer nicely:
+
+Please note the keywords in that example: expressive, simple, over-use, afraid, pragmatic. I can admit a few things here: I was afraid when I first picked up Go. I was a newcomer to the language, and I needed to spend time with the language before drawing conclusions so quickly. You will draw your own conclusions as well in reference to the article above, and as we dig into some best practices using mutex-based locking and what to watch out for. The article referenced above additionally has some nice guidelines around mutex vs channels.
+
+Ultimately every application is different and it may take some experimentation and false starts. For me, I follow the guidelines above but let me elaborate on them. When you need to protect access to a rather simple data structure such as a slice, or a map, or even something custom built, and if the interface to the said data structure is straightforward, start with a mutex. Additionally, it always helps to encapsulate the dirty details of the locking within your API. End-users of your data structure need not concern themselves with how your structure does its internal synchronization.
+
+If your mutex-based synchronization starts becoming unwieldy and you are playing the mutex dance, it’s time to move to a different strategy. Again, recognize that mutexes are useful and straightforward for simple scenarios to protect minimally shared state. Use them for what they are but respect them and don’t let them get out of control. Take back control of your application’s logic, and if you are fighting with mutexes then please consider re-thinking your design. Perhaps moving to channels would better suit your application logic, or even better, don’t share state period.
+
+Understand I am not advocating to use mutexes over channels. I am simply saying become familiar with both methods of synchronization, and should you find that your channel-based solution seems to be overly complicated, well you have another option. The topics in this article are here to help you write better, more maintainable and robust code. We as engineers have to be conscientious of how we deal with shared state and avoid data-races in multi-threaded applications. Go makes it incredibly easy to produce high performing concurrent and/or parallel applications but the pitfalls are there, and care must be taken to build a correct application. Let’s get into the details then:
+
+Item 1: When declaring a struct where the mutex must protect access to one or more fields, place the mutex above the fields that it will protect as a best practice. Here is an example of this idiom within Go’s own source code. Keep in mind this is purely convention and does not affect your application’s logic.
+
+Item 2: Hold a mutex lock only for as long as necessary. Example: If you can avoid it, don’t hold a mutex during an IO-based call. Instead, ensure to only protect your resource for only as long as needed. If you did something like this in a web handler for example, you effectively negate the effects of concurrency by serializing access to the handler.
+
+Item 3: Utilize defer to Unlock your mutex where a given function has multiple locations that it can return. This means less book-keeping for you and can mitigate deadlocks when someone comes long 3 months from now and adds a new case for returning early.
+
+However beware of just willy-nilly relying on defers in every case. The following code is a trap that can happen when you think that defers are are cleaned up in block scope rather than function scope.
+
+Lastly, consider not using the defer statement at all when you have extremely simple functions that don’t have multiple return paths to squeeze out a little performance. Deferred statements do have a slight overhead cost that is very often negligible. Regard this as a very premature and mostly unnecessary optimization.
+
+Item 4: Fine-grained locking can lead to better performance at the cost of more complicated bookkeeping while course-grained locking may be less performant, yet yield much simpler bookkeeping. Again, be pragmatic in your design. If you find yourself playing the “mutex dance” it may be time to either refactor your code or move to channel based synchronization.
+
+Item 5: As mentioned earlier in this post, it’s always nice if you can hide or encapsulate the method of synchronization used. Users of your package need not concern themselves with the intricacies of how your shared state is protected.
+
+In the example below let us consider the case where we provide a get() method call, that will only pull from the cache if there is at least one or more items in the cache. Well, since we need to take a lock to get the item out of the cache and get the caches count as well — this code will deadlock.
+
+A suggested pattern for dealing with the fact that Go’s locks are not re-entrant is as follows:
+
+Notice in the above code that there is a matching exported method for each non-exported method. The exported methods that operate at the public API level will take care of locking and unlocking. They then forward to their respective non-exported methods which do not take any locks at all. This means that all exported invocations of your code will only take a lock once to avoid the re-entrant issue.
+
+Item 6: In all the examples above we utilized the basic sync.Mutex lock which can simply: Lock() and Unlock() only. The sync.Mutex lock provides the same mutual exclusion guarantee, no matter if the goroutine is reading or writing data. There exists as well the sync.RWMutex which offers a little more control with the semantics of the locking during read scenarios. When would you want to use the RWMutex over the standard Mutex?
+
+In the above code, we can assume that the `sharedState` variable is some type of object — it could be a map perhaps where we can query it’s length. Since the function`count()` above respects the rule that no mutation is happening on the `sharedState` variable, this means it is safe for an arbitrary number of readers (goroutines) to call this method concurrently. In certain scenarios this could reduce the number of goroutines in a blocking state, and potentially warrant a performance gain in a read-heavy scenario. But remember, when you have code that mutates shared state as in the `set()` you must not use a rw.RLock() command but rather the rw.Lock() command.
+
+Item 7: Get to know Go’s Bad-Ass and built-in Race Detector. The race-detector has found scores of data races even within Go’s standard library. This is why the race detector is there and why there are quite a few talks and articles that will explain this tool better than I can.
+
+In summary I hope this article offers some solid advice around dealing with Go’s mutexes. Please play with Go’s lower-level synchronization primitives, make your mistakes, respect and understand the tools. Above all, be pragmatic in your development and use the right tool for the job. Don’t be scared like I was originally. If I always listened to every negative thing said about multi-threaded programming and locking I wouldn’t be in this business today writing kick-ass distributed systems while getting to use a kick-ass language like Go.
+
+Note: I love feedback, if you found this useful please ping me, tweet it or give me constructive feedback.|||
+
+Reader-level: Intermediate — this article assumes you have some basic familiarity with Go and its concurrency model and are at least a little familiar with data synchronization in the form of locking…

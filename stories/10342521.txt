@@ -1,0 +1,58 @@
+League of Legends players collectively send millions of messages every day. They're asking friends to duo-queue, suggesting a team comp on the champ select screen, and thanking opponents for a good game. On July 21st of this year (I picked a day at random), players forged 1.7 million new friendships in the game—that’s a lot of love! And each time players send a message they trigger a number of operations on the back-end technology that powers Riot chat.
+
+In the previous episode of this series on chat , I discussed the protocol we chose to communicate between client and server: XMPP (Extensible Messaging and Presence Protocol). Today I’ll dive into the mechanisms in place on the server-side and the architecture of the infrastructure, and I’ll discuss the work we’ve done to ensure that our servers are scalable and robust. Like the last article, I hope it’ll be interesting to anyone building out chat features to a distributed client base.
+
+Chat’s physical servers maintain a number of responsibilities to ensure that the service remains available to players. These servers manage individual players’ chat sessions, and also apply all necessary stability and security validations like privacy settings, traffic rate limiting, metrics collection, and logging.
+
+We deploy chat services on a per-region basis (we call them ‘shards’), meaning each League of Legends region has its own chat cluster that provides features only to players assigned to that shard. As a result players can’t communicate between shards, and chat servers can’t use data from other regions. For example, North America servers can’t directly communicate with Europe West servers.
+
+Each shard maintains a single chat cluster comprised of a number of heterogeneous physical servers running the same server software. Hardware specifications vary between regions for a number of reasons such as capacity requirements, age of equipment, and hardware availability: our newest servers run on modern 24-core CPUs with 196 GB of memory and solid-state drives, while older ones use CPUs with 24 GB of memory and spinning disks.
+
+Within a chat cluster, every node is fully autonomous and replaceable, allowing for easier maintenance while increasing the system’s overall fault tolerance. The number of nodes in a cluster ranges from six to twelve machines. Although we could run chat on fewer machines in every region, we prefer to maintain comfortable headroom for fault tolerance and to accommodate future growth. If upgrades require a shutdown, for example, we can shut down half of the nodes in a single cluster without interrupting service to players.
+
+The following is a simplified diagram showing our chat cluster architecture:
+
+In the past we’ve had numerous incidents related to hardware or network failures that forced us to shut down individual servers for a few days. However, since the system lacks a single point of failure, the service continued without disruption. Also, we implemented logic in the client that helped players connected to the shut-down servers automatically regain their connections.
+
+We write Riot chat servers primarily in Erlang (check out if you’re curious about the language), although we use C for bindings to certain lower-level operations such as XML parsing, SSL handling, and string manipulation. 10% of our chat server codebase is written in C while 90% is pure Erlang (ignoring external libraries and the Erlang VM itself).
+
+Before developing the components of the server written in C, we spent a lot of time profiling and optimizing the existing Erlang codebase. We tried to find potential concurrency and efficiency bottlenecks using a full battery of existing tools, operating at different abstraction levels:
+
+We found that most of the precious CPU cycles and memory allocations happened while processing text and data streams. Since Erlang are by definition immutable, performing any sort of intensive string manipulation would be costly no matter how much we optimize our code. Instead, we rewrote the heaviest parts of the string manipulation system in C and compiled parts of the standard library with —performance improved by over 60% for CPU utilization. For memory usage, we observed a drop from over 150kB allocated per player session, to 25kB for each session process.
+
+We try to follow , so Riot chat servers form a fully connected cluster where each Erlang VM maintains a single persistent TCP connection to each other chat server in the cluster. The server uses these connections, which speak the Erlang distributed protocol, for internal communication. Thus far, despite exhaustive testing, we have been unable to find any bottlenecks related to this communication model.
+
+I mentioned earlier that each individual server in a chat cluster is a fully independent unit—it can operate without any other cluster members, and we can service it at any time. In order to provide for sufficient scalability, we designed the system such that nodes share as little data as possible. As a result, servers in a chat cluster share only a few internal key-value tables that are fully replicated in-memory and communicated via a highly optimized Erlang-distributed store called Mnesia. (If you’d like to learn more about Mnesia, I urge you to check out material on and .) These tables map player or group chat identifiers (called JIDs in XMPP) to Erlang handler processes that maintain context-specific data.
+
+For individual player chat, this data might include the connection socket, friends list, and rate limiters; for group chats, room roster and chat history. Every time there’s a need to route any kind of information between player or group chat processes, the server consults these tables in order to resolve their session handlers using JIDs. Since each server holds full replicas of session tables, all reads can be executed locally, reducing the overall routing latency.
+
+The downside of this approach is that each update applied to terms stored in these tables must be replicated to all other connected chat servers. To our knowledge these tables are the only blocker from being able to linearly scale a chat cluster—however, our load tests show that we can grow chat clusters to at least 30 servers without seeing a performance degradation.
+
+In order to keep players’ session data and group chat data in sync in the event of network partitions or server problems, each chat server runs an Erlang process subscribed to the VM’s . Whenever an event is generated concerning a chat server going down, the other nodes will remove from their local tables all session entries that were running on the offline node. As soon as that node returns online (usually either after a restart or when the network connectivity restores) it will push its own local state to the other cluster members and download the state of those other members itself. Through this model chat servers play an authoritative role for their own data, and trust data coming from other chat servers.
+
+To illustrate this design, let’s consider the following example:
+
+This design allows us to build robust and self-healing infrastructure, removing the need for immediate manual intervention in case of connectivity failures. As a result, the service can automatically recover from network issues and restore its functionality to players.
+
+Given that server implementation, let’s examine the software processes that provide chat to players. Whenever a player’s client connects to the chat service, that client opens a persistent, encrypted (using AES256-SHA cipher) TCP connection to its public XMPP endpoint. The cluster load balancer then selects one of the individual chat servers on the back-end and assigns the player session to that particular box. Currently we use a regular round-robin load-balancing strategy to distribute load evenly across all available servers.
+
+As soon as the connection arrives, the chat server creates a new dedicated Erlang process to handle that player’s session. This process (called c2s for “client to server”) maintains the player’s TCP socket, instance, list of the player’s friends and ignored contacts, last presence data, summoner name, rate limit configuration, and other important details used by the server to provide the player experience. Upon connection, our system immediately requires authentication that validates the player’s identity. Here we leverage standard XMPP that are compatible with third-party clients.
+
+For further illustration, let’s consider Alice and Bob again. They are both Bronze II players with high hopes of getting to Master tier one day. They practice together day and night, honing their skills on Summoner’s Rift.
+
+Alice would like to ping Bob and arrange a ranked duo game so that they can finally be promoted to Bronze I. Here’s what happens behind the scenes once Alice is successfully authenticated:
+
+Obviously, upon receiving that question Bob agrees to join forces with Alice, and they carry their team to Bronze I in no time.
+
+Besides providing chat features directly to players, Riot chat servers also expose a battery of private REST interfaces for internal consumption. Typically, the service uses these REST endpoints to access the social graph (the network of players connected by virtue of being friends).
+
+As a real-world example, consider the request to get a list of friends of the summoner with ID 13131:
+
+In order to support these requests, chat servers run , an embedded web server, that handles the HTTP requests coming in from other internal services. For easier integration every endpoint self-documents via and returns JSON objects to fulfill requests.
+
+Although we’re currently using a centralized internal load balancer to dispatch these requests, in the future we’d prefer to move to a model that leverages and client-side load balancing mechanisms. This would allow us to dynamically resize our clusters without network reconfigurations, and make setting up new shards (internal for testing, or external for players) much easier, as services auto-configure themselves.
+
+In a single day, Riot chat servers often route a billion events (presences, messages, and IQ stanzas) and process millions of REST queries. While the system certainly isn’t perfect, the stable and scalable nature of the infrastructure keeps chat available to players—while hardware issues take down individual servers from time to time, the self-healing nature of the system has provided five 9’s of uptime in all Riot regions this year. Although I’ve only scratched the surface here, I hope it sheds some light on how chat functions on the server-side.
+
+If you have any questions or comments I would be really excited to read them. The next and final article in this series introducing Riot chat will focus on the databases we employ for persisting data on the service side. See you then!|||
+

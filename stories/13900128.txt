@@ -1,0 +1,36 @@
+The Signal messenger recently incorporated an interesting mechanism to circumvent censorship in some troubled countries, such as Egypt or the UAE. The technique called domain fronting uses popular cloud services like the ones from Google or Amazon as a middle man to route all traffic. You can read more on that on the Signal creators' blog or see the original paper.
+
+During my security analysis of the Telegram IM (full text available here) I've discovered Telegram obfuscates its traffic by re-encrypting everything with a prepended key. When I've prompted the Telegram Security team for comments, they responded that this measure is used to "counter some of the less sophisticated attempts at banning our service in certain countries". MTProto has a fixed structure where the auth_key_id value is always present at the beginning of the packet and therefore easily recognizable.
+
+Let's have a look how the official Telegram for Android application obfuscates the traffic and why this is quite a naive idea.
+
+When I started the analysis I wanted to check the network traffic Telegram produces. I've expected the data to correspond with the official documentation and to be in a form of:
+
+I've extracted my own auth_key_id and I expected to see it amongst the sniffed data. However, the whole traffic seemed random and therefore likely encrypted, and no sign of the expected structure was present.
+
+I've examined the code and after a few weeks of pain and despair I've discovered that the function responsible for this behavior is the Connection::sendData function. Before sending the data in the expected manner, Telegram encrypts them one more time with a random key attached in front of the data. Interestingly, the Counter block mode is used instead of the IGE endorsed by Telegram.
+
+To properly explain the obfuscation method I need to introduce my own terminology first to add a little more clarity because Telegram does not practise a great job in naming variables. Since the variables are explained in more detail in the following sections, reader may skip this list and use it as a reference later on.
+
+The obfuscation process starts by generating 64 random bytes obf_enc_key_bytes. The first 8 bytes are unused. Bytes 8 – 39 are used as an encryption key and bytes 40 – 55 as an IV. Bytes 56 – 63 are composed of the last 8 bytes of obf_enc_key_bytes encryption of itself. It is unclear what are those bytes used for. The final obf_enc_key_bytes to be sent:
+
+The length of the packet, yet again encrypted, and the real data to be transmitted as expected from the official documentation are then AES-CTR encrypted using the obf_enc_key and obf_enc_iv, and sent. All the other data in this TCP stream are encrypted using the same obfuscation key. When another connection is established, a new obf_enc_key_bytes is generated and the process repeats itself.
+
+Besides the obf_enc_key_bytes setup, the very same function deals with setting up the obf_dec_key_bytes. This temporary key is used for decrypting the incoming traffic.
+
+The obf_dec_key_bytes is derived from the obf_enc_key_bytes. 48 bytes are reversed from obf_enc_key_bytes, starting at position 8. This may be seen in the code snippet below. The first 32 bytes are then used as a key and the next 16 bytes as an IV for the incoming traffic decryption.
+
+I believe Telegram server receives the obf_enc_key_bytes, tampers with them in a way described in this section and finally encrypts the response with obf_dec_key_bytes.
+
+As a part of the analysis I've written a simple C software, which removes the obfuscation. The program does not sniff the network data so you have to provide it with a file of sniffed data. I've used Wireshark to do this.
+
+The program is also capable of describing the real MTProto traffic in case you use the master secret key auth_key as an argument. The key is obviously not available to an attacker rather this functionality is meant for study purposes if you want to examine what Telegram sends from your own device.
+
+You may check it out on github. A readme file and an example is available there.
+
+The obfuscation method is not officially documented, which makes sense if Telegram uses it to circumvent censorship. However, the reality of its functionality is doubtful at best. A more conventional approach would be much appreciated, such as the usage of SSL/TLS. If Telegram would use TLS, the traffic would then be indistinguishable from any other protocols using it, such as HTTPS.
+
+Finishing on a personal note; I wasn't sure whether I should publish or not. Obviously, I don't want to make things easier for any oppressive regimes, on the other hand if a non-paid student can find this in a month or two does anyone actually believe the agencies can't or didn't already?
+
+I came to a conclusion that I should publish these findings with a hope that Telegram might come up with a finer idea on how to do this or may get inspired by the Signal's technique.|||
+

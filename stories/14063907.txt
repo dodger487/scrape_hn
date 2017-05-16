@@ -1,2 +1,91 @@
-|||
+Before we dive into what ActionCable is capable of, I think it’s important that readers understand at a high level how ActionCable works:
 
+ActionCable appears to be the magic dust that Rails needs to keep pace with Node.js + Socket.io and more recently Realtime Django. It fulfils its goal of getting content and data to web-based visitors in real time very well. The API is simple, it just works and feels like a natural extension of Rails. This simplicity is certainly going to encourage Rails developers to add realtime components to the websites they are building without having to understand the intricacies of what’s happening under the hood.
+
+Whilst exploring how ActionCable works, I was impressed by the following:
+
+As each Connection is simply a Ruby object, and the Ruby object is part of the Rails app, sharing your business logic including authentication is incredibly simple. For example, if an auth cookie is issued in an HTTP request, subsequent WebSocket connections will send that cookie as part of the WebSocket request, and as such, can be authenticated in the same way. As the connection is persistent, authentication is only necessary once, and all Channel objects have access to the authenticated user through the use of the identified_by delegate on each Channel.
+
+Note: Sharing authentication only applies to ActionCable servers that are mounted on the same endpoint, if your ActionCable server is on a different port or domain name, this is not possible.
+
+Being able to mount the WebSocket endpoint directly inside your app is a big win, it simplifies deployment dramatically and allows sharing of cookies.
+
+Channel objects are created for each new subscription made on each connection. Conceptually they are simple to understand, and Rails looks after creating and destroying these Channel objects as subscriptions or their underlying connections come and go.
+
+The ActionCable client-side library is responsible for maintaining a connection and reattaching all subscriptions to Channels. If for example, your connection is abruptly terminated, the ActionCable client-side library will reestablish a connection and subscribe to all previously subscribed subscriptions automatically.
+
+ActionCable is bi-directional so browser clients can receive data broadcasted using the received method, but also send data to public methods on the Channel objects using the client-side perform function.
+
+Using Redis to power the Pub/Sub channels is a good choice, it’s a solid high performance piece of software engineering.
+
+Because Channel objects are part of your Rails stack, in theory it’s now trivial to render a partial instead of just data and send this to an ActionCable client over WebSockets. This can help simplify your front-end logic as it does not need to understand how to render data, but instead simply replace a DOM element with some HTML. This is conceptually quite similar to TurboLinks 3 partial support, except that content is pushed instead of pulled.
+
+The work done on ActionCable by the Rails community is impressive, however one has to remember that ActionCable was not designed to be a scalable, robust, global messaging service, but instead provide a simple full-duplex communication transport between a Rails server and a WebSocket enabled browser. For this reason, many of the shortfalls I have outlined below are unsurprising given ActionCable’s goals, however it’s important that developers are aware of them.
+
+As ActionCable is a long lived process, every connection established can have state on the server-side as long as the connection remains intact. This state is typically stored or referenced from each Channel object created in response to each client’s subscriptions. However, the problem is that any loss of connectivity that causes the client to reconnect to the server will result in all state being lost as the Channel object for each subscription is discarded. This may seem like an edge case, but it’s not, this will for example happen every time a user refreshes their browser, navigates to a new page, or if you routinely deploy your code to your servers.
+
+If connection state is lost, then all messages published whilst the client is disconnected too are lost. ActionCable provides no means to catch up on or replay what happened whilst disconnected. If you don’t like the idea of not just losing messages, but also not knowing you have missed messages whilst disconnected, ActionCable may not be for you.
+
+As a developer, you may consider adding some type of state management on the server whilst connections are briefly disconnected. However, if you do this, you need to be aware that firstly each subsequent reconnection via WebSockets may not arrive at the same server, and secondly, you will need an efficient way to keep track of who has received which messages without duplicating each message in memory. Retaining connection state in a recoverable way is complicated and probably the reason the Rails team have not attempted to address this.
+
+ActionCable is backed by Redis Pub/Sub. Redis is one incredible piece of engineering which we use extensively in our Ably infrastructure. However, like all services, you have to expect maintenance windows and some unexpected downtime. When your Redis instance is down, so is ActionCable. Clustering is of course an option, however as far as I am aware, there are currently no commercial Redis cluster database-as-a-service offerings.
+
+ActionCable provides bi-directional messaging across a WebSocket connection, however every message published or received is routed through your Rails server(s) in a single data centre. If perhaps you’re building a game or financial services platform, and latency matters to you, then you have a problem if your visitors are not near your servers. If for example you have two users playing a realtime game in Australia, yet your Rails servers are located in Europe, every message published will need to go half way around the world and back. One may think you could simply locate some Rails servers in Australia as well, however that won’t work as ActionCable is designed to be backed by a single Redis database.
+
+Whilst exploring how ActionCable works with a simple Rails app, I noticed that the application state was starting to get corrupted due to servers being abruptly terminated intentionally to reload the app. It then dawned on me that other developers will probably use Redis or some other data source to keep track of the system state, yet there is no way you can ever guarantee that all servers will shut down gracefully and thus clean up their state.
+
+A simple way to understand the problem is to think of a use case. Assuming you were building a simple chat app that keeps track of who is currently online. When a new subscriber connects to a channel, you could perhaps store the users’ details in a Redis Set, and then on unsubscribe remove them. However, if a server is abruptly terminated and never gets a chance to remove the user’s details from Redis, then that user will be reported as present indefinitely in that channel.
+
+Rails by design is meant to be as stateless as possible, however to solve these types of problems, you have to design a cluster that shares global state. By doing this, each participating node in the cluster is able to confirm each other’s liveness and clean up the data orphans if the data that node owns. For example, if server A has 3 users connected and dies abruptly, server B should detect this problem and remove the 3 users associated with server A. This is a complex problem to solve and one I would not expect any Rails developer to want to fix. At Ably, we have solved this problem through the use of gossip, consensus algorithms and shared state.
+
+I inspected the raw WebSocket messages when calling a channel method to see how ActiveCable dealt with message confirmations. For example, if you’re having a chat with colleagues and send a message to the group, you want to know that the messages was delivered to the system. If your app is notified that it fails, then at least you have the benefit of updating the UI for the user or perhaps reattempting to publish the message.
+
+When I looked at the raw messages, I was surprised to see that there is no acknowledgement of success or failure for the publishing of any messages from a client to your ActionCable server. See the raw messages below:
+
+Not only that, when I look at the code that sends messages, it does not even offer a callback for an HTTP or connection failure, see https://goo.gl/s3Hb9G.
+
+It is pretty obvious that without these sorts of failsafes, ActionCable messaging is not robust for delivering or receiving messages.
+
+I found it hard to believe that the ActionCable contributors did not choose to use one of the superb libraries that offer good fallback support such as Engine.io or SockJS. However when I thought about what that would require, I believe realised why.
+
+Typically if WebSockets is not supported, a XHR connection is made to the server over HTTP. In the case of ActionCable, that request would be sent to one of your Rails servers as dictated by the load balancer. If ActionCable then implemented the server-side components of SockJS / Engine.IO, then it could effectively treat that HTTP request as a WebSocket connection. However, HTTP connections are typically closed after a period of time (and often need to be in the case of Comet and JSONP), and messages publishes will issue a new HTTP request. As such, every subsequent HTTP request is not guaranteed to arrive at the same server. Therein lies the problem, the connection state may be on a different server to the one the request arrives at meaning the ActionCable team would need to move away from the Rails stateless design and allow the Channel & Connection objects across processes to communicate with each other.
+
+If you need to support older browsers, devices or environments where WebSockets are blocked such as corporate networks with proxy servers, then unfortunately ActionCable is not going to do the job. The problem I therefore see more generally with ActionCable is that if you cannot be certain everyone will be able to use it, how do you design you website or app accordingly. Do you blindly ignore those who can’t use ActionCable, or do you work to the lowest common denominator with progressive enhancement? The latter will inevitably force you to build things twice and increase complexity.
+
+If the order in which messages are delivered is important to you then ActionCable is not a good fit. Each message published does not have a serial number so it is impossible for the receiving end to ensure that it processes messages in order. Even if it could do that, or you implement a middleware to do that, the message delivery system on the other end won’t respect that either as each pub/sub event from Redis is processed in realtime. At Ably, we guarantee message ordering through the use of serial numbers in all messages.
+
+When looking into ActionCable, one of the first things I wanted to do was some performance testing (more on that below). As such, I wanted to communicate with ActionCable using a platform other than a browser. I came across the ES6-ActionCable NPM package, but soon discovered it only worked in a browser. Fortunately adding Node.js support was easy, however I then realised that ActionCable is very much a Javascript and Ruby technology, and as of now, I don’t see any client libraries for other platforms such as iOS, Android, Go, Python etc.
+
+If you’re planning on supporting platforms other than a browser, be that M2M between your services or micro-services, or realtime updates to your visitors on various devices, right now you’re going to have to build your own library. At Ably, we’ve spent a huge amount of time and energy building consistent realtime client libraries in every popular platform, and it’s been incredibly difficult.
+
+One can get too easily distracted by performance and prematurely optimise your code. I am a firm believer that optimisation should come later when building a service. However, when you are choosing a platform or framework that you are building your business on, I think the opposite is true. You want to be confident that the inherent design will scale as your business does.
+
+When reviewing the performance of ActionCable, I was interested in the overall throughput, however I was more interested with the performance as load increases. At Ably, we’ve spent a lot of time on performance optimisation, but the key metric we focus on is whether our solution has linear scalability: if sending 1,000 messages takes (say) 100 milliseconds, then sending 10,000 messages should take at most ten times that, 1,000 milliseconds. (In practice it can even be sublinear as we benefit from work distribution across nodes). Looking at ActionCable unfortunately, there are some worrying trends that indicate that as you place more load on the system, each operation takes longer.
+
+For reference, I built a simple Rails app with ActionCable, wrote a Node.js script to connect lots of clients to the service, and used a script in the browser to publish messages.
+
+In the graph below, I used data from the Rails process’ CPU usage whilst connecting 2,500 clients to ActionCable in batches. As you can see, the first 2,500 clients took 17.5s to connect, yet the last 2,500 clients took 71s to connect (roughly 4x times as long).
+
+Also, once I had 10,000 clients connected doing nothing (i.e. not sending or receiving messages), CPU was spiking to almost 100% every few seconds simply maintaining a connection.
+
+The graph below shows the trend of time taken for each new connection versus total number of connections open. Clearly it is evident that connection time is not linear with ActionCable.
+
+Unfortunately, much like the time it takes to connect to ActionCable, publishing time per individual message degrades as the number of subscribers and messages increases. See below, when 10k messages are being published each message takes around 2ms to publish, whereas when there are 2.5k messages, each message takes around 0.5ms to publish.
+
+Whilst technically the total number of threads is not necessarily an issue, it is generally acknowledged that threads are expensive. Whilst running my tests, ActionCable started over 1,690 operating system threads. In comparison, the process with next highest number of threads was the kernel itself at circa 150 threads. I am not comfortable with this number of threads running for a service that could mostly be handled using an evented single threaded model.
+
+One of the design goals of Ably was to distribute work so that a publish operation with one subscriber takes roughly the same time in total as publishing to 1,000 subscribers. Of course this is not always possible, however we have been able to leverage our infrastructure so that work is fanned out to all servers.
+
+However, an absolute requirement for us has been that the time taken per server for publishing operations is O(S+M), where S is the number of subscribers, and M is the number of messages published. So if a single server can send 10 messages in 1ms, then it will at most take 100ms to send 1,000 messages. Unfortunately, ActionCable fails our test in this regard as time taken grows exponentially as the workload increases.
+
+Having taken a look at ActionCable, I see some fantastic work that’s going to have a good impact on the Rails community. Pushing realtime data and content to visitors is a huge step forwards and delivering this as part of Rails with a simple API is good move.
+
+I believe however that at some point, when developers feel they need guaranteed performance or data delivery, or they wish to offload the messaging from their Rails servers, then they should consider swapping out ActionCable for a more robust purpose-built realtime messaging platform. If developers bear this in mind at the outset when building their apps, as they outgrow ActionCable, the migration to a realtime service should be straightforward as the underlying concept of pub/sub channels used for publishing remains the same.
+
+I hope that when Rails developers do consider the alternatives to ActionCable, they will consider Ably. At Ably, we consider a message lost or slow down in the service unacceptable, and as a result, we’ve created tightly coupled software with our infrastructure to fix these challenging problems. We have fallbacks and recovery strategies in our client libraries, global redundant infrastructure, our databases have global replication, and as such, we believe we can work around almost every eventuality whilst maintaining performance guarantees. It is for this reason, we offer a unique 100% uptime and QoS guarantee.
+
+If you are a developer, I invite you to give Ably a try by registering for a free API key. We have client libraries in all popular languages including one that I wrote in Ruby.
+
+If you have any questions, feedback or corrections for this article, please do get in touch with myself or the team.|||
+
+Please note that I am the co-founder of Ably, a scalable realtime messaging platform-as-a-service. As such, when reviewing ActionCable, I was specifically interested to see how the Rails team have…

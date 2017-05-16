@@ -1,2 +1,25 @@
-|||
+Wrapping C libraries with cgo is usually a pretty straightforward process.  However, one problematic situation I’ve come across recently is dealing with C functions which take a void* type as a parameter.  In C, a void* is a pointer to an arbitrary data type.
 
+I’ve been using one C library which allows you to store arbitrary data in a custom Tree-like data structure.  So naturally, you want to be able to feed a raw interface{} to your wrapper function.  Suppose your C library has two functions:
+
+What should our Go wrapper pass to set_data?  The easy solution is to do this:
+
+And this would work, prior to Go 1.6 (and is in fact the solution I had been using in my wrapper — though I don’t really use this feature of the library in question myself).  This, however, is dangerous (and also has the obvious problem that calling C.get_data is going to give you an unsafe.Pointer — hope you remember what kind of data you stored).  You’re passing a Go pointer to a C function which then stores said pointer, which means the Go garbage collector can no longer manage it.  This was considered so inadvisable that it is completely disallowed in Go 1.6 (try it and you’ll be rewarded with a nice runtime error: panic: runtime error: cgo argument has Go pointer to Go pointer )
+
+ Since I was busy building stuff using Go instead of following all of the discussions about this issue on the golang mailing list, I missed this little gem and had to spend some time figuring out why my builds started failing
+
+So, is there a solution to this?  Not really.  Well, nothing good.  You could do something like this, I suppose:
+
+What’s going on here?  Well, we’re making use of the encoding/gob package to convert the go interface{} into a Go byte array.  Then we’re passing a pointer to the first element in our byte array to C.set_data.
+
+I don’t like it much.  I mean, sure – the data is there, but in order to extract the data later and gob-decode it, you’re going to need to remember the size of the byte array you fed into C.set_data.
+
+So, let’s just disallow passing a raw interface{} to our wrapper function.  We could force the user to give us a byte array.  This simplifies things a bit:
+
+But we still have the problem of remembering the length of our byte array so we can extract it later using C.GoBytes.
+
+So, unfortunately passing arbitrary data from a Go interface{} into a C void* is just not practical.  For my particular C library wrapper, I just decided to require the user to supply a string rather than an interface{}.  This has the benefit of being easier to convert back and forth and you also don’t have to stash things like array sizes or references to C.free later.  Strings are reasonably versatile in that you could, say, convert a struct to JSON or even b64encode some binary data and shove it into a string if you really need to.  You could implement this solution thusly:
+
+As you can see, converting the data back from a void* (unsafe.Pointer) to a String isn’t very straightforward, but it works well enough.|||
+
+Wrapping C libraries with cgo is usually a pretty straightforward process.  However, one problematic situation I've come across recently is dealing with C functions which take a void* type as a parameter.  In C, a void* is a pointer to an arbitrary data type. I've been using one C library which allows you to store…

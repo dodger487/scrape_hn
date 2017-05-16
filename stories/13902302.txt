@@ -1,0 +1,146 @@
+American Fuzzy Lop is a great tool. It does take a little bit of extra setup and tweaking if you want to go into advanced usage, but mostly it just works out of the box.
+
+In this post, I’ll detail some of the steps you need to get started with fuzzing the OpenSSH daemon (sshd) and show you some tricks that will help get results more quickly.
+
+The AFL home page already displays 4 OpenSSH bugs in its trophy case; these were found by Hanno Böck who used an approach similar to that outlined by Jonathan Foote on how to fuzz servers with AFL.
+
+I take a slightly different approach, which I think is simpler: instead of intercepting system calls to fake network activity, we just run the daemon in “inetd mode”. The inet daemon is not used very much anymore on modern Linux distributions, but the short story is that it sets up the listening network socket for you and launches a new process to handle each new incoming connection. inetd then passes the network socket to the target program as stdin/stdout. Thus, when sshd is started in inet mode, it communicates with a single client over stdin/stdout, which is exactly what we need for AFL.
+
+If you are just starting out with AFL, you can probably just type in the top-level AFL directory to compile everything, and it will just work. However, I want to use some more advanced features, in particular I would like to compile sshd using LLVM-based instrumentation (which is slightly faster than the “assembly transformation by sed” that AFL uses by default). Using LLVM also allows us to move the target program’s “fork point” from just before entering main() to an arbitrary location (known as “deferred forkserver mode” in AFL-speak); this means that we can skip some of the setup operations in OpenSSH, most notably reading/parsing configs and loading private keys.
+
+Most of the steps for using LLVM mode are detailed in AFL’s . On Ubuntu, you should install the and packages, then run from the top-level AFL directory, and that’s pretty much it. You should get a binary called , which is what we’re going to use to compile sshd.
+
+I’m on Linux so I use the “portable” flavour of OpenSSH, which conveniently also uses git (as opposed to the OpenBSD version which still uses CVS – WTF!?). Go ahead and clone it from .
+
+Run to generate the script. This is how I run the config script:
+
+You obviously need to pass the right path to . I’ve also created two directories in the current (top-level OpenSSH directory), and . This is so that we can run without being root (although needs to have mode 700 and be owned by root) and without risking clobbering any system files (which would be extremely bad, as we’re later going to disable authentication and encryption!). We really do need to run , even though we’re not going to be running sshd from the installation directory. This is because sshd needs some private keys to run, and that is where it will look for them.
+
+If everything goes well, running should display the AFL banner as OpenSSH is compiled.
+
+You may need some extra libraries ( and on Ubuntu) for the build to succeeed.
+
+Run to install sshd into the subdirectory (and again, please don’t run this as root).
+
+We will have to rebuild OpenSSH a few times as we apply some patches to it, but this gives you the basic ingredients for a build. One particular annoying thing I’ve noticed is that OpenSSH doesn’t always detect source changes when you run (and so your changes may not actually make it into the binary). For this reason I just adopted the habit of always running before recompiling anything. Just a heads up!
+
+Before we can actually run sshd under AFL, we need to figure out exactly how to invoke it with all the right flags and options. This is what I use:
+
+This is what it means:
+
+Go ahead and run it. It should hopefully print something like this:
+
+If you type some garbage and press enter, it will probably give you “Protocol mismatch.” and exit. This is good!
+
+One of the first obstacles I ran into was the fact that I saw sshd crashing in my system logs, but AFL wasn’t detecting them as crashes:
+
+The problem is that OpenSSH comes with a “privilege separation mode” that forks a child process and runs most of the code inside the child. If the child segfaults, the parent still exits normally, so it masks the segfault from AFL (which only observes the parent process directly).
+
+In version 7.4 and earlier, privilege separation mode can easily be disabled by adding “UsePrivilegeSeparation no” to or passing on the command line.
+
+Unfortunately it looks like the OpenSSH developers are removing the ability to disable privilege separation mode in version 7.5 and onwards. This is not a big deal, as OpenSSH maintainer Damien Miller writes on Twitter: “the infrastructure will be there for a while and it’s a 1-line change to turn privsep off”. So you may have to dive into to disable it in the future.
+
+OpenSSH uses random nonces during the handshake to prevent “replay attacks” where you would record somebody’s (encrypted) SSH session and then you feed the same data to the server again to authenticate again. When random numbers are used, the server and the client will calculate a new set of keys and thus thwart the replay attack.
+
+In our case, we explicitly want to be able to replay traffic and obtain the same result two times in a row; otherwise, the fuzzer would not be able to gain any useful data from a single connection attempt (as the testcase it found would not be usable for further fuzzing).
+
+There’s also the possibility that randomness introduces variabilities in other code paths not related to the handshake, but I don’t really know. In any case, we can easily disable the random number generator. On my system, with the line above, all or most random numbers seem to come from in , so to make random numbers very predictable, we can apply this patch:
+
+One way to test whether this patch is effective is to try to packet-capture an SSH session and see if it can be replayed successfully. We’re going to have to do that later anyway in order to create our first input testcase, so skip below if you want to see how that’s done. In any case, AFL would also tell us using its “stability” indicator if something was really off with regards to random numbers (>95% stability is generally good, <90% would indicate that something is off and needs to be fixed).
+
+When fuzzing, we really want to disable as many checksums as we can, as Damien Miller also wrote on twitter: “fuzzing usually wants other code changes too, like ignoring MAC/signature failures to make more stuff reachable”. This may sound a little strange at first, but makes perfect sense: In a real attack scenario, we can always fix up CRCs and other checksums to match what the program expects.
+
+If we don’t disable checksums (and we don’t try to fix them up), then the fuzzer will make very little progress. A single bit flip in a checksum-protected area will just fail the checksum test and never allow the fuzzer to proceed.
+
+We could of course also fix the checksum up before passing the data to the SSH server, but this is slow and complicated. It’s better to disable the checksum test in the server and then try to fix it up if we do happen to find a testcase which can crash the modified server.
+
+The first thing we can disable is the packet CRC test:
+
+As far as I understand, this is a simple (non-cryptographic) integrity check meant just as a sanity check against bit flips or incorrectly encoded data.
+
+We can also disable Message Authentication Codes (MACs), which are the cryptographic equivalent of checksums, but which also guarantees that the message came from the expected sender:
+
+We do have to be very careful when making these changes. We want to try to preserve the original behaviour of the program as much as we can, in the sense that we have to be very careful not to introduce bugs of our own. For example, we have to be very sure that we don’t accidentally skip the test which checks that the packet is large enough to contain a checksum in the first place. If we had accidentally skipped that, it is possible that the program being fuzzed would try to access memory beyond the end of the buffer, which would be a bug which is not present in the original program.
+
+This is also a good reason to never submit crashing testcases to the developers of a program unless you can show that they also crash a completely unmodified program.
+
+The last thing we can do, unless you wish to only fuzz the unencrypted initial protocol handshake and key exchange, is to disable encryption altogether.
+
+The reason for doing this is exactly the same as the reason for disabling checksums and MACs, namely that the fuzzer would have no hope of being able to fuzz the protocol itself if it had to work with the encrypted data (since touching the encrypted data with overwhelming probability will just cause it to decrypt to random and utter garbage).
+
+Making the change is surprisingly simple, as OpenSSH already comes with a psuedo-cipher that just passes data through without actually encrypting/decrypting it. All we have to do is to make it available as a cipher that can be negotiated between the client and the server. We can use this patch:
+
+To use this cipher by default, just put “Ciphers none” in your sshd_config. Of course, the client doesn’t support it out of the box either, so if you make any test connections, you have to have to use the binary compiled with the patched above as well.
+
+You may have to pass pass from the client as well if it prefers to use a different cipher by default. Use strace or wireshark to verify that communication beyond the initial protocol setup happens in plaintext.
+
+I mentioned above that using (i.e. AFL’s LLVM deferred forkserver mode) allows us to move the “fork point” to skip some of the sshd initialisation steps which are the same for every single testcase we can throw at it.
+
+To make a long story short, we need to put a call to at the right spot in the program, separating the stuff that doesn’t depend on a specific input to happen before it and the testcase-specific handling to happen after it. I’ve used this patch:
+
+AFL should be able to automatically detect that you no longer wish to start the program from the top of every time. However, with only the patch above, I got this scary-looking error message:
+
+So there is obviously some AFL magic code here to make the fuzzer and the fuzzed program communicate. After poking around in , I found , which is a file descriptor pointing to a pipe used for this purpose. The value is 198 (and the other end of the pipe is 199).
+
+To try to figure out what was going wrong, I ran under strace, and it showed that file descriptors 198 and 199 were getting closed by sshd. With some more digging, I found the call to , which is a function that closes all inherited (and presumed unused) file descriptors starting at a given number. Again, the reason for this code to exist in the first place is probably in order to reduce the attack surface in case an attacker is able to gain control the process. Anyway, the solution is to protect these special file descriptors using a patch like this:
+
+At this point, I still wasn’t happy with the execution speed: Some testcases were as low as 10 execs/second, which is really slow.
+
+I tried compiling sshd with (for gprof) to try to figure out where the time was going, but there are many obstacles to getting this to work properly: First of all, sshd exits using through its function. This is not a “normal” exit and so the file (containing the profile data) is not written out at all. Applying a source patch to fix that, sshd will give you a “Permission denied” error as it tries to open the file for writing. The problem now is that sshd does a , meaning that it’s trying to write the profile data in a directory where it doesn’t have access. The solution is again simple, just add another to a writable location before calling . Even with this in place, the profile came out completely empty for me. Maybe it’s another one of those privilege separation things. In any case, I decided to just use valgrind and its “cachegrind” tool to obtain the profile. It’s much easier and gives me the data I need without hassles of reconfiguring, patching, and recompiling.
+
+The profile showed one very specific hot spot, coming from two different locations: elliptic curve point multiplication.
+
+I don’t really know too much about elliptic curve cryptography, but apparently it’s pretty expensive to calculate. However, we don’t really need to deal with it; we can assume that the key exchange between the server and the client succeeds. Similar to how we increased coverage above by skipping message CRC checks and replacing the encryption with a dummy cipher, we can simply skip the expensive operations and assume they always succeed. This is a trade-off; we are no longer fuzzing all the verification steps, but allows the fuzzer to concentrate more on the protocol parsing itself. I applied this patch:
+
+With this patch in place, execs/second went to ~2,000 per core, which is a much better speed to be fuzzing at.
+
+Before we can start fuzzing for real, we have to create the first few input testcases. Actually, a single one is enough to get started, but if you know how to create different ones taking different code paths in the server, that may help jumpstart the fuzzing process. A few possibilities I can think of:
+
+The way I created the first testcase was to record the traffic from the client to the server using strace. Start the server without :
+
+Then start a client (using the binary you’ve just compiled) under strace:
+
+This should hopefully log you in (if not, you may have to fiddle with users, keys, and passwords until you succeed in logging in to the server you just started).
+
+The first few lines of the strace log should read something like this:
+
+We see here that the client is communicating over file descriptor 3. You will have to delete all the writes happening on other file descriptors. Then take the strings and paste them into a Python script, something like:
+
+When you run this, it will print a byte-perfect copy of everything that the client sent to stdout. Just redirect this to a file. That file will be your first input testcase.
+
+You can do a test run (without AFL) by passing the same data to the server again (this time using ):
+
+Hopefully it will show that your testcase replay was able to log in successfully.
+
+Before starting the fuzzer you can also double check that the instrumentation works as expected using afl-analyze:
+
+This may take a few seconds to run, but should eventually show you a map of the file and what it thinks each byte means. If there is too much red, that’s an indication you were not able to disable checksumming/encryption properly (maybe you have to and rebuild?). You may also see other errors, including that AFL didn’t detect any instrumentation (did you compile sshd with ?). This is general AFL troubleshooting territory, so I’d recommend checking out the AFL documentation.
+
+I created an AFL “dictionary” for OpenSSH, which is basically just a list of strings with special meaning to the program being fuzzed. I just used a few of the strings found by running , etc. to allow the fuzzer to use these strings without having to discover them all at once (which is pretty unlikely to happen by chance).
+
+Just save it as ; to use it, we will pass the filename to the option of .
+
+First, create two directories, and . Place your initial testcase in the directory. Then, for the output directory, we’re going to use a little hack that I’ve found to speed up the fuzzing process and keep AFL from hitting the disk all the time: mount a tmpfs RAM-disk on with:
+
+Of course, if you shut down (or crash) your machine without copying the data out of this directory, it will be gone, so you should make a backup of it every once in a while. I personally just use a bash one-liner that just tars it up to the real on-disk filesystem every few hours.
+
+To start a single fuzzer, you can use something like:
+
+Again, see the AFL docs on how to do parallel fuzzing. I have a simple bash script that just launches a bunch of the line above (with different values to the or option) in different screen windows.
+
+Hopefully you should see something like this:
+
+In about a day of fuzzing (even before disabling encryption), I found a couple of NULL pointer dereferences during key exchange. Fortunately, these crashes are not harmful in practice because of OpenSSH’s privilege separation code, so at most we’re crashing an unprivileged child process and leaving a scary segfault message in the system log. The fix made it in CVS here: http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/kex.c?rev=1.131&content-type=text/x-cvsweb-markup.
+
+Apart from the two harmless NULL pointer dereferences I found, I haven’t been able to find anything else yet, which seems to indicate that OpenSSH is fairly robust (which is good!).
+
+I hope some of the techniques and patches I used here will help more people get into fuzzing OpenSSH.
+
+Other things to do from here include doing some fuzzing rounds using ASAN or running the corpus through valgrind, although it’s probably easier to do this once you already have a good sized corpus found without them, as both ASAN and valgrind have a performance penalty.
+
+It could also be useful to look into options to configure the build more like a typical distro build; I haven’t done anything here except to get it to build in a minimal environment.
+
+Please let me know in the comments if you have other ideas on how to expand coverage or make fuzzing OpenSSH faster!
+
+I’d like to thank Oracle (my employer) for providing the hardware on which to run lots of AFL instances in parallel :-)|||
+

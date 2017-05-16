@@ -1,0 +1,145 @@
+Cryptography is hard. But it doesn’t have to be.
+
+Most cryptographic errors are in construction, in the joints of putting together well known primitives. From an effective cryptography standpoint, you are the weakest link.
+
+There are libraries out there that make all the right decisions, and minimize your exposure to incorrect constructions, meaning you never have to type “AES” and build a broken system out of working primitives. The most well known tools are NaCl and cryptlib, but these are C based tools — not useful for the JVM. (There are Java bindings like Kalium, but they require dynamic linked libraries to work.)
+
+However, there is a library out there that builds on top of Java’s native cryptography (JCA) and doesn’t require OS level integration: Keyczar. Keyczar’s philosophy is easier cryptography for software developers, and this post is mostly about how to use Keyczar.
+
+Keyczar isn’t a new project — Google came out with Keyczar in 2008. It is, however, a brutally undervalued project. Cryptographers hold their software to a high standard, and Keyczar is one of the few which has held up over the years (barring Nate Lawson’s timing attack). But Keyczar doesn’t break any new ground technologically, and uses some older (although still perfectly good) algorithms. To cryptographers, it’s boring.
+
+To developers, however, Keyczar is a series of bafflingly arbitrary decisions. Why are RSA keys specified as either as encrypt/decrypt or as sign/verify? (Because “one key per purpose.”) Why such a complicated system for adding and removing keys? (Because key management is important.) Why all the metadata? (Because key management isn’t free.) The fact that these are all cryptographically correct decisions is besides the point — Keyczar does very little to explain itself to developers. So. Let’s start explaining Keyczar.
+
+Keyczar works on several levels. The first level is making sure you don’t make elementary crypto mistakes in encryption algorithms, like reusing an IV or using ECB mode. The second level is to minimize the possibility of key misuse, by setting up a key rotation system and ensuring keys are defined with a particular purpose. The third level is to set up cryptographic systems on top of the usual primitives that JCA or Bouncycastle will give you. Using Keyczar, you can effectively use public keys to add “PGP like” features to your application, or define signatures that are invalid after an expiration date.
+
+Note that the Java version of Keyczar does not cover password hashing or password based encryption (PBE). However, Keyczar is cross platform — there are .NET, Python, C# and Java libraries available, all designed to use the same underlying formats and protocols.
+
+Keyczar exposes operations, but doesn’t talk much about what you can do with it.
+
+More to the point, you don’t have to tremble in fear every time someone sends you a cryptography link. Even if you only have simple use cases, Keyczar will do what you want.
+
+The current documentation is all on the Github wiki at https://github.com/google/keyczar/wiki — there is a PDF, but it’s from 0.5, and is horribly out of date. Instead, you should download the Wiki to your local machine.
+
+The first step is to get source, binaries and documentation. Keyczar’s source is on Github at https://github.com/google/keyczar and currently the only way I know to get current binaries is to build it from source. The latest version is 0.7.1g, so that’s we’ll work with.
+
+If you are using an IDE or want to peruse the code by hand, you should go to as your project root — everything below is either for another language or binaries. Ignore the directory, as it only contains out of date files.
+
+Now that you have Keyczar binaries, you should generate some keys.
+
+The first thing to note about Keyczar is that you have to generate keys before you can get anything to work. This is done using KeyczarTool.
+
+KeyczarTool is different from other key generation tools like or . You don’t work with individual keys in Keyczar. You work with key sets. You define a key set for a particular purpose, and then you can promote a key inside that keyset. If you decide to promote a new key with a stronger key length, any ciphertext that was using the old key can still be decrypted.
+
+Key generation is deliberately kept at arms length from the code — you should not check keys or AES secrets to a software project, and you should think twice about even adding KeyczarTool to a software project or even an artifact repository.
+
+Here’s how to generate several different keysets — note that we’re able to limit the asymmetric keysets to encryption & verification respectively:
+
+Note that we create several different signing keys, so we’re only using one key per purpose here. Also it’s a good practice not to encode the size or algorithm directly into the name, as both may change — you may go from a 128 to a 256 AES key, for example.
+
+Once you have keys, you can keep adding new ones, by calling over again. Keyczar contains metadata about the key sets that keeps track of the key status, which are in the states “primary –> active –> inactive –> DELETED”
+
+When you call , the new key will be the primary, and the older keys will be active. If you want to downgrade the primary key to an active key, call . If you want to delete an active key, you have to call on it to make it inactive, and then finally will delete an inactive key.
+
+KeyczarTool has some undocumented features that are tucked away under OperationOtherFeatures — there’s a “usekey” command that allows you to encrypt or sign a message directly from KeyczarTool.
+
+First, the prerequisites. You should have JDK 1.8, latest version.
+
+You also need the JCE Unlimited Strength Policy Files, because if you don’t have the Unlimited Strength Policy files, you’ll see errors like “java.security.InvalidKeyException: Illegal key size” when you try to run 256-bit AES.
+
+If you’re not sure whether you’ve got them installed or not, there’s an easy way to check:
+
+Keyczar has few dependencies, but it requires manual addition to the project:
+
+Once you have the appropriate JSON library, you can start using Keyczar in earnest.
+
+Keyczar’s core functionality is contained in the operation classes. The supported operations are listed on the summary page. Broadly speaking, Keyczar operations fall into the following groups:
+
+All operation classes extend from the base class, which will take the in the constructor, and will immediately read in the keys when instantiated. This means all operation classes will fail-fast and throw an exception rather than exist in an invalid state. There’s a couple of subtle wrinkles in this, though.
+
+The first wrinkle is key rotation. The readers are designed to be stateless, and so will (for example) read from filesystem every time they are called. If you have a running application and promote a new key, you want new operations to pick up on that key immediately, which you can’t do if you keep a reference to a long running operation class. (Of course, there may be logic in Keyczar to deal with this, and I just haven’t found it yet.)
+
+The second wrinkle is that if you are using a Keyczar operation class with a reference to the filesystem, then your thread may block on I/O — you may want to wrap calls to Keyczar in a that returns the results of the operation. Given that these operations are computionally expensive, using a custom thread pool or Akka dispatcher is probably a good idea in any case.
+
+The good news is that, except for the and classes, the operation classes are intended to be thread-safe.
+
+First, you’ll want to read in some keys. The is the best option for reading in key sets from the file system:
+
+Or you can import keys from X.509 certificates using :
+
+or if you’re using a key encryption key, :
+
+Authenticated Encryption in Keyczar is done with either or , with the main difference being that is strictly for encrypting, and does not have the method, while does both. This means that only uses public key sets, and uses sets of symmetric or private keys.
+
+There’s a couple of assumptions built into Keyczar encryption that are surprising. For example, the documentation refers to “WebSafe64” strings. This doesn’t mean you have to do anything to your input. It means that all strings are encoded and decoded through a Base64 encoder automatically:
+
+Using a is about as simple as it gets. The only thing you can really mess up is using the wrong key set: if you use asymmetric encryption, then you’ll find it significantly slower than symmetric encryption. When you need fast asymmetric encryption, you should use the Sessions API.
+
+Note that the output from a Crypter is not raw AES! Instead, it is a ciphertext format that contains a header, the IV, the encrypted payload, and an optional signature. This means that a Keyczar encrypted file cannot be decrypted with a different set of cryptography tools without some additional processing.
+
+In the same way that encryption can be done with either a or a class, message authentication can be done either with a or with a more limited class, which only verifies and cannot sign. Likewise, Signers can be used with symmetric or private key sets, while Verifiers are used with symmetric or public key sets. EDIT: SEE THE LIMITATIONS SECTION BEFORE YOU USE ASYMMETRIC SIGNING.
+
+Following the principle of “one key per purpose”: although Keyczar allows you to pick a generic signing keyset that you can pass around everywhere, you may want to create different signing keys for each variant — for example, a “timeout-sign-keyset” and an “unversioned-sign-keyset”.
+
+Plain signing gives you a signature. A signature is a way to prove authenticity — either a digital signature or a HMAC that you can use later in a Verifier. There really isn’t much to it.
+
+Timeout signing is a variant of normal signing. It has the interesting property that the signature will only be valid up until a set expiration date, passed in as the milliseconds since Unix epoch. This is exceptionally useful in situations where data is time sensitive — for example, a session encoded in an HTTP cookie with Expires/Max-Age set.
+
+Unversioned signing is a variant which will produce a raw digest signature, without Keyczar metadata. This is useful for when Keyczar has to be used in conjunction with outside libraries. The verifier will go through all of the keys in the keyset until one works.
+
+Attached signing is used for Signed Sessions, where the payload is signed for authenticity. The nonce (meaning “N once” — a non-reusable value) in this case is presumably the session material. Outside of signed sessions, I don’t know where you would use this.
+
+The documentation on this one is very sparse, and frankly I’m not sure if it should be exposed at all.
+
+The Sessions API is a hybrid cryptosystem — a cross between symmetric and asymmetric encryption — and is useful in situations where large amounts of data may be passed around, or speed is an issue. “The core motivation is that RSA encryption / decryption is slow while AES is fast.”
+
+A session starts off using public key cryptography to encrypt and send a small amount of random data. That random data is then used as a shared secret for symmetric cryptography, which is much faster. The random data must be kept around for the duration, so it is known as a session key. This sounds involved, but it is commonly used — both TLS and PGP rely on session keys internally.
+
+Sessions are represented by the class, which can be instantiated in two modes. Note that is not thread safe, so cannot be shared widely.
+
+The only complication is that you must store the encrypted session key while you still have the encrypted data, so you have two pieces of state you have to float around. Because the session key is encrypted with , it is safe to store.
+
+Finally, there’s the Signed Sessions API. This is like Sessions, but goes the extra step to put a signature on the payload. It is represented by and , which are also not thread-safe. Note that it is also one way — the sender can only encrypt, and the receiver can only decrypt.
+
+If you plan to use public keys in your program, this is probably the class you should use. Using a signed session means you can do message authentication and decryption in one go, but it can be very confusing under the hood.
+
+How important are the Session classes? According to one of the Keyczar developers:
+
+There’s also some discussion that goes into why you’d want to use a signed session specifically:
+
+Keyczar has some limitations that are worth noting.
+
+First, the big one. Keyczar generates RSA and DSA signatures using SHA-1. This is a problem if you plan on using asymmetric signing (digital signatures) with Keyczar. According to SP 800-131A “SHA-1 shall not be used for digital signature generation after December 31, 2013.” This has been a bug since 2008, but has not been corrected. Arstechnica reports that a freestart collision (a tailored case where the initialization vectors are preselected) against SHA-1 was successful, and it’s expected that a SHA-1 collision would cost around $75,000 to $120,000 and several months right now… expensive for most people, but pocket change for a determined adversary.
+
+That being said, it doesn’t mean SHA-1 itself is “broken”. There are three different things that can involve SHA-1:
+
+A preimage attack (given a hash, find something that makes that hash) would break integrity. A second-preimage attack (given a message, find a different message with the same hash) would break authenticity. A collision attack would break non-repudiation. So, this attack would ONLY break asymmetric signing. There are references to truncated SHA-1 hashes throughout the documentation — these are integrity checks, so they’re fine. That being said… it’s not great.
+
+Keyczar, when using symmetric signing, will only generate HMAC-SHA1, and specifying size=256 will not magically turn it into a SHA256 hash. See above.
+
+DSA key size is only 1024 bits. Not that anyone uses DSA.
+
+The default AES size is 128 bits. Current recommendations are 256 bit keys for AES.
+
+There is no official support for Elliptic Curve Cryptography (ECC), although there is unofficial code tucked away.
+
+There are some more subtle design issues with Keyczar, which is covered in the “K2 elevator pitch” talking about the next generation of Keyczar:
+
+In much the same way that cryptography is hard, key management is also hard. There are any number of stories of companies that have leaked private keys onto the internet.
+
+Keyczar gives you a nice start by providing keys in the file system, but it’s easy enough to create a for any backend you want.
+
+There are systems that handle infrastructure secrets for you:
+
+And then there are solutions that focus directly on key management:
+
+There are a couple of good places to start with key management from an operational standpoint:
+
+However, key management is too big a topic to cover here. If you’re at the level to worry about cloud based systems, you will need a dedicated team to handle your key management — the point is that Keyczar can plug into whatever you have.
+
+Keyczar is the only pure Java high level cryptography library out there. Keyczar’s been reviewed and found good, and the algorithms are solid. However, it hasn’t fundamentally changed since 2008.
+
+The only real competitor on the JVM is Kalium, which is a Java layer with “auto-JNI” bindings to libsodium, which itself is a fork of NaCl with a decent build system. NaCl makes some unusual algorithmic choices which make it “pretty hardcore DJB-ware” — but because it’s a C based library, it gets more attention than KeyCzar.
+
+No matter what your choice, the best thing to do is to pick a library you feel comfortable with, and not implement crypto yourself.|||
+
+Cryptography is hard. But it doesn’t have to be. Most cryptographic errors are in construction, in the joints of putting together well known …

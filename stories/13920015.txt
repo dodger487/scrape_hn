@@ -1,0 +1,657 @@
+
+
+
+
+For the Crew Sketch, would it be an option to have the characters to be replaced with a blank section of page until the player sees their face, like with the flashback details pages? (as in, the background is always there, just with character-shaped holes until they're met). Maybe having them actively appearing the first time you check the sketches after watching a flashback, since it would make it easier to find a face without having to play Where's Wally every time a new person appears.
+
+Although I suppose it wouldn't work very well if there are any characters that you have to figure out by process of elimination without ever seeing their face.
+
+
+
+ Quote from: Innomin on February 04, 2017, 05:52:48 pm Not sure if anyone mentioned this, but a set of black footprints in the white void might look nice and signify its non-solidity. Plus it makes some in-game sense, since they would only appear on a second viewing and could be thought of as the player's footprints.
+
+ I really like this idea. It seems like it'd look far more mystical than a floating doorframe, and would make more sense with the whole void being an exit, rather than just a small spot in the void. I love reading this devlog. It's informative and really inspires me to work on my own ideas. Super looking forwards to this game's eventual release.For the Crew Sketch, would it be an option to have the characters to be replaced with a blank section of page until the player sees their face, like with the flashback details pages? (as in, the background is always there, just with character-shaped holes until they're met). Maybe having them actively appearing the first time you check the sketches after watching a flashback, since it would make it easier to find a face without having to play Where's Wally every time a new person appears.Although I suppose it wouldn't work very well if there are any characters that you have to figure out by process of elimination without ever seeing their face.I really like this idea. It seems like it'd look far more mystical than a floating doorframe, and would make more sense with the whole void being an exit, rather than just a small spot in the void.
+
+
+
+
+
+
+
+ 
+
+
+
+Getting up and running with a 3D first-person game in Unity is quick and easy. When it comes to collision and player movement, scene meshes can be marked as a solid colliders on import and there's some half-decent FPS player movement controllers, with or without physics. Build a scene, make it solid, drop in your player, walk around. Done.
+
+
+
+
+
+ Typical 3D colliders. The near table legs and distant chair have no collision, to avoid catching the player. 
+
+
+
+Except:
+
+
+
+ 
+
+Without careful planning, walking into certain configurations of colliders can causing the player's capsule to jitter awkwardly.
+
+
+
+ 
+
+The Obra Dinn is a dense ship with low ceilings, and there's often cargo and other stuff strewn about the decks. Smaller objects above or below the player's general line of sight can block the player's movement, hit their head, or bump them upwards while walking, which makes moving around uncomfortable and frustrating.
+
+
+
+ 
+
+The game has basically one environment, but in many flashbacks the ship is statically pitched at a steep angle as it crashes through the waves. The player remains upright in these scenes and hits the tilted colliders normally in 3D. This leads to many previous walls becoming ramps that can now be walked right up, pinches that trap the player's capsule, or just general chaos.
+
+
+
+ 
+
+For whatever unfortunate reason, Unity 3D physics behave differently on different computers. With the FPS controller code I'm using, these differences manifest as falling through the solid decks at random spots.
+
+
+
+
+
+ A pitched ship with manually-added upright collision boxes to prevent walking over the edge or getting 
+
+
+
+Most of these problems are pretty typical, and can be fixed with code hacks and careful collider placement and tweaking. Unfortunately for me, there's >40 flashback scenes with drastically different ship configurations. Hand-tweaking each of these would take forever, and there's good odds I'd miss at least a few pinching ceilings, invalid ramps, annoying obstacles, jittery corners, etc somewhere. I'd really like a robust generalized solution for smooth, well-defined player movement.
+
+
+
+
+
+ 
+
+
+
+  1 The player's feet never leave the ground. No jumping, no falling.
+
+  2 Player movement is mostly limited to traversing large manifold surfaces (decks).
+
+  3 Decks are stacked vertically and connected via narrow staircases.
+
+  4 Most ship geometry is static.
+
+  5 The ship can be tilted in any direction, sometimes extremely.
+
+  6 The player shape is modeled as a capsule with radius and height, always upright regardless of ship tilt.
+
+  7 There are a few dynamic objects (doors) that affect player movement.
+
+  8 There are many (statically built) ship configurations.
+
+
+
+
+
+ 
+
+
+
+One thing that's always frustrated me with standard 3D collision is how hard it is to visualize. Can I creep under that branch? Fit through that doorway? Visualization is the core method I use solve problems and figuring out the best way to visualize something usually leads me to a decent solution. How can I visualize 3D collision better?
+
+
+
+The key for Obra Dinn turns out to be ditching the 3rd dimension entirely and treating ship collision as top-down 2D maps. Each deck has its own map and they're connected via special staircases. I built a system called "Walkways" to automatically generate and use these 2D maps.
+
+
+
+
+
+ 
+
+
+
+Once we decide that player movement and collision can happen in 2D, the challenge is how to automatically collapse the complex 3D scenes into 2D without the need for manual touchup. Walkways encapsulate this as an offline build process. I'll first cover how individual walkways are built to let the player walk around on a single manifold surface. After that I'll talk about how multiple stacked walkways can be connected together to allow full navigation through a complex 3D scene.
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+Walkways are built from several components, starting with a floor. The floor defines the ground surface that the player sticks to. It doesn't have to be flat - the geometry can include bumps, dips, ramps, etc. The only restriction is that the player's foot position always stays on the highest Y point of the surface; no overlapping.
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+Our goal is to take the collection of 3D obstacles in the scene and reduce them to a top-down 2D representation. Since we're generating a 2D map of a 3D scene, we need to decide which slice of that scene will contribute to the map. Ideally we want to ignore small obstacles on the ground and ceiling and only consider the parts of obstacles that would cross the player's middle. To do this, "brow" and "knee" heights are defined as offsets from the floor. Anything above the knee and below the brow is considered solid. Anything outside this region should be ignored.
+
+
+
+
+
+ Solid region between brow and knee heights, defined as offsets from the floor. 
+
+
+
+ 
+
+
+
+Ignoring anything outside the solid region is easy to say, but how can we actually implement it? One way would be to run full geometry CSG on the shapes, intersecting each obstacle with the solid region. That's mathy and prone to CSG fuckups, the worst kind.
+
+
+
+Instead, we turn to the GPU:
+
+
+
+  1 Create a down-facing orthogonal camera that encapsulates the entire scene.
+
+  2 Render the floor+brow offset depth encoded into the RG channels of a render target.
+
+  3 Render the floor+knee offset depth encoded into BA channels of the same render target.
+
+  4 Render all the obstacles into another render target, clipping any pixels greater than or less than the brow/knee depths.
+
+
+
+ 
+
+Floor with brow and knee height offsets encoded into RGBA, and resulting obstacle map Floor with brow and knee height offsets encoded into RGBA, and resulting obstacle map 
+
+ 
+
+Debug view of the result. Note how the geometry is properly clipped based on the uneven floor shape.
+
+ Debug view of the result. Note how the geometry is properly clipped based on the uneven floor shape. 
+
+ Animating through different brow/knee heights. First animated gif of the post and it's a good one. 
+
+ 
+
+
+
+This "GPU CSG" technique is fast and easy but it critically misses writing any edges perpendicular to the top-down camera. In this case, the tall wall and tall cylinder are absent from the obstacle map. This is because their top/bottom caps are outside the solid region and the perpendicular edges resolve to no visible pixels.
+
+
+
+There's a relatively simple fix for this. Instead of just rendering a single top-down orthogonal view it's possible accumulate multiple renders, skewing the view a little bit each time using a carefully-calculated oblique matrix:
+
+
+
+
+
+ Skewed accumulated obstacle map. The wall and cylinder now appear. 
+
+
+
+This accounts for all shapes within the solid region and has the added bonus of exposing an "expansion" feature:
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+Now that we have the obstacle map, how can we use it? There's more than one way, but I decided keeping huge images around was a waste and I should vectorize it first. To do that, I reached back 9 years to dig out some code from one of our old games, 
+
+
+
+Anyways, my partner wrote the 1-bit bitmap vectorizer code for Mightier and after a quick port from C++ to C# it worked great for this task. The algorithms are pretty simple, based on flood fills and border tracing. The end result is a hierarchy of shapes.
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+The vectorizer also has a simplification pass, which makes it easy to scale the level of detail. I don't adjust this currently; just set it once and forget it. Maybe it'll be useful later when I want to tweak the complexity in some scene. It makes another decent animated gif though so here:
+
+
+
+
+
+ Running through the simplifier with various thresholds 
+
+
+
+ 
+
+
+
+With the vectorized shapes, it's now possible to get a 2D physics simulation going. You could add a simple circle or ray caster and be most of the way there. Or if you're on Unity you can just use the built-in Box2D implementation, which is totally independent of the 3D physics/collision system and can run concurrently.
+
+
+
+
+
+ Shapes converted to PolygonCollider2Ds, from XZ to XY 
+
+
+
+Unity makes this really easy - the shape points can be fed directly into closed PolygonCollider2D or open EdgeCollider2D components. There's some need to consider the coordinate changes since the 2D physics system runs on XY and our 3D world uses XZ, but it's not too painful.
+
+
+
+
+
+ 
+
+
+
+Because the vectorizer finds all the nested shapes, and there may be shapes that completely enclose the player's movement area (like the half-cylinder wall on the left), it's necessary to know which part of the obstacle map is considered "air" or empty space. In the Unity 2D physics world, this determines which shapes the player will be confined within (possibly-open EdgeCollider2Ds) and which ones they're prevented from entering (closed PolygonCollider2Ds).
+
+
+
+Given my pipeline I found it simplest to just add a locator child to the floor plane to specify where the open air was.
+
+
+
+
+
+ Placing the "air" locator to define empty space where the player can move 
+
+
+
+ 
+
+
+
+In the debug view, the dotted orange line represents the EdgeCollider2D that contains the player's outer bounds of movement. Moving the air position to inside the small half-circle wall limits the player to that space since there's no connection to the outside. 
+
+
+
+This could be used with the shape expansion parameter set to the player's radius to easily show the accessible area, a super useful thing in navigation. I say "could" because right now the shape expansion is only good enough for catching perpendicular edges and doesn't give exact expansions. Visually auditing the walkway is so easy currently that I haven't gone further.
+
+
+
+
+
+ 2D walkway generated for the top deck of the ship 
+
+
+
+(Too big for one post. Continued in next) Grab a cup of something.Getting up and running with a 3D first-person game in Unity is quick and easy. When it comes to collision and player movement, scene meshes can be marked as a solid colliders on import and there's some half-decent FPS player movement controllers, with or without physics. Build a scene, make it solid, drop in your player, walk around. Done.Except:Without careful planning, walking into certain configurations of colliders can causing the player's capsule to jitter awkwardly.The Obra Dinn is a dense ship with low ceilings, and there's often cargo and other stuff strewn about the decks. Smaller objects above or below the player's general line of sight can block the player's movement, hit their head, or bump them upwards while walking, which makes moving around uncomfortable and frustrating.The game has basically one environment, but in many flashbacks the ship is statically pitched at a steep angle as it crashes through the waves. The player remains upright in these scenes and hits the tilted colliders normally in 3D. This leads to many previous walls becoming ramps that can now be walked right up, pinches that trap the player's capsule, or just general chaos.For whatever unfortunate reason, Unity 3D physics behave differently on different computers. With the FPS controller code I'm using, these differences manifest as falling through the solid decks at random spots.Most of these problems are pretty typical, and can be fixed with code hacks and careful collider placement and tweaking. Unfortunately for me, there's >40 flashback scenes with drastically different ship configurations. Hand-tweaking each of these would take forever, and there's good odds I'd miss at least a few pinching ceilings, invalid ramps, annoying obstacles, jittery corners, etc somewhere. I'd really like a robust generalized solution for smooth, well-defined player movement.The player's feet never leave the ground. No jumping, no falling.Player movement is mostly limited to traversing large manifold surfaces (decks).Decks are stacked vertically and connected via narrow staircases.Most ship geometry is static.The ship can be tilted in any direction, sometimes extremely.The player shape is modeled as a capsule with radius and height, always upright regardless of ship tilt.There are a few dynamic objects (doors) that affect player movement.There are many (statically built) ship configurations.One thing that's always frustrated me with standard 3D collision is how hard it is to visualize. Can I creep under that branch? Fit through that doorway? Visualization is the core method I use solve problems and figuring out the best way to visualize something usually leads me to a decent solution. How can I visualize 3D collision better?The key for Obra Dinn turns out to be ditching the 3rd dimension entirely and treating ship collision as top-down 2D maps. Each deck has its own map and they're connected via special staircases. I built a system called "Walkways" to automatically generate and use these 2D maps.Once we decide that player movement and collision can happen in 2D, the challenge is how to automatically collapse the complex 3D scenes into 2D without the need for manual touchup. Walkways encapsulate this as an offline build process. I'll first cover how individual walkways are built to let the player walk around on a single manifold surface. After that I'll talk about how multiple stacked walkways can be connected together to allow full navigation through a complex 3D scene.Walkways are built from several components, starting with a floor. The floor defines the ground surface that the player sticks to. It doesn't have to be flat - the geometry can include bumps, dips, ramps, etc. The only restriction is that the player's foot position always stays on the highest Y point of the surface; no overlapping.Our goal is to take the collection of 3D obstacles in the scene and reduce them to a top-down 2D representation. Since we're generating a 2D map of a 3D scene, we need to decide which slice of that scene will contribute to the map. Ideally we want to ignore small obstacles on the ground and ceiling and only consider the parts of obstacles that would cross the player's middle. To do this, "brow" and "knee" heights are defined as offsets from the floor. Anything above the knee and below the brow is considered solid. Anything outside this region should be ignored.Ignoring anything outside the solid region is easy to say, but how can we actually implement it? One way would be to run full geometry CSG on the shapes, intersecting each obstacle with the solid region. That's mathy and prone to CSG fuckups, the worst kind.Instead, we turn to the GPU:Create a down-facing orthogonal camera that encapsulates the entire scene.Render the floor+brow offset depth encoded into the RG channels of a render target.Render the floor+knee offset depth encoded into BA channels of the same render target.Render all the obstacles into another render target, clipping any pixels greater than or less than the brow/knee depths.This "GPU CSG" technique is fast and easy but it critically misses writing any edges perpendicular to the top-down camera. In this case, the tall wall and tall cylinder are absent from the obstacle map. This is because their top/bottom caps are outside the solid region and the perpendicular edges resolve to no visible pixels.There's a relatively simple fix for this. Instead of just rendering a single top-down orthogonal view it's possible accumulate multiple renders, skewing the view a little bit each time using a carefully-calculated oblique matrix:This accounts for all shapes within the solid region and has the added bonus of exposing an "expansion" feature:Now that we have the obstacle map, how can we use it? There's more than one way, but I decided keeping huge images around was a waste and I should vectorize it first. To do that, I reached back 9 years to dig out some code from one of our old games, Mightier . There, the code was used to convert player drawings into inflated 3D characters that run around in small puzzle-platformer levels. Sort of. It's a weird game.Anyways, my partner wrote the 1-bit bitmap vectorizer code for Mightier and after a quick port from C++ to C# it worked great for this task. The algorithms are pretty simple, based on flood fills and border tracing. The end result is a hierarchy of shapes.The vectorizer also has a simplification pass, which makes it easy to scale the level of detail. I don't adjust this currently; just set it once and forget it. Maybe it'll be useful later when I want to tweak the complexity in some scene. It makes another decent animated gif though so here:With the vectorized shapes, it's now possible to get a 2D physics simulation going. You could add a simple circle or ray caster and be most of the way there. Or if you're on Unity you can just use the built-in Box2D implementation, which is totally independent of the 3D physics/collision system and can run concurrently.Unity makes this really easy - the shape points can be fed directly into closed PolygonCollider2D or open EdgeCollider2D components. There's some need to consider the coordinate changes since the 2D physics system runs on XY and our 3D world uses XZ, but it's not too painful.Because the vectorizer finds all the nested shapes, and there may be shapes that completely enclose the player's movement area (like the half-cylinder wall on the left), it's necessary to know which part of the obstacle map is considered "air" or empty space. In the Unity 2D physics world, this determines which shapes the player will be confined within (possibly-open EdgeCollider2Ds) and which ones they're prevented from entering (closed PolygonCollider2Ds).Given my pipeline I found it simplest to just add a locator child to the floor plane to specify where the open air was.In the debug view, the dotted orange line represents the EdgeCollider2D that contains the player's outer bounds of movement. Moving the air position to inside the small half-circle wall limits the player to that space since there's no connection to the outside.This could be used with the shape expansion parameter set to the player's radius to easily show the accessible area, a super useful thing in navigation. I say "could" because right now the shape expansion is only good enough for catching perpendicular edges and doesn't give exact expansions. Visually auditing the walkway is so easy currently that I haven't gone further.(Too big for one post. Continued in next) @dukope - Return of the Obra Dinn - Papers, Please - 6 Degrees of Sabotage - The Republia Times - Helsing's Fire
+
+
+
+
+
+ 
+
+
+
+At this point we've got a single walkway with its static 2D collision. Now we need some things to move around on it.
+
+
+
+ 
+
+
+
+The player uses a "WalkwayMotor" component that runs its simple movement as a circle in the 2D physics world, then applies that to the 3D player game object. This leans on the full Box2D simulation to move the player circle using collision-aware translations, and to be affected correctly by kinematic objects in the world. 
+
+
+
+
+
+ 
+
+
+
+Each Walkway maintains an optimized structure of its floor surface. Once a 2D position is known it's possible to quickly look up the floor's world height at that point, which can be stuffed directly into the player's y position. There's no jumping or falling and so no need to run any simulation on the 3D y/up axis. The optimized floor structure does contain 3D normals though, so player speed modulation can be applied on slopes.
+
+
+
+ 
+
+
+
+Doors are represented as "WalkwayPusher" components that also maintain a link between the 3D world and the 2D one. Door shapes are generated just like the static level obstacles, just in their own individual obstacle map.
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+ WalkwayPusher (in purple) created and slaved to the 3D door object 
+
+
+
+Pushers are implemented as kinematic objects in the 2D world, slaved to the position and rotation of their corresponding 3D object. All of the gameplay logic for reaching out, grabbing the handle, and opening the door is unrelated to the Walkway system. Any animation from the 3D door itself will be translated into a rotation of the 2D WalkwayPusher that affects the player's WalkwayMotor.
+
+
+
+
+
+ Colliding with and opening the door in 2D. This gif is only 5kb. 
+
+
+
+ 
+
+ 
+
+
+
+The same WalkwayPusher can also be used for non-moving switchable objects, like this railing. Why you'd want to switch this on and off is explained below.
+
+
+
+
+
+ Switching a railing obstacle on and off 
+
+
+
+ 
+
+
+
+So far there's enough to move the player around on a walkway, bumping into things and opening doors. The ship is made of multiple stacked decks though so we need a way to connect walkways together and allow the player to move between them. This is pretty simple, at least on the code side.
+
+
+
+
+
+ 
+
+
+
+Even though these walkways logically inhabit the same XZ space at different Y heights, their collision/physics components are implemented in 2D XY space. There's no vertical stacking possible in 2D so instead the physical representations for each walkway are offset on the (2D) Y axis far enough to keep them from interfering with each other.
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+The basic element that connects walkways is the "WalkwayPortal". A portal is just an axis-aligned 2D rectangle with references to the source walkway and the destination walkway. If a WalkwayMotor (player) enters the source portal's rectangle, it's instantly teleported to the same XZ position on the destination portal.
+
+
+
+
+
+ Portals (in yellow) on the aft deck 
+
+
+
+Both walkway floors (poop deck and main deck) have duplicates of the ramp geometry that connects them so that teleporting instantly between them while on the ramp doesn't produce any discontinuities in the player's y position. This requirement puts a little extra burden on the asset side, since we now need to make sure areas of transition are duplicated in both walkway floors. The resulting portal code is so simple though that it's worth it.
+
+
+
+
+
+ 
+
+
+
+In the 2D physics world, the WalkwayMotor switches walkways by adding the walkway separation offset to its Y position.
+
+
+
+ 
+
+
+
+In most cases we'd be done but of course this ship has special case headaches. The aft-deck stairs are simple "walk up over stuff" or "walk down off the edge" of their respective walkways. That's the exception. Most of the stairs connecting decks are right in the middle of a walkway somewhere, and they need to be switchable from closed to open.
+
+
+
+
+
+ 
+
+
+
+The only place this really causes trouble is with the floor Y calculation. To fix it, we can create special trapdoor geometry overlaying these holes.
+
+
+
+
+
+ 
+
+
+
+Trapdoors are attached to their respective walkway floors and can be enabled or disabled. Any time you want the Y height at a certain XZ, the walkway will return the greatest value of its own floor and any enabled trapdoor. When this example trapdoor is enabled, the player will walk straight over the hole and not descend.
+
+
+
+Bringing all this together to make nice mid-deck stairs requires careful orchestration of trapdoors, portals, and railing collision. Each component on its own is pretty simple but they can be combined to get pretty nice results:
+
+
+
+
+
+ Enabling/disabling different elements to open/close the trapdoor 
+
+
+
+ 
+
+
+
+The railing is low enough that it would normally be outside the "solid" region defined by the floor's knee/brow offsets. When the trapdoor is closed we don't want to get hung up on a useless railing. When the trapdoor is open and it's possible to descend, the railing corrals the player and keeps them from walking off the edge and popping down instantly. It sounds a little strange but feels good in practice in a "didn't even notice" sort of way.
+
+
+
+
+
+ 
+
+
+
+Walkways take care of the player movement by flattening it to 2D. It might be possible to ditch all the 3D collision except that I run a few 3D raycasts here and there, mostly for player reach/visibility checks. At this point I'm happy to move on.
+
+
+
+On the pipeline side, each walkway takes about a second to build from scratch. I added a simple caching system to reuse any collision that didn't change since the last build and it's fast enough to run indiscriminately. One last animated gif:
+
+
+
+
+
+ 
+
+
+
+ 
+
+
+
+This Walkways system sorts out the problems I was having with player navigation on the Obra Dinn, but it's tuned fairly specifically to what I need. There are other ways to stick it out with full 3D collision and get good results. 
+
+
+
+
+
+ 
+
+
+
+Writing this entry took almost as long as creating the Walkways system in the first place. I'd be mad except that I found and fixed several bugs while putting the post together. (Continuing)At this point we've got a single walkway with its static 2D collision. Now we need some things to move around on it.The player uses a "WalkwayMotor" component that runs its simple movement as a circle in the 2D physics world, then applies that to the 3D player game object. This leans on the full Box2D simulation to move the player circle using collision-aware translations, and to be affected correctly by kinematic objects in the world.Each Walkway maintains an optimized structure of its floor surface. Once a 2D position is known it's possible to quickly look up the floor's world height at that point, which can be stuffed directly into the player's y position. There's no jumping or falling and so no need to run any simulation on the 3D y/up axis. The optimized floor structure does contain 3D normals though, so player speed modulation can be applied on slopes.Doors are represented as "WalkwayPusher" components that also maintain a link between the 3D world and the 2D one. Door shapes are generated just like the static level obstacles, just in their own individual obstacle map.Pushers are implemented as kinematic objects in the 2D world, slaved to the position and rotation of their corresponding 3D object. All of the gameplay logic for reaching out, grabbing the handle, and opening the door is unrelated to the Walkway system. Any animation from the 3D door itself will be translated into a rotation of the 2D WalkwayPusher that affects the player's WalkwayMotor.The same WalkwayPusher can also be used for non-moving switchable objects, like this railing. Why you'd want to switch this on and off is explained below.So far there's enough to move the player around on a walkway, bumping into things and opening doors. The ship is made of multiple stacked decks though so we need a way to connect walkways together and allow the player to move between them. This is pretty simple, at least on the code side.Even though these walkways logically inhabit the same XZ space at different Y heights, their collision/physics components are implemented in 2D XY space. There's no vertical stacking possible in 2D so instead the physical representations for each walkway are offset on the (2D) Y axis far enough to keep them from interfering with each other.The basic element that connects walkways is the "WalkwayPortal". A portal is just an axis-aligned 2D rectangle with references to the source walkway and the destination walkway. If a WalkwayMotor (player) enters the source portal's rectangle, it's instantly teleported to the same XZ position on the destination portal.Both walkway floors (poop deck and main deck) have duplicates of the ramp geometry that connects them so that teleporting instantly between them while on the ramp doesn't produce any discontinuities in the player's y position. This requirement puts a little extra burden on the asset side, since we now need to make sure areas of transition are duplicated in both walkway floors. The resulting portal code is so simple though that it's worth it.In the 2D physics world, the WalkwayMotor switches walkways by adding the walkway separation offset to its Y position.In most cases we'd be done but of course this ship has special case headaches. The aft-deck stairs are simple "walk up over stuff" or "walk down off the edge" of their respective walkways. That's the exception. Most of the stairs connecting decks are right in the middle of a walkway somewhere, and they need to be switchable from closed to open.The only place this really causes trouble is with the floor Y calculation. To fix it, we can create special trapdoor geometry overlaying these holes.Trapdoors are attached to their respective walkway floors and can be enabled or disabled. Any time you want the Y height at a certain XZ, the walkway will return the greatest value of its own floor and any enabled trapdoor. When this example trapdoor is enabled, the player will walk straight over the hole and not descend.Bringing all this together to make nice mid-deck stairs requires careful orchestration of trapdoors, portals, and railing collision. Each component on its own is pretty simple but they can be combined to get pretty nice results:The railing is low enough that it would normally be outside the "solid" region defined by the floor's knee/brow offsets. When the trapdoor is closed we don't want to get hung up on a useless railing. When the trapdoor is open and it's possible to descend, the railing corrals the player and keeps them from walking off the edge and popping down instantly. It sounds a little strange but feels good in practice in a "didn't even notice" sort of way.Walkways take care of the player movement by flattening it to 2D. It might be possible to ditch all the 3D collision except that I run a few 3D raycasts here and there, mostly for player reach/visibility checks. At this point I'm happy to move on.On the pipeline side, each walkway takes about a second to build from scratch. I added a simple caching system to reuse any collision that didn't change since the last build and it's fast enough to run indiscriminately. One last animated gif:This Walkways system sorts out the problems I was having with player navigation on the Obra Dinn, but it's tuned fairly specifically to what I need. There are other ways to stick it out with full 3D collision and get good results. Casey Muratori wrote about his approach with The Witness where he built a clever "walk monster" to explore the movement space, then used the information gathered from that to fix the movement code and level geometry.Writing this entry took almost as long as creating the Walkways system in the first place. I'd be mad except that I found and fixed several bugs while putting the post together. @dukope - Return of the Obra Dinn - Papers, Please - 6 Degrees of Sabotage - The Republia Times - Helsing's Fire
+
+I added a bunch of timed hints to try to smooth this out. Nobody reads hints, even when shown large, unskippable, against a black screen. 
+
+I think it's worth noting that nobody reads hints… at expos.  When I've been to indie gaming events big (PAX Prime) and small (Playcrafting NYC's demo nights), I haven't had the patience or concentration to read flavor text in what is usually a noisy, crowded room of sensory over-stimulation— even for those that end up being the biggest games, I'm only interested in what it's about and if I should get into it or move on.
+
+
+
+Sitting down at my own computer to play a game, however, is a completely different environment, and the few times I've played through your GDC demo I've thoroughly enjoyed soaking up the experience— listening to the breeze, looking out into the ocean, watching the ropes sway, listening to the tonality and mood of each characters' voices, and… hanging on every word of each full-screen text break.  IMHO, as long as the hints remain as poignant and not-terribly-frequent as they were in the GDC demo, they're a viable solution that you shouldn't worry about.  And Obra Dinn feels in many ways like a classic novel that I can be inside of instead of having to read paragraph after paragraph of, so a touch of text here and there doesn't feel obtuse at all.
+
+
+
+ 
+
+Unrelated and fairly obligatory but still: I have to admit I'm extremely excited for this game to a level that's a rarity.  I mean, I'm a fan of many of the games you've done, but there have been only a few games (Myst and GTA Vice City come to mind) that have been able to pull me out of reality and into another time and place as effectively as the Obra Dinn GDC demo has been able to.  The interjection of intense moments of death with the still and clam of the present-day works just so beautifully, and is effective at harkening back to the slower pace of point-and-click adventure games on the Apple II and early Mac while on-demand punching up the pace to modern attention levels.  Add to that the number of well-written devblog posts you've put up here and the result is that I'm in love with this thing you're making.  So thank you, and best wishes for a successful completion and release. I think it's worth noting that.  When I've been to indie gaming events big (PAX Prime) and small (Playcrafting NYC's demo nights), I haven't had the patience or concentration to read flavor text in what is usually a noisy, crowded room of sensory over-stimulation— even for those that end up being the biggest games, I'm only interested in what it's about and if I should get into it or move on.Sitting down at my own computer to play a game, however, is a completely different environment, and the few times I've played through your GDC demo I've thoroughly enjoyed soaking up the experience— listening to the breeze, looking out into the ocean, watching the ropes sway, listening to the tonality and mood of each characters' voices, and… hanging on every word of each full-screen text break.  IMHO, as long as the hints remain as poignant and not-terribly-frequent as they were in the GDC demo, they're a viable solution that you shouldn't worry about.  And Obra Dinn feels in many ways like a classic novel that I can be inside of instead of having to read paragraph after paragraph of, so a touch of text here and there doesn't feel obtuse at all.Unrelated and fairly obligatory but still: I have to admit I'm extremely excited for this game to a level that's a rarity.  I mean, I'm a fan of many of the games you've done, but there have been only a few gamesthat have been able to pull me out of reality and into another time and place as effectively as the Obra Dinn GDC demo has been able to.  The interjection of intense moments of death with the still and clam of the present-day works just so beautifully, and is effective at harkening back to the slower pace of point-and-click adventure games on the Apple II and early Mac while on-demand punching up the pace to modern attention levels.  Add to that the number of well-written devblog posts you've put up here and the result is that I'm in love with this thing you're making.  So thank you, and best wishes for a successful completion and release.
+
+Quote from: Innomin on April 04, 2017, 07:30:37 pm Amazing update! I'm a huge fan of the custom system posts you do, because they really detail the entire process of solving a problem in an interesting and satisfying way.
+
+Regarding the default Unity collision[...]
+
+ 
+
+Thanks! I think it's definitely possible to get Unity's built-in solutions much closer to what I want. Writing a custom collision system is definitely overkill. One of the big reasons I enjoy making games though is being able to solve interesting technical problems. Unity's great because unlike when writing your own engine from scratch, you can pick and choose which battles are worth fighting. In this case I enjoyed writing a separate system and I especially appreciate the peace of mind it gives me about player movement behavior.
+
+
+
+
+
+ Quote from: capnslipp on April 07, 2017, 05:59:03 pm I think it's worth noting that nobody reads hints… at expos.[...]
+
+ 
+
+This is definitely true. Everyone plays games differently when people are watching them. But I've also found a lot of value in treating these situations as canary-coalmine tests. There are people that won't read important text in any situation, and I want the game to work for them. I've made a point so far to not ask the player to read a lot and putting gameplay-critical information in onscreen text is just pre-expo panic. It can work if the game is structured that way and the player understands this structure. But so far Obra Dinn wasn't/isn't like that so dropping major learning in an onscreen hint didn't feel right.
+
+
+
+In any case, figuring out how to fix this specific problem led me to a much better solution that I think actually adds a significantly cool element to the game. I'll try to get a post up about it later.
+
+
+
+ [...]I have to admit I'm extremely excited for this game to a level that's a rarity. [...]
+
+ 
+
+Thank you! I hope the final game doesn't disappoint. Thanks! I think it's definitely possible to get Unity's built-in solutions much closer to what I want. Writing a custom collision system is definitely overkill. One of the big reasons I enjoy making games though is being able to solve interesting technical problems. Unity's great because unlike when writing your own engine from scratch, you can pick and choose which battles are worth fighting. In this case I enjoyed writing a separate system and I especially appreciate the peace of mind it gives me about player movement behavior.This is definitely true. Everyone plays games differently when people are watching them. But I've also found a lot of value in treating these situations as canary-coalmine tests. There are people that won't read important text in any situation, and I want the game to work for them. I've made a point so far to not ask the player to read a lot and putting gameplay-critical information in onscreen text is just pre-expo panic. It can work if the game is structured that way and the player understands this structure. But so far Obra Dinn wasn't/isn't like that so dropping major learning in an onscreen hint didn't feel right.In any case, figuring out how to fix this specific problem led me to a much better solution that I think actually adds a significantly cool element to the game. I'll try to get a post up about it later.Thank you! I hope the final game doesn't disappoint. @dukope - Return of the Obra Dinn - Papers, Please - 6 Degrees of Sabotage - The Republia Times - Helsing's Fire
+
+Quote from: FROGANUS on April 08, 2017, 10:21:45 am [...]the only buggy thing I could mention from this demo was that if you're in a flashback and pause the game, the current sound clip continues playing, where I think pausing might be nicer? [...]
+
+ 
+
+Good catch. I fixed this recently by stopping the music and having the last bit of sound echo/decay for a few seconds. Just fully stopping the music sounds too abrupt so this works a little better.
+
+
+
+ 
+
+
+
+If you've played any of the public builds or read this devlog you may have noticed the "dust" effect I'm using in flashbacks.
+
+
+
+
+
+ 
+
+
+
+These are implemented as static single-pixel points, making something like a point cloud. I like the effect since it can be used to suggest movement and atmosphere, which sets the scene apart from present-day wandering around the ship.
+
+
+
+
+
+ 
+
+
+
+Creating dust clouds is a little laborious. I basically just create a model in Maya, import that into Unity, then generate a dust pixel for each vertex in the mesh. That works fine for showing movement; not so well for atmosphere.
+
+
+
+ 
+
+
+
+One thing I tried for atmosphere is "dust planes", subdivided planes with painted vertex colors. On import dust points are generated based on the interpolated color of the surface.
+
+
+
+
+
+ 
+
+This works ok, but it's labor-intensive and with so many scenes (a constant problem on this game) I really need something more automated. Also, without a lot more work, there's no consideration for occluded points. Some points are created inside other geometry and never seen.
+
+
+
+ 
+
+
+
+With the recent obstacle map work in the 2D collision system, my mind was exactly in the right place to think about this again. It turns out that the same system for detecting obstacles for player navigation can be used to build a fog map. Instead of vectorizing the shapes, I keep the map in a texture and run a few GPU processing steps on it to get blurred fog. The fog map is then dithered to 1-bit and serves as instructions for where I should create a dust pixel. Because the map is 2D, I randomize the height to give the fog layer some depth.
+
+
+
+
+
+ Building a fog map from an obstacle map. This fog layer is close to the deck. 
+
+
+
+Like the collision maps, these obstacle maps cover a certain range of distances above a floor plane. To get a variety in the fog coverage, I can adjust the resolution, plane height, and processing steps:
+
+
+
+
+
+ A fog layer much higher above the deck. 
+
+
+
+ 
+
+
+
+I won't show the whole scene to avoid spoilers. Trust me that it adds some quality atmosphere. Here:
+
+
+
+
+
+ 
+
+
+
+My only worry now is that I've gone too far. Working on a game for ~3 years, it's easy to grow tired of how it looks and want to snazz things up. Going completely overboard with fog/dust is my snazz. This particular scene is during a storm so it makes some sense here. I tone things down for the calmer below-deck scenes. Hopefully it works out ok.
+
+ Good catch. I fixed this recently by stopping the music and having the last bit of sound echo/decay for a few seconds. Just fully stopping the music sounds too abrupt so this works a little better.If you've played any of the public builds or read this devlog you may have noticed the "dust" effect I'm using in flashbacks.These are implemented as static single-pixel points, making something like a point cloud. I like the effect since it can be used to suggest movement and atmosphere, which sets the scene apart from present-day wandering around the ship.Creating dust clouds is a little laborious. I basically just create a model in Maya, import that into Unity, then generate a dust pixel for each vertex in the mesh. That works fine for showing movement; not so well for atmosphere.One thing I tried for atmosphere is "dust planes", subdivided planes with painted vertex colors. On import dust points are generated based on the interpolated color of the surface.This works ok, but it's labor-intensive and with so many scenes (a constant problem on this game) I really need something more automated. Also, without a lot more work, there's no consideration for occluded points. Some points are created inside other geometry and never seen.With the recent obstacle map work in the 2D collision system, my mind was exactly in the right place to think about this again. It turns out that the same system for detecting obstacles for player navigation can be used to build a fog map. Instead of vectorizing the shapes, I keep the map in a texture and run a few GPU processing steps on it to get blurred fog. The fog map is then dithered to 1-bit and serves as instructions for where I should create a dust pixel. Because the map is 2D, I randomize the height to give the fog layer some depth.Like the collision maps, these obstacle maps cover a certain range of distances above a floor plane. To get a variety in the fog coverage, I can adjust the resolution, plane height, and processing steps:I won't show the whole scene to avoid spoilers. Trust me that it adds some quality atmosphere. Here:My only worry now is that I've gone too far. Working on a game for ~3 years, it's easy to grow tired of how it looks and want to snazz things up. Going completely overboard with fog/dust is my snazz. This particular scene is during a storm so it makes some sense here. I tone things down for the calmer below-deck scenes. Hopefully it works out ok. @dukope - Return of the Obra Dinn - Papers, Please - 6 Degrees of Sabotage - The Republia Times - Helsing's Fire|||
+
+Return of the Obra Dinn [GDC 2016 Demo Build]

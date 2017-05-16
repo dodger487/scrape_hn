@@ -1,0 +1,36 @@
+As part of a push to make keeping track of my finances easier without surrendering banking credentials to popular money-management tools, I have been working on a project that allows me to track my incomes and expenditures in a database, with a simple companion app for adding transactions and running visualizations of the data. But one of the major hurdles to keeping track of my spending is the fact that I had to manually enter each and every transaction, not just categorize it. To solve this problem, we can tap into the data used by apps like Quicken to manage your banking information - OFX. Here, we’ll go over what OFX is, how to get data from your bank in an OFX format and how to lex and parse that data to make it useful.
+
+If you want to skip ahead, the full library is on Github.
+
+OFX is a product of collaboration between Microsoft and Intuit (of Quicken) in the late 90s. The initial versions were built on top of SGML, which is a precursor of XML. As used in OFX, there are no closing tags for leaf values in SGML - a fact that makes modern XML parsers unsuitable for translating it into a document that we can then work with in code. Banks that offer an ‘Online banking with Quicken’ feature will usually do so through an endpoint that speaks OFX, and access to this API is usually accessible for $10 per month or so, depending on the bank.
+
+As a prerequisite for parsing OFX data, we need to acquire some. OFX data transfer takes place over a single API endpoint, by sending an OFX document with one or more stanzas in it and receiving another document with a response For an example OFX request, here’s a request to fetch account information from my Chase account (certain information redacted, of course):
+
+As you can see, there are two stanzas in this request - the first, the , is common to all requests you will make to the server. It identifies who you are ( , ), which bank you want to talk to; Chase in this case, represented by it’s and identifiers. Values for your bank can be found online, GNUCash has a good list here. This section also identifies the application we are using to talk to the bank. In this case I am ‘Quicken’ version 2200. Some banks will refuse to talk to you unless you tell them that yes, you are definitely Quicken.
+
+The second stanza is our actual request for information - we are making an account information transaction request ( ), with a unique transaction UUID, with an account information section stating that we last checked for account info the day before the UNIX epoch, and so should be assumed to know nothing.
+
+To send this request to our bank, we will attach our generic OFX header and then send our request off, being sure to state the content type and , which seems to be necessary for some banks.
+
+Hopefully, the bank will respond to our information request with a nice blob of SGML (indented for readability):
+
+Excellent. Now let’s define a representation for this data that we can work with more easily in Erlang. There are two distinct node types - they may either have a value, and no close tag, or some children and a close tag. Let’s represent them as two different records, as such:
+
+Leex is a lexer, a tool for taking our blob of OFX text and turning it into a list of meaningful tokens. In order to do so, we need to specify a couple of rules first. Leex input files have three sections: , and .
+
+The definitions section is a context-free grammar for defining patterns that can then be used for building up rules. For example, can be defined as [A-Z], or a shorthand for all uppercase letters. can then be all lowercase ([a-z]) and the two can then be combined to refer to all letters as .
+
+Once we have a set of definitions for character groups, we can then write the rules section. This is where the requisites for tokenisation are defined - for example, we want to emit a token every time we see an opening tag, and want to include in that token the name of the tag. On the left hand side of the tag, we write the match expression - in this case, , for one or more characters in the set of allowable tag names bounded by angle brackets. On the right hand side, we then specify what the lexer should do when it encounters something that matches this pattern. In this case we want to emit a token, so we’ll write . This means it will emit a token that is a 2-tuple of the atom and a substring of the matched string that removes the enclosing ‘<>‘. So, for example, if the lexer encountered the tag it would then emit the token .
+
+The final section allows for the definition of generic Erlang methods that can then be used in the right hand side of rules. For example, we could take our substringing code from the match rule we just defined and place it in a convenience method in the code section.
+
+Once we are finished writing our rules, we end up with a leex file that looks like this:
+
+We emit three kinds of tokens - , when a tag is opened, , when a tag is closed and when we encounter a string literal (tag value). With just these three types, we can then build a parser that can turn this list of tokens into a document tree.
+
+As stated when we built our records, we only have two cases we need to deal with here - leaf nodes, which will always be and parent nodes, which will be . This means that leaf nodes can be parsed easily by matching on the head of the tag list, and our more complex case of a parent node can be handled by a secondary method that accumulates all nodes until it encounters a specified terminal node. The implementation is as follows:
+
+This isn’t robust against malformed SGML, and will need as many stack frames as the tree is deep, but it gets the job done. If we now take the our list of lexed tags from the previous step, we can run them through the parser and we should get a workable tree of records like so:
+
+Using the methods exposed in the ofx_tree module, we can then easily parse out the information we might care about:|||
+

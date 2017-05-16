@@ -1,0 +1,130 @@
+In recent releases, Debian has been using strong crypto to validate downloaded packages. This is commonly called "secure apt" (or "apt-secure") and was implemented in Apt version 0.6 in 2003, which Debian migrated to in 2005. Since the documentation (here and here) is fairly slim on how this all works from an administrator's point of view, this document will try to explain in detail how secure apt works and how to use it.
+
+This article discusses things at a relatively high level. For details on the format of the files Debian repositories please refer to the DebianRepository/Format page. For detailed information on commands please refer to the man pages of the tools.
+
+Here are a few basic concepts that you'll need to understand for the rest of this document.
+
+A secure hash function (a type of checksum) is a method of taking a file and boiling it down to a reasonably short number that will uniquely identify the content of the file, even if people are deliberately trying to create a pair of different files with the same checksum or create a new file that matches a previous checksum. APT was originally designed around MD5 but people have since managed to construct collisions and so support for newer hash functions has been added.
+
+Public key cryptography is based on pairs of keys, a public key and a private key. The public key is given out to the world; the private key must be kept a secret. Anyone possessing the public key can encrypt a message so that it can only be read by someone possessing the private key. It's also possible to use a private key to sign a file, not encrypt it. If a private key is used to sign a file, then anyone who has the public key can check that the file was signed by that key. Anyone who doesn't have the private key can't forge such a signature.
+
+These keys are quite long numbers (at least 1024 bits, i.e. 256 or more hex digits and preferably a lot more), and to make them easier to work with they have a key id, which is a shorter, 8 or 16 digit number that can be used to refer to them. However care should be taken with key IDs, especially the short 8 character ID as it is possible to generate collisions.
+
+gpg is the tool used in secure apt to sign files and check their signatures.
+
+apt-key is a program that is used to manage a keyring of gpg keys for secure apt. The keyring is kept in the file /etc/apt/trusted.gpg (not to be confused with the related but not very interesting /etc/apt/trustdb.gpg). apt-key can be used to show the keys in the keyring, and to add or remove a key. In more recent Debian GNU/Linux versions (Wheezy, for example), the keyrings are stored in specific files all located in the /etc/apt/trusted.gpg.d directory. For example, that directory could contain the following files: debian-archive-squeeze-automatic.gpg or debian-archive-wheezy-automatic.gpg. Incidentally, both files are provided by the debian-archive-keyring package.
+
+A Debian archive contains a Release file, which is updated each time any of the packages in the archive change. Among other things, the Release file contains some checksums of other files in the archive. An excerpt of an example Release file:
+
+Now if we look inside a Packages file, we'll find more checksums, one for each package listed in it. For example:
+
+These two checksums allow apt to verify that it has downloaded a correct copy of the Packages file, with a checksum that matches the one in the Release file. And when it downloads an individual package, it can also check its checksum against the content of the Packages file. If apt fails at either of these steps, it will abort.
+
+None of this is new in secure apt, but it does provide the foundation. Notice that so far there is one file that apt doesn't have a way to check: The Release file. Secure apt is all about making apt verify the Release file before it does anything else with it, and plugging this hole, so that there is a chain of verification from the package that you are going to install all the way back to the provider of the package.
+
+To plug the hole, secure apt adds a gpg signature for the Release file. This is put in a file named Release.gpg that's shipped alongside the Release file. It looks something like this, although only gpg actually looks at its contents normally:
+
+Secure apt always downloads Release.gpg files when it's downloading Release files, and if it cannot download the Release.gpg, or if the signature is bad, it will complain, and will make note that the Packages files that the Release file points to, and all the packages listed therein, are from an untrusted source. Here's how it looks during an apt-get update:
+
+Note that the second half of the long number is the key id of the key that apt doesn't know about, in this case that's 2D230C5F.
+
+If you ignore that warning and try to install a package later, apt will warn again:
+
+If you say Y here you have no way to know if the file you're getting is the package you're supposed to install, or if it's something else entirely that a black hat has arranged for you, containing a nasty surprise.
+
+Note that you can disable these checks by running apt with --allow-unauthenticated.
+
+It's also worth noting that newer versions of the Debian installer use the same signed Release file mechanism during their debootstrap of the Debian base system, before apt is available, and that the installer even uses this system to verify pieces of itself that it downloads from the net. Also, Debian does not currently sign the Release files on its CDs; apt can be configured to always trust packages from CDs so this is not a large problem.
+
+So the security of the whole system depends on there being a Release.gpg file, which signs a Release file, and of apt checking that signature using gpg. To check the signature, it has to know the public key of the person who signed the file. These keys are kept in apt's own keyring (/etc/apt/trusted.gpg), and managing the keys is where secure apt comes in.
+
+By default, Debian systems come preconfigured with the Debian archive key in the keyring.
+
+Here 55BE302B is the key id, and notice that this key is only valid for a limited period. Debian occasionally rotates these keys as a last line of defense against some sort of security breach breaking a key.
+
+That will make apt trust the official Debian archive, but if you add some other apt repository to /etc/apt/sources.list, you'll also have to give apt its key if you want apt to trust it. Once you have the key and have verified it, it's a simple matter of "apt-key add file" to add it. Getting the key and verifying it are the trickier part.
+
+The debian-archive-keyring package is used to distribute keys to apt. Upgrades to this package can add (or remove) gpg keys for the main Debian archive.
+
+For other archives, there is not yet a standard location where you can find the key for a given apt repository. There's a rough standard of putting the key up on the web page for the repository or as a file in the repository itself, but no real standard, so you might have to hunt for it.
+
+The current and the retired Debian archive "signing" keys are available from https://ftp-master.debian.org/keys.html.
+
+gpg itself has a standard way to distribute keys, using a keyserver that gpg can download a key from and add it to its keyring. For example:
+
+You can then export that key from your own keyring and feed it to apt-key:
+
+By adding a key to apt's keyring, you're telling apt to trust everything signed by the key, and this lets you know for sure that apt won't install anything not signed by the person who possesses the private key. But if you're sufficiently paranoid, you can see that this just pushes things up a level, now instead of having to worry if a package, or a Release file is valid, you can worry about whether you've actually gotten the right key. Is the information on http://ftp-master.debian.org/keys.html mentioned above correct or is this all some clever trap?
+
+It's good to be paranoid in security, but verifying things from here is harder. gpg has the concept of a chain of trust, which can start at someone you're sure of, who signs someone's key, who signs some other key, etc., until you get to the archive key. If you're sufficiently paranoid you'll want to check that your archive key is signed by a key that you can trust, with a trust chain that goes back to someone you know personally. If you want to do this, visit a Debian conference or perhaps a local LUG for a key signing.
+
+If you can't afford this level of paranoia, do whatever feels appropriate to you when adding a new apt source and a new key. Maybe you'll want to mail the person providing the key and verify it, or maybe you're willing to take your chances with downloading it and assuming you got the real thing. The important thing is that by reducing the problem to what archive keys to trust, secure apt lets you be as careful and secure as it suits you to be.
+
+Here's a blog post with a procedure to verify the key's integrity. See also Securing Debian, Ch7.
+
+Since secure apt was introduced, the keys used to sign the main Debian archive have changed a couple of times. Since secure apt is young, we don't have a great deal of experience with changing the key and there are still rough spots.
+
+In January 2006, a new key for 2006 was made and the Release file began to be signed by it, but to try to avoid breaking systems that had the old 2005 key, the Release file was signed by that as well. The intent was that apt would accept one signature or the other depending on the key it had, but apt turned out to be buggy and refused to trust the file unless it had both keys and was able to check both signatures. This was fixed in apt version 0.6.43.1. There was also confusion about how the key was distributed to users who already had systems using secure apt; initially it was uploaded to the web site with no announcement and no real way to verify it and users were forced to download it by hand. This was fixed by the introduction of the debian-archive-keyring package, which manages apt keyring updates.
+
+In late 2006, a new key was created that will be used to sign the archive for the lifetime of the Debian 4.0 release (until 2009-07-01). The archive began to be signed by this new key in addition to the yearly signing key for 2006. That was a bit confusing, because the key began to be used before it was announced and before debian-archive-keyring was updated to include it! Apt's warning message in this situation is slightly opaque to end users. There's obviously still room for improvement in how we roll out new keys. This new key does answer the question of how users of the 4.0 (etch) release will be able to validate their software for the lifetime of that release. This new key is also being used to sign other versions of Debian (like unstable).
+
+On February 7th 2007, the 2006 key expired. Currently the only known breakage of this is that it broke rc1 of the etch installer, since the installer images only know about the 2006 key. Daily builds of the installer have the 2007 key and continue to work.
+
+Most recently, a new Etch stable release key has been added. This key is an offline key that will be used to sign releases of Etch (including point releases).
+
+There are sometimes you want to manually check that a package hasn't been tampered since the time it was uploaded to the archive and the time you downloaded it. The apt system will take care of this procedure automatically, but in this section we will describe how to perform these safety tests manually.
+
+First, we're assuming you have downloaded the Release information from a trusted source (official Debian servers and mirrors). You'll need to check the Release file as the first step, for that you'll use the signature Release.gpg file, as in the following example.
+
+Note: You will have to import the public key for the archive if isn't in your keyring; and use your current distribution instead of "sid".
+
+After that you check the md5sums of the Packages file for each of the components. For example:
+
+Finally, we check the MD5 or SHA checksum of the package itself.
+
+This section is far for complete, but we expect is a good introductory material for digging into the Debian packages' trust chain.
+
+If you want to provide archive signatures in an archive under your maintenance you have to:
+
+Whenever the contents of the archive changes (new packages are added or removed) the archive maintainer has to follow the first two steps previously outlined.
+
+Don't be surprised if you attempt to and things do not work as expected. Additionally, trying to resolve the missing key with procedures on this page will fail too. If you encounter the issues, please file a bug report.
+
+Below is a typical set of failures you will encounter using Debian Hurd as an example. Many ports fail the same way.
+
+Conectiva implemented something similar in their fork of APT. Debian Developers Colin Walters and Isaac Jones implemented APT Secure for Debian in 2003. Around Christmas 2003, Matt Zimmerman(?) integrated this patch into APT 0.6. In February 2005, Debian started migrating to apt-secure.
+
+Debian isn't Ubuntu and won't have sudo installed by default. It might be worth changing the usage of sudo, and making the examples use the root account explicitly -- SteveKemp
+
+Given the failure modes I've seen from gpg --recv-keys, suggesting that a user run it as root doesn't seem wise to me. But I've never actually audited it either.. Despite sudo not being installed by default (in sarge), I think that most of the audience of this page are familiar with it, or can skip over it. -- JoeyHess
+
+Does it make any sense to pre-install debian-server-keyring on every debian system? At least the user should be asked if s/he trusts this key. Until now (2006-01-07) the Debian Archive Automatic Signing Key is not in the strong set of keys. Thus is it not possible to test via pathfinders if there is a trust path from my key to the Debian Archive Automatic Signing Key. (See http://pgp.cs.uu.nl/ or http://www.lysator.liu.se/~jc/wotsap/search.html)
+
+Yes, the debian-archive-keyring package will be our key upgrade path for all Debian systems, so it should be installed on all of them, and I assume will be in standard. -- JoeyHess
+
+Can we somehow integrate this idea into this page? I think it's important we also move in this direction. -- madduck
+
+I tried making a local repository using apt-move, serving machines running testing and stable. I could not use the same repository for both stable and testing due to incopatibilities between apt v5 and v6. You might highlight this when you get around to writing the bit about crating a repository. I could get v6 working for testing but not for sarge. --?MartinHodges
+
+What does it mean for md5sum to be broken? Since it's a checksum, I thought the only way it can be broken is that it fail to compute the proper checksum. I have a feeling some other meaning is intended. --?RossBoylan
+
+**it is broken as people were able to actually create a fake certificate that could sign anything and was trusted, they did this by finding a collision, they created a certificate that had the same md5 sum as the certificate they were issued, and where thereby able to give themselves right other than they were granted.--Scientes
+
+***apt has supported sha256 checksums since version 0.7.7, so these will be used in lenny and future releases. --JoeyHess
+
+The idea is that generating a checksum from a file is easy, but recreating a file from a checksum (or making another file generate the same checksum) is very hard (ideally, it would be impossible). "md5sum is being broken" means that that "very hard" path becomes quite possible. In other words, it is becoming (or maybe even has become) feasible to create a "rogue" Debian package that still generates the same checksum as the original true package. --JohnZaitseff
+
+I'd say "theoretically possible in certian cases which may or may not include the Debian Packages files", not "quite possible" --JoeyHess
+
+Does Secure APT cover the possibility that the archive machine itself is broken into? What is there to stop someone "inserting" a rogue version of a Debian package and simply regenerating the Packages and Release/Release.gpg files? I strongly suspect this has been considered, but this document does not mention it. Perhaps a link to appropriate documentation, if such exists? --JohnZaitseff
+
+If someone has root access to your machine they already have everything, they do not need to break apt. Detecting if your machine has been broken into is another topic and something extremely difficult, although there are certainly some things debian could do better. --Scientes
+
+Yes, if this happens we can revoke the archive key, and introduce a new key for the new install of ftp-master and rollback of the archive to its last known good state that we'd have to do after such an incident. --JoeyHess
+
+It might be worth linking to http://www.debian.org/doc/manuals/securing-debian-howto/ch7.en.html#s-check-non-debian-releases as it explains briefly how to create the Release and Release.gpg files for repositories. --?JohnLamb
+
+I had a problem where apt gave the dreaded "WARNING: The following packages cannot be authenticated" message despite having debian-archive-keyring installed and having run "apt-get update". It turned out that my sources list contained instead of Apt found the packages file and could find all the debs, but it was not locating the Releases and Releases.gpg files. --AlexKing
+
+Would you add an explanation of why apt-get, apt-key, etc. might run into the GnuPG "resource limit" and how to fix it? This seems to result in the "NO_PUBKEY" warnings even if the respective keys are in the trustdb trusted.gpg. E.g.:|||
+

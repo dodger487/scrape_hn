@@ -1,0 +1,16 @@
+Elasticsearch is a distributed search engine. One can store “documents” within “indices”, which are collections of documents. One common pattern for storing time based data is to use one index per day. E.g.: , and so on. This makes having many indices decently common, and it also makes searching across many indices common in a single search.
+
+Elasticsearch has a query type called IndicesQuery, which lets you (among other things) optimise your query path by knowing which index to search in. For example, say that you have one index pattern for tweets ( ) and one for Reddit posts ( ). Say that someone searches for “hashtag: kittens OR subreddit: awww”. You know that you don’t have to execute the hashtag query in the Reddit indices and that you do not have to execute the subreddit query in the tweet indices. This is done by specifying to only execute the hashtag in indices that match .
+
+When executing the query, Elasticsearch will consider each shard (of an index) separately. Usually one has 2-5 shards per index. For each shard, it will check if the index name matches the pattern given by the . This is where we find our performance bug.
+
+The algorithm in the 1.X and 2.X versions of ES work by first expanding a pattern into the list of all matching indices – becomes . Then, for each index being considered, it checks for membership in that list:
+
+This means that the time complexity per shard is , where n is the number of indices in your cluster. Since we consider at least one shard per index, the overall search complexity then goes to . Furthermore, this expansion (and Elasticsearch’s pattern matcher) generate a lot of garbage, stressing the garbage collector and making the process even slower.
+
+We used this query in our not-too-shabby production cluster. At the time, it had a total of 1152 cores and we searched over roughly 150 TB of data in about 8500 indices. We discovered that we spent almost half of our CPU time in the method. We patched the algorithm to instead directly check if the current index matches any of the specified indices, making it O(m), where m is the number of index patterns specified in the query (we usually had 2-3). On top of the saved CPU, this also had the benefit of making us spent about 1/3 as much time in Garbage Collection pauses, due to the fewer allocations of Strings.
+
+This seems to have been fixed in the ‘Great Query Rewrite’ for Elasticsearch 5. I do not know if this was explicitly targeted as a performance fix, if it was by accident or if someone just thought ‘oh this might be slow’.
+
+This post was contributed by Anton Hägerstrand.|||
+

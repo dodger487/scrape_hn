@@ -1,0 +1,30 @@
+I am also seeing this issue on HLK 1607 targeting OS build 14393.rs1_release.161220-1747 (Windows 10 Pro x64).  The sparta miniport fails to start with code 10 (ERROR_BAD_ENVIRONMENT).  A possibly related older thread:  https://social.msdn.microsoft.com/Forums/windowshardware/en-US/98cf611a-64ec-4834-ad44-b343aebf491b/wfp-tests-enable-sparta-miniport-primarytertiaryquaternary-failed?forum=whck
+
+However, the answer in that thread isn't very helpful, as it does not mention what constitutes a "dirty environment" or how to fix it other than completely starting over with a clean image.  There is also no mention of this "clean environment" requirement in any of the Filter driver/WFP HLK tests on MSDN, that I could find at least.
+
+As to why the test actually fails, for future people googling this... Looking at the test source code (WFPLogoSetup.js) and the corresponding log output, the test spins in a loop (120 iterations, with short sleeps) waiting for three Sparta interfaces to come online by comparing the MAC address of each interface belonging to a pre-defined sparta adapter to a global array of MAC addresses (specNetworkAdapter.MACAddress == SPARTA_MAC_ADDRESSES[macIndex]).  If there is a match, the loop breaks and the test then attempts to assign a static IP address to the adapter.  If there is no match, it still attempts to assign the address.  In my case, the latter happens, and is where my test is failing:
+
+Status 0x26c/620 is ERROR_INVALID_PLUGPLAY_DEVICE_PATH.  This is not returned by any OS subsystem or component, but rather it's statically set by the test for some reason.
+
+The test log is full of print statements that dump the list of adapter names, as it waits for the expected MAC addresses to appear.  As you can tell from the output, these interfaces never come up due to the adapter start failure:
+
+So this doesn't explain why the driver is failing to start.  Running 'devcon install SpartaMini.inf *SpartaMini' manually shows the driver installs fine and again fails to start (10).  With an attached kernel debugger, the problem is beginning to reveal itself:
+
+The MiniportInitializeHandler of the SpartaMini.sys driver calls the NdisMSetMiniportAttributes macro several times as part of miniport initialization:  once for:  (1) registration attributes, (2) general attributes, (3) task offload and (4) NDK.  It is this last call, #4, which fails with 0xC000000D (STATUS_INVALID_PARAMETER).  Looking at the NDIS_MINIPORT_ADAPTER_ATTRIBUTES passed to NdisMSetMiniportAttributes in this 4th call, the object header correctly indicates it is a NDIS_MINIPORT_ADAPTER_NDK_ATTRIBUTES structure (type=0xb3, revision=0x01, size=0x10).  The two other values specified in this structure are Enabled (if NDK miniport feature is enabled) and a pointer to a NDIS_NDK_CAPABILITIES structure.  The values supplied by the sparta driver are 0 (NDK disabled) and a pointer to such a structure.  These values shown below:
+
+Referencing the second command above, we see 4 bytes of padding then the object header size 0x0010, the revision 0x01, and the object type 0xb3, then the pointer to the ndk attributes structure which is ffffc100`81ffc0b0.  The values in this structure seem incorrect:
+
+Here the object header shows a type of 0xa7 (NDIS_OBJECT_TYPE_OFFLOAD), revision 0x03, and size 0x009c.  It looks like the code is trying to tell NDIS that the miniport does not support NDK, but as required by the API, still passes a pointer for NDK attributes.  However, it uses the pointer to the TCP offloading attributes structure passed in the previous call to NdisMSetMiniportAttributes, and apparently NDIS is reading this pointer and failing due to unexpected values.  The actual check in ndis!NdisMSetNDKAttributes is clear:
+
+The passed-in NDIS_MINIPORT_ADAPTER_NDK_ATTRIBUTES structure ('a2') must have object revision of 1 and size of 16, while the embedded NDIS_NDK_CAPABILITIES pointer (set to 'v2') must have object type 0x80 (NDIS_OBJECT_TYPE_DEFAULT), revision of 1, size of at least 0x38, and a non-zero pointer at offset 0x30 (NDK_ADAPTER_INFO* NdkInfo). Based on the actual values in the structure passed by SpartaMini, as shown previously, this validation fails.
+
+At first it appears that Sparta driver assumes setting Enabled to FALSE in the top level NDIS_MINIPORT_ADAPTER_NDK_ATTRIBUTES structure is enough to initialize the miniport with NDIS, even though an incorrect NDKAttributes pointer is provided in this same structure.  This assumption that NDIS would ignore the embedded pointer when Enabled=FALSE is not supported by related MSDN documentation (https://msdn.microsoft.com/windows/hardware/drivers/network/initializing-an-ndk-miniport-adapter), so it's unlikely this is the case.
+
+It might be that there is a bug in how SpartaMini!MiniportInitializeHandler copes with the failure of NdisMSetMiniportAttributes to validate the NDK structure.  In the code below, it appears the driver checks for a failure and actually continues on if the failure was for an expected scenario:
+
+
+
+v66 appears to be some per-adapter context structure that relates to NDK support.  This value is 1 and so the driver checks that the return value was STATUS_NOT_SUPPORTED (0xc00000bb), but in fact it was STATUS_INVALID_PARAMETER.  This check fails, so the driver fails initialization here.  If the return status had been STATUS_NOT_SUPPORTED, the driver properly copes with the NDK support failure and continues to succeed initialization.  Perhaps an update to NDIS changed this status from what it had been in the past, thus breaking
+
+As a side note, MSDN docs state that the INF for the miniport should enable or disable NDK as part of installation (https://msdn.microsoft.com/en-us/windows/hardware/drivers/network/enabling-and-disabling-ndk-functionality), but the INF for sparta doesn't seem to set this value nor read it from the hardware registry.  However, adding "*NetworkDirect = 0 " to the INF didn't seem to make any difference.|||
+

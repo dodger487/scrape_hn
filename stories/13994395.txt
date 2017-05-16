@@ -1,0 +1,77 @@
+Algolia helps developers build search. At the core of Algolia is a built-from-scratch search engine exposed via a JSON API. In February 2017, we processed 21 billion queries and 27 billion indexing operations for 8,000+ live integrations. Some more numbers:
+
+We’ve written about our stack before and are big fans of StackShare and the community here. In this post we‘ll look at how our stack is designed from the ground up to reduce latency and the tools we use to monitor latency in production.
+
+I’m Josh and I’m a Developer Advocate at Algolia, formerly the VP Engineering at Keen IO. Being a developer advocate is pretty cool. I get to code, write and speak. I also get to converse daily with developers using Algolia.
+
+Frequently, I get asked what Algolia’s API tech stack looks like. Many people are surprised when I tell them:
+
+The primary design goal for our stack is to aggressively reduce latency. For the kinds of searches that Algolia powers—suited to demanding consumers who are used to Google, Amazon and Facebook—latency is a UX killer. Search-as-you-type experiences, which have become the norm since Google announced instant search in 2011, have demanding requirements. Any more than 100ms from end-to-end can be perceived as sluggish, glitchy and distracting. But at 50ms or less the experience feels magical. We prefer magic.
+
+Our monitoring stack helps us keep an eye on latency across all of our clusters. We use Wavefront to collect metrics from every machine. We like Wavefront because it’s simple to integrate (we have it plugged in to StatsD and collectd), provides good dashboards, and has integrated alerting.
+
+We use PagerDuty to fire alerts for abnormalities like CPU depletion, resource exhaustion and long-running indexing jobs. For non-urgent alerts, like single process crashes, we dump and collect the core for further investigation. If the same non-urgent alert repeats more than a set number of times, we do trigger a PagerDuty alert. We keep only the last 5 core dumps to avoid filling up the disk.
+
+When a query takes more than 1 second we send an alert into Slack. From there, someone on our Core Engineering Squad will investigate. On a typical day, we might see as few as 1 or even 0 of these, so Slack has been a good fit.
+
+We have probes in 45 locations around the world to measure the latency and the availability of our production clusters. We host the probes with 12 different providers, not necessarily the same as where our API servers are. The results from these probes are publicly visible at status.algolia.com. We use a custom internal API to aggregate the large amount of data that probes fetch from each cluster and turn it into a single value per region.
+
+Downed machines are detected within 30 seconds by a custom Ruby application. Once a machine is detected to be down, we push a DNS change to take it out of the cluster. The upper bound of propagation for that change is 2 minutes (DNS TTL). During this time, API clients implement their internal retry strategy to connect to healthy machines in the cluster, so there is no customer impact.
+
+When a query takes abnormally long - more than 1 second - we dump everything about it to a file. We keep everything we need to rerun it including the application ID, index name and all query parameters. High-level profiling information is also stored - with it, we can figure out where time is spent in the heaviest 10% of query processing. A syscall called getrusage analyzes resource utilization of the calling process and its children.
+
+For the kernel, we record the number of major page faults (ru_majflt), number of block inputs, number of context switches, elapsed wall clock time (using gettimeofday, so that we don’t skip counting time on a blocking I/O like a major page fault since we’re using memory mapped files) and a variety of other statistics that help us determine the root cause.
+
+With data in hand, the investigation proceeds in this order:
+
+The easiest problem to detect is a hardware issue. We see burned SSDs, broken memory modules and overheated CPUs. We automate the reporting of the most common failures like SSDs by alerting on S.M.A.R.T. data. For infrequent errors, we might need to run a suite of specific tools to narrow down the root cause, like mbw for uncovering memory bandwidth issues. And of course, there is always syslog which logs most hardware failures.
+
+Individual machine failures will not have a customer impact because each cluster has 3 machines. Where it’s possible in a given geographical region, each machine is located in a different datacenter and attached to a different network provider. This provides further insulation from network or datacenter loss.
+
+We have some close-to-zero cost profiling information obtained from the getrusage syscall. Sometimes that’s enough to diagnose an issue with the engine code. If not, we need to look to profiling. We can’t run a profiler in production for performance reasons, but we can do this after the fact.
+
+An external binary is attached to a profiler, containing exactly the same code as the module running inside of nginx. The profiler uses information obtained by google-perftools, a very accurate stack-sampling profiler, to simulate the exact conditions of the production machine.
+
+If we can rule out hardware and software failure, the problem might have been with the operating environment at that point in time. That means analyzing system-wide data in the hope of discovering an anomaly.
+
+Once we discovered that defragmentation of huge pages in the kernel could block our process for several hundred milliseconds. This defragmentation isn’t necessary because we keep large memory pools like nginx. Now we make sure it doesn’t happen, to the benefit of more consistent latency for all of our customers.
+
+Every Algolia application runs on a cluster of 3 machines for redundancy and increased throughput. Each indexing operation is replicated across the machines using a durable queue.
+
+Clusters can be mirrored to other global regions across Algolia’s Distributed Search Network (DSN). Global coverage is critical for delivering low latency to users coming from different continents. You can think of DSN like a CDN without caching - every query is running against a live, up-to-date copy of the index.
+
+When we release a new version of the code that powers the API, we do it in an incremental, cluster-aware way so we can rollback immediately if something goes wrong.
+
+Automated by a set of custom deployment scripts, the order of the rolling deploy looks like this:
+
+First, we test the new code with unit tests and functional tests on a host that with an exact production configuration. During the API deployment process we use a custom set of scripts to run the tests, but in other areas of our stack we’re using Travis CI.
+
+One thing we guard against is a network issue that produces a split-brain partition during a rolling deployment. Our deployment strategy considers every new version as unstable until it has consensus from every server, and it will continue to retry the deploy until the network partition heals.
+
+Before deployment begins, another process has encrypted our binaries and uploaded them to an S3 bucket. The S3 bucket sits behind CloudFlare to make downloading the binaries fast from anywhere.
+
+We use a custom shell script to do deployments. The script launches the new binaries and then checks to make sure that the new process is running. If it’s not, the script assumes that something has gone wrong and automatically rolls back to the previous version. Even if the previous version also can’t come up, we still won’t have a customer impact while we troubleshoot because the other machines in the cluster can still service requests.
+
+For a search engine, there are two basic dimensions of scaling:
+
+To increase your search capacity with Algolia, you can replicate your data to additional clusters using the point-and-click DSN feature. Once a new DSN cluster is provisioned and brought up-to-date with data, it will automatically begin to process queries.
+
+Today, Algolia customers who cannot fit on one cluster need to provision a separate cluster and create logic at the application layer to balance between them. This is often needed by SaaS companies who have customers growing at different rates, and sometimes one customer can be 10x or 100x compared to the others, so you need to move that customer to somewhere they can fit.
+
+Soon we’ll be releasing a feature that takes this complexity behind the API. Algolia will automatically balance data a customer’s available clusters based on a few key pieces of information. The way it works is similar to sharding but without the limitation of shards being pinned to a specific node. Shards can be moved between clusters dynamically. This avoids a very serious problem encountered by many search engines - if the original shard key guess was wrong, the entire cluster will have to be rebuilt down the road.
+
+Our humans and our bots congregate on Slack. Last year we had some growing pains, but now we have a prefix-based naming convention that works pretty well. Our channels are named , , , etc.. The channels are for members of a team, channels are for getting help from a team, and channels are for collecting automatic notifications.
+
+It would be hard to count the number of Zoom meetings we have on a given day. Our two main offices are in Paris and San Francisco, making 7am-10am PST the busiest time of day for video calls. We now have dedicated "Zoom Rooms" with iPads, high-resolution cameras and big TVs that make the experience really smooth. With new offices in New York and Atlanta, Zoom will become an even more important part of our collaboration stack which also includes Github, Trello and Asana.
+
+When you're an API, performance and scalability are customer-facing features. The work that our engineers do directly affects the 15,000+ developers that rely on our API. Being developers ourselves, we’re very passionate about open source and staying active with our community.
+
+We’re hiring! Come help us make building search a rewarding experience. Algolia teammates come from a diverse range of backgrounds and 15 different countries. Our values are Care, Humility, Trust, Candor and Grit. Employees are encouraged to travel to different offices - Paris, San Francisco, or now Atlanta - at least once a year, to build strong personal connections inside of the company.
+
+See our open positions on StackShare.
+
+Questions about our stack? We love to talk tech. Comment below or ask us on our Discourse forum.
+
+Thanks to Julien Lemoine, Adam Surak, Rémy-Christophe Schermesser, Jason Harris and Raphael Terrier for their much-appreciated help on this post.|||
+
+The tech stack behind Algolia

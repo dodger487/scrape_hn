@@ -1,0 +1,42 @@
+Let's look at some code and see why the driver didn't yet achieve this standard.
+
+Here is where the address family, either IPv4 or IPv6, is determined in the code that parses the MongoDB URI:
+
+You can see that if the driver finds any " " characters in the string it sets the family to IPv6, for which " " is a required component of an address. Otherwise it uses IPv4, where the “ ” is prohibited in both hostnames and addresses.
+
+Later, in a different function, in a different file, the address family is used for DNS resolution:
+
+As Alexey pointed out, this logic prevented us from translating a hostname like "example.com" into an IPv6 address. He submitted a one-line patch for the URI-parsing code:
+
+This change looked good to me: given a hostname, libmongoc should try to connect over IPv6, IPv4, or whatever gives us. Hannes, libmongoc's other maintainer, also reviewed the patch. It was simple and it passed our tests, so we accepted the change and decided to include it in our upcoming release, version 1.5.2.
+
+Just from looking at Alexey's patch, I might have realized that it had only accomplished half an improvement. It switched the address family from to , so now the driver would resolve a hostname to a list of IPv6 and IPv4 addresses. But, it did not try connecting to each address until one succeeded; it only tried the first. If the first address was IPv6 and the MongoDB server was only listening on IPv4, the whole procedure failed.
+
+I assumed that libmongoc already implemented a loop to try each address in turn, because my understanding of libmongoc was biased from time spent developing PyMongo's code. I knew that, from its early days, PyMongo implemented the following loop:
+
+PyMongo had "always" worked this way, as far as I knew. You passed it a hostname and PyMongo resolved it to a list of addresses, then tried to connect to each address until one succeeded. I imagined that libmongoc must, too.
+
+Imagining code is a necessary step when you take over a large project—you will never read all the code. But if you do not distinguish code you imagined from the code you've seen with your own eyes, then you become prone to making decisions without evidence. When I reviewed Alexey's patch, I only saw a few lines surrounding the change. I imagined that a loop similar to PyMongo's was in libmongoc, in a different function in another file, and in my complacency, I never verified that what I imagined was truly so.
+
+Maybe it's because we love technology so much, when many of us imagine a machine we assume each part of it has been fully and beautifully developed. William Gibson, a founding cyberpunk writer, said:|||
+
+On January 10, I released a badly broken version of the MongoDB C Driver, 
+libmongoc 1.5.2. For most users, that version could not connect to a server 
+at all! Luckily, in under 24 hours a developer reported the bug, I reverted 
+the mistake and released a fix. Although it was resolved before it did any 
+damage, this is among the most dramatic mistakes I've made since I switched 
+from the PyMongo team to libmongoc almost two years ago. My error stemmed 
+from three mistaken assumptions I've had ever since I changed projects. 
+What were they?
+
+Inception
+
+Here's how the story began. In December, a libmongoc user named Alexey 
+pointed out a longstanding limitation: it would only resolve hostnames to 
+IPv4 addresses. Even if IPv6 address records existed for a hostname, the 
+driver would not look them up -- when it called getaddrinfo on the hostname 
+to do the DNS resolution, it passed AF_INET as the address family, 
+precluding anything but IPv4. So if you passed the URI
+ mongodb://example.com, libmongoc resolved "example.com" to an IPv4 address 
+like 93.184.216.34 and tried to connect to it. If the connection timed out, 
+the driver gave up.

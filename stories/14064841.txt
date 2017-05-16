@@ -1,0 +1,48 @@
+In one of my early posts, I mentioned a status review we had with BillG for the DOS Lan Manager redirector (network filesystem).
+
+I also talked to Robert Scoble about this in the last of my Channel9 videos.  One thing that somehow got missed in both the original article (later updated) and the video was our reaction to Bill’s feedback.
+
+The simple answer is that we fixed the problem.  My team didn’t do much with the transports and network drivers (because they were out of our scope), but we were able to do something about the footprint of the redir.exe program (it was a T&SR application).
+
+When we were done with it, I managed to shrink the below 640K running size of redirector to 128 bytes in size, beyond which I couldn’t figure out how to go.
+
+The question that obviously comes up is: How did you manage to do that?  Raymond, please forgive me for what I’m about to disclose, for within this tale lie dragons.  This discussion is for historical purposes ONLY.  I don’t recommend it as a practice.
+
+The MS-DOS redirector was actually originally written as a part of the MSDOS.SYS (IBMDOS.COM) binary.  For obvious reasons (not every user in the world had a network card, especially in 1984), the redirector was split out from the DOS binary after the product shipped.  In fact, when I took over the redirector project, the binary used to link with hundreds of unresolved external symbol errors (because the redirector linked with some, but not all of the MS-DOS binaries).  One of the first things that I did while working on the project was to clean this up so that the redirector would cleanly link without relying on the MS-DOS objects.  But being a part of MS-DOS, it was written in “tiny” mode – the code and data were commingled internally.
+
+The first thing I did when trying to shrink the footprint of the redirector was to separate the code and data segments.  Today, this seems utterly obvious, but in 1986, it was a relatively radical idea, especially for real-mode software.  Once I had split the data and code, I was able to make the data segment relocatable.  This change was critical, because it enabled us to do a boatload of things to reduce our footprint.  One thing to keep in mind about the redirector was that even though the data (and eventually code) was relocatable, the motion wasn’t dynamic.
+
+The first thing I did was to lay the redirector’s code and data as follows:
+
+By laying out the code and data this way, I could slide the data over the initialization code after the initialization was done.  It wasn’t that much of a real savings, however, since the original redirector simply started the dynamic data at the start of the initialization code (and left it uninitialized).
+
+The next thing to do was to take advantage of a quirk in the 286 processor.  The 8086 could only address one megabyte of memory, all the memory above 640K was reserved for system ROMs. (A quick aside: DOS could (and did) take advantage of more than 640K of RAM – DOS could address up to 1M of RAM, all the processor could support if it wasn’t for the system ROMs.  In particular, there were several 3rd party memory cards that allowed mapping memory between 640K and 0xB0000, which was the start of video memory).  With the addition of the 286 processor, the machine could finally address more than 1M of RAM.  It turns out that if the machine had more than 640K of RAM, most systems mapped the memory above 640K to above 1M.  Unfortunately, there were a number ofapplications that depended on the fact that the 8086 could only address 1M of RAM, and performed arithmetic that assumed that physical address 0xFFFF0+0x30=0x000020.  To control this, the PC/AT and its successors defined a software controllable pin called the “A20 line” – if it was disabled , memory access between 1M and 1M+64K was redirected to 0, if it was enabled , then it was mapped to real memory.  This is really complicated, but the effect was that if you enabled the A20 line, an application could have access to 64K of additional memory that didn’t impact any running MS-DOS applications!  This 64K was known as the “High Memory Area”, or HMA.
+
+Because the powers that be knew that this would be a highly contentious piece of real estate (everyone would want to party on it), Microsoft (or Intel, or IBM, I’m not sure who) wrote a specification and a driver called HIMEM.SYS.  HIMEM.SYS’s purpose was to arbitrate access to that 64K chunk of RAM.
+
+Well, for the DOS Lanman redirector, we wanted to use that area, so if we were able to reserve the region via himem.sys, we moved the data (both dynamic and static) up to that memory.  On every entry to the redirector, we enabled the A20 line (via himem.sys), and on every exit, we disabled the A20 line.
+
+That saved about 30K of the 60K MS-DOS footprint, so far so good.
+
+The next step in the process was to remove our dependencies on himem.sys.  Around this time, Lotus, Intel and Microsoft had defined a specification for an expanded memory manager, known as LIM.  This allowed a 3rd party memory card to bank swap memory into the 0xA0000->0xFFFFF memory region.  Marlin Eller joined the team about that time, and he wrote the code to move the data segment for the DOS redirector into LIM (if himem.sys wasn’t available, and LIM was).  After finishing that work, he moved on to other projects within Microsoft.  That’s where things stood for Lan Manager 1.5, the data had been removed, but nothing else.  A HUGE improvement, but we weren’t satisfied.
+
+So far, we were just moving the data around, we hadn’t done anything to deal with the 30K or so of code.
+
+The next thing we did was to split the redirector up still further:
+
+We added a low code and data segment.  The “low” code segment contained all the external hooks into the redirector (interrupt handlers, etc), and code to enable the HMA and LIM segments.  We then moved the data into LIM memory, and the code into the HMA.  This was a bit trickier, but we managed.
+
+So we now had a low code segment that was about 2K or so, and the code and data was moved up out of the 640K boundary.  Normally, I’d be satisfied with this, but I love a challenge.
+
+The next step was to look long and hard at the low code.  It turns out that most of the low code didn’t really NEED to be low, it was just convenient.  Since the code had been moved into the HMA, all I needed to do was to have a low-memory stub with enough code to enable the HMA, and dispatch to the corresponding function in high memory.
+
+The other thing I realized was that the MS-DOS PSP (Program Segment Prefix, the equivalent of a task in MS-DOS) contained 128 bytes of OS stuff, and 128 bytes of command line (this is where Raymond starts cringing).  Since the redirector didn’t use the command line, I figured I could re-use that 128 bytes of memory for my stub to enable the high memory area.  And that’s what I did – I used the 128ish bytes of command line to hold the interrupt dispatch routines for all the entrypoints to the redirector (there were about 4 of them), and pointers to the corresponding routines in the high memory area, and the code to enable (and disable) the HMA.
+
+And voila, I had a 0 footprint redirector.  The only negative that came from this was that applications that enumerated the “running” processes didn’t handle the “code-in-the-command-line” thing.
+
+Btw, the work I did here was pretty much totally clean.  I used the linker to define the segments that were relocated, I didn’t do any of the other sleazy things that MS-DOS programmers did to make their code small (like combining multiple instructions together relying on the relative offset of a jump instruction to form the first byte of a different instruction).  It was actually a pretty cool piece of work.
+
+Oh, and this description doesn’t really give the full flavor of what had to be done to get this to work.  A simple example: Because I had to handle moving the data over the code that was performing the move – that meant that I need to first move the initialization code out of the way (past the end of the data), jump to the moved initialization code, move the data over the original initialization code, then terminate the application.
+
+But we eventually (for Lan Manager 2.2) had a 0 footprint redirector.  It took some time, and it didn’t work for every configuration, but we DID make it work.|||
+

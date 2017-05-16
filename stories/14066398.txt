@@ -1,0 +1,76 @@
+At the GTK hackfest in London (which accidentally became mostly a Flatpak hackfest) I've mainly been looking into how to make D-Bus work better for app container technologies like Flatpak and Snap.
+
+The initial motivating use cases are:
+
+At the moment, Flatpak runs a D-Bus proxy for each app instance that has access to D-Bus, connects to the appropriate bus on the app's behalf, and passes messages through. That proxy is in a container similar to the actual app instance, but not actually the same container; it is trusted to not pass messages through that it shouldn't pass through. The app-identification mechanism works in practice, but is Flatpak-specific, and has a known race condition due to process ID reuse and limitations in the metadata that the Linux kernel maintains for sockets. In practice the use of X11 rather than Wayland in current systems is a much larger loophole in the container than this race condition, but we want to do better in future.
+
+Meanwhile, Snap does its sandboxing with AppArmor, on kernels where it is enabled both at compile-time (Ubuntu, openSUSE, Debian, Debian derivatives like Tails) and at runtime (Ubuntu, openSUSE and Tails, but not Debian by default). Ubuntu's kernel has extra AppArmor features that haven't yet gone upstream, some of which provide reliable app identification via LSM labels, which can learn by querying its socket. However, other kernels like the ones in openSUSE and Debian don't have those. The access-control (AppArmor mediation) is implemented in upstream dbus-daemon, but again doesn't work portably, and is not sufficiently fine-grained or flexible to do some of the things we'll likely want to do, particularly in dconf.
+
+After a lot of discussion with dconf maintainer Allison Lortie and Flatpak maintainer Alexander Larsson, I think I have a plan for fixing this.
+
+This is all subject to change: see fd.o #100344 for the latest ideas.
+
+Each user (uid) has some uncontained processes, plus 0 or more containers.
+
+The uncontained processes include dbus-daemon itself, desktop environment components such as gnome-session and gnome-shell, the container managers like Flatpak and Snap, and so on. They have the user's full privileges, and in particular they are allowed to do privileged things on the user's session bus (like running ), and act with the user's full privileges on the system bus. In generic information security jargon, they are the trusted computing base; in AppArmor jargon, they are unconfined.
+
+The containers are Flatpak apps, or Snap apps, or other app-container technologies like Firejail and AppImage (if they adopt this mechanism, which I hope they will), or even a mixture (different app-container technologies can coexist on a single system). They are containers (or container instances) and not "apps", because in principle, you could install 1.0, run it, and while it's still running, upgrade to 2.0 and run that; you'd have two containers for the same app, perhaps with different permissions.
+
+Each container has an container type, which is a reversed DNS name like or representing the container technology, and an app identifier, an arbitrary non-empty string whose meaning is defined by the container technology. For Flatpak, that string would be another reversed DNS name like ; for Snap, as far as I can tell it would look like .
+
+The container technology can also put arbitrary metadata on the D-Bus representation of a container, again defined and namespaced by the container technology. For instance, Flatpak would use some serialization of the same fields that go in the Flatpak metadata file at the moment.
+
+Finally, the container has an opaque container identifier identifying a particular container instance. For example, launching twice (maybe different versions or with different command-line options to ) might result in two containers with different privileges, so they need to have different container identifiers.
+
+App-container managers like Flatpak and Snap would create an socket inside the container, it to an address that will be made available to the contained processes, and , but not any new connections. Instead, they would fd-pass the new socket to the dbus-daemon by calling a new method, and the dbus-daemon would proceed to connections after the app-container manager has signalled that it has called both and . (See fd.o #100344 for full details.)
+
+Processes inside the container must not be allowed to contact the socket used by the wider, uncontained system - if they could, the dbus-daemon wouldn't be able to distinguish between them and uncontained processes and we'd be back where we started. Instead, they should have the new socket bind-mounted into their container's and connect to that, or have the new socket set as their and be prevented from connecting to the uncontained socket in some other way. Those familiar with the kdbus proposals a while ago might recognise this as being quite similar to kdbus' concept of endpoints, and I'm considering reusing that name.
+
+Along with the socket, the container manager would pass in the container's identity and metadata, and the method would return a unique, opaque identifier for this particular container instance. The basic fields (container technology, technology-specific app ID, container ID) should probably be added to the result of , and there should be a new API call to get all of those plus the arbitrary technology-specific metadata.
+
+When a process from a container connects to the contained server socket, every message that it sends should also have the container instance ID in a new header field. This is OK even though dbus-daemon does not (in general) forbid sender-specified future header fields, because any dbus-daemon that supported this new feature would guarantee to set that header field correctly, the existing Flatpak D-Bus proxy already filters out unknown header fields, and adding this header field is only ever a reduction in privilege.
+
+The reasoning for using the sender's container instance ID (as opposed to the sender's unique name) is for services like dconf to be able to treat multiple unique bus names as belonging to the same equivalence class of contained processes: instead of having to look up the container metadata once per unique name, dconf can look it up once per container instance the first time it sees a new identifier in a header field. For the second and subsequent unique names in the container, dconf can know that the container metadata and permissions are identical to the one it already saw.
+
+In principle, we could have the new identification feature without adding any new access control, by keeping Flatpak's proxies. However, in the short term that would mean we'd be adding new API to set up a socket for a container without any access control, and having to keep the proxies anyway, which doesn't seem great; in the longer term, I think we'd find ourselves adding a second new API to set up a socket for a container with new access control. So we might as well bite the bullet and go for the version with access control immediately.
+
+In principle, we could also avoid the need for new access control by ensuring that each service that will serve contained clients does its own. However, that makes it really hard to send broadcasts and not have them unintentionally leak information to contained clients - we would need to do something more like kdbus' approach to multicast, where services know who has subscribed to their multicast signals, and that is just not how dbus-daemon works at the moment. If we're going to have access control for broadcasts, it might as well also cover unicast.
+
+The plan is that messages from containers to the outside world will be mediated by a new access control mechanism, in parallel with dbus-daemon's current support for firewall-style rules in the XML bus configuration, AppArmor mediation, and SELinux mediation. A message would only be allowed through if the XML configuration, the new container access control mechanism, and the LSM (if any) all agree it should be allowed.
+
+By default, processes in a container can send broadcast signals, and send method calls and unicast signals to other processes in the same container. They can also receive method calls from outside the container (so that interfaces like can work), and send exactly one reply to each of those method calls. They cannot own bus names, communicate with other containers, or send file descriptors (which reduces the scope for denial of service).
+
+Obviously, that's not going to be enough for a lot of contained apps, so we need a way to add more access. I'm intending this to be purely additive (start by denying everything except what is always allowed, then add new rules), not a mixture of adding and removing access like the current XML policy language.
+
+There are two ways we've identified for rules to be added:
+
+Initially, many contained apps would work in the first way (and in particular would add a rule that allows almost everything), while over time we'll probably want to head towards recommending more use of the second.
+
+We talked about the possibility of using a very similar ruleset to control access to the system bus, as an alternative to the XML rules found in and . We didn't really come to a conclusion here.
+
+Allison had the useful insight that the XML rules are acting like a firewall: they're something that is placed in front of potentially-broken services, and not part of the services themselves (which, as with firewalls like ufw, makes it seem rather odd when the services themselves install rules). D-Bus system services already have total control over what requests they will accept from D-Bus peers, and if they rely on the XML rules to mediate that access, they're essentially rejecting that responsibility and hoping the dbus-daemon will protect them. The D-Bus maintainers would much prefer it if system services took responsibility for their own access control (with or without using polkit), because fundamentally the system service is always going to understand its domain and its intended security model better than the dbus-daemon can.
+
+Analogously, when a network service listens on all addresses and accepts requests from elsewhere on the LAN, we sometimes work around that by protecting it with a firewall, but the optimal resolution is to get that network service fixed to do proper authentication and access control instead.
+
+For system services, we continue to recommend essentially this "firewall" configuration, filling in the variables as appropriate:
+
+We discussed the possibility of moving towards a model where the daemon uid to be allowed is written in the file, together with an opt-in to "modern D-Bus access control" that makes the "firewall" unnecessary; after some flag day when all significant system services follow that pattern, dbus-daemon would even have the option of no longer applying the "firewall" (moving to an allow-by-default model) and just refusing to activate system services that have not opted in to being safe to use without it. However, the "firewall" also protects system bus clients, and services like Avahi that are not bus-activatable, against unintended access, which is harder to solve via that approach; so this is going to take more thought.
+
+For system services' clients that follow the "agent" pattern (BlueZ, polkit, NetworkManager, Geoclue), the correct "firewall" configuration is more complicated. At some point I'll try to write up a best-practice for these.
+
+At the moment, it's harder than it needs to be to provide non-trivial access control on the system bus, because on receiving a method call, a service has to remember what was in the method call, then call to find out who sent it, then only process the actual request when it has the information necessary to do access control.
+
+Allison and I had hoped to resolve this by adding new D-Bus message header fields with the user ID, the LSM label, and other interesting facts for access control. These could be "opt-in" to avoid increasing message sizes for no reason: in particular, it is not typically useful for session services to receive the user ID, because only one user ID is allowed to connect to the session bus anyway.
+
+Unfortunately, the dbus-daemon currently lets unknown fields through without modification. With hindsight this seems an unwise design choice, because header fields are a finite resource (there are 255 possible header fields) and are defined by the D-Bus Specification. The only field that can currently be trusted is the sender's unique name, because the dbus-daemon sets that field, overwriting the value in the original message (if any).
+
+To make it safe to rely on the new fields, we would have to make the dbus-daemon filter out all unknown header fields, and introduce a mechanism for the service to check (during connection to the bus) whether the dbus-daemon is sufficiently new that it does so. If connected to an older dbus-daemon, the service would not be able to rely on the new fields being true, so it would have to ignore the new fields and treat them as unset. The specification is sufficiently vague that making new dbus-daemons filter out unknown header fields is a valid change (it just says that "Header fields with an unknown or unexpected field code must be ignored", without specifying who must ignore them, so having the dbus-daemon delete those fields seems spec-compliant).
+
+This all seemed fine when we discussed it in person; but GDBus already has accessors for arbitrary header fields by numeric ID, and I'm concerned that this might mean it's too easy for a system service to be accidentally insecure: It would be natural (but wrong!) for an implementor to assume that if returned non- , then that was guaranteed to be the correct, valid sender uid. As a result, fd.o #100317 might have to be abandoned. I think more thought is needed on that one.
+
+As happens at any good meeting, we took the opportunity of high-bandwidth discussion to cover many useful things and several useless ones. Other discussions that I got into during the hackfest included, in no particular order:
+
+More notes are available from the GNOME wiki.
+
+The GTK hackfest was organised by GNOME and hosted by Red Hat and Endless. My attendance was sponsored by Collabora. Thanks to all the sponsors and organisers, and the developers and organisations who attended.|||
+

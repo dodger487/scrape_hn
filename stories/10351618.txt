@@ -1,0 +1,43 @@
+Atomic read-modify-write operations – or “RMWs” – are more sophisticated than atomic loads and stores. They let you read from a variable in shared memory and simultaneously write a different value in its place. In the C++11 atomic library, all of the following functions perform an RMW:
+
+, for example, reads from a shared variable, adds another value to it, and writes the result back – all in one indivisible step. You can accomplish the same thing using a mutex, but a mutex-based version wouldn’t be lock-free. RMW operations, on the other hand, are designed to be lock-free. They’ll take advantage of lock-free CPU instructions whenever possible, such as / on ARMv7.
+
+A novice programmer might look at the above list of functions and ask, “Why does C++11 offer so few RMW operations? Why is there an atomic , but no atomic , no and no ?” There are two reasons:
+
+Out of all the available RMW operations in C++11, the only one that is absolutely essential is . Every other RMW operation can be implemented using that one. It takes a minimum of two arguments:
+
+This function attempts to store the value to , but only if the current value of matches . It returns if successful. If it fails, it loads the current value of back into , which despite its name, is an in/out parameter. This is called a compare-and-swap operation, and it all happens in one atomic, indivisible step.
+
+So, suppose you really need an atomic operation, though I can’t imagine why. Here’s one way to implement it:
+
+This is known as a compare-and-swap loop, or CAS loop. The function repeatedly tries to exchange with until it succeeds. If no concurrent modifications happen in other threads, will usually succeed on the first try. On the other hand, if is concurrently modified by another thread, it’s totally possible for its value to change between the call to and the call to , causing the compare-and-swap operation to fail. In that case, will be updated with the most recent value of , and the loop will try again.
+
+The above implementation of is both atomic and lock-free. It’s atomic even though the CAS loop may take an indeterminate number of tries, because when the loop finally does modify it does so atomically. It’s lock-free because if a single iteration of the CAS loop fails, it’s usually because some other thread modified successfully. That last statement hinges on the assumption that actually compiles to lock-free machine code – more on that below. It also ignores the fact that can fail spuriously on certain platforms, but that’s a rare event.
+
+just replaces the value of with a multiple of the same value. What if we want to perform a more elaborate kind of RMW? Can we still make the operation atomic and lock-free? Sure we can. To offer a somewhat convoluted example, here’s a function that loads a shared variable, decrements the value if odd, divides it in half if even, and stores the result back only if it’s greater than or equal to 10, all in a single atomic, lock-free operation:
+
+It’s the same idea as before: If fails – usually due to a modification performed by another thread – is updated with a more recent value, and the loop tries again. If, during any attempt, we find that is less than 10, the CAS loop terminates early, effectively turning the RMW operation into a no-op.
+
+The point is that you can put anything inside the CAS loop. Think of the body of the CAS loop as a critical section. Normally, we protect a critical section using a mutex. With a CAS loop, we simply retry the entire transaction until it succeeds.
+
+This is obviously a synthetic example. A more practical example can be seen in the class described in my earlier post about semaphores. It uses a CAS loop with multiple steps to atomically increment a shared variable up to a limit of 1.
+
+So far, we’ve only looked at examples that perform an atomic operation on a single shared variable. What if we want to perform an atomic operation on multiple variables? Normally, we’d protect those variables using a mutex:
+
+This mutex-based approach is atomic, but obviously not lock-free. That may very well be good enough, but for the sake of illustration, let’s go ahead and convert it to a CAS loop just like the other examples. is a template, so we can actually pack both shared variables into a and apply the same pattern as before:
+
+Is this operation lock-free? Now we’re venturing into dicey territory. As I wrote at the start, C++11 atomic operations are designed take advantage of lock-free CPU instructions “whenever possible” – admittedly a loose definition. In this case, we’ve wrapped around a struct, . Let’s see how GCC 4.9.2 compiles it for x64:
+
+We got lucky. The compiler was clever enough to see that fits inside a single 64-bit register, and implemented using . The compiled code is lock-free.
+
+This brings up an interesting point: In general, the C++11 standard does not guarantee that atomic operations will be lock-free. There are simply too many CPU architectures to support and too many ways to specialize the template. You need to check with your compiler to make absolutely sure. In practice, though, it’s pretty safe to assume that atomic operations are lock-free when all of the following conditions are true:
+
+As a personal preference, I like to hang my hat on that third point, and limit myself to specializations of the template that use explicit integer or pointer types. The safe bitfield technique I described in the previous post gives us a convenient way to rewrite the above function using an explicit integer specialization, :
+
+Some real-world examples where we pack several values into an atomic bitfield include:
+
+In general, any time you have a small amount of data protected by a mutex, and you can pack that data entirely into a 32- or 64-bit integer type, you can always convert your mutex-based operations into lock-free RMW operations, no matter what those operations actually do! That’s the principle I exploited in my Semaphores are Surprisingly Versatile post, to implement a bunch of lightweight synchronization primitives.
+
+Of course, this technique is not unique to the C++11 atomic library. I’m just using C++11 atomics because they’re quite widely available now, and compiler support is pretty good. You can implement a custom RMW operation using any library that exposes a compare-and-swap function, such as Win32, the Mach kernel API, the Linux kernel API, GCC atomic builtins or Mintomic. In the interest of brevity, I didn’t discuss memory ordering concerns in this post, but it’s critical to consider the guarantees made by your atomic library. In particular, if your custom RMW operation is intended to pass non-atomic information between threads, then at a minimum, you should ensure that there is the equivalent of a synchronizes-with relationship somewhere.|||
+
+Atomic read-modify-write operations – or “RMWs” – are more sophisticated than atomic loads and stores. They let you read from …

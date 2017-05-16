@@ -1,0 +1,46 @@
+We write a lot of C++ here at OkCupid. It's pretty great, except when it's really not. I've been evaluating Rust as another potential language for our Backend Team. It seems to fit in quite nicely with a lot of our existing code base and I like a lot of the benefits and guarantees that come with Rust.
+
+OkCupid also happens to have a lot of custom infrastructure that has been developed over the last decade. I've been doing a moderate amount of soul searching about the best way to pay down tech debt without impacting our internal velocity (and ideally increasing it). Rust is unique among the new "modern languages" where it would allow us to keep writing high performance code and still easily keep the good parts of our stack.
+
+Before I go crazy and re-write everything in Rust, there are a few missing components that are needed to make Rust a first-class citizen in our custom software ecosystem. The biggest blocker is the RPC system. OkCupid has a decently service oriented architecture with our webservers making RPC calls to our "rpc server tier". This gets us some light security guarantees and serves as a useful heuristic for separation of responsibilities. To make Rust a first class citizen, it needs to speak our RPC protocol.
+
+We use XDR - RFC 4506 and RPCv2 - RFC 1831 to communicate between our servers. XDR/RPC is a fairly basic RPC implementation. It has a well defined language-independent specification file and a very simple wire protocol. It might not be the best RPC protocol out there, but the simplicity makes it a tractable project for a Hackweek.
+
+I had to convert XDR definitions code that looks like this:
+
+Into Rust code that looks like this:
+
+See those , traits? Over the wire, those should make the code look like this
+
+which really also needs to be able to as well. It also needs to speak the exact same wire protocol that the rest of our services do. We have some in-house modifications, such as prepending the length of the XDR message for easier framing (at least, that's what I assume, the person who wrote our XDR implementation is long gone). There isn't much point to an RPC protocol that can't talk to other things.
+
+It's worth pointing out right now that XDR is not a self describing protocol. You can't take arbitrary XDR and know what it represents; it's a fairly naive binary protocol. Those bits have to parsed by a function that knows the type of its output. This will be important later on.
+
+I used Nom, which is a fantastic Rust parser combinators library. I had a lot of fun doing this, since this was my first time using parser combinators as opposed to parser generators. Nom is a great example of how Rust macros can be used to construct simple DSLs.
+
+This is a series of parsers that combine to build the AST Token. It's a technique that I found very modular and easy to reason about. It also allowed me to work on the parser piecemeal, so that I could work on other steps at the same time. It is far more rewarding to see code be generated than a parse tree.
+
+The code generator is essentially a large matching statement. There are only so many valid token patterns in XDR. Based on that, I wrote the generated Rust at a lexical level. I started off using Aster, which seems to be the canonical way to manipulate syntax trees in Rust. After futzing around with it, I decided hand-rolling a Rust templating solution would be easier (Hackweek, remember?). XDR has a limited amount of things it can express and hand-rolling allowed for far faster iteration on the project as a whole.
+
+Translation from XDR to Rust was fairly easy with the exception of how XDR nests data structures within each other. Working around this involved a mechanism for hoisting chunks of the AST to the top-level. I also needed to make everything "Rusty". Rust is quite opinionated about how to name types and variables, so I needed to alter the identifiers. OkCupid also has the annoying style throughout our codebase, which I special-cased to make
+
+Serde is the star here. Serde leverages Rust's traits and procedural macros to avoid runtime reflection. You define how you want to serialize and deserialize for certain types and data structures.
+
+This is also the first time I really hit upon a impedance mismatch between Rust and XDR.
+
+XDR has both an and that map to the Rust concept of an . The is used as a switch statement, the is used as a C-style enum. The type uses the as the discriminant. As I pointed out earlier, XDR isn't self-describing, so when attempting to de-serialize discriminant unions, the types need to known beforehand. This doesn't work well in the generated Rust code, because Rust sees these as different types. I had to use Serde's annotation capabilities to inject extra information. Disappointingly, this does mean that you can't send arbitrary Rust - you need to have properly codegen'd it from a valid XDR definition file.
+
+Serializing the Rust as an integer requires the macro to expand out the custom (de-)serialization traits. Between this and the annotation, it's very easy to tell which XDR data structure the Rust code came from.
+
+All I have done up until now is get Rust to understand the wire protocol for XDR, nothing about services. The RPC protocol is defined in the spec in XDR - which I can now convert into Rust! The above code snippets are output from that. I, with the help of Brendon Scheinman, took this a step further and made it so we could codegen all the boiler plate for a service. A properly defined XDR file now can be converted directly into a service.
+
+We decided to build these services on top of tokio which is the networking stack that the Rust community is converging around. Tokio is quite complex and gives you lots of flexibility to work at different levels of the stack. However, it is not always the easiest to work with... especially when you are attempting to automatically generate the code. It heavily leverages the futures-rs library which is amazing, but like all async programming, has it's own amount of cognitive overhead. We walked away from these libraries very satisfied with them and intending to continue using them, but they both have steep non-trivial learning curves.
+
+The code generator takes the definition and generates all the code to decode the bits on the wire and dispatch them to the right functions. We currently assume that every service has a MySql DB connection. We also assume a fairly simple call/response pattern, which several of our services have. As I try to write more services in Rust, I'll probably refactor this pattern somewhat to take into account other communication interfaces such as PubSub.
+
+I am pretty proud of this week of work. Brendon and I just barely finished a functioning replacement to one of our simpler services in time for our internal demo presentations. Our demo may have been boring to watch (we really should have had some flashy graphics...), but it was a lot of fun to implement. Rust is a joy to write. I've found that it feels faster to develop in compared to C++, with no negative trade offs. Building this was one the last hurdles to us using Rust in production.
+
+The code is on Github. Remember, the library started life as a hackweek project. There are currently some rough edges, both known and unknown.
+
+Thanks go out to Brendon for contributing heavily to the Service Generation segment of this project and everyone in the office for dealing with my unabashed enthusiasm over the course of the hackweek.|||
+

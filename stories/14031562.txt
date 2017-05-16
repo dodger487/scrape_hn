@@ -1,0 +1,76 @@
+In this article we will show you how Rails 5.0.0 ActionCable applications on Puma, the new default Rails app server, might be exposed to denial of service by slow clients. We will be using the OS X network shaping tools to simulate an attack, revealing the vulnerability.
+
+In our previous ActionCable article we talked about how we stress tested ActionCable and found and solved a couple of issues. Those issues have since been fixed and the fixes have been merged into Rails. In this article we report on another issue that we have found as a result of our stress testing efforts.
+
+A fix for the issue we found was merged into Rails a couple of months ago and was recently released as part of Rails 5.0.1. Passenger users have never been affected by this issue.
+
+The next few paragraphs will explain the basic theory and implications of slow clients. If you are already familiar with the slow client problem and how it is mitigated you can skip this section and scroll down to "Testing whether ActionCable is protected against slow clients". In that section we explain how we simulated an attack against Rails on both Puma and Passenger and found that applications on just Puma are vulnerable to DoS by slow clients.
+
+Slow clients are users of your web application that are on an internet connection that has low bandwidth. They might be connecting with their cell phone, or from a remote location or from an area that simply has bad internet connectivity. They might also be malicious attackers who deliberately limit their bandwidth to bring down your application.
+
+There are two aspects of slow clients that can block your application. Both have to be dealt with in order to ensure reliable service; not just to the slow clients, but to all users of your application, slow or fast. Slow clients send their data slowly, and they receive their data slowly.
+
+This means that in a naively written web application a thread or process that is servicing a request might spend seconds or even minutes receiving data, before it even has a chance to perform business logic or query a database. Then when it has finished building its response it might spend seconds or minutes again sending that response to the client.
+
+Most Ruby application servers utilize a synchronous request/response I/O model with multiple worker processes and/or worker threads, so they are (partially) susceptible to this issue.
+
+A worst-case scenario looks like this: imagine that your application server is configured to have 100 worker processes, designed to process thousands of requests per second. Now imagine a single attacker. Sending just a hundred severely bandwidth limited requests. As each of your 100 worker processes encounters a request from the attacker it is delayed for minutes, causing other requests to queue up.
+
+Eventually all your processes will be busy taking minutes servicing just a single attacker request, and tens of thousands requests are queued up or dropped. A more persistent attacker might delay your application indefinitely using only minimal resources.
+
+Threads mitigate this problem somewhat, as they are much less costly than processes, and so you can have more of them, but the basic problem still remains. The attacker will simply have to perform more of those cheap slow requests.
+
+In practice, Ruby application servers are already well-protected against slow clients on the receiving side by using an evented I/O buffering system that can handle a much larger I/O concurrency.
+
+How do various Ruby application servers utilize an evented I/O buffering system?
+
+Nginx as a buffering reverse proxy has one weakness: it must receive the entire request from the client before it forwards the request to the application, and it must receive the entire response from the application before it sends any data to the client. This is normally not a problem, but it is a problem in combination with WebSockets. WebSocket frames must be immediately received from and sent to the client; otherwise it defeats the purpose of WebSockets.
+
+This means that in order to make WebSockets (and ActionCable, which is based on WebSockets) work, Nginx’s I/O buffering system -- and thus slow client protection by Nginx -- must be disabled. ActionCable tries to mitigate this problem somewhat by providing its own evented I/O multiplexer for incoming WebSocket data. This means that ActionCable protects against slowly-sending WebSocket clients, but not against slowly-receiving WebSocket clients.
+
+In the next sections we’ll provide a practical example of this problem. We will also show that Passenger does not suffer from this problem at all because it is capable of buffering I/O and immediately sending data to clients. Thus Passenger is capable of protecting the application against slowly-receiving and slowly-sending WebSocket clients.
+
+With the theory out of the way it is time to move on to the practical consequences. To ascertain whether a Rails application might be vulnerable to slow client attacks we have built a small application that sends a steady stream of data to any connected clients using ActionCable.
+
+Running this application and connecting four clients will result in the above image. Each of the clients reports their current delay. On an old MacBook that is about 10 milliseconds on average. Note that this delay includes some things like rendering and parsing the JSON objects, which are quite large for the purposes of this test, a normal application will have much smaller response times.
+
+As we have established that the application is functioning correctly we can move on to the test conditions. To establish that there is a slow client problem we introduce a slow client and observe the response times in the other (fast) clients. If they remain the same or are minimally impacted we have not shown a problem. If they change and are significantly impacted we can conclude there is in fact a slow client problem.
+
+Since we do not have a 56k modem lying around and internet connections in The Netherlands are “unfortunately" very fast, we will have to simulate the network conditions of the slow client. Most modern operating systems come with tools for this, on OS X we can use .
+
+First, we have to see whether is currently enabled by running:
+
+If it is not then it can be enabled by running:
+
+The next step is to create a dummynet like so:
+
+This extends the existing with the dummynet and then instructs to use that configuration. If at any time you want to roll back to the original configuration you can issue the following two commands:
+
+Then we find out which connection we would like to throttle. In this example the clients are 4 instances of Chrome connected to our web server at port 3000, so we issue the following command to find out their outgoing port number:
+
+This yields the port numbers we need, we pick one of them (in this example it is 58983) and insert that into the following instruction:
+
+Now all data from that port is routed through the dummy network. The last step is to reduce the flow of traffic:
+
+The effect should be immediate for the affected client, its delay should rise to multiple seconds.
+
+First we start the Rails application using the default server, which used to be WEBrick but is now the more production suitable Puma web server, like so:
+
+Introduction of the slow client did not only result in an increased delay in that client but also in all of its peers. This means that it is vulnerable to the slow client problem, and as such is not suitable for exposing WebSockets directly to the internet without a protective reverse proxy. Unfortunately the most recommended reverse proxy, Nginx, does not offer this protection, as explained under “The special problem of traditional slow client mitigation in combination with WebSockets".
+
+Starting the Rails application using Passenger and introducing a slow client does not result in a situation where all clients are affected by that slow client. This means that exposing a Passenger web server to the internet is safe in this regard, even without a buffering reverse proxy.
+
+To deal with slow clients Passenger puts a buffer between the application and the network. The buffer accepts data from the application immediately, storing it in memory or on the disk if the client can not receive the data fast enough. This enables the application to function as if it has a super fast client.
+
+Because Passenger has an internal evented I/O architecture it does not have to dedicate threads or processes to the data streams filling these buffers. That means there's little overhead per connection allowing it to deal with many slow clients without a problem. Additionally while Passenger buffers it also sends the data to the client immediately so there is no delay perceived by the client.
+
+We conducted an experiment by building a small demo application; and by using network traffic shaping, simulated the effects of slow clients the reliability of an ActionCable server. As a result of this experiment we concluded that an ActionCable application served by Puma is at risk of denial-of-service by slow clients that take up costly worker processes and threads.
+
+The same application served by Passenger is not affected by slow clients as Passenger buffers outgoing data. Using Nginx as a reverse proxy in front of Puma does not solve this problem as Nginx’s buffering system is not compatible with WebSockets.
+
+The issue was reported to the Puma and Rails teams, who responded by building a response buffer into Rails. This patch was merged and was recently released with Rails 5.0.1.
+
+Passenger ensures that your Ruby, Python, Node.js and Meteor apps, microservices, and APIs are served with outstanding reliability, performance and control. For additional features and premium support, check out the enterprise edition.
+
+Union Station is Phusion's brand new take on Passenger application monitoring and analytics. Union Station aims to help you easily find performance bottlenecks and errors in your application and to help you fix them. Sign up for a free trial today!|||
+

@@ -1,0 +1,91 @@
+Numerical optimization is at the core of much of machine learning. Once you’ve defined your model and have a dataset ready, estimating the parameters of your model typically boils down to minimizing some multivariate function $f(x)$, where the input $x$ is in some high-dimensional space and corresponds to model parameters. In other words, if you solve:
+
+then $x^*$ is the ‘best’ choice for model parameters according to how you’ve set your objective.
+
+In this post, I’ll focus on the motivation for the L-BFGS algorithm for unconstrained function minimization, which is very popular for ML problems where ‘batch’ optimization makes sense. For larger problems, online methods based around stochastic gradient descent have gained popularity, since they require fewer passes over data to converge. In a later post, I might cover some of these techniques, including my personal favorite AdaDelta.
+
+Note: Throughout the post, I’ll assume you remember multivariable calculus. So if you don’t recall what a gradient or Hessian is, you’ll want to bone up first.
+
+Most numerical optimization procedures are iterative algorithms which consider a sequence of ‘guesses’ $x_n$ which ultimately converge to $x^*$ the true global minimizer of $f$. Suppose, we have an estimate $x_n$ and we want our next estimate $x_{n+1}$ to have the property that .
+
+Newton’s method is centered around a quadratic approximation of $f$ for points near $x_n$. Assuming that $f$ is twice-differentiable, we can use a quadratic approximation of $f$ for points ‘near’ a fixed point $x$ using a Taylor expansion:
+
+where $
+
+abla f(x)$ and $
+
+abla^2 f(x)$ are the gradient and Hessian of $f$ at the point $x_n$. This approximation holds in the limit as $|| \Delta x || \rightarrow 0$. This is a generalization of the single-dimensional Taylor polynomial expansion you might remember from Calculus.
+
+In order to simplify much of the notation, we’re going to think of our iterative algorithm of producing a sequence of such quadratic approximations $h_n$. Without loss of generality, we can write and re-write the above equation,
+
+where $\grad_n$ and $\hessian_n$ represent the gradient and Hessian of $f$ at $x_n$.
+
+We want to choose $\Delta x$ to minimize this local quadratic approximation of $f$ at $x_n$. Differentiating with respect to $\Delta x$ above yields:
+
+Recall that any $\Delta x$ which yields $\frac{\partial h_n(\Delta x)}{\partial \Delta x} = 0$ is a local extrema of $h_n(\cdot)$. If we assume that $\hessian_n$ is [postive definite] (psd) then we know this $\Delta x$ is also a global minimum for $h_n(\cdot)$. Solving for $\Delta x$:
+
+This suggests $\invhessian_n \grad_n$ as a good direction to move $x_n$ towards. In practice, we set for a value of $\alpha$ where $f(x_{n+1})$ is ‘sufficiently’ smaller than $f(x_n)$.
+
+The above suggests an iterative algorithm:
+
+The computation of the $\alpha$ step-size can use any number of line search algorithms. The simplest of these is backtracking line search, where you simply try smaller and smaller values of $\alpha$ until the function value is ‘small enough’.
+
+In terms of software engineering, we can treat $\mathbf{NewtonRaphson}$ as a blackbox for any twice-differentiable function which satisfies the Java interface:
+
+With quite a bit of tedious math, you can prove that for a convex function, the above procedure will converge to a unique global minimizer $x^*$, regardless of the choice of $x_0$. For non-convex functions that arise in ML (almost all latent variable models or deep nets), the procedure still works but is only guranteed to converge to a local minimum. In practice, for non-convex optimization, users need to pay more attention to initialization and other algorithm details.
+
+The central issue with $\mathbf{NewtonRaphson}$ is that we need to be able to compute the inverse Hessian matrix. Note that for ML applications, the dimensionality of the input to $f$ typically corresponds to model parameters. It’s not unusual to have hundreds of millions of parameters or in some vision applications even billions of parameters. For these reasons, computing the hessian or its inverse is often impractical. For many functions, the hessian may not even be analytically computable, let along representable.
+
+Because of these reasons, $\mathbf{NewtonRaphson}$ is rarely used in practice to optimize functions corresponding to large problems. Luckily, the above algorithm can still work even if $\invhessian_n$ doesn’t correspond to the exact inverse hessian at $x_n$, but is instead a good approximation.
+
+Suppose that instead of requiring $\invhessian_n$ be the inverse hessian at $x_n$, we think of it as an approximation of this information. We can generalize $\mathbf{NewtonRaphson}$ to take a $\mbox{QuasiUpdate}$ policy which is responsible for producing a sequence of $\invhessian_n$.
+
+We’ve assumed that $\mbox{QuasiUpdate}$ only requires the former inverse hessian estimate as well tas the input and gradient differences ($s_n$ and $y_n$ respectively). Note that if $\mbox{QuasiUpdate}$ just returns $
+
+abla^2 f(x_{n+1})$, we recover exact $\mbox{NewtonRaphson}$.
+
+In terms of software, we can blackbox optimize an arbitrary differentiable function (with no need to be able to compute a second derivative) using $\mathbf{QuasiNewton}$ assuming we get a quasi-newton approximation update policy. In Java this might look like this,
+
+Note that the only use we have of the hessian is via it’s product with the gradient direction. This will become useful for the L-BFGS algorithm described below, since we don’t need to represent the Hessian approximation in memory. If you want to see these abstractions in action, here’s a link to a Java 8 and golang implementation I’ve written.
+
+What form should $\mbox{QuasiUpdate}$ take? Well, if we have $\mbox{QuasiUpdate}$ always return the identity matrix (ignoring its inputs), then this corresponds to simple gradient descent, since the search direction is always $
+
+abla f_n$. While this actually yields a valid procedure which will converge to $x^*$ for convex $f$, intuitively this choice of $\mbox{QuasiUpdate}$ isn’t attempting to capture second-order information about $f$.
+
+Let’s think about our choice of as an approximation for $f$ near $x_{n}$:
+
+A good property for is that its gradient agrees with $f$ at $x_n$ and $x_{n-1}$. In other words, we’d like to ensure:
+
+Using both of the equations above:
+
+Using the gradient of $h_{n+1}(\cdot)$ and canceling terms we get
+
+This yields the so-called “secant conditions” which ensures that $\hessian_{n+1}$ behaves like the Hessian at least for the diference . Assuming is invertible (which is true if it is psd), then multiplying both sides by yields
+
+where is the difference in gradients and is the difference in inputs.
+
+Recall that the a hessian represents the matrix of 2nd order partial derivatives: $\hessian^{(i,j)} = \partial f / \partial x_i \partial x_j$. The hessian is symmetric since the order of differentiation doesn’t matter.
+
+Intuitively, we want $\hessian_n$ to satisfy the two conditions above:
+
+Given the two conditions above, we’d like to take the most conservative change relative to $\hessian_{n-1}$. This is reminiscent of the MIRA update, where we have conditions on any good solution but all other things equal, want the ‘smallest’ change.
+
+The norm used here is the weighted frobenius norm. The solution to this optimization problem is given by
+
+where $\rho_n = (y_n^T s_n)^{-1}$. Proving this is relatively involved and mostly symbol crunching. I don’t know of any intuitive way to derive this unfortunately.
+
+This update is known as the Broyden–Fletcher–Goldfarb–Shanno (BFGS) update, named after the original authors. Some things worth noting about this update:
+
+The last point is significant since it will yield a procedural algorithm for computing $\invhessian_n d$, for a direction $d$, without ever forming the $\invhessian_n$ matrix. Repeatedly applying the recurrence above we have
+
+Since the only use for $\invhessian_n$ is via the product $\invhessian_n \grad_n$, we only need the above procedure to use the BFGS approximation in $\mbox{QuasiNewton}$.
+
+The BFGS quasi-newton approximation has the benefit of not requiring us to be able to analytically compute the Hessian of a function. However, we still must maintain a history of the $s_n$ and $y_n$ vectors for each iteration. Since one of the core-concerns of the $\mathbf{NewtonRaphson}$ algorithm were the memory requirements associated with maintaining an Hessian, the BFGS Quasi-Newton algorithm doesn’t address that since our memory use can grow without bound.
+
+The L-BFGS algorithm, named for limited BFGS, simply truncates the update to use the last $m$ input differences and gradient differences. This means, we only need to store and to compute the update. The center product can still use any symmetric psd matrix , which can also depend on any or .
+
+There are lots of variants of L-BFGS which get used in practice. For non-differentiable functions, there is an othant-wise varient which is suitable for training $L_1$ regularized loss.
+
+One of the main reasons to not use L-BFGS is in very large data-settings where an online approach can converge faster. There are in fact online variants of L-BFGS, but to my knowledge, none have consistently out-performed SGD variants (including AdaGrad or AdaDelta) for sufficiently large data sets.|||
+
+Numerical optimization is at the core of much of machine learning. In this post, we derive the L-BFGS algorithm, commonly used in batch machine learning applications.

@@ -1,0 +1,49 @@
+In today’s world, it’s common for applications to be distributed across many networked components. Whether these components are microservices within your own stack or third-party SaaS APIs, the components that depend on them need to be able to talk to them. This is most commonly done with an API client, often just a simple class that provides easy-to-use methods that wrap HTTP requests.
+
+ButterCMS is a good example of a SaaS API with associated clients. ButterCMS is a “Content Management System as a service” — the database, logic, and administrative dashboard of a CMS is provided as a hosted service and its content is made available through a web API. With Butter’s API-first CMS and content API you can retrieve the content through its API clients and plug it into your website. In C#, the API methods can be called through a single class.
+
+Let’s take a look at the structure of the class. It has a number of public methods that send API requests through the private and methods. We'll just deal with the method and its synchronous callers for simplicity's sake. Here's one of the public methods, used for retrieving a list of blog posts:
+
+Nice and simple. As you can see, it takes a parameter (which is just the unique URL segment that identifies the blog post we want to load), assembles it into the post's URL on the ButterCMS server, and passes it to the method, which gets a JSON response and returns it for marshaling into our class. We can then take that data and render it in a page template on our public website.
+
+Let’s dive a little deeper into what happens inside the method:
+
+This method simply makes an HTTP request to the given URL and returns the response body as a string, which can be parsed by the caller as JSON, XML, etc. It has some built-in error checking which is used to throw exceptions in case of a bad response. This prevents callers from accidentally trying to parse them as legitimate data.
+
+This API client gets the job done, but you know what would be nice to have? The ability to automatically retry failed requests. Requests may occasionally fail because of intermittent connection problems. Suppose the connection is broken as we’re making the request, or the server recieves the request but the connection is dropped before it finishes sending a response. These are likely to be intermittent problems that can be resolved by simply re-sending the request. It would be a shame to show an error page to the user when we could have just tried again and showed them the content they wanted.
+
+Let’s try to implement auto-retry functionality in this API client. It’s important to note here that this is relatively simple with a client like this one — all we have to do is catch any exceptions thrown by the method and call it again with the same parameters up to a limited number of tries (we don't want the retries to go on forever if there's a persistent problem). This is because this client only makes requests. requests, if implemented and used correctly, have an important property called idempotency.
+
+Idempotency sounds like a fancy word, but it’s a simple concept — it’s the ability to perform the same action multiple times while only producing “side effects” on the server once. Side effects are defined as changes to the persistent data on the server. Properly implemented requests are only used to retrieve data from the server, never to make changes to it, so they're naturally idempotent. This is a special case called being safe. Safe methods are methods that are idempotent because they never produce any side effects. The HTTP and verbs also share this property.
+
+There are two HTTP verbs which are idempotent but unsafe, the and methods. That is, they produce side effects the first time they succeed, but do nothing on subsequent requests. For example, if I call on the resource at , the resource at that URL will be deleted. If I call it again, nothing happens because that resource no longer exists. Same thing with —call it once to replace a resource with some new data, then call it again and nothing happens because now you're "updating" it to the same data that's already there.
+
+Now that we understand idempotency, it’s easy to see why a simple retry mechanism isn’t safe for all types of requests. Any time we make a non-idempotent request that succeeds on the server, but the response fails to reach us, a “dumb” retry mechanism would send that request again. If it’s non-idempotent, that could be disastrous (or at least lead to some angry customers — “DOUBLE CHARGED MY CREDIT CARD, EH?!”).
+
+Since our example API client is effectively read-only (only makes requests), we can use a "dumb" retry mechanism that simply re-sends requests until one succeeds or we exceed our maximum allowed number of retries. Constructing a retry mechanism for non-idempotent requests requires cooperation from the server. Namely, the client attaches a unique ID to each request (a GUID/UUID would suffice). When the server processes a request successfully, it saves the ID and a copy of the response it wants to send back. If that response never makes it back to the client, the client will send the request again, reusing the same ID. The server will recognize the ID, skip the actual processing of the request, and just send back the stored response. This makes all requests effectively idempotent from the client's point of view. While not a particularly complicated mechanism to implement on either the client or the server, this article is only an introduction to idempotency and retries, so we'll stick with the simpler case of requests and "dumb" retries for our example.
+
+Let’s get back to the code. We need to “watch” the method so that we can re-execute it if it throws an exception. This can be done with a simple wrapper method that catches the exceptions. First, let's rename our old method to to more accurately express its purpose.
+
+Now let’s build our wrapper method. We’ll call it so that our existing public methods will call it instead instead of the function we just renamed. For now we'll just make it a simple wrapper that doesn't add any functionality:
+
+The API client should now function exactly as before, so we really haven’t accomplished anything yet. Let’s start by writing a simple loop to retry the request up to a certain number of times. To “keep the loop going” in the event that throws an exception, we need to catch those exceptions inside the loop.
+
+This code will escape the loop via the statement if the request is successful. If an exception is thrown by it will be swallowed and the loop will continue up to times. The syntax ensures that requests will always execute at least once, even if is misconfigured and set to something like or .
+
+Of course, this code has a glaring problem — it swallows all the exceptions. If all the requests fail, it will just return a string. But how can we handle this? We can't throw the exceptions from inside the block or execution will escape the loop, defeating the purpose of the entire method. We should throw the exceptions after, and only if, all of the requests fail. We can do this by aggregating them in a and throwing an at the end of the method.
+
+If all the requests fail, this method will now throw an containing a list of all the exceptions thrown on each request. If any request succeeds, no exceptions will be thrown and we'll just get our response string. This is definitely sufficient. But let's make it just a little nicer—most repeated failures will be caused by a persistent problem, so each request will throw the exact same exception. If all our requests throw an (which happens when our API auth token is invalid), do we really want to return an with, say, 3 identical s? Wouldn't it be more ergonomic to just throw a single ? To do this, we need to "collapse" any duplicates in our exceptions list into a single "representative" exception. We can use Linq's method to do this, but it won't collapse the exceptions by default because they're...well...distinct objects and will compare them by reference. We can use its overload, which accepts a custom that we can use to identify exceptions that can be considered duplicates for our purposes. Here's our implementation:
+
+This equality comparer considers two exceptions to be equal if they share the same type and property. For our purposes, this is a good enough definition of "duplicates".
+
+Now we can collapse the duplicate exceptions thrown by our request attempts:
+
+This is a little more ergonomic. In short, we throw only distinct exceptions generated by the request attempts. If there’s only one, either because we only made one attempt or because multiple attempts all failed for the same reason, we throw that exception. If there are multiple exceptions, we throw an with one of each type/message combo.
+
+Implementing retry functionality for idempotent requests on an API client is as simple as that. Even for non-idempotent requests, we could just create a new before our loop and include it in each request attempt. The server would be responsible for keeping track of the request IDs and responses.
+
+Be sure to check out ButterCMS, a hosted API-first CMS and content API that lets you build CMS-powered apps using any programming language including Ruby, Rails, Node.js, .NET, Python, Phoenix, Django, Flask, React, Angular, Go, PHP, Laravel, Elixir, and Meteor.
+
+I hope you found this tutorial helpful. May your APIs be always ergonomic and may your websites be reliable. And may you never double-charge a customer.|||
+
+How to create idempotent API’s and resilient API clients that retry operations.

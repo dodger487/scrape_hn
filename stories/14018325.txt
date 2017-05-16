@@ -1,2 +1,77 @@
-|||
+Microsoft Orleans markets itself as “A straightforward approach to building distributed, high-scale applications in .NET”. Orleans offers an improved actor model that makes it possible to architect applications in a radically new way that is still undiscovered by most developers.
 
+This is the third and final part of a series about an exploration of modern web application architecture, RROD (for React, Redux, Orleans and Dotnet Core). For the introduction, see here.
+
+I have worked with Microsoft Orleans for about two years now. It has taken me quite some time to understand how to use it. Now that I do, I never want to go back to traditional web server architecture. I built my first “database-driven website” in 1995, and helped build many more in the years after that, but a lot of the knowledge that I built over those years I consider now deprecated. Actor systems turn traditional web server architecture completely upside down: instead of getting all the data to the webserver and executing the logic there, distributed actor systems execute the logic where the data is. An Actor system makes sure that every data element / actor object lives in only one place (one machine in the cluster), so there is no duplication of data, which simplifies things dramatically. Actor objects run in a single thread, simplifying things even further. Finally, Actors can call or notify other actor objects of changes, effectively pushing data, through a graph of actor objects, to the user.
+
+Once you understand how an actor system works, the whole idea of gobbling data together to render a page on the webserver by executing database queries, mapping to objects, caching data, dealing with conflicts caused by data duplication, locking, and doing that over and over again for every web request, seems very cumbersome. Web servers do an awful lot of complex data manipulation that can be avoided completely when using the Actor model.
+
+This project is about modern application architecture, based on Dotnet Core. Microsoft Orleans is a large codebase, that is used for running some big projects inside and outside Microsoft. The current version runs on the .NET 4.5 Framework. It makes heavy use of binary serialization and it uses Windows API’s to manage memory and CPU load. This makes it non-trivial to create a cross-platform Dotnet Core version. But the people working on the Orleans project are very capable and work on the Dotnet Core-compatible version 2.0 has progressed steadily. The second pre-release came out recently. I am using this preview version in this project.
+
+Setting up a solution to use Microsoft Orleans requires a project structure consisting of a minimum of four projects:
+
+During development, the OrleansHost and Webapp processes can simply be started and debugged together on the developer machine. In production, they will usually run separately on a cluster consisting of multiple machines, offering reliability and distributed resource management. Of course, a small application could still run on a single machine, without the reliability but still benefiting from the real-time architecture and high performance.
+
+In the introduction I said I didn’t want to be bothered with caching anymore. However, several AspNet Core libraries need a distributed cache. In a scale-out architecture, you’d normally use the Redis cache implementation that is provided as the default. As an illustration on how one can use Orleans, here is my complete distributed cache implementation for Dotnet Core, using Orleans instead of Redis:
+
+The GrainInterface class declares four functions needed to implement the cache (Get, Set, Clear, Refresh). The Grain implementation just wraps the cachedata in an Immutable (a performance optimization to avoid copying) and keeps a reference to it in a member variable.
+
+The OrleansCache class then implements the IDistributedCache interface that Dotnet Core defines in Microsoft​.Extensions​.Caching​.Distributed. It uses to get a reference to a CacheGrain identified by the cache key and then stores and retrieves data as a byte array. Grains can be generic types, so we can directly use the byte array with the CacheGrain. Registering this cache service at startup by calling gets you a fully scalable, production ready distributed cache for Dotnet, that other services (such as Session State) will automatically use.
+
+This kind of code is easy to understand and trivial to debug. There is no need to install and manage Redis, think about redundancy, manage an extra connection string, learn another API, learn another query language if the cache needs to be smarter. It’s all built into the technology stack.
+
+Ok, now you know how to do CRUD style actors on Orleans. But this is almost the same as using a database and building with Entity Framework or a Micro ORM. Actors offer performance and scalability advantages, but using them this way brings nothing revolutionary.
+
+The fun part begins when you realize that this data layer can have logic in itself, you can program it in C# (or F#) and make it talk back! When you start thinking about the patterns this enables, I hope you will see why I made some big claims in the introduction. Using stateful objects and (observable) streams in the back-end enables an architecture that is very different from the data-driven request-response based architectures we are used to.
+
+As I wrote in my previous post on RROD, I thought the Redux javascript technology was so cool that I started to wonder if it would be possible to use it on the server as well. Redux is actually a pretty simple idea that looks a lot like Event Sourcing, so implementing it in .NET can’t be too hard. Indeed, as it turns out, Redux combines really well with Actor model.
+
+There is a Redux.NET library on nuget, mainly aimed toward building application user interfaces. The base implementation of Redux is only about 50 lines of code. I used that code to implement Redux-style event sourcing for some of my Grain objects in Orleans (there is also the official Orleans EventSourcing package but that is currently not very useful as it lacks storage support). For the ReduxGrain I wrote some custom storage logic, using Azure Table Storage, which is fast, reliable and very inexpensive, and it’s also the default storage mechanism that Orleans uses for normal Stateful grains.
+
+The advantages that I hope this architecture will deliver are:
+
+I think this project mostly achieves these benefits. Some more work is needed to make it work offline (add redux-offline and sw-precache). Also, edit-and-continue in Dotnet can only handle limited code changes, meaningful changes often require an application restart.
+
+I am exploring client-side and server-side technologies together. To find out how an Orleans based back-end could work together with a modern javascript front-end, I created a server-side version of the “Counter” sample that is often used to demonstrate Redux. This demo simply increments and decrements an integer value by dispatching Redux Actions, displaying the current state. My version has the following additions:
+
+Here is a schematic overview of the flow:
+
+And here is what this looks like to the user:
+
+Below is a snippet from the AsyncAction that gets called when the user clicks the “Increment” button. Note that I’m adding a header to protect against cross-site scripting (someone better than me at javascript would intercept the call and add the header auto-magically).
+
+The code below also shows the ES2015 / “modern javascript” syntax using and , and references typescript interfaces and string constants generated from C# server code by Typewriter (in the Server import), as discussed in my previous post on client-side javascript.
+
+The MVC Controller receives the request, gets a reference to the Counter Grain for the current session and calls the corresponding method, awaiting the result.
+
+The Redux reducer that processes the action server-side in C# is almost the same as the one in typescript working client-side: it processes the action and returns a new resulting state.
+
+The base-class takes this reducer function as a constructor parameter, together with an injected storage handler of the correct state type, to implement the and functions.
+
+The method takes an action and updates the State, using the Reducer. The function is functionally equivalent to how normal Stateful grains store data in Orleans. This makes it easy to change normal Orleans grains to Event Sourcing grains. ReduxGrain implements its own version of that appends its internal list of unsaved actions to an Azure Storage Table using a partition-key based on the grain id and a row-key based on the timestamp.
+
+The methods inside are the equivalent of the AsyncAction in javascript Redux. executes the reducer which should be a pure function without side effects. Grain methods can dispatch actions and execute side-effects, such as saving to storage, publishing events to a stream and starting timers. The architecture could be taken even further by moving those methods into another type SagaGrain that would manage long processes.
+
+In the StartCounter case, we start an Orleans Timer, after which the registered method will be triggered every 3 seconds.
+
+If you look into the source code of the RROD project you might notice that I experimented with different ways of sending actions between the browser, the web server and the Orleans server: using WebSockets or Web API, using Orleans Streams or direct RPC, passing Command objects to a generic Process method or using separate Web API calls with typed data. All these methods work; I eventually settled on using plain Web API calls when going from Client to Server, the controller method will just forward a request by calling the corresponding interface method on the Orleans Grain. The (Promise) in javascript will resolve only after the Web API is fully processed in the Orleans Grain. This makes it easy to handle errors.
+
+Data flowing back from the server to the client uses Action messages that flow through a WebSocket connection that is opened when the client starts. The flow is made fully asynchronous, using Orleans Streams. Making secondary messages asynchronous in Orleans avoids deadlock scenarios that can otherwise happen easily in Actor systems.
+
+I used SignalR in the past with great success and I wanted to use it here too. However, a cross-platform AspNetCore version of SignalR is not available yet. It is currently being built by the AspNetCore team. I first tried to use a prerelease version, but could’t get this to work together with currently released versions of Dotnet Core. Then I found this WebSocket manager middleware for AspNet Core (by Radu Matei) that worked, so I went with that. There is no fallback for browsers that don’t support websockets, and it’s somewhat low-level, but it works well enough for passing simple json objects. When SignalR becomes available, it can easily replace the current code.
+
+As in the previous installments of this series, you can play with this yourself. Clone https://github.com/Maarten88/rrod.git, open it in Visual Studio 2017 and run both OrleansHost and Webapp projects. Start the Azure Storage emulator first. Alternatively, on Linux or OSX, you could use VS Code and run dotnet restore, dotnet build and dotnet run on those projects. The Azure Storage emulator is Windows-only, so you may also need to create and configure a “real” Azure Storage connection in the appsettings.config file. Automatic typescript model generation for C# models only works in VS 2017, install the Typewriter Add-in and change any model class to see it working. The generated typescript files are checked-in so if you don’t use Visual Studio you can still run the project, but you’ll have to synchronize javascript and C# models manually if you change something in them.
+
+The resulting Counter page works as designed: Updates can be initiated from the client and from the server. Page rendering works server-side and client-side, and the page is updated automatically when the state changes. The complete action history is saved in an Azure Storage Table.
+
+If you start at the Home page, navigate to the Counter page, increment the counter you’ll see that the Counter page is rendered client-side. View-source will show an incorrect count. Do a refresh while on the Counter page and you’ll see that the page is re-rendered server-side, and you see the correct current count in the html source.
+
+Deleting the session cookie and refreshing the page will generate a new session, resetting the counter to its initial value of zero. Don’t worry if you start a timer and then leave the grain behind: Orleans will let the grain run for some time and then deactivates it automatically when it doesn’t receive input anymore. If you want a grain to persistently reactivate, you can use an Orleans Reminder.
+
+The only limitation of an Orleans-based architecture that I ran into is that it provides no built-in way of searching for data, or doing interactive analysis on data. Modelling actors in a smart way can often avoid the need for an index, but sometimes you just need to search through a big pile of static data and loading all of it in memory as actor objects is not feasible. This can only be efficiently implemented with an index. I used Elastic Search or Azure Search as a addition to my Orleans projects to fill that gap, for instance to provide an faceted search and navigation feature. If you need powerful reporting then PowerBI is another good addition to Orleans.
+
+There are several other solutions that make reactivity and real-time processing on the server possible. Meteor, Firebase and RethinkDB are just a few well-known technologies that can bring real-time data to your application, usually over websockets. They all offer some way of subscribing to updates as they happen in the back-end and let you connect these events to business logic.
+
+I prefer the Actor based approach because I think it’s simpler and more easily scalable. With actors, everything uses the same programming language, all the notification/subscribe logic is in the actor and you can make it do anything you want. It’s just a few API’s, there’s no fancy infrastructure and no bottlenecks where all updates must pass through.|||
+
+Microsoft Orleans markets itself as “A straightforward approach to building distributed, high-scale applications in .NET”. Orleans offers an improved actor model that makes it possible to architect…

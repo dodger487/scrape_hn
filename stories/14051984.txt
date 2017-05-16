@@ -1,0 +1,35 @@
+As I was taking in the beauty of Big Sur during Thanksgiving weekend, an alert goes off indicating that the Botmetrics (the conversational intelligence platform we’re building) was experiencing high page-load latencies for our dashboards pages.
+
+We’d just signed up a large customer the previous week and while we were processing millions of events per day (3–5k requests per minute), our query engine was having intermittent trouble (with request latencies >15s) digesting large volumes of data.
+
+With the help of our friends at Citus, we re-architected our system in a matter of days, and were able to speed up our query engine 150x. This is how we did it.
+
+Botmetrics is a conversational intelligence platform that allows customers to measure and analyze conversations. We support Facebook, Kik, Slack, SMS (Twilio), Google Home and web-based conversations. We did have a couple of high volume customers but a week before Thanksgiving, we onboarded one of the top Facebook Messenger bots on our platform and the volume of data we were processing increased by an order of magnitude.
+
+Botmetrics uses Postgres as its primary data store and has served us well. The key data model that is relevant to this story is the table — which stores all of the different events that are sent by our customers (these can include events such as plain text, but also complicated structured data such as images, location coordinates, button clicks and so on). Different messenger platforms have different data schemas for their message payloads but with Postgres’ JSONB data structure, we are able to ingest all of the varied data and store them in a single table.
+
+With JSONB, we can set uniqueness constraints on child elements of the JSON column so that we don’t duplicate events. For e.g. Facebook uses a combination of and to determine the uniqueness of an event, Slack uses a combination of and and with Postgres we are able to set conditional uniqueness constraints (depending on the messenger platform).
+
+As with any well-designed event ingestion architecture, our Events Collection API is decoupled from the Events Processing Engine, thus allowing us to scale each component independently. The HTTP endpoints queues up events in our message queue and event processors then pick up the events and performs pre-processing on it (validation, normalization of data fields and de-deduplication) before INSERTing into the events table in Postgres.
+
+The Query Engine would then query the table to generate time-series data, which is used by the web frontend to display the pretty graphs and tables.
+
+The limitation of this design is that as the number of rows in the database approaches tens of millions, querying this table (even with good indexes) results in very large query times. Some queries require >15s query time which results in an inferior user experience.
+
+One of the solutions (which we had intended to get to at some point) is for the engine to not query the table directly but to cache the counts in a separate column or table and query that instead.
+
+Coming from a Rails world, the obvious solution would have been to use and callbacks and store the rolled-up counts for events in a separate table. There are a few problems with this however:
+
+It was clear to us at this point that we needed a solution that was native to the database. Enter Citus.
+
+Thanks to the amazing content from the folks at Citus, I came across a reference implementation of how rollups can be implemented in a sane way. You should definitely watch the video tutorial, but the TL;DR is:
+
+The function that is invoked to flush the table is presented here:
+
+The updated data flow model is presented here:
+
+The next step was to deploy the system in production with zero-downtime and zero data-loss. Our de-coupled event processing system allowed us to perform upgrades to our database without any downtime.
+
+(For the curious, we performed three dry runs of this process, ran scripts to make sure there was no data loss before we deployed the changes to production).|||
+
+As I was taking in the beauty of Big Sur during Thanksgiving weekend, an alert goes off indicating that the Botmetrics (the conversational intelligence platform we’re building) was experiencing high…

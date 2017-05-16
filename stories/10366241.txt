@@ -1,0 +1,74 @@
+Cost-per-performance, not cost-per-capacity, turns out to be the better metric for evaluating the true value of SSDs.
+
+In the Big Data ecosystem, solid-state drives (SSDs) are increasingly considered a viable, higher-performance alternative to rotational hard-disk drives (HDDs). However, few results from actual testing are available to the public.
+
+Recently, Cloudera engineers did such a study based on a combination of SSDs and HDDs, with the goal of determining to what extent SSDs accelerate different MapReduce workloads, as well as the optimal configurations for getting the best performance on each workload.
+
+And here is a preview of our findings, to be explained in detail below:
+
+These results are based on running MapReduce v2 (MR2) on YARN in Cloudera Enterprise 5 Beta 1, on physical clusters, comparing HDDs with PCI Express (PCIe) SSDs. This work builds on recognized past studies in the Apache Hadoop ecosystem on SSD performance that used memory to approximate SSD behavior (“Hadoop and Solid State Drives”, by Dhruba Borthakur) and simulated SSD performance as a tiered cache for Apache HBase (“Analysis of HDFS under HBase: A Facebook Messages Case Study”, presented by Tyler Harter et al at FAST ’14).
+
+A MapReduce job proceeds as indicated in the diagram below. The data movements in different stages generate roughly two kinds of IO patterns:
+
+We used the Linux tool to verify that these two behaviors indeed hold for the MapReduce jobs used in our tests (see appendix).
+
+Based on the MapReduce dataflow and storage medium characteristics, we expect that:
+
+The remainder of the post describes our experimental setup and results.
+
+We used PCIe SSDs with 1.3TB capacity with a list price of US$14,000 each, and SATA HDDs with 2TB capacity with a list price of US$400 each. Each storage device is mounted with the Linux ext4 file system, with default options and 4KB block size. Otherwise, the machines are Intel Xeon 2-socket, 8-core, 16-thread systems, with 10Gbps Ethernet and 48GB RAM. They are connected as a single rack cluster.
+
+To get a sense of the user-visible storage bandwidth without HDFS and MapReduce, we measured the duration of copying a 100GB file to each storage device. This test indicates the SSDs can do roughly 1.3GBps sequential read and write, while the HDDs have roughly 120MBps sequential read and write.
+
+We evaluate the following storage configurations:
+
+The SSD and HDD-11 setups allow us to compare SSDs versus HDDs on an equal-bandwidth basis. The HDD-6 setup serves as a baseline of IO-constrained cluster. The HDD-6, HDD-11, and Hybrid setups allow us to investigate the effects of adding either HDDs or SSDs to an existing cluster.
+
+We run the following MapReduce jobs. Each is either a common benchmark, or a job constructed specifically to isolate a stage of the MapReduce IO pipeline.
+
+Note that the jobs here are IO-heavy jobs selected and sized specifically to compare two different storage media. In general, real-world customer workloads have a variety of sizes and create load for multiple resources including IO, CPU, memory, and network.
+
+Our experiments involve runs with as well as without map output compression enabled. Compression is a common technique to shift load from IO to CPU. Map output compression is turned on by default in CDH, as most common kinds of data are readily compressible. Tuning compression allows us to examine tradeoffs in storage media under two different IO and CPU mixes. Job output compression is disabled by default in CDH and all our tests.
+
+We present the results of our benchmarking in the context of these two questions:
+
+Our goal here is to compare SSDs versus HDDs of the same aggregate bandwidth. Let’s look at a straightforward comparison between the SSD (1 SSD) and HDD-11 (11 HDDs) configurations. The graphs below show job durations for the two storage options, with the SSD values normalized against the HDD-11 values for each job. The first graph shows results with intermediate data compressed, and the second one without.
+
+Based on this comparison, our observations are:
+
+Our goal here is to compare adding an SSD or many HDDs to an existing cluster, and to compare the various configurations possible in a hybrid SSD-HDD cluster.
+
+We use a baseline cluster with six HDDs per node (HDD-6). To this baseline we add an SSD or five HDDs, resulting in the Hybrid and HDD-11 setups. Note that on an equal bandwidth basis, “adding one SSD” should ideally be compared to “adding 11 HDDs”. (Our machines do not have 6 + 11 = 17 disks.) However, the setups are sufficient to lead us to the following observations:
+
+For default configurations, a Hybrid cluster offers lower than expected performance: The graph below compares job durations for the HDD-6, HDD-11, and Hybrid setups. For brevity, we show the results with uncompressed intermediate data, since that setting more clearly highlights the tradeoffs.
+
+Both HDD-11 and Hybrid provide visible improvement over HDD-6. However, even with its additional hardware bandwidth (add one SSD versus add five HDDs), the Hybrid setup offers no improvement over HDD-11. This observation triggered further investigations below.
+
+On a Hybrid cluster, when HDFS and shuffle use separate storage media, the benefits depend on workload: The default Hybrid configuration assigns HDDs and SSD to both the HDFS and shuffle local directories. We tested whether separating the storage media offers any improvement. Doing so requires two more cluster configurations: HDDs for HDFS with SSD for intermediate data, and vice versa.
+
+From the results, we see that the shuffle-heavy jobs (TeraSort and Shuffle) benefit from assigning SSD completely to intermediate data, while the HDFS-heavy jobs (TeraGen, TeraValidate, TeraRead, HDFS Data Write) are penalized. We see the opposite when the SSD is assigned to only HDFS. This is expected, as the SSD has a higher bandwidth than six HDDs combined. However, one would expect the simple hybrid to perform half way between assigning SSD to intermediate data and HDFS. This led to the next set of tests.
+
+On a Hybrid cluster, SSD should be split into multiple local directories: A closer look at HDFS and MapReduce implementations reveals a critical insight: both the DataNode and the NodeManager pick local directories in a round-robin fashion. A typical setup would mount each piece of storage hardware as a separate directory (for example: , , ). HDFS and MapReduce both have the concept of “local directories”. For HDFS, local directories store the actual blocks. For MapReduce, local directories contain the intermediate shuffle data. One can configure HDFS and MapReduce to use multiple local directories ( through plus ) for our Hybrid setup. There, when the NodeManager decides to write out intermediate shuffle data, it will pick the 11 HDD local directories and the single SSD directory a round-robin fashion. Hence, when the job is optimized for a single wave of map tasks, each local directory receives the same amount of data, and faster progress on the SSD is held up by slower progress on the HDDs.
+
+So, to fully utilize the SSD, we need to split the SSD into multiple directories to maintain equal bandwidth per local directory. In our case, SSDs should be split into 10 directories. In our single-wave map output example, the SSDs would then receive 10x the data directed at each HDD, written at 10x the speed, and complete in the same amount of time. (Note: While splitting the SSD into multiple local directories improves performance, the SSD will fill up faster than the HDDs.)
+
+The graph below shows the performance of the split-SSD setup, compared against the HDD-6, HDD-11, and Hybrid-default setups. Splitting SSD into 10 local directories invariably leads to a major improvement over the default Hybrid setup.
+
+Our findings suggest SSD has higher performance compared to HDD-11. However, from an economic point of view, the choice of storage media depends on the cost-per-performance for each.
+
+This differs from the cost-per-capacity metric ($-per-TB) that appears more frequently in HDD versus SSD comparisons. Cost-per-capacity makes sense for capacity-constrained use cases. As the primary benefit of SSD is high performance rather than high capacity, we believe storage vendors and customers should also track $-per-performance for different storage media.
+
+From our tests, SSDs have up to 70 percent higher performance, for 2.5x higher $ per performance (average performance divided by cost). This is far lower than the 50x difference in $ per TB computed in the table below. Customers can consider paying a premium cost to obtain up to 70 percent higher performance. (Note: Our tests focus on equal aggregate bandwidth for SSDs and HDDs. In the future, we would like to revisit this for setups with equal costs. That translates to 1 SSD against 35 HDDs. We do not have the necessary hardware to test this setup; however, we suspect the performance bottleneck likely shifts from IO to CPU [2 slots per core for MR2, not enough slots to keep all disks occupied].)
+
+Our tests also show that SSD benefits vary depending on the MapReduce job involved. Hence, the choice of storage media needs to consider the aggregate performance impact across the entire production workload. The precise improvement depends on how compressible the data is across all datasets, and the ratio of IO versus CPU load across all jobs.
+
+Enterprise data hubs (EDHs) enable data to be ingested, processed, and analyzed in many different ways. To fully understand the implications of SSDs for EDHs, we need to study the tradeoffs for other components such as Apache HBase, Cloudera Impala, and Cloudera Search. These components are much more sensitive to latency and random access — they aggressively cache data in memory, and cache misses heavily affect performance. SSDs could potentially act as a cost-effective cache between memory and disk in the storage hierarchy, but we need measurements on real clusters to verify.
+
+Overall, SSD economics involves the interplay between ever-improving software and hardware, as well as ever-evolving customer workloads. The precise trade-off between SSDs, HDDs, and memory deserves regular re-examination over time.
+
+Karthik Kambatla is a member of the Platform Engineering team at Cloudera and a Hadoop committer. Yanpei Chen is a member of the Performance Engineering team at Cloudera.
+
+Below find data, showing TeraSort and WordCount macro-benchmarks that have non-negligible data in all IO stages. The data confirms that shuffle IO sizes are generally smaller than HDFS IO sizes, and that SSD sequential (HDFS) IO sizes are ~2x that of HDDs. (Map output compression is enabled for these tests.)
+
+To confirm that these SSDs have higher sequential IO size than HDDs in general, we copied a series of large files to each storage medium, with showing KB-per-IO nearly identical to the values in the table below. These values are per-node averages across the cluster.|||
+

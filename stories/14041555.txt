@@ -1,0 +1,93 @@
+Skip to the Wayback Machine Scraper GitHub repo if you’re just looking for the completed command-line utility or the Scrapy middleware. The article focuses on how the middleware was developed and an interesting use case: looking at time series data from Reddit.
+
+The Archive.org Wayback Machine is pretty awe inspiring. It’s been archiving web pages since 1996 and has amassed 284 billion page captures and over 15 petabytes of raw data. Many of these are sites that are no longer online and their content would have been otherwise lost to time. For sites that are still around, it can be absolutely fascinating to watch how they’ve evolved over the years.
+
+Take Reddit for instance. You can go back in time and watch it grow from this…
+
+with about 192 thousand other stops along the way. That’s just absolutely incredible to me (if you agree then please consider donating to help them keep doing what they do).
+
+That’s all well-and-good but the thing about 192 thousand web captures, let alone 284 billion, is that that’s just way too much for one person to sift through by hand. There’s a lot of interesting data there, but if you want to actually do something with it then you’ll need some sort of scraper to collect the data from the Wayback Machine.
+
+What might one call such a thing? Hmmm, I dunno. Maybe a…
+
+That’s what I called my own reusable middleware and command-line utility at least (original, right?).
+
+In this article, I’ll walk you through the process of writing it using python and Scrapy. I should mention that scraping archived pages from the Wayback Machine isn’t exactly a new idea- the official Scrapy docs list scraping cached copies of pages under “Common Practices”- but I’m going to try to put a little bit of a twist on it.
+
+If all you wanted to do was fetch a current or historical snapshot then you could just write something like
+
+and “waybackify” your URLs before crawling them. That’s great if you just want to avoid rate limits and bans but it sure doesn’t make for much of a web scraping tutorial! Aside from that, it doesn’t really help much if you’re interested in how a page changes over time. For example, I wanted to look at all of the available Hacker News snapshots when I was writing the Reverse Engineering the Hacker News Ranking Algorithm.
+
+The most obvious solution in cases like this is to write a spider that crawls the archive index pages
+
+and extracts the timestamps from the URLs. That’s definitely doable but it gets slightly more complicated than it seems at first and if you’re putting this logic in your spider then chances are that reusing the code won’t be trivial. Scraping time series data is a fairly general problem and so it would be nice if the code be reused with minimal modifications to spider code.
+
+A more natural way to approach the problem is to write middleware that does the dirty work and integrates easily with existing code. I had basically already done this myself but hadn’t quite cleaned it up enough that I would feel comfortable open sourcing it. After recently writing Advanced Web Scraping and receiving a lot of really positive feedback, I realized that others might find it informative if I did a little walkthrough of how I developed it and made the code available.
+
+Just talking about middleware can get a little bit boring so I’ll frame the discussion within the context of trying to analyze time series data from Reddit. The analysis there won’t be particularly deep but there was something pretty interesting that popped out of the data. It should be more than enough of a starting point to do some internet archaeology of your own!
+
+Let’s begin by throwing together a very simple spider that just grabs the titles and scores of the stories on the front page of Reddit. We’ll do that right after we get the boilerplate out of the way by setting up a virtualenv, installing Scrapy, and scaffolding out a default Scrapy project.
+
+If any of that stuff doesn’t make sense to you then you might want to go check out The Scrapy Tutorial or The Advanced Web Scraping Tutorial (though you can probably follow along fine just knowing that that sets up a project scaffold).
+
+Now we can add a basic spider to
+
+This spider is about as simple as they come: it starts at and doesn’t crawl anywhere else from there. It uses a few CSS selectors to pull out the title and votes for each story on the front page and then attaches a timestamp to them. If we run the spider with
+
+then it will produce an uglified version of something like
+
+To track changes over time, we could now set up a cron job to run our scraper at regular intervals. That’s a great way to collect frequently changing data but- much like in the movie Primer- you can’t go back further than when you first turned it on. That’s where the Wayback Machine comes in.
+
+The Wayback Machine is basically a much more complicated spider that is saving the entire HTML content of each snapshot. If we can feed the historical HTML snapshots into our spider and attach the correct timestamps then it will effectively be as though we were running our scraper at those points in time.
+
+The point that I’m trying to make here isn’t the obvious one that we can use the HTML snapshots to extract the historical data. It’s that if we connect the snapshots to our spider in the right way then the spider should be none the wiser and things should just work. This is in contrast to the other approach we discussed where our spider would need to be aware of the archive index pages, urls, etc.
+
+Writing a Scrapy Downloader Middleware is generally where you’ll end up whenever you need to intercept requests and responses to modify or replace them. Downloader middleware classes implement and methods that have a lot of freedom in what they can do. Let’s start piecing together the middleware in and it should hopefully become clear exactly how much you can accomplish with this freedom.
+
+We’ll first add the basic initialization that loads our setting and saves the crawler.
+
+There are a few other things in here but they aren’t doing anything yet and we’ll get to them shortly (so just ignore them for now). To actually turn this on, we’ll have to also add a couple of settings to .
+
+Our middleware is now enabled but we need to implement request and response processing to actually make it useful. The request processing is the simpler of the two: we’ll let any web.archive.org requests through without modification and for everything else we’ll construct a request to the Wayback Machine’s public CDX Server API.
+
+Returning a new request aborts the current request processing and sends the new request into the downloader pipeline. The new request passes through our middleware unscathed this time because the URL starts with . It (hopefully) makes it all the way CDX server which will provide what is basically the computer-friendly version of the archive index pages. The CDX server will specifically return a JSON file including the timestamp, URL, and statuscode of each snapshot request as well as a hash of the snapshot content. That will look something like
+
+and, like all responses, will make its way back through the downloader middleware. Our spider wouldn’t know what to do with it though so we need to intercept the response and prevent it from making it that far. We can do this by implementing .
+
+We start out by grabbing the meta information on the request (you may have already noticed that we had attached some to our CDX request in ). This meta information is then used to determine whether this is a response to a CDX request; if it is then we parse it to construct requests for the individual snapshots, schedule these with the Scrapy engine, and then abort the request by throwing an unhandled error that we defined earlier. The last little bit of code there is to make the response URL match that of the original request for the snapshot requests so that the spider doesn’t have to know about where the snapshot responses actually came from.
+
+The final piece of the puzzle is to implement the code for actually parsing the CDX responses and building the snapshot requests.
+
+You can see here that our snapshot requests are built using as a base. This means that they still have the original callbacks attached and are otherwise identical except for the extra meta data that we attach (and the temporarily different property). Additionally, our uses a lesser known feature of the Wayback Machine API that allows us to get the original raw page content instead of the one with modified links and added content. After we switch back to in , the response will only be distinguishable from one coming from the original server in that it has the additional and meta data attached. This will all come in handy when it comes time to integrate the middleware with our spider as we’ll do momentarily.
+
+We designed our middleware in such a way that pretty much any existing spider should “just work” and now we get to reap the benefits of that. No modifications of any generated requests are required and the only evidence that the responses were fetched from archive.org should be the additional meta data and some minor header differences. Indeed, we could run our scraper again now and it would successfully parse all of the available snapshots. The only problem is that the timestamps would be wrong because we’re populating them with .
+
+To remedy this, we simply replace
+
+in . Running the crawler with should now yield items for every front page snapshot from 2016!
+
+We now have the data in a nice structured format and can finally get to the fun part. Let’s start with loading the JSON Lines file back into python
+
+We’re computing the median scores here instead of the average scores in order to suppress the noise of unusually popular stories. The median score should be fairly representative of some convolution of Reddit site traffic and their scoring algorithm. Now let’s take a look at how the median scores change over time by plotting them.
+
+Things are fairly stable with a small upwards trend until we hit December and the median scores go crazy! Let’s zoom in a little bit so we can see more clearly when this happened.
+
+It looks like the median scores abruptly doubled on December 7th and the variations within each day also became more pronounced. It’s pretty clear that there was some algorithm change at Reddit that took place on that date. This was also a significant enough change that it would likely be noticed by regular users.
+
+Let’s Google ‘Reddit vote scores “December 7th, 20016”’ and see who else noticed it. One of the first results is Reddit overhauls upvote algorithm to thwart cheaters and show the site’s true scale which links to a Reddit self-post by an admin named KeyserSosa from December 6th, 2016. Here is an abridged excerpt from that post.
+
+And that’s exactly what we saw in the data. The data lets us even go a bit further and see that the new rules were relatively constant from the 7th up until the 16th or 17th when the median scores seem to fluctuate between the 5k-20k range and the 30-40k range. It’s hard to say exactly why this was happening from just the plots we’ve generated so far; maybe they were trying out new rule variations or maybe specific thresholds were being reached. If we were to dig in a little bit deeper and track individual story trajectories then we could probably make some more specific guesses (this is sadly outside the scope of this article however).
+
+In addition to the scores, we also scraped the story titles. Let’s cycle through all of the stories again and pick out the most highly rated ones.
+
+Well, now I kind of wish that we had scraped the URLs too so I could include the links. Here’s 1 dad reflex 2 children at least, it’s pretty impressive.
+
+There’s a ton more that we could do here if we extracted a bit more data, but hopefully this is enough to give you a test for how easy it is to mess around with the data once we have it.
+
+Well, I hope that you enjoyed our little foray into internet archaeology here. There are countless possibilities for what you can do with time series data that you scrape from the Wayback Machine and what we’ve done here barely scrapes the surface. You could use the data that we scraped here to apply the techniques developed in Reverse Engineering the Hacker News Ranking Algorithm to Reddit or you could scrape other sites to find historical product prices, review scores, or anything else you’re curious about or need to run your business.
+
+I would love to here about whatever analysis you might undertake so feel free to reach out at evan@intoli.com (that’s doubly true if you’re looking for someone to help your business solve their data needs!). If you do plan to actually use the middleware that we developed then please check out the full code on the Scrapy Wayback Machine GitHub repo. I skipped over some important error handling and edge cases to simplify the code a bit during this tutorial and you’ll really want those in production. The repo contains those additions as well as a really useful command-line utility for scraping pages without custom parsing (which may be useful if you want to parse them in a language other than python).
+
+Finally, please don’t forget to donate to archive.org if you’re scraping data from their servers. They provide an awesome public server and scraping consumes a lot of their resouces. Throwing them a few bucks goes a long way in helping them provide the services that they do!|||
+
+Founder

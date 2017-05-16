@@ -1,0 +1,40 @@
+Mattermost is a Slack-like self-hosted and open-source alternative. We use it at work but for some reason link previews don’t work. Before diving into Mattermost’s internals I wanted to see if I could write a quick workaround using the fact that Mattermost does show an image if you post a link ending with or .
+
+When you post an image link, Mattermost makes a request to show it in the application. It detects those images using a regexp; not by e.g. sending a request to get the content type. If you have an image URL that doesn’t end with common extentions Mattermost won’t show it.
+
+Mattermost doesn’t serve you a preview of the image; it rather gives you an with the original URL. That means every single person reading the channel will request the image from its original location. Slack, on the other hand, fetch images, cache them, and serves them from its own domain, . Slack uses a custom user-agent for its request so you know where it comes from.
+
+Mattermost, on the other hand, can’t use a custom user-agent because the request is done by your browser. The only thing distinguishing Mattermost’s request for a preview and any other request is it asks for an image:
+
+The header above is Chrome telling the Web server it can deal with WebP images, then images in any format, then anything; in that order. Note it explicitly says it accepts WebP images because some browsers don’t support the format.
+
+Unfortunately not all browsers are explicit. Firefox sends since Firefox 47 and so did IE8 and earlier versions. In those cases we can’t really do anything beside complicated rules based on the user-agent and other headers.
+
+If we know how to tell if a request comes from Mattermost asking for an image preview rather than a “normal” user we can serve different contents to them: a link preview as an image to Mattermost, and the normal content to the user.
+
+All we have to do is to make some sort of intelligent proxy. Using Flask we can make something like this:
+
+This is a small web application that takes any route in the form of and either redirects you to that URL if your header doesn’t start with ; either serves you a page.
+
+All we have to do now is to return an actual image in lieu of that placeholder text. I used Requests and Beautiful Soup to fetch and parse webpages, and Pillow to generate images.
+
+When one requests , the app fetches that URL; parses it to extract its title and some excerpt; write that on a blank image; and serves it.
+
+Extracting the title is as easy as grabbing that HTML tag. If available, I also try the and tags. If none of those are available, I fallback on the first or tag.
+
+Getting an usable excerpt is not too hard; here again I search for common tags: , , . If I can’t get any of them I take the first that looks long enough.
+
+You can check that code on GitHub.
+
+The Pillow library makes it easy to write text on an image. I replaced the (ugly) default font with Alegreya. The tricky part is mostly to fit the text on the image. I used a combination of Draw#textsize to get the dimensions of some text as if it were written on the image and Python’s module to cut the title and excerpt so that they wouldn’t cross the right side of the image.
+
+I used fixed dimensions for all images (400×70) and kept a small padding along their sides. Previews with small or missing excerpts get some unused white space at the bottom; this could be fixed by pre-computing the final size of the image before creating it.
+
+On most websites the preview works fine. We could tweak the text size as well as add a favicon or an extracted image.
+
+In the end it took a couple hours to have a working prototype. Most of that time was spent dealing with encoding issues and trying various webpages to find edge cases.
+
+The result is acceptable; it has the issue of not being accessible at all but that’s still better than nothing.
+
+The source code is on GitHub.|||
+

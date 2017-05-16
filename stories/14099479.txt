@@ -1,0 +1,86 @@
+This works in an upcoming version of dapper; we like it:
+
+And this works in an upcoming release of protobuf-net:
+
+But - all is not necessarily as it seems. Here we will discuss the nuances of C# 7 tuple usage, and look at the limitations and restrictions that the implementation imposes. In doing so, we can look at what this means for library authors, and what expectations consumers should have.
+
+One of the fun new tools in C# 7 is language-level tuple support. Sure, we’ve had the family for ages, but that forces you to use , (etc) naming, and it is a - so involves allocations, but… it works:
+
+The ever-terser syntax for read-only properties makes it not too hard to write your own manual tuples, but it isn’t necessarily the best use of your time (especially if you want to do it well - the code is less trivial than people imagine); a simple example might look like:
+
+Maneagable, but… not very friendly if you’re just trying to hack a few values around in close proximity to each-other.
+
+More recently, the family has been added on nuget; this solves the allocation problem, but still leaves us with names like , :
+
+The new thing, then, is language support to prettify this. As an illustration, we can re-write that as:
+
+This allows us to conveniently represent some named pieces of data. It looks broadly similar to anonymous types:
+
+But it is implemented very differently, as we’ll see. Anonymous types are very limited in scope - bacause you can’t say their name, you can’t expose them on any API boundary (even methods). Tuples, however, don’t have this limitation - they can be used in parameters and return types:
+
+And you can even express them in generics:
+
+Given how similar they look to anonymous types, you’d be forgiven for assuming that they were implemented similarly - perhaps defining a struct instead of a class. Let’s test that by decompiling a basic console exe:
+
+We’ll compile that in release mode and look at the IL:
+
+and find the method - we see:
+
+I don’t expect everyone to be able to read IL, but what you won’t see in there is any mention of or - and there are no additional types in the assembly (just ). Instead, it is using . The IL we have here is exactly the same as we would get if we had compiled:
+
+This is by design and is always the case - which is why you need a reference to in order to use language tuples. In fact, to make things more fun, you’re *still allowed to use the etc names:
+
+Things would obviously get very confusing if you had used as a name in your tuple syntax - the compiler has enough sense to check that if you declare , it must be in the second spot; and a few other well-known method names are blocked too, but generally: you’ll be fine.
+
+After all, this works:
+
+So the logical names ( and ) are clearly being conveyed somehow, but this is still . If we look at the IL again, we see the trick in the top of the declaration of :
+
+Don’t worry if you’re not an IL expert - they key point is that it declares attributes ( ) against the parameter and return type that include the names, essentially as though we had done:
+
+This tells us once and for all that the names are nothing to do with the type, and are either removed completely, or exposed simply as decorations via attributes (when used on an API).
+
+Note that we don’t just need to consider returning flat tuples - the individual elements of tuples can themselves be tuples, or involve tuples (lists of tuples, arrays of tuples, tuple fields, etc). To be honest I don’t expect to see this much in the wild (if you’re getting this complex, you should probably define your own type), but this works:
+
+which is described as:
+
+which is the equivalent of:
+
+In truth, I don’t know the significance of the , or how exactly the mapping works in terms of position in the compound tuple vs position in the array.
+
+EDIT: oops, silly me - the is because I didn't name the element described by - yes, that's allowed.
+
+It is very common in code that uses libraries to create an insteance and then push it into an API either as or via generics ( ). For example:
+
+with (for a simple example:
+
+If we run this, we see:
+
+This output confirms that once again we’re seeing in play. As before, let’s look at the relevant part of the IL for these two calls (note I added some other code, not shown, to force the value into locals for simplicity):
+
+The first call converts the tuple to by “boxing” it; the second call uses generics without boxing. But neither of them include anything whatsoever about the names. This is consistent with what we saw by dumping the fields, and gives us the summary statement:
+
+Tuple names can be passed outwards (names declared in the public signature of a method can be used in code that consumes that method), but can not be passed inwards (names declared in one method will never be available to general library code that consumes those values). This has significant implications in a wide range of scenarios that we normally expect to be able to access names via reflection: the names simply won’t exist. For example, if we serialized a tuple to JSON, we would expect to see , , etc instead of the names we thought we declared. And there is nothing whatsoever the library author can do to get the original names. It would be nice if there was something akin to the method caller attributes ( etc), that library authors could attach to an optional parameter to receive the dummy names in some structured form (one part per generic type parameter), but: I can see that it would be very hard to define the semantics of this in the general case (it could be a generic method on a generic type nested in a generic type, for example).
+
+OK, so names are off the table. But that doesn’t mean that tuples are completely useless for use with library code. We still have position. And if a library can do something sensible just using the position semantics, then it doesn’t matter that the library doesn’t know the names that the caller had in mind.
+
+This is a binary serialization library that follows the protocol buffers (protobuf) serialization format. One of the ways that protobuf achieves efficent encoding is that it doesn’t care about names. At all (at least, in the binary protocol). All it knows is that there is an integer in field 1, a utf8 string in field 2, and an array of floats in field 3 (for example). In this case, we don’t lose anything when we see - all we need to do is to make sure that the library recognises the pattern and knows how to infer the contract from the type (so maps to field 1, maps to field 2, etc).
+
+As it happens, protobuf-net already had code to recognise a general family of tuple patterns, so this very nearly worked for free without any changes. The only thing that tripped it up was that historically the “is this a tuple” check made the assumption that any sensible tuple would be immutable. As it happens, is implemented as fully mutable (with mutable public fields). By softening that check a little bit, protobuf-net now works with any such tuple it sees.
+
+This is an ADO.NET helper utility, that makes it really really simple to correctly execute parameterized commands and queries, and populate records from the results. In terms of the latter, when executing , it executes the ADO.NET query, then maps the results by name into the fields and properties of , one instance of per row received. As we’ve discovered before, we are never going to able to respect the caller’s names when using C# 7 tuples, and it is unlikely that people will conveniently call their columns , , etc. That means that it probably isn’t going to be useful to use value tuples with domain entity objects, but… if you’re using value tuples for your domain entity objects you already need a stiff talking to.
+
+However! There is another very common query scenario with dapper; ad-hoc local queries that get trivial data. In a lot of these cases, it really isn’t worth going to the trouble of declaring a custom type to receive the results, so dapper supports as a “meh, it’ll work” helper:
+
+This works, but: it involves the DLR (relatively expensive compared to direct C#), and has a few other overheads. What we can do is change dapper to recognise that names aren’t useful in , but rely instead on the column position:
+
+That’s actually pretty handy for a wide range of scenarios where we’re going to consume the data immediately adjacent to the query. And because they are value types we don’t even pay heap allocation costs. I wouldn’t use it for populating real domain objects, though.
+
+you’ll notice that we also have a anonymous type usage to pass parameters into dapper. There are a number of reasons that I’ve left this alone and have made no attempt to support value tuples:
+
+All in all, I’m happy to just say “use anonymous types for the parameters; use tuples for output rows” - it is a pragmatic compromise that covers the huge majority of useful real-world scenarios. I have added code to detect being used in the parameters and raise an appropriate exception guiding the user on the problem an how to fix it.
+
+We’ve explored C# 7 tuples and their implementation. Armed with the implementation details, we’ve explored what that means for code that consumes C# 7 tuples - both upstream and downstream. We’ve discussed the limitations for use with libary code, but we’ve also seen that they still have plenty of uses with library code in some scenarios. If I’ve missed anything, let me know on twitter!
+
+After publishing, Daniel Crabtree very rightly notes that the fields only go up to , and that additional fields are stored in the field which can itself be a tuple. You can read more about that in his post here.|||
+

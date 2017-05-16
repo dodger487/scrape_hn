@@ -1,0 +1,30 @@
+At many a BSD conference, there’s a keynote from somebody involved in the early development of BSD. They get up and talk about the history of some program they contributed, and explain how some of the strange quirks it has came to be. This is usually a good opportunity to then go into the source and review it to see if it can perhaps be simplified.
+
+For example, the gettytab man page has for at least 20 years (even before import into NetBSD and FreeBSD) said, “The he capability is stupid.” Why does anyone even need hostname editing here? Dennis Ferguson mentioned, as an aside, at AsiaBSDCon 2015 that this was a holdover because somebody somewhere didn’t like the way their hostname was printed. Actually, I’ve forgotten exactly how or why it was added, it was that obscure. But finally, Dennis gave us permission to delete this feature. So I did.
+
+Yesterday, I happened to read an article Code Hoarders which I thought showed promise, but just as I was finishing the introduction, I discovered it was actually the conclusion. How is it that code hoarding happens?
+
+Also yesterday, Paul Vixie outlined his history with BSD, including the development of cron. Naturally, this meant I started looking into the cron source for old stuff we didn’t need anymore. In the process, I came across what I think is a good example of code hoarding.
+
+In popen.c, there’s a very popen like function. Reference to cvsweb.
+
+/* this came out of the ftpd sources; it's been modified to avoid the * globbing stuff since we don't need it. also execvp instead of execv. * Special version of popen which avoids call to shell. This ensures noone * may create a pipe to a hidden program as a side effect of a list or dir
+
+Sounds good. As the popen man page says in the BUGS section, “The popen() argument always calls sh(1).” We definitely don’t want that in ftpd. Maybe we don’t want it in cron either, and code reuse is good, right? I note that although the code was updated to remove the globbing code, the second comment was not updated to remove references to the list or dir commands. cron does not have such commands.
+
+The interesting thing about this code is that it also keeps a rather large array to track the pid of the spawned process, so that later when one calls pclose (or cron_pclose), it will wait for the child. We don’t know what file descriptors we’ll get for the pipe we use to talk to the child, so we need a nice big array. And it’d be dangerously silly to only track a single pid. What if somebody uses this code to open two pipes? Alright, it makes some sense.
+
+But actually, why not just return the pid to the caller? They can keep track of it, and then when they close the pipe, pass it back. And so that’s exactly what I did. (One could even make a new struct consisting of the pipe and the pid, but that was more disruptive than needed for a single purpose function.)
+
+Now, why wasn’t this done in the first place? If we dig into the ftpd source, we find:
+
+To spare ourselves another if/else the code uses function pointer, therefore requiring that ftpd_pclose have the same function signature as fclose. Given that all the variables and necessary state is local to a single function, I think this is a rather unnecessary abstraction, but that’s how it is.
+
+So, how does all this relate to code hoarding and reuse? cron inherited this code, and its strange global array of pids, from ftpd. ftpd at least had a tiny excuse for doing it this way, because the interface was constrained. But cron has no such constraints. It was a very simple and straightforward matter to change cron’s functions to return the pid to the caller, and have it return it the close function.
+
+Reusing code without reevaluating its design decisions means we are prone to inherit all of its constraints as well. Often there can be a better, simpler way of doing things, but this requires asking why the code is the way it is. Otherwise, like the proverbial hoarder, we end up with piles and piles of stuff in the mistaken belief that since it was useful yesterday, it must still be useful today.
+
+The best time to address this problem is at the time of reuse. In the case of cron, I was able to trace the code back to the origins and reconstruct the original constraints. That may not have been possible had the ftpd source no longer been available to me. Many people will evaluate a chunk of existing code to make sure it meets all their requirements. (The rest of us assume all our problems are unique and start from scratch.) However, one should then go on to ask what other requirements the code was designed to meet that may no longer be applicable.
+
+This idea is in tension with the idea that we shouldn’t rewrite code because we will accidentally throw away implicit assumptions (and fixes) that were being made. Also true. Blindly throwing out all the strange code will certainly introduce bugs. That just means one should work to discover the rationale for a piece of code. But simpler, leaner code will be safer to reuse in the future.|||
+

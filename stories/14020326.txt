@@ -1,2 +1,64 @@
-|||
+Tens of millions of people are out exploring the new world of Pokémon Go. It turns out that many of those users are not people at all, but automated agents, or bots. Game-playing bots are not a new phenomenon, but Pokémon Go offers some new use cases for bots. These bots have started interfering with everyone’s fun by overwhelming Pokémon Go servers with automated traffic. Pokémon Go is a perfect case study in how automated attacks and defenses work on mobile APIs. At Shape we deal with these types of attacks every day, so we thought we would take a closer look at what happened with the Pokémon Go API attacks.
+
+Niantic recently published a blog post detailing the problems bots were creating through the generation of automated traffic, which actually hindered their Latin America launch. The chart included in the post depicts a significant spatial query traffic drop since Niantic rolled out countermeasures for the automation at 1pm PT 08/03. The automated traffic appears to have been about twice that of the traffic from real human players. No wonder Pokémon Go servers were heavily overloaded in recent weeks.
+
+Figure 1. Spatial query traffic dropped more than 50% since Niantic started to block scrapers. Source: Niantic blog post
+
+There are two types of Pokémon bots. The first type of bot automates regular gameplay and is a common offender on other gaming apps, automating activities such as walking around and catching Pokémon. Examples of such bots include MyGoBot and PokemonGo-Bot. But Pokémon Go has inspired the development of a new type of bot, called a Tracker or Mapper, which provides the location of Pokémon. These bots power Pokémon Go mapping services such as Pokevision and Go Radar.
+
+A mobile API bot is a program that mimics communication between a mobile app and its backend servers—in this case servers from Niantic. The bot simply tells the servers what actions are taken and consumes the server’s response.
+
+Figure 2 shows a screenshot of a Pokémon Go map which marks nearby Pokémon within a 3-footstep range of a given location. To achieve this, the bot makers usually follow these steps:
+
+Using Pokémon Go app as an example, let’s examine how a mobile app is cracked by reverse engineering to reveal its secrets. Since attackers mainly exploited Pokémon Go’s Android app, let’s focus on Android app cracks and defenses.
+
+The Pokémon Go app and the backend servers communicate using ProtoBuf over SSL. ProtoBuf defines the data format transferred on the network. For example, here is an excerpt of the ProtoBuf definition for player stats:
+
+Pokémon Go was reverse-engineered and published online by POGOProtos within only two weeks. How did this happen so quickly? Initially, Niantic didn’t use certificate pinning.
+
+Certificate pinning is a common approach used against Man-in-the-Middle attacks. In short, a mobile app only trusts server certificates which are embedded in the app itself. Without certificate pinning protection, an attacker can easily set up a proxy such as Mitmproxy or Fiddler, and install the certificate crafted by the attacker to her phone. Next she can configure her phone to route traffic through the proxy and sniff the traffic between the Pokémon Go app and the Niantic servers. There is actually a Pokémon Go-specific proxy tool that facilitates this called pokemon-go-mitm.
+
+On July 31, Niantic made a big change on both its server and its Pokémon Go app. Pokémon Go 0.31.0 was released with certificate pinning protection. Unfortunately, the cat was out of the bag and the communication protocol was already publicly available on GitHub. In addition, implementing certificate pinning correctly is not always easy. In the later sections, we will cover some techniques commonly used by attackers to bypass certificate pinning.
+
+The Android application package (APK) is the package file format used by Android to install mobile apps. Android apps are primarily written in Java, and the Java code is compiled into dex format and built into an apk file. In addition, Android apps may also call shared libraries which are written in native code (Android NDK).
+
+Dex files are known to be easily disassembled into SMALI languages, using tools such as Baksmali. Then tools such as dex2jar and jd-gui further decompile the dex file into Java code, which is easy to read. Using these techniques, attackers decompiled the Pokémon Go Android app (version 0.29.0 and 0.31.0) into Java code. The example code shown below implements certificate pinning from the com.nianticlabs.nia.network.NianticTrustManager class.
+
+When application source code is exposed, reverse engineering becomes a no-brainer. Pokemon Go Xposed used less than 100 lines of Java code to fool the Pokémon Go app into believing the certificate from the MITMProxy was the authentic certificate from Niantic.
+
+How did Pokemon Go Xposed achieve this? Quite easily. The tool simply hooks to the call of the function checkServerTrusted mentioned in the above code snippet. The hook changes the first parameter of the function, chain, to the value of Niantic’s certificate. This means that no matter what unauthorized certificate the proxy uses, the Pokémon Go app is tricked into trusting the certificate.
+
+There are many tools that can help make disassembly and static analysis by attackers more difficult. ProGuard and DexGuard are tools that apply obfuscation to Java code and dex files. Obfuscation makes the code difficult to read, even in decompiled form. Another approach is to use Android packers to encrypt the original classes.dex file of Android apps. The encrypted dex file is decrypted in memory at runtime, making static analysis extremely hard, if not impossible, for most attackers. Using a native library is another way to significantly increase the difficulty to reverse-engineer the app.
+
+The most interesting cat-and-mouse game between the pokemongodev hackers and Niantic was around the field named “Unknown6”, which was contained in the signature sent in the map request to get nearby Pokémon at a location. “Unknown6” is one of the unidentified fields in the reverse-engineered protobuf. Initially, it wouldn’t matter what value Unknown6 was given; Niantic servers just accepted it. Starting at 1pm PT on 08/03, all Pokémon Go bots suddenly could not find any Pokémon, which eventually resulted in the significant query drop in Figure 1.
+
+The hackers then noticed the importance of the “Unknown6” field in the protocol, and initially suspected Unknown6 to be some kind of digest or HMAC to validate the integrity of the request. This triggered tremendous interest from the pokemongodev community and an “Unknown6” team was quickly formed to attempt to crack the mysterious field. The Discord channel went private due to the wide interest from coders and non-programmers, but a live update channel kept everybody updated on the progress of the cracking effort. After 3 days and 5 hours, in the afternoon of 08/06, the Unknown6 team claimed victory, releasing an updated Pokémon Go API that was once again able to retrieve nearby Pokémon.
+
+While the technical writeup of the hack details has yet to be released, many relevant tools and technologies were mentioned on the forums and the live update. IDA-Pro from Hex-Rays is a professional tool that is able to disassemble the ARM code of a native library, and the new Hex-Rays decompiler can decompile a binary code file into a C-style format. These tools allow attackers to perform dynamic analysis, debugging the mobile app and its libraries at run time. Of course, even with such powerful tools, reverse-engineering a binary program is still extremely challenging. Without any intentional obfuscation, the disassembled or decompiled code is already hard to understand, and the code size is often huge. As an illustration of the complex and unpredictable work required, the live update channel and a subsequent interview described how the encryption function of “Unknown6” was identified within hours but the team spent an extensive amount of additional time analyzing another field named “Unknown22”, which turned out to be unrelated to Unknown6.
+
+As a result, obfuscation still has many practical benefits for protecting native libraries. A high level of obfuscation in a binary may increase the difficulty of reverse-engineering by orders of magnitude. However, as illustrated by the many successful cracks of serial codes for Windows and Windows applications, motivated mobile crackers are often successful.
+
+Server-side defenses work in a completely different way than client-side defenses. Here are some of the techniques used in the context of protecting Pokémon Go’s mobile API.
+
+Rate limiting is a common approach to try to stop, or at least slow down, automated traffic. In the early days, Pokémon scanners were able to send tens of requests per second, scan tens of cells, and find every Pokémon.
+
+On 07/31, Niantic added rate limiting protections. If one account sent multiple map requests within ~5 seconds, Niantic’s servers would only accept the first request and drop the rest. Attackers reacted to these rate limits by: a) Adding a delay (5 seconds) between map requests from their scanning programs b) Using multiple accounts and multiple threads to bypass the rate limit
+
+In the case of Pokémon Go, the use of rate-limiting just opened another battleground for automated attacks: automated account creation. They quickly discovered that while rate limiting is a fine basic technique to control automation from overly aggressive scrapers or novice attackers, it does not prevent advanced adversaries from getting automated requests through.
+
+Blocking IPs is a traditional technique used by standard network firewalls or Web Application Firewalls (WAFs) to drop requests from suspicious IPs. There are many databases that track IP reputation and firewalls and WAFs can retrieve such intelligence periodically.
+
+In general, IP-based blocking is risky and ineffective. Blindly blocking an IP with a large volume of traffic may end up blocking the NAT of a university or corporation. Meanwhile, many Pokémon bots or scanners may use residential dynamic IP addresses. These IPs are shared by the customers of the ISPs, so banning an IP for a long time may block legitimate players.
+
+Hosting services such as Amazon Web Services (AWS) and Digital Ocean are also sources for attackers to get virtual machines as well as fresh IPs. When attackers use stolen credit cards, they can even obtain these resources for free. However, legitimate users will never use hosting services to browse the web or play games, so blocking IPs from hosting services is a safe defense and is commonly used on server side. Niantic may decide to ban IPs from AWS according to this forum post.
+
+Behavior analysis is usually the last line of defense against advanced attackers that are able to bypass other defenses. Bots have very different behaviors compared to humans. For example, a real person cannot play the game 24x7, or catch 5 Pokémon in one second. While behavioral analysis sounds a promising approach, building an accurate detection system to handle the huge data volume like Pokémon Go isn’t an easy task.
+
+Niantic just implemented a soft ban on cheaters who use GPS spoofing to “teleport” (i.e., suddenly moving at an impossibly fast speed). It was probably a “soft ban” because of false positives; families share accounts and GPS readings can be inaccurate, making some legitimate use cases seem like bots.
+
+On around Aug 12 2016, Niantic posted a note on its website, and outlined that violation of its terms of service may result in a permanent ban on a Pokémon Go account. Multiple ban rules targeting bots were also disclosed unofficially. For example, the Pokemon over-catch rule bans accounts when they catch over a thousand Pokemon in a single day. In addition Niantic encourages legitimate players to report cheaters or inappropriate players.
+
+In our experience, behavioral modeling-based detection can be extremely effective but is often technically or economically infeasible to build in-house. As Niantic commented in their blog post, “dealing with this issue also has opportunity cost. Developers have to spend time controlling this problem vs. building new features.” The bigger issue is that building technology to defend against dedicated, technically-savvy adversaries armed with botnets and other tools designed to bypass regular defenses, requires many highly specialized skillsets and a tremendous development effort.
+
+As Pokémon Go continues to be loved by players, the game between bot makers and Niantic will also continue. Defending against automated traffic represents a challenge not only for gaming but for all industries. Similar attack and defense activities are taking place across banking, airline, and retailer apps where the stakes are orders of magnitude higher than losing a few Snorlaxes. Bots and related attack tools aren’t fun and games for companies when their customers and users cannot access services because of unwanted automated traffic.|||
 

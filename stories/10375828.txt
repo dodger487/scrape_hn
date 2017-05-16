@@ -1,0 +1,56 @@
+I run collectd stats on many of my servers and one thing I enable on some (but not all) of them is the protocols plugin. This plugins pulls from the counters and submits them to the stats server. You can view the data in a human friendly way on linux by running , which should give you something like this:
+
+However I always thought it was strange when I saw this:
+
+The point of interest here is ; since 69 is not a valid ICMP code -it’s in the reserved range- and I am apparently sending a lot of them but not getting any back. I never really looked into this before since I always had more important things to do when I noticed it on my servers, especially since it never seemed to increment.
+
+However this weekend I thought I should look into it more and decided to take a stab into the issue to see what was happening.
+
+RFC792 (The main RFC for ICMP) ) lists the ICMP types as the following (with addendums for clarity):
+
+Since type 69 is in the “Reserved” section, this means that something on my end is spitting out ICMP packets that are wrong.
+
+Looking into things that could possibly doing it (and anything that could possibly trigger it that infrequently and at random sporadic times) I was stumped, so I took my concerns to the kernel code to see how it even gets this information.
+
+First thing I did is grep for anything that could be using or in the kernel code. Unfortunately for this approach, there are many hex encoded data tables in the kernel, making the results a lot of effort to look though. I aborted that quickly and went looking for the code in more precise ways. At that time, I had no idea how the kernel code handles ICMP packets and therefore didn’t really know what I was looking for.
+
+Arriving at and doing a grep for “stats” brought me to these results:
+
+is interesting. However it is fed its type upstream so the bug couldn’t be here. is used in 3 files:
+
+In and it is called in the same way however calls it in differently:
+
+In this case, the type is passed to the function which would mean that the program calling it would have to be supplying crap. This is certainly possible, but since I couldn’t see any type 69 packets in WireShark I thought it unlikely.
+
+Let’s take a look at and now (both of the files are the same):
+
+Okay, so this one is a little more prone to failure since it depends on a few things being right.
+
+First of all since both of these are to do with general output rather than ICMP packets only, this is going to see more mileage (raw sockets and general IP output).
+
+I will assume has the correct value at this point and isn’t triggered randomly, otherwise I would see this much more often, and you would generally see more posts online about why the SNMP counters are so wildly full of strange values.
+
+However if we start looking at how packets are formed, the cast ( ) begins to look more suspicious:
+
+In the case of ICMP, the part that is being sent into the SNMP counters is at the first 8 bits of the packet, in the case of IPv4 there the first two nibbles are Version (a static var) and Internet Header Length - i.e., how long the IP part of the header is. This is as good as static, unless you use Router Alert in IGMP or anything that appends IP options to packets - which basically never happens in the grand scheme of things.
+
+IHL’s are made rather strangely, but basically they are how many 32 bit words long the packet is. Since packets are (other than as above) practically always 20 bytes, that is 5 32 bit words.
+
+Now we have plus meaning that the final byte on the wire is . or decimal 69!
+
+So, what is clearly happening is that when is given the packet, it gives back the packet beginning at the IP part. meaning that when it is cast into an the IPv4 version and IHL is turned into the ICMP type, that is then given to and thus we get the reason why I keep seeing 69 in my stats.
+
+After looking into it, it happens that I was running MTR when I was seeing all the type 69 packets. MTR uses raw sockets to send out its ICMP packets, and that ran into this bug and thus when the counters were updated, it was updated as 69 rather than the actual ICMP type it was sending!
+
+To prove that this is the case, I hacked on a sample program that sends an IPv4 ICMP packet using raw sockets to send a slightly altered IPHL, to see if my changed. (link to program)
+
+Bingo! OutType70! That confirms that the IPv4 version and the IPHL header are being used as the ICMP message value used in the SNMP counter code.
+
+The function is documented to have this quirk, in a few guides like “How to filter network packets…” it is explained that this function won’t always return what someone might be expecting:
+
+In the case of (the path I’m pretty sure that I am going through in my case) it is not that simple and in the rare case that someone does send extra IP Header options, we need to be ready for that, lucky for us just above this code is meaning we can reuse that so that this statement becomes:
+
+Or at least I think so - I don’t program kernels daily, but I am pretty sure this will fix the problem here.
+
+I’ve sent a patch upstream to see if this is the right way to fix it, and if it is, hey I just got code in the Kernel!|||
+

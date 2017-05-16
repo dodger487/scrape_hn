@@ -1,0 +1,147 @@
+Ekam ("make" backwards) is a build system which automatically figures out what to build and how to build it purely based on the source code. No separate "makefile" is needed.
+
+Ekam works by exploration. For example, when it encounters a file ending in ".cpp", it tries to compile the file, intercepting system calls to find out its dependencies (e.g. included headers). If some of these are missing, Ekam continues to explore until it finds headers matching them. When Ekam builds an object file and discovers that it contains a "main" symbol, it tries to link it, searching for other object files to satisfy all symbol references therein. When Ekam sees a test, it runs the test, again intercepting system calls to dynamically discover what inputs the test needs (which may not have been built yet). Ekam can be extended to understand new file types by writing simple shell scripts telling it what to do with them.
+
+Thus Ekam is, in fact, Make in reverse. Make starts by reading a Makefile, sees what executables it wants to build, then from there figures out what source files need to be compiled to link into them, then compiles them. Ekam starts by looking for source files to compile, then determines what executables it can build from them, and, in the end, might output a Makefile describing what it did.
+
+Ekam is an experimental project that is not ready for wide use.
+
+That said, I (Kenton) have successfully used Ekam as my primary build system throughout the development of Cap'n Proto and Sandstorm.
+
+At this time, Ekam only runs on Linux. It requires GCC 4.8+ or Clang 3.3+, as it uses C++11 features.
+
+In the past, Ekam worked on FreeBSD and Max OSX, but the code to support that atrophied and was eventually deleted. Ekam uses a lot of OS-specific hacks and so is unlikely to work on any platform which is not explicitly supported.
+
+We'd like to see other platforms supported, but Ekam's primary user and maintainer right now (Sandstorm.io) is itself highly Linux-specific, so there is not much pressure. (Let us know if you want to help.)
+
+Download and compile Ekam like so:
+
+If successful, Ekam should have built itself, with the output binary at "bin/ekam".
+
+Yes, we use make in order bootstrap Ekam, mostly just because it's slightly nicer than a shell script.
+
+Compiling Ekam requires the GCC flag to enable C++11 features, but currently there is no way for the code itself to specify compiler flags that it requires. You can only specify them via environment variable. So, to build Ekam with Ekam, type this command at the top of the Ekam repository:
+
+The tells Ekam to run up to four tasks at once. You may want to adjust this number depending on how many CPU cores you have.
+
+Note that Ekam looks for a directory called within the current directory, and scans it for source code. The Ekam source repository is already set up with such a subdirectory containing the Ekam code. You could, however, place the entire Ekam repository inside some other directory called , and then run Ekam from the directory above that, and it will still find the code. The Protocol Buffers instructions below will take advantage of this to create a directory tree containing both Ekam and protobufs.
+
+Ekam places its output in siblings of called (for intermediate files), (for output binaries), (for output libraries, although currently Ekam doesn't support building libraries), etc. These are intended to model Unix directory tree conventions.
+
+If you invoke Ekam with the option, it will watch the source tree for changes and rebuild derived files as needed. In this way, you can simply leave Ekam running while you work on your code, and get information about errors almost immediately on saving.
+
+Note that continuous building is the only way to do incremental builds with Ekam -- any time you run a new Ekam process, it always starts from scratch. I generally just leave Ekam running in a console window 24/7.
+
+Ekam can, while running, export a network interface which allows other programs to query the state of the build, including receiving the task tree and error logs.
+
+If you pass the flag to Ekam, it will listen for connections on a port and stream build status updates to anyone who connects. Invoke like:
+
+is a very simple program that prints an Ekam build status stream to the console exactly as Ekam itself does. Currently doesn't actually know how to create a network connection but instead reads the stream from standard input, so you can invoke it like this:
+
+is mostly just a tech demo, since it displays the same info that is already visible in the console where Ekam itself is running.
+
+The directory in the Ekam repository contains source code for a Qt Creator plugin. Qt Creator is an open source C++ IDE that, despite its name, is quite nice even for non-Qt code.
+
+To build the Qt Creator plugin, you'll want to download the Qt Creator source code release and build it from scratch. Then, go into the directory in the Ekam repo and do the following:
+
+This should build the plugin and install it directly into your Qt Creator build.
+
+Now you can start Qt Creator and choose the "Ekam Actions" view in the navigation frame. The plugin connects to a local Ekam instance running on port 41315; so, start ekam like this:
+
+The plugin will also add error markers to you source code, visible in the issue tracker. Double-clicking on a failed rule in the tree view will navigate the issues view to the first message from that action, which you can in turn use to navigate to the source location of the error.
+
+An Ekam project directory must contain a directory called which contains all source code. Ekam will ignore everything other than this directory.
+
+Ekam will create sibling directories called , , and ; you probably shouldn't have any files in those directories to start, because it's nice to be able to them to clean.
+
+In order for Ekam to be able to build a project, it needs to find its rule files, which are under in Ekam's own source code. You will want to symlink this directory into your project's source tree somewhere. It does not have to be anywhere in particular, but is probably a good bet.
+
+You can set the following environment variables to control how Ekam compiles your code:
+
+When Ekam finds or compiles a file that defines the symbol , it will attempt to link the file with other files defining all needed symbols (transitively) in order to produce a binary. The binary takes the name of the with the extension removed, e.g. produces a binary .
+
+The binary is initially just dropped into the directory, which mirrors the directory. For example, will be compiled to , which will link (if it defines ) into . If you'd like for the binary to be output to the directory, you must declare a manifest file with the extension . This file is a simple text file where each line names a file and its output directory. For example:
+
+This says: "Once you've built (within this directory), copy it into ."
+
+You can also choose to rename the file when installing:
+
+This says: "Once you've built (within this directory), copy it to ."
+
+Currently, Ekam does not support building libraries. This seems complicated to support since there's no automated way for Ekam to decide what makes a good library. You'd need to declare some set of modules representing the public interface, which is a bit sad.
+
+For now, Ekam is suitable for projects where the final output is a binary. A "library" in Ekam is just a directory that contains some code. It does not build to a or file; instead, the objects may be directly linked into binaries found in other directories as needed.
+
+There is a common pattern in C++ code in which a particular file's symbols are not referenced from other files, but instead the file registers itself in some global registry at program startup which makes its functionality discoverable to the rest of the program.
+
+By default, this pattern does not work with Ekam, because Ekam has no way to tell which of these magic self-registering files should be linked into which binaries, since their symbols are not referenced from other files.
+
+To solve this problem, don't. This design pattern sucks and you should not use it. Rewrite your code so that its functionality is not dependent on what objects were specified on the link line. For example, have your function explicitly call , , etc., for all the magic modules you want registered, ideally passing a registry object to each function so you don't need a singleton registry.
+
+If you want to be able to find your code when debugging Ekam-built binaries, you should set up a couple symlinks as follows:
+
+To understand the reason for these symlinks, see the explanation of later in this document.
+
+If Ekam builds a binary which ends in or , it will run that binary and report pass/fail depending on the exit status. Passing tests are marked in green in the output (whereas regular successful build actions are blue) in order to help you develop a pavlovian attachment to writing tests and seeing them pass.
+
+Ekam has additional built-in support for two test frameworks: Google Test and KJ tests. When Ekam compiles a source file which declares test cases using one of these frameworks (e.g. using Google Test's or macros, or KJ's macro) but without a function, it will automatically link against the respective framework's test runner (which supplies ) in order to produce a test binary. Note that the detection of test declarations is based on linker symbols, not on scanning the source code, so don't worry if you've declared your own wrapper macros.
+
+In order for Google Test or KJ test integration to work, the respective test framework's code must be in your source tree as a dependency (see below).
+
+Note that tests are run with injected, which has implications if your test does any filesystem access. See the explanation of later in this document.
+
+If your project depends on other projects, and you want to build those other projects as part of your own build (rather than require the user to install the libraries on their system), you should follow the pattern that Ekam itself does.
+
+The basic idea is to have a directory called into which you download the repositories of your external dependencies. Then, under , place symlinks that deep-link into and pull out the code you want.
+
+For example, to depend on Cap'n Proto, you would do something like:
+
+Note that should not be checked into your repository. Instead, you should provide a script that people run after cloning your repo that downloads dependencies. For Ekam's own build, we handle this in the Makefile, so you can look at that for an example. We may eventually add functionality to Ekam to handle dependencies so that you no longer need a Makefile for this.
+
+Now, here's the fun part: If you work on a lot of different projects, instead of nesting dependencies as described above, you can symlink to , such that all your git clones are siblings:
+
+You can do this with Ekam, for instance, if you happen to have Cap'n Proto cloned as a sibling to Ekam.
+
+If your dependency is not organized for Ekam, you might need to link to its top-level directory rather than a source subdirectory. For instance, Google Test separates its source code into and directories, so if you only link in its you'll miss the headers. Instead, link in the whole repo like:
+
+When Ekam sees a directory named , it adds that directory to the include path for all other code it compiles. Thus the Google Test headers will end up includable by your code.
+
+Note that projects imported this way will usually have a bunch of errors reported since they are not Ekam-clean. However, often (such as in the case of Google Test) the important parts will compile well enough to use.
+
+To specify some additional compiler options that should apply within a particular directory (and all children, recursively), you may create a file called and populate it with simple variable assignments in shell syntax. For example:
+
+files are actually executed using just before invoking the compiler. When multiple flags files are in-scope, the flags file in the outermost directory runs first.
+
+You may teach Ekam how to handle a new type of file -- or introduce a one-off build rule not triggered by any file -- by creating a rule file. A rule file is any executable with the extension . Often, they are shell scripts, but this is not a requirement. Rule files can themselves be the output of other rules, so you could compile a C++ program that acts as a rule.
+
+Ekam executes custom rules and then communicates with them on stdin/stdout using a simple line-based text protocol described below. The rule may also write error logs intended for the user to stderr.
+
+When Ekam encounters an executable with the extension, it first runs it with no arguments in order to "learn" it. At that time, the program may tell ekam what kinds of files it should trigger on using the command (below). When Ekam encounters a trigger file, it will execute the rule again with the trigger file's canonical name as the argument. Alternatively, if you just want to implement a one-off action, then the rule may simply perform that action at "learn" time without registering any triggers.
+
+A file's "canonical" name is the name without the or prefix. Thus canonical names do not distinguish between source files and build outputs. No two files can have the same canonical name -- it is an error for a build action to output a file which exists in the directory, or for two actions to produce the same file under .
+
+You can ask Ekam to map a canonical name to a physical disk name using the command.
+
+Ekam rules are triggered by tags. A tag is a simple string, conventionally of the format . Tags are applied to files. For example, a file declaring the symbol might be given the tag . Rules may assign new tags to any file (source or output).
+
+Ekam has some default rules that assign tags meant for broad use:
+
+A rule may perform the following commands by writing them to standard output.
+
+Sometimes, it's hard to know what a build tool's exact inputs and outputs will be ahead of time. For instance, a C++ compiler run will need to input all of the header files ed by the source file. There's no reasonable way to know what these might be in advance, much less look up the locations of files to satisfy each.
+
+To solve this, Ekam implements a library which can be injected into a tool via in order to intercept filesystem calls, automatically issues the proper Ekam commands to register inputs and outputs, and then map the call to the real disk path.
+
+The interceptor library is implemented in and built by . You may request it by requesting the tag , which maps to the compiled , which you may then inject into an arbitrary command using . See to see how this is done with the C++ compiler.
+
+When filesystem calls are being intercepted, an attempt to open a regular filename will be heuristically mapped to the closest file whose canonical name contains the full requested name as a suffix. For example, when processing , if the tool tries to open , this could map to or or , but not nor nor .
+
+If you want to open a file by tag, the special virtual path can be used. For example, since the rule tags all C++ header files with , when we invoke the compiler using the inteceptor, we pass the flag .
+
+If you want to open a file purely by its whole canonical path (not using the heuristic that finds nearby files), you may do so by opening , since as described above every file gets tagged with .
+
+Have a question about Ekam, or want to contribute? Talk to us on the Ekam discussion group.
+
+Ekam is currently developed as part of the Sandstorm.io project and is primarily used by Sandstorm. If you like Ekam, consider getting involved with Sandstorm.|||
+
+ekam - Ekam Build System

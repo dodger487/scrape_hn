@@ -1,0 +1,174 @@
+I recently found a very interesting data set derived from the NBA’s Last Two Minute Report by Russell Goldenberg of The Pudding. Since 2015, the NBA has released a report reviewing every call and non-call in the final two minutes of every NBA game where the teams were separated by five points or less with two minutes remaining. This data set has extracted each play from the NBA-distributed PDF and augmented it with information from Basketball Reference to produce a convenient CSV. The Pudding has published two very interesting visual essays using this data that you should definitely explore.
+
+The NBA is certainly marketed as a star-centric league, so this data set presents a fantastic opportunity to understand the extent to which the players involved in a decision impact whether or not a foul is called. We will also explore other factors related to foul calls.
+
+We begin by loading the data set from GitHub. For reproducibility, we load the data from the most recent commit as of the time this post was published.
+
+We restrict our attention to decisions from the 2016-2017 NBA season, for which salary information is readily available from Basketball Reference.
+
+We have only loaded some of the data set’s columns; see the original CSV header for the rest.
+
+The response variable in our analysis is derived from , which contains information about whether the incident was a call or non-call and whether, upon post-game review, the NBA deemed the (non-)call correct or incorrect. Below we show the frequencies of each type of .
+
+The possible values of are
+
+While decision provides information about both whether or not a foul was called and whether or not a foul was actually committed, this analysis will focus only on whether or not a foul was called. Including whether or not a foul was actually committed in this analysis introduces some subtleties that are best left to a future post.
+
+In this dataset, the “committing” player is the one that a foul would be called against, if a foul was called on the play, and the other player is “disadvantaged.”
+
+We now encode the data. Since the committing player on one play may be the disadvantaged player on another play, we the raw data frame to have one row per player-play combination so that we can encode the players in a way that is consistent across columns.
+
+After encoding, we pivot back to a wide data frame with one row per play.
+
+In addition to encoding the players, we have include a column ( ) that indicates whether or not a foul was called on the play.
+
+In order to understand how foul calls vary systematically across players, we will use salary as a proxy for “star power.” The salary data we use was downloaded from Basketball Reference.
+
+Since NBA salaries span many orders of magnitude (LeBron James’ salary is just shy of $31M while the lowest paid player made just more than $200K) we will use log salaries, standardized to have mean zero and standard deviation one in our model.
+
+We also produce a dataframe associating players to teams, along with some useful per-player summaries.
+
+Throughout this post, we will develop a series of models for understanding how foul calls vary across players, starting with a simple beta-Bernoulli model and working our way up to a hierachical item-response theory regression model.
+
+Before building models, we must introduce a bit of notation. The index \(i\) will correspond to a disadvantaged player and the index \(j\) corresponds to a committing player. The index \(k\) corresponds to a play. With this notation \(i(k)\) and \(j(k)\) are the index of the disadvantaged and committing player involved in play \(k\), respectively. The binary variable \(y_k\) indicates whether or not a foul was called on play \(k\). All of our models use the likelihood
+
+Each model differs in its specification of the probability that a foul is called, \(p_{i, j}\).
+
+One of the simplest possible models for this data focuses only on the disadvantaged player, so \(p_{i, j} = p_i\), and places independent beta priors on each \(p_i\). For simplicity, we begin with uniform priors, \(p_i \sim \textrm{Beta}(1, 1).\)
+
+Even though this model is conjugate, we will use to perform inference with it for consistency with subsequent, non-conjugate models.
+
+Throughout this post, we will use the no-U-turn sampler for inference, tuning the sampler’s hyperparameters for the first two thousand samples and subsequently keeping the next two thousand samples for inference.
+
+We now sample from the beta-Bernoulli model.
+
+We use energy energy plots to diagnose possible problems with our samples.
+
+Since the energy and energy difference distributions are quite similar, there is no indication from this plot of sampling issues. For an in-depth treatment of Hamiltonian Monte Carlo algorithms and convergence diagnostics, consult Michael Betancourt’s excellent paper A Conceptual Introduction to Hamiltonian Monte Carlo.
+
+We will use the widely applicable information criterion (WAIC) and binned residuals to check and compare our models. WAIC is a Bayesian measure of out-of-sample predictive accuracy based on in-sample data that is quite closely related to [leave-one-out cross-validation](https://en.wikipedia.org/wiki/Cross-validation_(statistics%29#Leave-one-out_cross-validation). It attempts to improve upon known shortcomings of the widely-used deviance information criterion. (See Understanding predictive information criteria for Bayesian models for a review and comparison of various information criteria, including DIC and WAIC.) WAIC is easy to calculate with .
+
+We see that the WAIC calculation indicates difficulties with the beta-Bernoulii model, which we will soon confirm.
+
+In addition to the WAIC value, we get an estimate of its standard error ( ) and the number of effective parameters in the model ( ). The number of effective parameters is an indication of model complexity.
+
+The second diagnostic tool we use on our models are binned residuals, which show how well-calibrated the model’s predicted probabilities are. Intuitively, if our model predicts that an event has a 35% chance of occurring and we can observe many repetitions of that event, we would expect the event to actually occur about 35% of the time. If the observed occurrences of the event differ substantially from the predicted rate, we have reason to doubt the quality of our model. Since we generally can’t observe each event many times, we instead group events into bins by their predicted probability and check that the average predicted probability in each bin is close to the rate at which the events in that bin are observed.
+
+The binned predictions and residuals for the beta-Bernoulli model are shown below.
+
+In these plots, the dashed black lines show how these quantities would be related, for a perfect model. The area of each point is proportional to the number of events whose predicted probability fell in the relevant bin. From these plots, we get further confirmation that our simple beta-Bernoulli model is quite unsatisfactory, as many binned residuals exceed 5% in absolute value.
+
+Below we plot the posterior mean and 90% credible interval for \(p\) for each player in the data set (grouped by team, for legibility), along with the player’s observed foul called percentage when disadvantaged. The area of the point for observed foul called percentage is proportional to the number of plays in which the player was disadvantaged.
+
+These plots reveal an undesirable property of this model and its inferences. Since the prior distribution on \(p_i\) is uniform on the interval \([0, 1]\), all posterior estimates of \(p_i\) are pulled towards the prior expected value of 50%. This phenomenon is known as shrinkage. In extreme cases of players that were never disadvantaged, the posterior estimate of \(p_i\) is quite close to 50%. For these players, the league average foul call rate would seem to be a much more reasonable estimate of \(p_i\) than 50%. The league average foul call rate is shown as a dotted black line on the charts above.
+
+There are several possible modifications of the beta-Bernoulli model that can cause shrinkage toward the league average. Perhaps the most straightforward is the empirical Bayesian method that sets the parameters of the prior distribution on \(p_i\) using the observed data. In this framework, there are many methods of choosing prior hyperparameters that make the prior expected value equal to the league average, therefore causing shrinkage toward the league average. We do not use empirical Bayesian methods in this post as they make it cumbersome to build the more complex models we want to use to understand the relationship between salary and foul calls. Empirical Bayesian methods are, however, an approximation to the fully hierachical models we begin building in the next section.
+
+A hierarchical logistic-normal model addresses some of the shortcomings of the beta-Bernoulli model. For simplicity, this model focuses exclusively on the disadvantaged player and assumes that the log-odds of a foul call for a given disadvantaged player are normally distributed. That is,
+
+which is equivalent to
+
+We address the beta-Bernoulli model’s shrinkage problem by placing a normal hyperprior distribution on \(\mu\), \(\mu \sim N(0, 100).\) This shared hyperprior makes this model hierarchical. To complete the specification of this model, we place a half-Cauchy prior on \(\sigma\), \(\sigma \sim \textrm{HalfCauchy}(2.5)\).
+
+Throughout this post we use an offset parameterization for hierarchical models that significantly improves sampling efficiency. We now sample from this model.
+
+The energy plot for this model gives no cause for concern.
+
+We now calculate the WAIC of the logistic-normal model, and compare it to that of the beta-Bernoulli model.
+
+The left-hand plot above shows that the logistic-normal model is a significant improvement in WAIC over the beta-Bernoulli model, which is unsurprising. The right-hand plot shows that the logistic-normal model has roughly 20% the number of effective parameters as the beta-Bernoulli model. This reduction is due to the partial pooling effect of the hierarchical prior. The hyperprior on \(\mu\) causes observations for one player to impact the estimate of \(p_i\) for all players; this sharing of information across players is responsible for the large decrease in the number of effective parameters.
+
+Finally, we examine the binned residuals for the logistic-normal model.
+
+These binned residuals are much smaller than those of the beta-Bernoulli model, which is further confirmation that the logistic-normal model is preferable.
+
+Below we plot the posterior distribution of \(\operatorname{logit}^{-1}(\mu)\), and we see that the observed foul call rate of approximately 25.1% lies within its 90% interval.
+
+With this posterior for \(\operatorname{logit}^{-1}(\mu)\), we see the desired posterior shrinkage of each \(p_i\) toward the observed foul call rate.
+
+The inferences in these plots are markedly different from those of the beta-Bernoulli model. Most strikingly, we see that estimates have been shrunk towards the league average foul call rate, and that players that were never disadvantaged have posterior foul call probabilities quite close to that rate. As a consequence of this more reasonable shrinkage, the range of values taken by the posterior \(p_i\) estimates is much smaller for the logistic-normal model than for the beta-Bernoulli model. Below we plot the top- and bottom-ten players by \(p_i\).
+
+The hierarchical logistic-normal model is certainly an improvement over the beta-Bernoulli model, but both of these models have focused solely on the disadvantaged player. It seems quite important to understand the contribution of not just the disadvantaged player, but also of the committing player in each play to the probability of a foul call. Item-response theory (IRT) provides generalizations the logistic-normal model that can account for the influence of both players involved in a play. IRT originated in psychometrics as a way to simultaneously measure individual aptitude and question difficulty based on test-response data, and has subsequently found many other applications. We use IRT to model foul calls by considering disadvantaged players as analagous to test takers and committing players as analagous to questions. Specifically, we will use the Rasch model for the probability \(p_{i, j}\), that a foul is called on a play where player \(i\) is disadvantaged by committing player \(j\). This model posits that each player has a latent ability, \(\theta_i\), that governs how often fouls are called when they are disadvantaged and a latent difficulty \(b_j\) that governs how often fouls are not called when they are committing. The probability that a foul is called on a play where player \(i\) is disadvantaged and player \(j\) is committing is then a function of the difference between the corresponding latent ability and difficulty parameters,
+
+In this model, a player with a large value of \(\theta_i\) is more likely to get a foul called when they are disadvantaged, and a player with a large value of \(b_j\) is less likely to have a foul called when they are committing. If \(\theta_{i(k)} = b_{j(k)}\), there is a 50% chance a foul is called on that play.
+
+To complete the specification of this model, we place priors on \(\theta_i\) and \(b_j\). Similarly to \(\eta\) in the logistic-normal model, we place a hierarchical normal prior on \(\theta_i\),
+
+We also place a hierarchical normal prior on \(b_j\), though this prior must be subtley different from that on \(\theta_i\). Since \(\theta_i\) and \(b_j\) are latent variables, there is no natural scale on which they should be measured. If each \(\theta_i\) and \(b_j\) are shifted by the same amount, say \(\delta\), the likelihood does not change. That is, if \(\tilde{\theta}_i = \theta_i + \delta\) and \(\tilde{b}_j = b_j + \delta\), then
+
+Therefore, if we allow \(\theta_i\) and \(\beta_j\) to be shifted by arbitrary amounts, the Rasch model is not identified. We identify the Rasch model by constraining the mean of the hyperprior on \(b_j\) to be zero,
+
+We now specify the Rasch model’s likelihood and sample from it.
+
+Again, the energy plot for this model gives no cause for concern.
+
+Below we show the WAIC of our three models.
+
+The Rasch model represents a moderate WAIC improvement over the logistic-normal model, and unsurprisingly has many more effective parameters (since it added a nominal parameter, \(b_j\), per player).
+
+The Rasch model also has reasonable binned residuals, with very few events having residuals above 5%.
+
+For the Rasch model (and subsequent models), we switch from visualizing the per-player call probabilities to the latent parameters \(\theta_i\) and \(b_j\).
+
+Though these plots are voluminuous and therefore difficult to interpret precisely, a few trends are evident. The first is that there is more variation in the committing skill (\(b_j\)) than in disadvantaged skill (\(\theta_i\)). This difference is confirmed in the following histograms of the posterior expected values of \(\theta_i\) and \(b_j\).
+
+The following plots show the top and bottom ten players in terms of both \(\theta_i\) and \(b_j\).
+
+We focus first on \(\theta_i\). Interestingly, the top-ten players for the Rasch model contains many more top-tier stars than the logistic-normal model, including John Wall, Russell Westbrook, and LeBron James. Turning to \(b\), it is interesting that the while the top and bottom ten players contain many recognizable names (LaMarcus Aldridge, Harrison Barnes, Kawhi Leonard, and Ricky Rubio) the only truly top-tier player present is Anthony Davis.
+
+As basketball fans know, there are many factors other than the players involved that influence foul calls. Very often, sufficiently close NBA games end with intentional fouls, as the losing team attempts to stop the clock and force another offensive possesion. Therefore, we expect to see in increase in the foul call probability as the game nears its conclusion.
+
+The plot above confirms this expectation, which we can use to improve our latent skill model. If \(t \in \{0, 1, \ldots, 120\}\) is the number of seconds remaining in the game, we model the latent contribution of \(t\) to the logodds that a foul is called with a Gaussian random walk,
+
+This prior allows us to flexibly model the shape of the curve shown above. If \(t(k)\) is the number of seconds remaining during the \(k\)-th play, we incorporate \(\lambda_{t(k)}\) into our model with
+
+This model is not identified until we constrain the mean of \(\theta\) to be zero, for reasons similar to those discussed above for the Rasch model.
+
+We now sample from the model.
+
+The energy plot for this model is worse than the previous ones, but not too bad.
+
+We see that the time remaining model represents an appreciable improvement over the Rasch model in terms of WAIC.
+
+The binned residuals for this model also look quite good, with very few samples appreciably exceeding a 1% difference.
+
+We now compare the distribtuions of \(\theta_i\) and \(b_j\) for this model with those for the Rasch model.
+
+The effect of constraining the mean of \(\theta\) to be zero is immediately apparent. Also, the variation in \(\theta\) remains lower than the variation than \(b\) in this model. We also see that the top- and bottom-ten players by \(\theta\)- and \(b\)-value remain largely unchanged from the Rasch model.
+
+Basketball fans may find it amusing that under this model, Dwight Howard has joined the top-ten in terms of \(\theta\) and Ricky Rubio is no longer the worst player in terms of \(b\).
+
+While this model has not done much to change the rank-ordering of the most- and least-skilled players, it does enable us to plot per-player foul probabilities over time, as below.
+
+Here we have plotted the probability of a foul call while being opposed by an average player (for both \(\theta\) and \(b\)), along with the probability curves for the players with the highest and lowest \(\theta\) and \(b\), respectively. While these plots are quite interesting, one weakness of our model is that the difference between each player’s curve and the league average is constant over time. It would be an interesting and useful to extend this model to allow player offsets to vary over time. Additonally, it would be interesting to understand the influence of the score on the foul-called rate as the game nears its end. It seems quite likely that the winning team is much less likely to commit fouls while the losing team is much more likely to to commit intentional fouls in close games.
+
+We now plot the per-player values of \(\theta_i\) and \(b_j\) under this model.
+
+Our final model uses salary as a proxy for “star power” to explore its influence on foul calls. We also (somewhat naively) impute missing salaries to the (log) league average.
+
+With \(s_i\) denoting the \(i\)-the player’s standardized log salary, our model becomes
+
+In this model, each player’s \(\theta_i\) and \(b_j\) parameters are linear functions of their standardized log salary, with (hierarchical) varying intercepts. The varying intercepts \(\theta_{0, i}\) and \(b_{0, j}\) are endowed with the same hierarchical normal priors as \(\theta_i\) and \(b_j\) had in the previous model. We place normal priors, \(\delta_{\theta} \sim N(0, 100)\) and \(\delta_b \sim N(0, 100)\), on the salary coefficients.
+
+The energy plot for this model looks a bit worse than that for the time remaining model.
+
+The salary model also appears to be a slight improvement over the time remaining model in terms of WAIC.
+
+The binned residuals continue to look good for this model.
+
+Based on the posterior distributions of \(\delta_{\theta}\) and \(\delta_b\), we expect to see a fairly strong relationship between a player’s (standardized log) salary and their latent skill parameters.
+
+The following plots confirm this relationship.
+
+It is important to note here that these relationships are descriptive, not causal. Our original intent was to use salary as a proxy for the difficult-to-quantify notion of “star power.” These plots suggest that the probability of getting a foul called when disadvanted and not called when committing are both positively related to salary, and therefore (a bit more dubiously) star power.
+
+Importantly, \(\theta_i\) and \(b_j\) should no longer be interpreted directly as measuring latent skill, which is presumably intrinsic to a player and not directly dependent on their salary. In fact, it seems at plausible that NBA scouts, front offices, players, and agents would be somewhat able to appreciate these latent skills, place a value on them, and thereby price them into contracts. It would be interesting future work to refine this model to give an econometric answer to this question.
+
+Since we shouldn’t interpret \(\theta_i\) and \(b_j\) as measures of latent skill in this model, we will not plot their per-player distributions.
+
+We set out to explore the relationship between players involved in a play and the probability that a foul is called, along with other factors related to that probability. Through a series of progressively more complex Bayesian item-response models, we have seen that
+
+In this post we have only scratched the surface of Bayesian item-response theory. For a more in-depth treatment, consult Bayesian Item Response Modeling.
+
+This is is available as a Jupyter notebook here.|||
+

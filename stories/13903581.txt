@@ -1,0 +1,76 @@
+Where there’s money, there’s fraud. To help fight fraud on such a large scale, Uber Engineering’s fraud prevention platform team built Mastermind, a rules engine that can detect highly evolved forms of fraud in a fraction of a second. In this article, we explain how Mastermind works and why we chose a rules engine in the first place.
+
+Because we don’t want to interrupt Uber’s seamless experience for riders and driver partners, our algorithm must deduce a rider’s ability to pay—and detect any fraud—in a fraction of a second. The fraud prevention scope covers payment fraud, account takeover, driver-partner/rider collusion, and promotion abuse. Mastermind helps us fulfill this charter, all while maintaining a seamless customer experience.
+
+To understand why we went with a rules engine, let’s look at the landscape of fraud prevention at Uber pre-Mastermind. Logic that resembled rules was scattered across the Uber codebase, fracturing our fraud prevention effort. One team was using rule-type logic to accept or reject driver signups, while another team had rules to handle trips and yet another team had rules to handle yet another thing, and so on for many teams across Uber.
+
+Another issue was that analysts couldn’t write rules themselves. They had to enlist the help of whichever engineers owned the code that contained the relevant logic. Engineers would have to spend time writing or changing code, which became very tedious. It took an engineer about an hour to write and deploy a rule. The risk of making mistakes also increased, as important details might get lost in communication between the engineer and the analyst.
+
+The system was riddled with inefficiencies. It was clear we needed a way for analysts to write, test, and deploy rules themselves as quickly as possible and with little-to-no engineer involvement.
+
+At first, it may seem like machine learning is the best way to solve this problem, in lieu of a rules engine. Fraudulent activity is so variable and wide in scope that it is impossible for rules to capture every scenario. Preventing fraud requires intelligent decision-making, and we are using machine learning extensively, so why did we build a rules engine?
+
+First, fraudsters act faster than we can train a machine learning model. Second, there are cases where heuristics are more accurate than training data. Third, our fraud system currently hooks into about two dozen user events (e.g., login, signup, and ride request), and a small team like ours can’t build a machine learning model for each of these. Instead, we only build models for the important and complicated events, like trip requests, and use rules for everything else.
+
+In 2015, Uber Engineering had a few options when it came to implementing Mastermind:
+
+Given the variety of fraudulent activity that a large international platform like Uber attracts, we could not settle for the first or second options, and chose to build a new system from the ground up with fraud prevention at Uber being the original and intended application.
+
+Two years later in early 2017, we have an advanced rules engine that not only runs rules but also:
+
+For example, if Mastermind determines a user has moderate risk for fraudulent activity, it slows down their ride request velocity to allow the system more time to analyze the user. At the extreme end of the spectrum, if Mastermind determines a user has high risk, it may reject their ride request and ban them.
+
+Mastermind is also incredibly easy for analysts to use. They can write, test, and deploy a rule within minutes. Given a problem, a set of user features, and a business model, analysts can write a rule and test it in Mastermind by running the rule in Evaluate mode. A status of Evaluate means that the rule is being run but won’t actually affect the user; we’re just logging data to analyze later. This allows analysts to see how often a rule fires and how it performs in general. Once they know the rule is working, they can give the rule a status of Active and run it in production. Engineers don’t need to get involved, and the process is streamlined.
+
+We had to build two versions of Mastermind before we could realize our outlined goals. The first version took two months to build and served us for a little over a year. In this version, rules were configured as Python dictionaries. The design wasn’t perfect—it took analysts about an hour to implement, test, and deploy a rule—but it was still much faster to use rules than have engineers write new code every time, since in this model the features, predicates, and actions that make up a rule can all be reused.
+
+The second version of Mastermind had to be higher-performing than the first, but also entirely compatible with it. We used shadow testing to achieve this. We migrated all existing rules into the new system and routed production traffic through both versions of Mastermind. The new version didn’t actually make decisions, but rather recorded the results of the decisions it would have made. Afterwards, we compared the results of each system to see if they were the same. Once we were sure the second version made accurate predictions, we took the first version offline. It ended up taking four months to build the second version of Mastermind and another two months to migrate it, but now it is much faster to create and deploy a rule than it was in the first version.
+
+Here’s how Mastermind fits into our larger system:
+
+Analysts author rules in the front end. The rules are then stored in a database. The front end can validate the rule syntax, and the author can also test the rule by inputting feature values. Mastermind refreshes rules from the database into memory periodically. It takes about a minute for a frontend change to go into production, a huge improvement over the hour it took in Mastermind’s first version.
+
+The second version not only stores and runs rules; it also provides the framework to fetch features (e.g., number of ride requests in the last hour), run machine learning models, and take actions. The typical event flow for request evaluation looks like this:
+
+Some actions are synchronous, like when Mastermind rejects a request and returns it back to the caller. Some actions are asynchronous, like banning the user. Mastermind calls the fraud actions service to do that.
+
+Let’s take a closer look at how Mastermind’s rule control flow works.
+
+We started building Mastermind by analyzing all the hard-coded rules scattered about the Uber codebase. We discovered some useful patterns in the logic, which we abstracted out to build our current rule control flow (RCF). The RCF consists of a series of checkpoints. Each checkpoint contains a set of rules, and each rule contains a set of attributes. Here’s an example:
+
+Let’s break down the elements of our RCF:
+
+Checkpoints are user events where Mastermind does a fraud check (e.g., user signup). Each checkpoint contains one or more rules, and each rule is independent.
+
+Rules are conditionals that contain three building blocks: properties, predicates, and actions.
+
+Note that predicates and actions can be reused across rules, while each property belongs to one rule.
+
+Here, SPEC is a constant associated with the location Daresbury. We resolve SPEC to a property, so SPEC[Threshold] will resolve to 10 for Daresbury. Domain(Email) is a user-defined function on Email.
+
+With this rule control flow, how did we build Mastermind so that our analysts can write a rule and deploy it within minutes? 
+
+ Like we said earlier, one of our priorities in the design phase was making it easier for analysts to write free-form rules without engineering help. To do this, we needed Mastermind to understand a free-form language (which we now call Predicate-eval) that analysts could easily write in. This would drastically cut the time it took to write, test, and deploy a rule. That being said, we really didn’t want to build a programming language from scratch, considering how difficult and time-consuming that would be.
+
+After much fruitless research, we finally stumbled upon the Python abstract syntax tree (AST) module. AST is a tree that represents the structure of a program. For example, using ASTs, you can write a Python program that takes another program as an input.
+
+ASTs would allow us to build on the foundation of Python and modify/customize the language for our purposes without having to write a whole new language ourselves. We used this to build Predicate-eval, a free-form language for analysts to write and evaluate their rules.
+
+Building Predicate-eval on the foundation of Python suits our purpose well because:
+
+With Python, you could just use the built-in eval() function. However, that introduces a security loophole. Instead, we took a whitelist approach and used the Python AST module to parse an expression into an abstract syntax tree. We defined the handlers of nodes in the tree to protect ourselves further. Dangerous operations that can be used to gain access to the base class (e.g., attribute access) are not implemented and therefore impossible.
+
+With this approach, we not only made Predicate-eval more secure, but also safer to use. Did you know that the expression, None < 1, evaluates to true in Python? Consider this rule: if feature < 1, then ban the user. If the feature happens to be missing for one reason or another, then the user would mistakenly be banned. Predicate-eval disallows this kind of unsafe evaluation.
+
+We also introduced some user-defined functions in Predicate-eval, like lower() and upper() for strings. This way, analysts don’t need to import those functions.
+
+Since Predicate-eval builds on top of Python, Mastermind also needs to be written in Python. With Python GIL, we don’t get access to multiple cores and can’t run rules in parallel. So we did some optimization, like caching parsed abstract syntax trees in memory. Now, running 300 complex rules takes only 30 milliseconds.
+
+The biggest problem we face is that most rules are effective for several weeks; then fraudsters adapt, and rules end up with more false positives. So, we need to continually improve Mastermind to automatically evaluate the effectiveness of rules over time. We also plan to send cases for manual review if confidence in the rule isn’t high enough.
+
+Another issue is that currently, predicates can only be combined with AND logic, limiting us in terms of the criteria we can check for. To increase flexibility and make components more reusable, we may allow predicates to be used as variables so that they can be nested in other predicates. The nested syntax would look like this: Predicate_B = (Predicate_A == True) or (feature < 3).
+
+Mastermind enables us to react fast and boosts the productivity of our fraud analysts. Under the first version of Mastermind, it took analysts a year and a half to implement 300 rules. Under the second version, analysts were able to implement 200 new rules just three months after we launched the front end. If you want to help us detect and prevent fraud faster than ever, check out our fraud engineering openings.
+
+Yifu Diao is a software engineer on Uber’s fraud prevention platform team and the Mastermind project lead, and wrote this article with Isabel Geracioti, a technical writer focusing on this area of Uber Engineering. For more team info, see the fraud prevention team profile.|||
+

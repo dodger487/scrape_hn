@@ -1,0 +1,87 @@
+Coding for SSDs – Part 6: A Summary – What every programmer should know about solid-state drives
+
+This is Part 6 over 6 of “Coding for SSDs”. For other parts and sections, you can refer to the Table to Contents. This is a series of articles that I wrote to share what I learned while documenting myself on SSDs, and on how to make code perform well on SSDs.
+
+In this part, I am summarizing the content from all the other parts in the form of concise self-contained paragraphs. Each paragraph is referencing one or more sections of the other parts, which allow to get more detailed information regarding each topic.
+
+Translations: This article was translated to Simplified Chinese by Xiong Duo and to Korean by Matt Lee (이 성욱).
+
+To receive a notification email every time a new article is posted on Code Capsule, you can subscribe to the newsletter by filling up the form at the top right corner of the blog.
+
+As usual, comments are open at the bottom of this post, and I am always happy to welcome questions, corrections and contributions!
+
+A solid-state drives (SSD) is a flash-memory based data storage device. Bits are stored into cells, which exist in three types: 1 bit per cell (single level cell, SLC), 2 bits per cell (multiple level cell, MLC), 3 bits per cell (triple-level cell, TLC).
+
+Each cell has a maximum number of P/E cycles (Program/Erase), after which the cell is considered defective. This means that NAND-flash memory wears off and has a limited lifespan.
+
+Testers are humans, therefore not all benchmarks are exempt of errors. Be careful when reading the benchmarks from manufacturers or third parties, and use multiple sources before trusting any numbers. Whenever possible, run your own in-house benchmarking using the specific workload of your system, along with the specific SSD model that you want to use. Finally, make sure you look at the performance metrics that matter most for the system at hand.
+
+See also: Sections 2.2 and 2.3
+
+Cells are grouped into a grid, called a block, and blocks are grouped into planes. The smallest unit through which a block can be read or written is a page. Pages cannot be erased individually, only whole blocks can be erased. The size of a NAND-flash page size can vary, and most drive have pages of size 2 KB, 4 KB, 8 KB or 16 KB. Most SSDs have blocks of 128 or 256 pages, which means that the size of a block can vary between 256 KB and 4 MB. For example, the Samsung SSD 840 EVO has blocks of size 2048 KB, and each block contains 256 pages of 8 KB each.
+
+It is not possible to read less than one page at once. One can of course only request just one byte from the operating system, but a full page will be retrieved in the SSD, forcing a lot more data to be read than necessary.
+
+When writing to an SSD, writes happen by increments of the page size. So even if a write operation affects only one byte, a whole page will be written anyway. Writing more data than necessary is known as write amplification. Writing to a page is also called “to program” a page.
+
+A NAND-flash page can be written to only if it is in the “free” state. When data is changed, the content of the page is copied into an internal register, the data is updated, and the new version is stored in a “free” page, an operation called “read-modify-write”. The data is not updated in-place, as the “free” page is a different page than the page that originally contained the data. Once the data is persisted to the drive, the original page is marked as being “stale”, and will remain as such until it is erased.
+
+Pages cannot be overwritten, and once they become stale, the only way to make them free again is to erase them. However, it is not possible to erase individual pages, and it is only possible to erase whole blocks at once.
+
+The Flash Translation Layer (FTL) is a component of the SSD controller which maps Logical Block Addresses (LBA) from the host to Physical Block Addresses (PBA) on the drive. Most recent drives implement an approach called “hybrid log-block mapping” or one of its derivatives, which works in a way that is similar to log-structured file systems. This allows random writes to be handled like sequential writes.
+
+Internally, several levels of parallelism allow to write to several blocks at once into different NAND-flash chips, to what is called a “clustered block”.
+
+Because NAND-flash cells are wearing off, one of the main goals of the FTL is to distribute the work among cells as evenly as possible so that blocks will reach their P/E cycle limit and wear off at the same time.
+
+The garbage collection process in the SSD controller ensures that “stale” pages are erased and restored into a “free” state so that the incoming write commands can be processed.
+
+Background operations such as garbage collection can impact negatively on foreground operations from the host, especially in the case of a sustained workload of small random writes.
+
+Avoid writing chunks of data that are below the size of a NAND-flash page to minimize write amplification and prevent read-modify-write operations. The largest size for a page at the moment is 16 KB, therefore it is the value that should be used by default. This size depends on the SSD models and you may need to increase it in the future as SSDs improve.
+
+See also: Sections 3.2 and 3.3
+
+Align writes on the page size, and write chunks of data that are multiple of the page size.
+
+See also: Sections 3.2 and 3.3
+
+To maximize throughput, whenever possible keep small writes into a buffer in RAM and when the buffer is full, perform a single large write to batch all the small writes.
+
+See also: Sections 3.2 and 3.3
+
+Read performance is a consequence of the write pattern. When a large chunk of data is written at once, it is spread across separate NAND-flash chips. Thus you should write related data in the same page, block, or clustered block, so it can later be read faster with a single I/O request, by taking advantage of the internal parallelism.
+
+A workload made of a mix of small interleaved reads and writes will prevent the internal caching and readahead mechanism to work properly, and will cause the throughput to drop. It is best to avoid simultaneous reads and writes, and perform them one after the other in large chunks, preferably of the size of the clustered block. For example, if 1000 files have to be updated, you could iterate over the files, doing a read and write on a file and then moving to the next file, but that would be slow. It would be better to reads all 1000 files at once and then write back to those 1000 files at once.
+
+When some data is no longer needed or need to be deleted, it is better to wait and invalidate it in a large batches in a single operation. This will allow the garbage collector process to handle larger areas at once and will help minimizing internal fragmentation.
+
+If the writes are small (i.e. below the size of the clustered block), then random writes are slower than sequential writes.
+
+ If writes are both multiple of and aligned to the size of a clustered block, the random writes will use all the available levels of internal parallelism, and will perform just as well as sequential writes. For most drives, the clustered block has a size of 16 MB or 32 MB, therefore it is safe to use 32 MB.
+
+Concurrent random reads cannot fully make use of the readahead mechanism. In addition, multiple Logical Block Addresses may end up on the same chip, not taking advantage or of the internal parallelism. A large read operation will access sequential addresses and will therefore be able to use the readahead buffer if present, and use the internal parallelism. Consequently if the use case allows it, it is better to issue a large read request.
+
+A large single-threaded write request offers the same throughput as many small concurrent writes, however in terms of latency, a large single write has a better response time than concurrent writes. Therefore, whenever possible, it is best to perform single-threaded large writes.
+
+Many concurrent small write requests will offer a better throughput than a single small write request. So if the I/O is small and cannot be batched, it is better to use multiple threads.
+
+Hot data is data that changes frequently, and cold data is data that changes infrequently. If some hot data is stored in the same page as some cold data, the cold data will be copied along every time the hot data is updated in a read-modify-write operation, and will be moved along during garbage collection for wear leveling. Splitting cold and hot data as much as possible into separate pages will make the job of the garbage collector easier.
+
+Extremely hot data and other high-change metadata should be buffered as much as possible and written to the drive as infrequently as possible.
+
+The two main host interfaces offered by manufacturers are SATA 3.0 (550 MB/s) and PCI Express 3.0 (1 GB/s per lane, using multiple lanes). Serial Attached SCSI (SAS) is also available for enterprise SSDs. In their latest versions, PCI Express and SAS are faster than SATA, but they are also more expensive.
+
+A drive can be over-provisioned simply by formatting it to a logical partition capacity smaller than the maximum physical capacity. The remaining space, invisible to the user, will still be visible and used by the SSD controller. Over-provisioning helps the wear leveling mechanisms to cope with the inherent limited lifespan of NAND-flash cells. For workloads in which writes are not so heavy, 10% to 15% of over-provisioning is enough. For workloads of sustained random writes, keeping up to 25% of over-provisioning will improve performance. The over-provisioning will act as a buffer of NAND-flash blocks, helping the garbage collection process to absorb peaks of writes.
+
+Make sure your kernel and filesystem support the TRIM command. The TRIM command notifies the SSD controller when a block is deleted. The garbage collection process can then erase blocks in background during idle times, preparing the drive to face large writes workloads.
+
+To ensure that logical writes are truly aligned to the physical memory, you must align the partition to the NAND-flash page size of the drive.
+
+This summary concludes the “Coding for SSDs” article series. I hope that I was able to convey in an understandable manner what I have learned during my personal research over solid-state drives.
+
+If after reading this series of articles you want to go more in-depth about SSDs, a good first step would be to read some of the publications and articles linked in the reference sections of Part 2 to 5.
+
+Another great resource is the FAST conference (the USENIX Conference on File and Storage Technologies). A lot of excellent research is being presented there every year. I highly recommend their website, a good starting point being the videos and publications for FAST 2013.|||
+
+This is Part 6 over 6 of "Coding for SSDs". For other parts and sections, you can refer to the Table to Contents. This is a series of articles that I wrote to

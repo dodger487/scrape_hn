@@ -1,0 +1,50 @@
+In the guest post below, my colleague Tim Bray explains how he built IsItOnAWS.com . Powered by the list of AWS IP address ranges and using a pair of AWS Lambda functions that Tim wrote, the site aims to tell you if your favorite website is running on AWS.
+
+Is it on AWS?
+
+ I did some recreational programming over Christmas and ended up with a little Lambda function that amused me and maybe it’ll amuse you too. It tells you whether or not a given domain name (or IP address) (even IPv6!) is in the published list of AWS IP address ranges. You can try it out over at IsItOnAWS.com. Part of the construction involves one Lambda function creating another.
+
+That list of of ranges, given as IPv4 and IPv6 CIDRs wrapped in JSON, is here; the how-to documentation is here and there’s a Jeff Barr blog. Here are a few lines of the “IP-Ranges” JSON:
+
+As soon as I saw it, I thought “I wonder if IsItOnAWS.com is available?” It was, and so I had to build this thing. I wanted it to be:
+
+Database or Not?
+
+ The construction seemed pretty obvious: Simplify the IP-Ranges into a table, then look up addresses in it. So, where to put the table? I thought about Amazon DynamoDB, but it’s not obvious how best to search on what in effect is a numeric range. I thought about SQL databases, where it is obvious, but note #2 above. I thought about Redis or some such, but then you have to provision instances, see #1 above. I actually ended up stuck for a few days scratching my head over this one.
+
+Then a question occurred to me: How big is that list of ranges? It turns out to have less than a thousand entries. So who needs a database anyhow? Let’s just sort that JSON into an array and binary-search it. OK then, where does the array go? Amazon S3 would be easy, but hey, look at #3 above; S3’s fast, but why would I want it in the loop for every request? So I decided to just generate a little file containing the ranges as an array literal, and include it right into the IsItOnAWS Lambda function. Which meant I’d have to rebuild and upload the function every time the IP addresses change.
+
+It turns out that if you care about those addresses, you can subscribe to an Amazon Simple Notification Service (SNS) topic that will notify you whenever it changes (in my recent experience, once or twice a week). And you can hook your subscription up to a Lambda function. With that, I felt I’d found all the pieces anyone could need. There are two Lambda functions: the first, , gets the change notifications, generates the JavaScript form of the IP-Ranges data, and uploads a second Lambda function, , which includes that JavaScript. Vigilant readers will have deduced this is all with the Node runtime.
+
+The new-ranges function, your typical async/waterfall thing, is a little more complex than I’d expected going in.
+
+Postmodern IP Addresses
+
+ Its first task is to fetch the IP-Ranges, a straightforward HTTP GET. Then you take that JSON and smooth it out to make it more searchable. Unsurprisingly, there are both IPv4 and IPv6 ranges, and to make things easy I wanted to mash ’em all together into a single array that I could search with simple string or numeric matching. And since IPv6 addresses are way too big for JavaScript numbers to hold, they needed to be strings.
+
+It turns out the way the IPv4 space embeds into IPv6’s ( ) is a little surprising. I’d always assumed it’d be like the BMP mapping into the low bits of Unicode. I idly wonder why it’s this way, but not enough to research it.
+
+The code for crushing all those CIDRs together into a nice searchable array ended up being kind of brutish, but it gets the job done.
+
+Building Lambda in Lambda
+
+ Next, we need to construct the lambda that’s going to actually handle the request. This has to be a Zipfile, and NPM has tools to make those. Then it was a matter of jamming the zipped bytes into S3 and uploading them to make the new Lambda function.
+
+The sharp-eyed will note that once I’d created the zip, I could have just uploaded it to Lambda directly. I used the S3 interim step because I wanted to to be able to download the generated “ranges” data structure and actually look at it; at some point I may purify the flow.
+
+The actual runtime is laughably simple, aside from a bit of work around hitting DNS to look up addresses for names, then mashing them into the same format we used for the ranges array. I didn’t do any HTML templating, just read it out of a file in the zip and replaced an invisible with the results if there were any. Except for, I got to code up a binary search method, which only happens once a decade or so but makes me happy.
+
+Putting the Pieces Together
+
+ Once I had all this code working, I wanted to connect it to the world, which meant using Amazon API Gateway. I’ve found this complex in the past, but this time around I plowed through Create an API with Lambda Proxy Integration through a Proxy Resource, and found it reasonably linear and surprise-free.
+
+However, it’s mostly focused on constructing APIs (i.e. JSON in/out) as opposed to human experiences. It doesn’t actually say how to send HTML for a human to consume in a browser, but it’s not hard to figure out. Here’s how (from Node):
+
+Once I had everything hooked up to API Gateway, the last step was pointing isitonaws.com at it. And that’s why I wrote this code in December-January, but am blogging at you now. Back then, Amazon Certificate Manager (ACM) certs couldn’t be used with API Gateway, and in 2017, life is just too short to go through the old-school ceremony for getting a cert approved and hooked up. ACM makes the cert process a real no-brainer. What with ACM and Let’s Encrypt loose in the wild, there’s really no excuse any more for having a non-HTTPS site. Both are excellent, but if you’re using AWS services like API Gateway and CloudFront like I am here, ACM is a smoother fit. Also it auto-renews, which you have to like.
+
+So as of now, hooking up a domain name via HTTPS and CloudFront to your API Gateway API is dead easy; see Use Custom Domain Name as API Gateway API Host Name. Worked for me, first time, but something to watch out for (in March 2017, anyhow): When you get to the last step of connecting your ACM cert to your API, you get a little spinner that wiggles at you for several minutes while it hooks things up; this is apparently normal. Fortunately I got distracted and didn’t give up and refresh or cancel or anything, which might have screwed things up.
+
+By the way, as a side-effect of using API Gateway, this is all running through CloudFront. So what with that, and not having a database, you’d expect it to be fast. And yep, it sure is, from here in Vancouver anyhow. Fast enough to not bother measuring.
+
+I also subscribed my email to the “IP-Ranges changed” SNS topic, so every now and then I get an email telling me it’s changed, and I smile because I know that my Lambda wrote a new Lambda, all automatic, hands-off, clean, and fast.|||
+

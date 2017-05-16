@@ -1,0 +1,141 @@
+Scaling a database, regardless of the technology behind it, is always a challenge. This is particularly true with a traditional RDBMS such as MySQL and PostgreSQL which power most applications out there. With “standard” replication it is possible to scale reads but not writes as in most configurations there’s just a single master and many slaves. Then there is the issue of high availability: a single master means a single point of failure. Replication lag can also be an issue in many cases.
+
+For MySQL there are solutions based for example on the Galera replication (in the past I’ve often used Percona’s XtraDB Cluster with success) which removes the replication lag issue and make it possible to scale reads and to some extent also writes while also having a highly available system at the same time (I’m sure there are similar solutions for other RDBMS). Unfortunately, a system like this requires that each node store a copy of all of the data, making it impossible to manage huge volumes of data however beefy the servers are. Techniques such as sharding can help with this but can be a nightmare depending on the upfront design.
+
+Over the past few years, new technologies commonly referred to as “NoSQL” (which stands for “Not only SQL” or “Non relational” depending on who you ask) have become very popular as they address some or all the aforementioned issues with relational databases and are a better fit when scalability and high availability of huge volumes of data are paramount.
+
+One of the best NoSQL database systems currently available is Apache Cassandra, which was open sourced by Facebook in 2008 and became an Apache project in 2010. At the moment of this writing the latest version is 3.10.
+
+Based on Amazon Dynamo for the distributed architecture and Google’s BigTable for the data model, Cassandra is an open source distributed, masterless, highly available (no SPOF), fault tolerant and very fast NoSQL database system written in Java that runs on commodity servers and offers near linear scalability; it can handle very large volumes of data across lots of nodes even in different data centers.
+
+Sounds great, right? It does have some limitations though such as the lack of joins and limited support for aggregations in CQL (Cassandra Query Language, a SQL-like language which we’ll look into later); however these limitations are by design to force you to denormalize data so that most queries can be efficiently executed on a single node rather than on multiple nodes or the entire cluster, which wouldn’t be very efficient. Other limitations include per-partition ordering defined when creating a table, and that data for a partition must fit on a single node (it’s important to design tables so that partitions don’t grow indefinitely). The key here is not to try to just use Cassandra as a replacement for a RDBMS when designing applications.
+
+Besides Facebook, many companies such as Netflix and Apple use Cassandra to manage massive amounts of data distributed across thousands of nodes in multiple data centers. Cassandra is available in various flavours, including a “standard” open source version and those offered by DataStax with additional features. In this post, we’ll see how to set up and use a Cassandra cluster using the standard open source version. We’ll use Ubuntu 16.04 LTS as the Linux distro for the nodes of the cluster, so many steps will be different if you use another distro.
+
+To play with Cassandra, I suggest you either use a virtualisation software on your computer (hereinafter the “host”) such as the free Virtualbox, or use some cloud VPS provider such as Amazon AWS, Digital Ocean, or others – which will cost money though. If you go the first route – which I recommend for simplicity – make sure you configure your VMs with “bridged” virtual network adapters otherwise you may have some problems with networking between the nodes.
+
+I will assume here that you use a virtualisation software. To get started, run ifconfig on the host and take note of your IP address; we’ll configure the Cassandra nodes to use static IPs in the same network so that the host can easily SSH into the each node. In my case, for example, the IP of the host is 192.168.10.56.
+
+To setup the first node, create a VM configured with as many cores as the number of cores on your computer and 1GB or more of RAM depending on how much RAM is installed on the host.
+
+Start this first VM, the login and as root edit with VIM or another editor the file /etc/network/interfaces to change the line
+
+with these lines (taken from a node of my test cluster as example):
+
+Make sure you specify the correct name for the network interface in your case, and the correct IP and gateway. In my case, the gateway is 192.168.10.1 and I’m gonna use IPs from 192.168.10.101 to 192.168.10.104 for the 4 nodes in the test cluster (we’ll set up 4 nodes to observe how Cassandra behaves depending on the replication factor).
+
+Next, edit /etc/hostname and change the hostname to something like node1. I’m gonna name my nodes as node1 to node4. Done that, edit /etc/hosts and add the following, so that the node will already have some configuration to reach the other nodes later:
+
+Reboot with sudo reboot for the changes to take effect.
+
+To more easily work on the VM from a terminal on the host, edit ~/.ssh/config on the host and add
+
+Do the same for node2, node3 and node4.
+
+Also, still on the host, edit /etc/hosts and add:
+
+Then run ssh-copy-id node1 to copy your SSH key (assuming you have one) into the VM and then run ssh node1, and login.
+
+Now that you are in the VM from a terminal on the host, you need to install Java as it’s Cassandra’s main dependency.
+
+ Run the following commands:
+
+To check if Java is correctly installed run
+
+Next, run the following to install Cassandra:
+
+Cassandra should now be up and running as a single node – you can check with
+
+Then edit /etc/cassandra/cassandra.yaml and change the following:
+
+ – set cluster_name to whatever, or leave it as the default “Test Cluster” (make sure though you use the same cluster name on all of the nodes);
+
+ – search for seed_provider and under seeds set the IP of this first node to 192.168.10.101; this means that the first node will kinda use itself to seed its data, another way of saying that it will start as a single node cluster;
+
+ – change listen_address and rpc_address to 192.168.10.101; the former is the address the other nodes will connect to in order to exchange information with this node through “gossip”. The latter is the address clients will connect to in order to execute queries.
+
+You can run nodetool status to verify that the single node cluster is up and running. You’ll see something like
+
+Where “UN” stands for “UP and Normal” (Normal meaning the node is fully operational).
+
+To set up the other nodes, repeat all the steps so far but make sure you set, on each node:
+
+ – cluster_name to the same name you specified on the first node
+
+ – listen_address and rpc_address to the IP address of the new node
+
+ – seeds to the IPs of the other nodes
+
+If you run nodetool status again from any node, you’ll see something like the following
+
+This shows that all the 4 nodes are up and running in the same cluster.
+
+CQL, or Cassandra Query Language, is a SQL-like language that can be used to communicate with Cassandra from clients and execute queries. You can experiment with CQL using the cqlsh shell provided with Cassandra upon installation. In order for it to work, you must install python and the driver for Cassandra:
+
+The last step might take some time. Now you should be able to run cqlsh from any node with:
+
+You can specify the IP address of any node, it doesn’t matter really. You’ll see a prompt similar to this:
+
+For a full reference on CQL see https://cassandra.apache.org/doc/latest/cql/index.html. Here I’ll show a few basic commands to get started.
+
+Here we are creating a keyspace, that is a database in Cassandra parlance, named testdb. We are specifying SimpleStrategy, which means a simple replication factor for the cluster; in a production environment you may want to use NetworkTopologyStrategy instead since this allows to specify a different replication factor for each data center. The replication factor is simply the number of nodes which will hold replicas of the data. It is also possible to change the replication factor after creating the table, as we’ll see later.
+
+Now, let’s create a sample table which will contain names, after switching to the newly created keyspace:
+
+We can then insert data as we would do in a typical SQL database:
+
+Note: when creating the table we specified a composite primary key on the last_name and first_name columns; the first column specified is also the partition key, meaning that the rows having the same values for that column will be stored together in the same partition. As mentioned earlier, it is important that tables are designed in such a way that partitions don’t grow indefinitely because each partition must fit entirely on each node that contains a replica of it; for example you may partition by date. The second column, first_name, will determine the ordering of the data. So we’ll basically have names with the same last name stored together and sorted by first_name.
+
+To test this let’s load some sample data. I should mention that you can generate some test data can be done with the cassandra-stress tool but here we’ll use a simple Ruby script to generate some random names to play with. Assuming Ruby is already installed, run
+
+to install the gems required for this example. cassandra-driver is the equivalent of an ORM for Cassandra, while faker is a library that generates real-looking sample data, in this case we’ll use it to generate first names and last names. Open an editor and create a file named e.g. cassandra-test.rb with the following content:
+
+In this sample script, we are connecting to the cluster specifying the IPs of its nodes (you don’t have to specify all of them, as it will automatically figure out the missing nodes and use this information for automatic load balancing), switching to the testdb keyspace, creating a “prepared statement”, then generating and executing 1000 batches of 1000 inserts each with first names and last names generated by Faker. This way we create approximately 1M rows (I say “approximately” because Faker may generate duplicate combinations of first name and last name so the total rows created will likely be close to 1M but not exactly 1M, because new rows with an existing combination of first name and last name will be ignored when inserting). The reason why I am running 1000 times a batch of 1000 inserts is that there is a limit to the size of the batch that can be executed at once.
+
+Then, to check that the data has been generated, go back to cqlsh on any node and run
+
+You’ll see something like the following:
+
+Now run nodetool status on any node and see how the data is distributed across the nodes (“Owns”) – remember that we created the keyspace specifying a replication factor of 1. You’ll see something like this:
+
+Note that Owns is ~25% on each node. With a replication factor of 1 the data is distributed but not replicated, so if we lose one node, for example, the cluster is still up and running but we lose 25% of the data.
+
+Let’s change the replication factor to 3 with
+
+As you can see now each node stores 75% of the data because we have 4 nodes and a replication factor of 3.
+
+If we set the replication factor to 4:
+
+We’ll see that each node contains all the data (Owns = 100%):
+
+We’ve already seen how the nodetool status command can list all the nodes in the cluster with some basic information about their status. Among other useful commands you can use with nodetool is nodetool info, which shows information about a particular node. You can see all the possible commands by just running nodetool without any parameters.
+
+There are other tools which can be used for monitoring and that like nodetool communicate with Cassadra through JMX (Java Management Extensions). For example, jconsole – available with the JDK – allows to “look” inside a Java process and, in our case, to see lots of useful metrics for the Cassandra cluster. It requires a GUI though so it won’t work out of the box on our server version of Ubuntu. However you can run it from another machine (such as the host computer in our case) by connecting to a node on the port 7199. To make it work with our test cluster, you’ll need to either enable password authentication or edit /etc/cassandra/cassandra-env.sh on a node and change the line
+
+Then restart cassandra with sudo service cassandra restart. You should now be able to run jconsole on the host and connect to the remote process on the node at :7199.
+
+Another option is DataStax OpsCenter which is a web app that allows to both monitor and manage a Cassandra cluster. It’s a great tool, but unfortunately the latest version (6.x) no longer supports open source/community editions of Cassandra. So you’d have to use the DataStax Enterprise (DSE) distribution of Cassandra instead.
+
+When a node goes down and then comes back later, it may have out of date data. Assuming a replication factor greater than 1, when you bring the node back in the cluster you should “repair” it so that the node can be updated using another replica as seed. This can be done with the nodetool repair command:
+
+Optionally, it is possible to specify a keyspace to repair
+
+When a node requires maintenance or you want to reduce capacity, you can remove it from the cluster. In the case the removal is planned, you can use the
+
+command to decommission the node. If you run nodetool status from any node while the node is being decommissioned, you will see that the status for that node is UL, meaning that the node is still up but is leaving the cluster. Eventually, Cassandra will automatically redistribute the data stored on the node being decommissioned to the other nodes and the decommissioned node will disappear altogether from the nodetool status list. Note that decommissioning a node does not remove data from that data. Also note that if you are running this command from a node to decommission another node, you may need to configure authentication or disable it on the node being decommissioned (as explained earlier), so that the two nodes can communicate via JMX.
+
+Because the data is not removed from a decommissioned node, before adding it back to the cluster (for example once maintenance is complete) you may want to “clear” that data if the node has been down for a while – this also makes adding the node back to the cluster quicker. To delete the data from the decommissioned node, run (on that node):
+
+The node will reappear in the nodetool status list as UJ (J stands for “joining”); Cassandra will redistribute the data once again including this node and eventually the status of this node will be UN.
+
+When adding back a node to the cluster, you may want to “compact” the data stored on the other nodes, since the data that was previously copied from the decommissioned node to those nodes, remains for a while on those nodes. You can do this with the following command:
+
+From nodetool status you’ll see that the amount of data stored on the node (“Load“) is reduced.
+
+We’ve seen how to decommission a node for maintenance or something like that; if a node unexpectedly dies for example due to hardware failure, you’d want to use the removenode command instead of decommission to remove it. First, take note of the ID of the node to remove from the nodetool status list, then run
+
+Adding the node back to cluster once the problem has been fixed works the same as for a decommissioned node.
+
+This was just an introduction to Cassandra; it’s a big topic and it’s impossible to cover everything in a single post also because I am still learning myself, so I may write more about it later as I learn.|||
+
+How to set up and use an Apache Cassandra cluster.

@@ -1,0 +1,51 @@
+Building the Thoughtful Home means reinventing products that are important to safety, security and comfort. Traditionally, devices ranging from thermostats, smoke detectors and security cameras to lights, locks and appliances have been self-contained, operationally independent units in the home. But Nest’s cloud service platform opens up a wide range of possibilities for how these devices can interact and coordinate when they are operating in a connected mode.
+
+One of the challenges in scaling a platform is developing a reliable data service architecture to support high-volume, real-time and batch logging from devices. In this post, we’ll discuss ideas for leveraging Google Cloud Dataflow at a performance level required for such data intensive applications, including terabyte-level daily data ingestion and processing, and petabyte-level storage.
+
+Nest products log different types of data to the service, ranging from state events (e.g. heater turned on, alarm went off) to time series data (e.g. room temperature, CO readings) to system data that describes how a device is functioning.
+
+This information can be used in a variety of tools and formats to present data to users, including within direct reports like our monthly Nest Home Report, to measuring energy and money savings such as in our Rush Hour Rewards and Seasonal Savings programs, to supporting important field studies, and generally for the continued development of products. In a more real-time example, devices emit sensor events that are inputs into service-based features such as Home/Away Assist. This feature is used to adjust device settings based on an estimate of whether or not users are at home, allowing, for example, Nest Protect to run a monthly sound check to test its audio alert systems only when the home is unoccupied.
+
+One of the perennial problems smart home developers face is that devices in the home are subject to a wide range of conditions in their environments. As a result, the quality and reliability of the data can be unpredictable. For example, factors such as poor WiFi/network connectivity, power loss and battery drain can impact a device’s logging stream. To further complicate things, the devices themselves are subject to stringent battery budgets, which limits available processing power and time spent connected to the network.
+
+The solution to this universal challenge: a robust data architecture and corrective processing downstream to account for data loss, late-arriving data, data duplication, invalid data and even corruption.
+
+The following diagram depicts — at a high-level — the main components of a data architecture suitable for applications like Nest’s.
+
+In this system, devices present their logs and real-time events to the service through logging endpoints which provide authentication, basic data validation, and delivery for downstream processing.
+
+The data pipeline begins with stream processing components that convert events in various formats to Apache Avro. These Avro data are streamed to Apache Kafka topics, with a separate topic for each Avro schema. For instance, one topic may contain temperature data from thermostats. A system with millions of devices could result in several hundreds of topics, with the total event arrival rates into the millions per second.
+
+Some of these data persist in HDFS using a system comprising Apache Storm and Hadoop. Although ideally one might want to persist all of these data in HDFS, the cost and scale of the system required to achieve this, from an infrastructure and operational perspective, becomes unsustainable as systems scale.
+
+Also, the tools available to the users of this data need to evolve with the needs of users. If ad-hoc access to this data is required, Apache Hive is a common approach. Regularly scheduled jobs use a combination of Cascading, Scalding and Apache Spark. Managing resources to service all the users with a reasonable latency on a non-elastic cluster is challenging.
+
+One last area we identified to advance the original pipeline: data backfill. Although rare, it’s not unheard of to run into cases where we need to reload past data. Since the existing pipeline is primarily based on a streaming architecture, supporting backfill requires building and maintaining a separate set of systems that can run in batch mode.
+
+If you want to evolve a data architecture like the one above, without disrupting the existing pipelines or duplicating the entire pipeline, you might introduce Cloud Dataflow and Google BigQuery into the architecture.
+
+Using Cloud Dataflow, the Avro events can be read from Kafka, thereby creating a parallel pipeline to the HDFS ingest pipeline. These events are converted to BigQuery format and streamed into daily BigQuery tables. The snapshot below shows an example of a Cloud Dataflow streaming pipeline.
+
+If you look closely, you can see that this Cloud Dataflow job consists of several parallel “pipelines” (DAGs) with no interdependencies. All but two (we’ll talk about these TickIO pipelines later) of those DAGs do similar transformations, with the exception that they are processing different event types. The first block in these DAGs show the Kafka source that reads from several Kafka topics matching the same event type. The next two blocks do various transformations to map these events to a BigQuery schema for that event type. The last block is the BigQuery sink, which writes these events to daily tables. The target daily tables are determined based on the time the event actually occurred. Note that the event time may be very different from wall clock time because of inherent and unpredictable latencies in the event streams of IoT devices. For instance, devices with poor connectivity or power constraints may buffer events in local memory until they reestablish a connection for upload.
+
+The same pipeline (leveraging shared code with a few modifications) is also run in batch mode for backfilling. The main difference between these pipelines is the data source. In batch mode, the data sources are Avro files stored in Google Cloud Storage or HDFS. There are also some minor differences in how these are parsed and transformed. In batch mode, the BigQuery sink internally uses BigQuery load jobs. BigQuery load jobs are free and can do atomic updates. However, the bottom line is that both streaming and batch jobs are launched from the same Java class (with different arguments). Typically, one might run the batch jobs per event type for a date range. See below for the snapshot of one such job. Each DAG in this job loads data into a single daily BigQuery table.
+
+Earlier, we referred to TickIO DAGs in the context of streaming pipelines. TickIO is a custom source that handles periodic tasks. In the streaming pipeline, there are two TickIO sources — TickIO-5Min and TickIO-Daily. As the names imply, the former performs periodic tasks every five minutes and the latter performs tasks every day.
+
+Some pipelines deal with large enough volumes of streaming data that they could exceed per table streaming quota limits in BigQuery. For such event types, one can stream data into multiple daily tables per event type. To hide this from consumers of these data, we provide daily views over these split tables. As a result, consumers can have a consistent interface across widely varying event volumes and types. The CreateBigQueryView transform run as part of the TickIO-Daily DAG is responsible for the creation of these daily views.
+
+Our Kafka source periodically checkpoints the current consumed offset to a Bigtable table. The TrackKafkaSourceOffsets transform in the TickIO-5Min DAG makes use of this information to compute the Kafka consumer lag for each partition and emits those metrics to Stackdriver. We have set up Stackdriver alerts to alert us whenever these lags exceed certain thresholds.
+
+For example, the following Stackdriver chart shows one such metric which is configured to alert when the Kafka consumer lag exceeds 5%.
+
+Following is an example of another metric which is set to alert when the read rate from a Kafka topic drops below a certain threshold [Note that the alert policies are set elsewhere in the Stackdriver console. These charts are just visual representations].
+
+In addition to the above Stackdriver metrics, we also make use of Cloud Dataflow custom counters to keep track of event level metrics (event counts, error metrics etc.). We have a monitoring system which pulls these data periodically from the Cloud Dataflow job and publishes them to Stackdriver.
+
+By integrating Cloud Dataflow into the data ingest pipeline, a system owner can create flexibility and scale capacity to handle the wide variety of logging conditions and challenges presented by a large-scale fleet of data-logging devices. This also creates a foundational data architecture for leveraging other Google Cloud Services such as Cloud Pub/Sub and Cloud Bigtable.
+
+For large-scale IOT architectures, Cloud Dataflow may be primarily useful for streamlining ingestion, but the easy integration between Cloud Dataflow and Google BigQuery also opens up other uses as well. For example, Cloud Dataflow can be used for data set curation, fleet health monitoring, algorithm performance verification and customer report generation.
+
+We have discussed the basics of data movement and the use of Cloud Dataflow. In reality when dealing with private or sensitive data, security considerations need to be layered on top of any data infrastructure to ensure appropriate measures are in place.|||
+
+Building the Thoughtful Home means reinventing products that are important to safety, security and comfort. Traditionally, devices ranging from thermostats, smoke detectors and security cameras to…

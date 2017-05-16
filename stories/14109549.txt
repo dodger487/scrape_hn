@@ -1,2 +1,63 @@
-|||
+HumanGeo has grown with GitLab over the years. We started off with a meager instance built from source years ago, and finally upgraded to the Omnibus installation last year. Fast-forward to today, GitLab CI has started to knock Jenkins off the throne as continuous integration tool of choice for some of our teams.
 
+As part of our growth and expansion (from around 20 employees then to more than 140 today), along with the emergence of amazing tools like Spark and Docker, the volume and intensity of builds started to outgrow the all-in-one box that we had GitLab & GitLab CI running on. This blog post outlines how we were able to utilize the Docker Machine features of in conjunction with AWS to create a scalable solution that’s cost-effective and most importantly, actually works.
+
+This post assumes that you’ve already set up GitLab CI and have some basic knowledge of how GitLab administration and GitLab runners work.
+
+I figured we could grow with an all-in-one box for a long time. But one day, builds started failing without much in the way of consistency. The times that builds would last before failing, and the steps that would cause failure, were never consistent. In this case, a Spark-based project that uses Gradle as its build tool was choking. First things first, let’s check out the build logs:
+
+Odd. Let’s check the host and see what (and/or kern.log) have to say about this:
+
+We seem to have found the murderer. To corroborate the evidence, searching around reveals this in the Jenkins Wiki:
+
+
+
+ We’re using GitLab CI, not Jenkins, but this still makes sense. The build is utilizing enough resources that the host decides the process has to go. Since is a separate process, thankfully only the build fails and not GitLab itself. Still, this is not ideal. If enough resources are getting used that the OOM Killer is doing its thing, then we may be getting to a point where builds are going to start affecting GitLab performance, including never finishing at all. We don’t want that. After some back and forth with the developer, trying to see what was going on with the tests (there was a lot happening), it became clear that we weren’t able to strip the build down enough to make it work on the current host.
+
+So now comes the time to offload the builds to a separate host. Things have changed since we last added resources for Gitlab. Our current host is an Amazon Web Services EC2 instance of type. To give the runner host a little bit more horspower, we’re going to utilize a newer instance type. However, arbitrarily spinning up new instances for builds can get expensive. Expenses matter, but so do working builds, so we need to find a middle ground.
+
+GitLab’s documentation is spread out over multiple documents, but after reviewing them I devised a plan. Enter ’s ability to harness Docker Machine to help manage aspects like schedule and spot requests to help us get the best of both worlds. Docker Machine can use many different drivers to back the machines it spins up. Since we’re working within AWS, we decided to move forward with the AWS driver.
+
+Now is a good time to consider your security posture. I mention this because your GitLab instance is going to need to talk to the runners over the network, so consider the sensitivity of your projects and communication between nodes when moving forward. This has implications on the AWS security groups you’ll need, your DNS configuration, and other networking factors. For example, we keep the EC2 resources that we want segmented away from public traffic in a VPC called services. Your environment is likely different, so consider what works best for your situation.
+
+On the subject of DNS, we use a BIND DNS service for clients within our network. For our AWS resources, we give public domains A records that point to the instance’s public IP address via Route 53. Why does this matter? If GitLab (or any other client) resolves the domain you’re using to a public IP address, you’ll need to modify your security groups to reflect the use of a public address or point the instance to your internal DNS server for communication over a local network.
+
+Docker Machine will attempt to use a default security group with rules for port 2376, which is required for communication with the Docker daemon. In my opinion, it’s easier to create a security group with the rules you need and provide that when you spin up the runner. This way you can customize it to your liking ahead of time based on your networking environment.
+
+You’ll need an AWS Access Key tied to a user with permission to scale (EC2) and update the cache (via S3). I created a gitlab-scaler IAM user with policies for EC2 (AmazonEC2FullAccess) and S3 (AmazonS3FullAccess). You can dial this back to be more specific if that doesn’t work for your organization. I disabled console login and grabbed the security credentials for this user. We’ll use this later during runner configuration.
+
+Now that we’ve got our cloud settings tuned to our liking, it’s time to configure to use the new configuration. Start by installing or updating the runner service. Our environment uses Ubuntu 16.04 instances on EC2-backed hosts, so your mileage may vary. For other platforms, check out the docs.
+
+Add the GitLab repo and install the runner:
+
+Minor Opinionated Derail: ing scripts from the internet is always a risk, especially when the instructions have you pipe it directly to . Make sure when following instructions like these (which I’ve copied from the official GitLab docs) that you trust the host and you can take that a step further by navigating to the resource manually in the browser and checking out the script before you run it. It is convenient, but I am not a fan.
+
+Register the runner. You’ll need a registration token for this step. You will likely want to use a Shared runner so that all of your projects can use this autoscaling setup, not just a Specific runner which is tied to a project’s scope.
+
+Follow the instructions generated by the command, which will prompt you for the token we just mentioned and some other information. I won’t regurgitate all of the steps here, but the steps for installing a runner in your environment are available as part of the official GitLab documentation. When prompted for the executor, we’re looking for docker+machine.
+
+The registration step above should create (or update, if you already had runners) a configuration file at /etc/gitlab-runner/config.toml. We’ll take this in sections to better discuss why each parameter is needed. Let’s start with the top section - concurrency.
+
+We want up to three concurrent builds at once. You can alter this based on your organization’s needs and cost tolerance. is part of a formula that helps determine the upper limit of the number of instances you will use. Next, we’ll tackle the runners.
+
+We had multiple problems with the GitLab runner’s DNS resolution, which is written in Go. After some furious Googling, we devised the configuration you see above that forces Go to use the ‘native’ resolver instead of of its built-in resolver. is increased to allow you to dump up to 16MB of logs into the console (instead of the default 4MB). The should be the one you used as part of registration. is part of the aforementioned formula used to determine your upper limit. Let’s move on to our Docker settings.
+
+We’re using the default of , but in most cases, each of our build configs (in ) specify their own image. We have turned on to allow the Docker containers to access the hosts Docker daemon for builds. To accommodate our DNS setup, we had to specify that any references to our gitlab.* and nexus.* domains should be routed internally. Now that we have that in place, let’s configure a cache.
+
+This one is pretty straight-forward. The only supported by GitLab CI at the moment is S3 (to include S3-compatible APIs). We’re going to use AWS, thus our . Your and are the credentials for the IAM user you created. The is the S3 bucket that will be used to store the cache. For our deployment, I had to manually create this bucket, but again - your mileage may vary based on when you’re running this. is the region that bucket is located in, and means that all runners use the same bucket and folder structure enabling them to use cached items from other build steps. You may want to disable this if you want a totally fresh build each time, but it has helped improve performance in our setup. The next section helps us determine our level of concurrency and control more of Docker Machine.
+
+Now this is where things start to get interesting. We want at least one machine “hot” (ready for builds) during business hours, specified in our . We’re cool with our hosts being idle for up to 30 minutes (because we’re using spot instances), specified in . To rotate hosts to keep build machines “clean”, we only want each one to run 100 builds before starting a new instance and terminating the old one ( ). For example, GitLab.com only uses one to keep builds sandboxed. The that should be used by Docker Machine is AWS EC2. To make sure everyone knows these machines are the runners, we specify a which will tag the spawned instances. Since our after-hours requirements are much less demanding, we specify our to say that 7:00 PM to 7:00 AM is “after hours”. We don’t need any idle machines during those hours ( ) and will stop the idle instances after a more aggressive cooldown of 20 minutes, set in . Finally, these are the parameters we’ll pass through to Docker Machine.
+
+As detailed above, the specifies which driver should be used. The parameters will be passed through to that driver (as if one was running on the command line). Our VPC and Subnet IDs are needed to tell where to place our EC2 instances. We want to take advantage of awesome new instance types like m4.2xlarge. We want everything to use a private address to keep traffic internal. I’ve specified the keys that should use (docker-machine will make new ones if you don’t). We throw some tags on to help identify the instance, assign it the security group that we defined earlier, and last (but not least): spot instances! We get to harness the power of better instance types at a fraction of the cost, and they only live as long as we need them. This works out much better for everyone.
+
+Worth Noting: If you specify amazonec2-private-address-only as one of the machine options, your EC2 instance won’t get assigned a public IP. This is fine if your VPC is configured correctly with an Internet Gateway (IGW) and routing is fine, but it’s something to consider if you’ve got a more exotic configuration.
+
+While so much of this awesome (moar power, moar cheaper), it isn’t without its issues.
+
+Overall we’re having a lot more success with our build setup and have something that can grow with us instead of confining us. As our build needs increase, we can set our higher limits for max/concurrent builds, and quickly switch out for a newer, better instance type if one is made available without experiencing downtime.
+
+There’s obviously a lot of minutiae that has to be adjusted to make this hierarchy work for you organization. I was fortunate enough to have cool co-workers who were willing to put their builds through the crucible of testing. Ultimately we were able to adjust our configuration to make things work.
+
+Questions or comments? Ways to make this better? Shoot me a tweet at @kwonstant.|||
+
+HumanGeo has grown with GitLab over the years. We started off with a meager instance built from source years ago, and finally upgraded to the Omnibus install...

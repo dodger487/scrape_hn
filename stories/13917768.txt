@@ -1,0 +1,81 @@
+In the first post of this series, I outlined Shopify’s history with flash sales, our move to Nginx and Lua to help manage traffic, and the initial attempt we made to throttle traffic that didn’t account sufficiently for customer experience. We had underestimated the impact of not giving preference to customers who’d entered the queue at the beginning of the sale, and now we needed to find another way to protect the platform without ruining the customer experience.
+
+
+
+Timestamps for Everyone!
+
+To improve fairness around our checkout throttle, we needed to add preference for users based on when they tried to get through. We created a timestamp for their first attempt to checkout, and then as they queued we assessed their priority level by comparing that timestamp against the total set of current users’ timestamps. This ensured that among queued users, ones who arrived earlier wouldn’t lose out to those who came later.
+
+
+
+The most direct way to accomplish this would be using a data store: all user timestamps get stored in a database and when a user requests to checkout we query the database to compare their timestamp with all other timestamps. Some problems quickly became apparent. A data store would be a new point of failure, especially under high load. Furthermore, our load balancers are in multiple data centres. Cross data center replication is nontrivial for something like Redis and requesting data from another data center would be slow.
+
+
+
+We had to find a solution without a data store. An alternate way to fairly queue users was to decide preference by calculating a threshold that each incoming timestamp would be compared against. It’d be like the virtual version of the “Now Serving: 42” counters at delis or the DMV, and all timestamps before the threshold could move ahead to the leaky bucket. This number would have to be calculated independently on each load balancer to maintain the statelessness of our edge tier. The timestamp itself would be stored in a securely signed cookie to prevent tampering.
+
+
+
+To avoid complicating the code, we broke the code path into two phases. The first would decide if a user was a high priority customer, that is, were they close enough to the front of the queue. If they are, they were forwarded to the second phase: the leaky bucket I mentioned in the last post, with functionality remaining the same. Ideally, the number of requests passed would match our capacity limits exactly.
+
+
+
+The question now became how to calculate this threshold. One consideration for the calculation was to not become heavily skewed by customers it saw at the start of the sale that stopped polling without reaching checkout. In the end, we decided that the threshold should look at all the timestamps it saw in the last bucket and adjust itself based on available capacity.
+
+To have a threshold that could adjust itself based on the timestamps of incoming traffic, we found inspiration from our university days. We blew the dust off our control theory textbooks and re-familiarized ourselves with PID controllers.
+
+A PID controller is a control loop feedback mechanism used to dynamically correct for a system’s error value. If your eyes began to glaze over by the end of that sentence, you’re not alone. To put it simply, a PID controller is something that’s informed of a desired state in an environment. It’ll then continually calculate how far off the current state is from the desired state (formally known as the error value). The PID controller will run the error value through a function to calculate the correction required to bring the room to the desired state.
+
+
+
+The function, seen below, is the acronym PID stands for: proportional, integral, and derivative.
+
+
+
+The coefficients of each piece of the function dictates its importance. This function is tuned for each individual PID depending on the system.
+
+
+
+The most common example of a PID controller is the digital climate control in your home. Suppose you set it to 23°C, but the room temperature is 22°C. The climate control detects an error value of 1°C, using that it calculates a correction of 1°C of heat and the heater is activated. After a certain amount of time it’ll check again and at this point it might have overshot so that the room is at 23.5°C. The new required correction is calculated and the air conditioner is activated to bring the temperature down. This cycle of checking the current state and correcting for the error from the desired state continues indefinitely.
+
+
+
+Stateless Fair Queueing
+
+We used these same ideas to calculate the threshold. The desired state was to have exactly the limit of the second phase pass through the first phase. The error rate became the bucket limit minus the number of requests passed to the second phase. Depending on the error rate, the threshold would be moved farther back in time or closer to current time. I mentioned earlier how the PID controller function to calculate the correction is tuned to every system. After running simulations with MATLAB, we settled on calculating corrections with only the proportional term.
+
+
+
+Let’s now take a look at how that practically works for our system. To control traffic hitting our checkout area, we calculate a threshold based on the available capacity in the bucket. If the bucket has room, all requests are considered high priority and flow through. The threshold is dynamic, so that once the bucket fills up, the threshold demarcates requests into high and low priority. Once room opens up again, the threshold recalculates, and the appropriate number of low priority requests become high priority.
+
+
+
+To validate that this worked, we can look at graphs around customer queue times. In the first version of checkout throttle that used random polling, take a look at the p95 (blue), average (yellow), and median (purple) queue times for customers.
+
+As you can see, the variance is quite high. The median and p95 queue times have a huge gap between them and this represents the difference in queue times customers experienced. Now, let’s take a look at what happens after we implemented the feedback system.
+
+See now how the queue time results are more in sync, and the decreased variance indicates that on average everyone spent an equal amount of time in the queue. With our stateless fair queueing shipped, there were no reports of long queue times or unfairness checking out. (We checked Twitter to make sure.) The next sale triggered all our load precautions and everything worked as expected.
+
+
+
+Conclusion
+
+From a distance, it’s easy to look at this story and wonder why Shopify would invest all this time into flash sales. We build for the long-term. So, Shopify decided to never fire a customer for the amount of traffic they bring.
+
+
+
+Flash sales drive bursts of large volumes of traffic making the problem of scaling Shopify substantially more difficult. But they also force us to constantly be thinking about the future. This led us to invest a large amount of engineering effort into supporting shops that could drive orders of magnitude more traffic than our typical baseline for minutes at a time.
+
+
+
+Sales that would take the entire platform down two years ago now go completely unnoticed. Load that could once only be handled by the biggest of retailers can now be handled by a shop of any size. So, when the next million dollar idea starts on Shopify, that merchant can sleep easy knowing their shop is in safe hands.
+
+
+
+This was a team effort, and credit goes to Justin Li, Scott Francis, Shiv Nagarajan, Kat Drobnjakovic, and Thierry Joyal.
+
+
+
+Feel free to add comments or ask questions below. I’m looking forward to answering any questions about what we built, Nginx + OpenResty, or working at Shopify.|||
+
+In the first post of this series, I outlined Shopify’s history with flash sales, our move to Nginx and Lua to help manage traffic, and the initial attempt we ma

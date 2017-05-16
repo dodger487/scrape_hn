@@ -1,0 +1,75 @@
+The hottest modern infrastructure projects are powered by Go*, including Kubernetes*, Docker*, Consul*, etcd*, and many more. Go is turning into a go to language for devops, web servers, and microservices. It is easy to learn, easy to deploy, fast, and has a great set of tools for developers.
+
+But as businesses become more data driven, there is a need to integrate computationally intensive algorithms at every level of a company’s infrastructure, including those levels where Go is playing a role. Thus, it’s natural to ask how we might integrate things like machine learning, distributed data transformation, and online data analysis into our blossoming Go-based systems.
+
+One route to providing robust, performant, and scalable data processing within Go is to utilize the Intel® Data Analytics Acceleration Library (Intel® DAAL) within our Go programs. This library already provides batch, online, and distributed algorithms for a host of useful tasks:
+
+Because Go provides a nice way to interface with C/C++, we can pull this functionality into our Go programs without too much trouble. In doing so, we can take advantage of Intel’s optimizations of these libraries for their architectures right out of the box. As shown here, Intel DAAL can be up to seven times faster than Spark* plus MLlib* for certain operations, like principal component analysis. Woah! I would say it’s time we explore how to level up our Go applications with that sort of power.
+
+Intel DAAL is available as open source and can be installed by following these instructions. On my Linux* machine this was as simple as:
+
+Before trying to integrate Intel DAAL into any Go program, it’s a good idea to make sure that everything works normally. You can do this by following the various getting started guides in the Intel DAAL docs. Specifically, these getting started guides provide an example Intel DAAL application for Cholesky decomposition that we will be recreating in Go, below. The raw C++ example of Cholesky decomposition looks like this:
+
+Try compiling and running this to make sure your Intel DAAL installation has succeeded. It will also give you a taste of what we will be doing in Go. Any questions or issues with the Intel DAAL installation can be discussed in the Intel DAAL forum (which was a great resource for me while I was getting spun up with Intel DAAL).
+
+When utilizing Intel DAAL from within Go, we have a couple of options:
+
+I will demonstrate both of these options below, and all of the code used can be found here. This is just one example, and, eventually, it would be great to add more Go plus Intel DAAL examples to this repository. As you experiment, please submit your Pull Requests. I’m excited to see what you create!
+
+If you are new to Go you should familiarize yourself a bit before continuing with this tutorial. In fact, you don’t have to install Go locally to start learning. You can take the online Tour of Go and use the Go Playground, and then when you are ready, install Go locally.
+
+Go actually provides a tool, called cgo, which enables the creation of Go packages that call C code. In this case, we will use cgo to interoperate our Go program with Intel DAAL.
+
+Note: there are various trade-offs for using cgo with your Go programs that are discussed at length across the Internet (in particular, see Dave Cheney’s discussion or this article from Cockroach Labs*). When choosing to use cgo you should consider these costs, or at least be aware of them. In this case, we are saying that we are willing to work with the cgo trade-offs in order to take advantage of the highly optimized and distributed Intel DAAL library, a trade-off that is likely warranted in certain data-intensive or compute-intensive use cases.
+
+To integrate the Intel DAAL Cholesky decomposition functionality in a sample Go program, we will need to create a directory structure that looks like this (in our $GOPATH):
+
+The file is our Go program that will utilize the Intel DAAL Cholesky decomposition functionality. The and files are C++ definition/declaration files that include Intel DAAL and will signal to cgo what Intel DAAL functionality we are going to wrap. Let’s take a look at each of these.
+
+First, let’s take a look at the file:
+
+These files define a choleskyDecompose wrapper function in C++ that utilizes the Intel DAAL Cholesky decomposition functionality to compute the Cholesky decomposition of an input matrix and output the first element of the Cholesky factor (similar to what is shown in the Intel DAAL getting started guides). Note, in this case, our input is in an array with a length of the matrix dimension (that is, a 3 x 3 matrix would correspond to an input array of length 9). We need to include in our file. This will let the C++ compiler that cgo calls know that we need to export relevant names defined in our C++ files.
+
+Once we have the Cholesky decomposition wrapper function defined in our and files, we can call that function directly from Go. looks like:
+
+Let’s walk through this step by step to understand what is happening. First, we need to tell Go that we want to utilize cgo when we compile our program, and we want to compile with certain flags:
+
+To use cgo, we need to , which is a pseudo-package telling Go that we are using cgo. If the import of "C" is immediately preceded by a comment, that comment which is called the preamble is used as a header when compiling the C++ parts of the package.
+
+CXXFLAGS and LDFLAGS allow us to specify the compile and linking flags that we want cgo to use during compilation, and we can include our C++ function via . I used Linux with gcc to compile this example, so those flags are reflected above. However, you can follow this guide to determine how you should link your application to Intel DAAL.
+
+After that, we can write our Go code just as we would with any other program, and access our wrapped function as :
+
+One peculiarity here (unique to using cgo) is that we need to convert the pointer to the first element of our float64 slice to an unsafe pointer, which can then be explicitly converted to a (compatible with C++) pointer for our function. The unsafe package, as the name implies, allows us to step around the type safety of Go programs.
+
+Ok, great! Now we have a Go program that called our Intel DAAL Cholesky decomposition. Now let’s build and run this program. We can do that as usual with :
+
+and we get the expected output! Indeed, the first Cholesky decomposition factor is 1. We have successfully tapped into the power of Intel DAAL directly from Go! However, our Go program does look a little peculiar with the unsafe and C bits. Also, this is kind of a one-time solution. Now, let’s cook this functionality into a reusable Go package that we can import, just like any other Go package.
+
+To create a Go package that wraps Intel DAAL functionality, we are going to use a tool called SWIG*. In addition to cgo, Go knows how to call SWIG at build time to compile Go packages that wrap C/C++ functionality. To enable this sort of build, we need to create a directory structure that looks like:
+
+Our and wrapper files can stay the same. However, we now need to add a file. This file looks like:
+
+This instructs the SWIG tool to generate wrapping code for our Cholesky function, which allows us to use it as a Go package.
+
+Also, now that we are creating a reusable Go package (not a standalone Go application), the file doesn’t need to include a package main or function main. Rather, it simply needs to define our package name. In this case, let’s call it , which would mean that looks like:
+
+Now we can build and install our package locally:
+
+This builds all of the necessary binaries and libraries that are called when a Go program utilizes this package. Go can see that we have a file in our directory and, as a result, it will automatically use SWIG to build our package.
+
+Awesome; we now have a Go package that uses Intel DAAL. Let’s see how we would import and use the package:
+
+Nice! This looks a lot cleaner as compared to our direct wrapping of Intel DAAL. We can import the Cholesky package, similar to any other Go package, and call our wrapped function as . Also, SWIG has taken care of all that unsafe stuff for us. Now we can just pass the address of the first element of our original float64 slice to .
+
+Similar to any other Go program, this can be compiled and run with :
+
+Yay! The correct answer. We can now utilize this package in another other Go program where we need Cholesky decomposition.
+
+With Intel DAAL, cgo, and SWIG we were able to integrate optimized Cholesky decomposition right in our Go programs. However, these techniques aren’t limited to Cholesky decomposition. You could create Go programs and packages that utilize any of the Intel DAAL implemented algorithms the same way. That means you can implement batch, online, and distributed neural networks, clustering, boostings, collaborative filtering, and much more right there in your Go applications.
+
+All of the code used above can be found here.
+
+Daniel (@dwhitena) is a Ph.D. trained data scientist working with Pachyderm (@pachydermIO). Daniel develops innovative, distributed data pipelines which include predictive models, data visualizations, statistical analyses, and more. He has spoken at conferences around the world (ODSC, Spark Summit, Datapalooza, DevFest Siberia, GopherCon, and more), teaches data science/engineering with Ardan Labs (@ardanlabs), maintains the Go kernel for Jupyter, and is actively helping to organize contributions to various open source data science projects.|||
+
+Using Intel® Data Analytics Acceleration Library (Intel® DAAL) with the Go* programming language to enable batch, online, and distributed processing

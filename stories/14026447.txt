@@ -1,0 +1,85 @@
+With clear requirements we set out to find a solution that ticked the most boxes on our checklist. Not a small task, considering we also needed to write all the code that would be deployed and make our customers happy.
+
+While already gaining a lot of momentum, Docker was still a relatively novel technology (in 2015). That meant there weren’t many off the shelf solutions to run it in production. Amazon’s Ec2 Container Service (ECS) was in beta at the time and only available in us-west-2. Another offering by Amazon we looked at was the Elastic Beanstalk. We dropped Beanstalk out of the race, because it’s geared more towards simple workloads and we chose to go with a micro service architecture.
+
+While building out the prototype using ECS, an exciting new alternative emerged: Kubernetes. This quirkily named container orchestration system was initially developed and released by Google, based on the production experience with their internal system called Borg.
+
+It caught our attention at just the right time. We set our first Kubernetes prototype up in the 0.x days (roughly around 0.19). Compared to ECS, it had a few major differences.
+
+On the plus side:
+
+As anything else, it had some downsides as well:
+
+The early stage of the project wasn’t an issue for us at the time, as their release plans aligned with our production target (albeit a bit tight, but you got to sprinkle some excitement here and there, right).
+
+“Do we really need Google scale?” The answer is no.
+
+In fact, we benefit most from all the amazing features and the power of the tooling with kubectl.
+
+Kubernetes enables us to declare our services with simple YAML files. It gives us a simple and powerful way to roll new versions out — rolling back automatically when bad things happen. It provides simple and automatic service discovery. Gives us a simple way of scaling out our service. It utilizes underlying resources better by binpacking our services.
+
+It turns out there are two different components when starting from zero to running in production. The first is getting a working Kubernetes cluster up and running. The second is utilizing this cluster to provision and operate your services.
+
+Provisioning the cluster is done infrequently. So far, we only made changes when upgrading to a newer version of Kubernetes. We’re running two clusters: Production and Canary (our staging environment). Having this process fully automated also makes it trivial to provision new clusters as needed. For example, when testing out new version of Kubernetes.
+
+Initially, Kubernetes shipped with shell scripts that would provision EC2 instances, and setup a working cluster. I didn’t like this approach, because I find long bash scripts complex and difficult to maintain. Luckily, AWS provides CloudFormation, which allows you to declare all the components of your infrastructure. Using this and minimal bash scripts to automate common tasks, we can provision a new cluster in 20 minutes (most of that time is spent provisioning an RDS Postgres instance). Roughly at the same time, this approach was validated by CoreOS (and it has since graduated into it’s own project), who have poured an enormous amount of work and resources into Kubernetes.
+
+Unfortunately, we’re still using our homegrown CloudFormation templates, due to changes in the lower parts of the stack. Moving to completely stock distribution is on our roadmap. While doing it ourselves initially provided a lot of learning experience, we’ve found it challenging keeping up with the pace of development due to limited resources. If I was starting again today, I would use kube-aws by CoreOS.
+
+Note: I use the term service to refer to an application performing a certain function in our stack. It’s not the same as a Kubernetes service.
+
+We separate build from deploy, using CircleCI to build our images and Docker Hub to host them.
+
+Currently we only build two branches: goes to the Canary cluster and to Production. Feature branches can currently only be built manually.
+
+The biggest problem we’ve encountered was configuration management. Configuration is passed to our applications via ENV variables. This means that the images don’t have any configuration baked in (such as a configuration file passed in at build time).
+
+But the scheduler needs to know of the configuration values when it runs the application. Where does it get it from?
+
+It seems there are roughly two camps here. One that would never put configuration in version control and the other that would. We’ve decided not to put it in git, to limit exposure.
+
+Instead, we put all our configuration in a file which contains all bash environment variable definitions. This configuration file was evaluated by scripts that rendered our replication controller declarations. The scripts would render declarations and upload them to Kubernetes via  . We chose coffeescript for this, because the syntax resembles YAML. This allowed us to keep the familiarity of all the standard examples and add logic to our templates.
+
+We were updating our replication controllers (container versions and configuration) in the same way. A script would render the new declaration and rolling update the specified replication controller.
+
+This has served us well for a long time, but it had a major limitation by design: in order to keep the configuration file always up to date, we made editing it a hard requirement of the update process. This makes it impossible to deploy from anywhere. To collaborate, we’ve provisioned a quick and dirty EC2 instance, which we all used to deploy, sharing the configuration file there.
+
+There are ways we could improve our scripts to not rely on a local static file for configuration values, taking it from the running declaration of the replication controller instead. We could even use to mutate the declaration in place.
+
+Fortunately, Kubernetes released a new feature, which addresses the issue of configuration management: Config Maps. Essentially, it allows you to store configuration keys and values in the cluster and give them their own lifecycle, decoupled from application lifecycle.
+
+We went from rendering replication controller declarations, which included configuration values to using completely static Deployments (next generation of Replication Controllers), which merely reference configuration declared in Configuration Maps.
+
+For the most part, the only variable parts of Deployment declaration are the container version and the list of referenced configuration variables. Container version can easily be changed with and configuration manipulated with .
+
+We now have our configuration neatly organized across multiple ConfigMaps. For example, we have one ConfigMap per service, one for common configuration and a few others to group keys together logically:
+
+Sensitive configuration (app keys, etc.) can be stored as a Secret and referenced in a similar way. Both can be consumed by the application as mounted files too, if that’s your requirement.
+
+Just like separating build from deploy and provisioning the cluster from operating our services, we now have separate tasks of managing configuration and operating our services.
+
+This is great, because configuration changes infrequently and we deploy often. It’s simplifies both operations — great for automation!
+
+As mentioned above, the configuration values can be modified with :
+
+While the container version update is as simple as:
+
+Kubectl does all the heavy lifting for us, which leaves us only with the most basic shell scripts to make common tasks even simpler. This has proven to be a significant benefit for us, as it gave us a lot of power for the time invested in developing and maintaining our own operations toolkit.
+
+We used docker-compose to run our services locally for a long time. It worked great for us, but the vision was always to reuse the automation across all the stages of the process — production, stating, and local environments.
+
+Today, we run our services exactly the same way locally, as we do in production using Minikube.
+
+With no external dependencies left, all we need to setup continuous delivery is granting access to the cluster (generating certificates) and installing kubectl.
+
+Here is an example for CircleCI (relevant parts only):
+
+Set  , and  , as ENV variables in your CircleCI settings. It’s better to define them in you project settings, than commit them in the repository.
+
+Create a archive of the certificates and keys:
+
+Store this value in your CircleCI settings (or whatever applies to your CI/CD tool of choice)
+
+We continue to make improvements to our stack, as new requirements crop up, and we learn new things. With the move to Deployments and ConfigMaps, we’ve streamlined the operations of our own services significantly. We’d like to move our cluster provisioning to utilize kube-aws, and time permitting, contribute to the project (as well as to Kubernetes).|||
+
+Roughly two years ago, we decided to overhaul our tech stack completely. We had a frontend Angular app, with Parse as the backend, which went through many quick iterations in its lifetime. Starting…

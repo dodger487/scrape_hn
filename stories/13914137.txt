@@ -1,0 +1,142 @@
+I wrote a self-hosting C compiler which I named 8cc in 40 days. This is a log when I was writing it from scratch by myself in 2012. The code and its history are available at GitHub.
+
+Arrays are correctly decayed into pointers, so the code like this works too. It also supports function calls.
+
+Implementing these features is easy because this is the second time for me. I've gotten better at handling pointers and arrays.
+
+Of course it lacks many features. These sample programs are carefully crafted to not use unimplemented ones.
+
+The implementation is pretty straightforward; it doesn't even have register allocator. It compiles source programs onto a stack machine that uses the machine stack as the stack. Every operation would require memory access, but it's OK at least for now.
+
+At first the compiler was about 20 lines long, and the only thing that was able to do is to read an integer from the standard input and then emit a program that immediately exits with the integer as exit code. Now it's 2,000 lines long. From the git log, it seems to have evolved this way.
+
+It seems it's working as it should; I can define a struct containing a struct. I'm able to create a pointer to a struct and dereference it. Both a struct containing an array and an array of a struct work. Although I already knew that the code should work in theory, it still made me happy when the code actually worked in a complicated test case like this.
+
+However, I don't feel I completely understand why this code behaves correctly. It feels somewhat magical because of its recursive nature.
+
+I cannot pass a struct to a function. In x86 calling convention, structs are copied to the stack and their pointers are passed to functions. But in x86-64, you have to destructure a struct into multiple pieces of data and pass them via registers. It's complicated, so I'll leave it alone for now. It's rare that you want to pass a struct as a value instead of passing a pointer to a struct.
+
+Supporting the floating point number was hard. Looks like implicit type conversion between integers and floats is working, but floating point numbers cannot be passed to functions. In my compiler, all function parameters are first put onto the stack and then popped to the registers in the order as defined in the x86-64 calling convention, but there must be a bug in that process. It is failing with SIGSEGV. It's hard to debug it by looking at assembly output because my compiler's non-optimized assembly is too long to read. I thought that I would be able to finish this in a day, but I was wrong.
+
+I found that printf() fails with SEGV if I pass multiple floating point numbers to the function. I tried to find the condition to reproduce. It turned out that position of the stack frame matters, which made me recall the x86-64 ABI requirement.
+
+I did not care about that at all, so the stack frame was aligned only to 8 bytes, but printf() did not complain as long as it takes only integers. This problem could be fixed easily by adjusting the stack frame before executing CALL instruction. But this kind of issue cannot be avoided unless you've read the spec extremely carefully before writing code.
+
+There's another change that's more meaningful than that. I rewrote tests in shell script in C. Prior to that change, each test function is compiled with my compiler, linked with main() which is compiled with GCC, and then executed by the shell script. That was slow because it spawns many processes for each test. I had no choice when I started the project since my compiler lacked so many features that I couldn't write tests in it (it couldn't compare a result with an expected value because of the lack of comparison operators, for example.) Now it's powerful enough to compile test code. So I rewrote it to make them faster.
+
+I also implemented larger types such as long and double. Writing the code was fun because I succeeded in implementing the features as quickly as I can.
+
+Implementing C preprocessor is no easy task.
+
+It's a part of the C standard, so it's defined in the spec. But the spec says too little about it that it's not useful to implement by itself. The spec includes a few examples of macros with their expanded forms, but it say only little about the algorithm. I think it doesn't even say the details of its expected behavior. In short, it's underspecified.
+
+As far as I know the PDF in this blog is the only and the best resource about how to implement a C preprocessor. The algorithm described in the document, which is Dave Prosser's algorithm, is basically to try to expand as much tokens as possible while avoiding infinite macro expansion. Each token has its own expansion history so that tokens are not expanded by the same macro more than once.
+
+C preprocessor is itself an independent language. It's rich in features, and only seasoned C programmers understand that well.
+
+System header files are large and complicated. It requires many new features to the compiler, such as enum or typedef. I implemented them one by one, but I sometimes cut corners. I'm trying to read stdio.h. I have no idea how long it will take for me to finish.
+
+The compiler is currently 4,000 lines long. A small compiler, LCC, is 12,000 lines long. Using it as a guide I think my compiler should be able to work as a real C compiler soon.
+
+I'm surprised that I wrote 500 lines of code today. I can be in the zone for 12 hours, but it may be inefficient because it tired me without noticing. Anyways I have to admit I'm a person with a lot of free time.
+
+The scheme I'm using to implement a C compiler is to create a compiler for a very small subset of C first and then evolve it into the real C language. Until recently I didn't have to try hard to implement features that I don't fully understand. I could write as much code as I want and leave the rest. That was fun.
+
+The external stuff like the system header caused too much trouble. Now I have to implement all the feature that a "right" C compiler is expected to have. I made so many dirty hacks to read stdio.h till its end. For example, I implemented a hack to ignore all occurrences of token "const". It made me sad.
+
+You would say why don't you do that in the right way from the beginning. I'd say because it's not fun, too. For example, C's type declaration syntax is too complicated without any sane reason, and implementing it is not fun at all.
+
+That being said, there's something I cannot avoid. I should probably change my mind to implement all the features from end to end. I may find it fun as I'm approaching the goal. Sometimes, I have to write more code than I want to write in order to achieve a goal.
+
+I think I've been writing C for almost 15 years, but today I feel like I finally understand the C type syntax for the first time. It's no wonder I couldn't write working code. It's because I simply wasn't understanding it correctly.
+
+The code that I just wrote is too complicated and fragile that even I can barely understand. I don't believe Dennis Ritchie, the creator of the C language, understood the implications of what he was doing. I suspect that he invented a syntax, wrote code for it, which turned out to be more complicated than he had expected. And that was eventually standardized by the ANSI committee. It's hard to implement a standardized language because you have to get everything right. It's rather easy to write your own toy language.
+
+Today it succeeded to self-compile a file of the compiler itself for the first time. It worked when I linked it with other files compiled with GCC. The resulting compiler seemed to work. The goal seems to be getting closer.
+
+The C vararg spec is not well-designed. If you pass all function arguments via the stack, va_start may be implemented pretty easily, but on the modern processor and in modern calling convention, arguments are passed via registers to reduce overhead of function calls. So the assumption of the spec does not match the reality.
+
+Roughly speaking, x86-64 ABI that AMD standardized requires a variadic function dump all registers to the stack to prepare for subsequent va_start call. I understand they had no choice other than that, but it feels awkward.
+
+I was wondering how other compilers handle variadic functions. I looked at the header of TCC, and it looked like it's not compatible with x86-64 ABI. If the data structure for varargs is different, functions passing va_list (such as vprintf) becomes incompatible. Am I wrong? [I was actually wrong  —  it is compatible.] I also looked at Clang but it looks complicated. I stopped reading it. If I read too much code of the other compilers, it may spoil fun of doing it myself.
+
+I tried to support functions that have more than 6 parameters but couldn't finish it in one day. In x86-64, the first 6 integer parameters are passed via registers, and the rest are passed via the stack. Currently it only supports register passing. It shouldn't be hard to pass arguments via the stack, but it took too much time to debug. I believe there is no function in my compiler that has more than 6 parameters, so I can leave it alone for now.
+
+What make it worse is that in the core files I'm using relatively new C features such as compound literal and designated initializer. They make it hard to self-host. I shouldn't have used them, but rewriting it with the plain old C would be counter-productive, so I'd like to support them in my compiler. It will take time, though.
+
+First of all, the lexer remembers the position where it is reading, and when it dies for an unexpected reason, it always prints out the current position where it left off. That makes it easy to find a bug that a compiler does not accept a valid input.
+
+There's a command line option to print out the internal abstract syntax tree. If there's a bug in the parser, I'd look at the syntax tree.
+
+Code generator makes extensive use of recursion because it emits assembly code snippets as it traverses the abstract syntax tree. I made it print a mini stack trace for each line of assembly output. If I find something wrong, I can trace the code generator by looking at it.
+
+Most internal data structures have function to stringnize it. It's useful for printf debugging.
+
+I always write unit tests as I write a new feature. Even while I'm implementing a new feature, I was careful to keep the code compile as much as possible, so that I can run tests. The tests are written to finish in a short period of time, so that you can run them as often as you want.
+
+I think the only lacking feature for self-hosting is struct assignment. I hope everything would work as designed without much debugging once I have all the features.
+
+I thought I had no choice other than printf debugging because the second generation is compiled using my compiler which does not support debug information. I added printf at suspicious points. The printf debug messages were then displayed while compiling the second generation, which surprised me a bit. I only wanted to have the debug output while I'm using the second generation, so I did not expect the output being made while I'm creating the second generation.
+
+It reminds me of the movie, Inception. We need to go deeper to reproduce this bug. It's a fun part of debugging a self-hosting compiler.
+
+I fixed many issues caused by low quality code that I wrote at the early stage of this project. That made me tired.
+
+I believed that I had all features for self-hosting, but that was not true. It didn't even have pre-increment/decriment operators. For some C99 features I rewrote a part of the compiler to make it more compiler friendly. Because I wasn't expecting to be able to approach self-hosting so soon, I've been using as much new C features as I want without thinking about self-hosting.
+
+It took about 40 days. It's a pretty short period of time to write a self-hosting C compiler, don't you think? I believe my approach of making a small compiler for a very limited subset of C first and then improving it into a real C compiler worked pretty well. Anyways I'm very happy today.
+
+Looking at my code, even though I wrote it, it feels magical to me that it can handle itself as an input and translate it to assembly.
+
+There are many bugs and unimplemented features left. I'd probably finish them, and then start working on improving the output code quality.
+
+Source code is here. I don't know if it's worth reading, but it may be interesting for you to look at it as a sample of C code that a simple compiler written in 5,000 lines can handle.
+
+I added a test to run the self-compiler twice to see if the results were the same for the second and the third generation files. If I remember correctly, GCC has a similar test.
+
+For example, my compiler interprets "
+
+" (a sequence of backslash and character "n") in a string literal as "
+
+" (a newline character in this case). If you think about this, you would find this a little bit weird, because it does not have information as to the actual ASCII character code for "
+
+". The information about the character code is not present in the source code but passed on from a compiler compiling the compiler. Newline characters of my compiler can be traced back to GCC which compiled mine.
+
+Compilers can pass on much larger information than a character code.
+
+This amazing story was presented by Ken Thompson at his Turing Award lecture. The information that Ken planted in the early version of Unix compiler was the ability to recognize the login program to make it silently accept some password, so that Ken could login to any Unix account. He also made the compiler recognize the compiler itself to pass on the login program hack and the compiler hack itself, so that these backdoors (which don't exist in their source code) are inherited from generation to generation. You couldn't remove them even if you carefully inspect every line of the compiler source code and recompile it, since the compiler that processes the source code was polluted. It's an amazing story, isn't it?
+
+Techniques to write parsers is one of my most useful skills as a programmer. It has helped me countless times.
+
+However, when I was reading the C language spec to write a recursive-descendent parser for the grammar, I found that some derivations are left-recursive. I had to think for a while and open a textbook again to recall how to rewrite the grammar to make it right-recursive. Elimination of left recursion is a very basic topic about parsing that all introductory textbooks would cover. But I can't remember such basic stuff when I don’t use the technique for a long period of time.
+
+I read the Dragon Book again for that topic without feeling that I fully understood it. The book is a bit too abstract that I cannot immediately apply to my case.
+
+My compiler is 2x slower than GCC when compiling itself. It is not as bad as I thought. My compiler emits terribly naive assembly, but such naive code is not slow in order of magnitude.
+
+I moved implicit type conversion out of the code generator. They are now explicitly expressed in AST. It makes it easy to understand what's going on under the hood. I also made random improvements at various places. I was thinking that it was almost complete, but there were actually many unimplemented features and bugs.
+
+I got better at understanding compiler optimization as I read more pages of the Dragon Book. I might be able to start writing code if I understand it a little bit more.
+
+My first guess was (mis-)alignment of the stack pointer, but that was not the case because the stack pointer was already properly aligned on 16 byte boundaries. I couldn't find any bugs in the assembly output. I decided to bisect.
+
+I tried to compile each file using my compiler and the rest using GCC to nail down the file and successfully identified the function with which I can reproduce the issue. But the function seemed to have no bugs. That is not the function that prints out the error message — they are not even in the same file. A theory is that one function creates bad data which causes the other function to fail later.
+
+After a fair number of random debugging, I finally found the cause: the compiler didn't initialize struct fields with zeros. The C spec requires that, if an initializer is given for a struct, fields with no initializers must be automatically initialized with zeros by the compiler. I knew the spec when I was writing the code (so my code depends on that behavior), but I forgot to implement it. As a result, some struct fields were initialized by garbage on the stack instead of zeros. Garbage data varies on the current stack position, so changing the stack pointer changed the program's behavior randomly.
+
+The fix was just one line despite the three-day extensive debugging. I wish I had some means to make this kind of debugging easier.
+
+I again narrowed the bug down to a specific file by bisecting. I moved functions from that file to another one-by-one to find a function that is causing the issue. That function was not very small, so I split it up and moved the code to another file. Finally I got a few lines of C code. I compiled that using my compiler and GCC to compare.
+
+The only difference was this: My compiler checks all bits in a register to determine if the register contains a boolean true value, while GCC checks only the least significant 8 bits. Thus, if a value in a register is 512 (= 29 or 0x100), for example, my compiler thinks that it represents true while GCC thinks the opposite. GCC actually returns some very large number with all least significant 8 bits cleared as a false value.
+
+Because of this incompatibility, a loop that is using a function compiled with GCC for the terminating condition (but the loop itself is compiled with my compiler) terminated immediately on the first iteration. As a result, no preprocessor macros were defined. That made some predefined tokens to be undefined, which caused the parser to print out the syntax errors for some inputs. The cause was far from the place where the error was reported, but I finally nailed it.
+
+The x86-64 ABI spec has a small note saying that only the least significant 8 bits are significant for boolean return values. I read that but didn't understand what that meant at first, so I didn't even remember such specification existed. It is now super clear what that means to me. I have a mixed feeling — I learned a new stuff, but I could have learned that without spending this much time.
+
+You can pack multiple variables into small area using bit fields, but the compiler still has to create rooms between them depending on their types. My quick investigation on GCC output showed that the rule is this (this is not guaranteed to be correct, of course):
+
+The computed goto is compiled to a single indirect jump instruction. It is probably easier to understand in terms of assembly than in C. My compiler emits assembly, so it was very easy to implement.
+
+I also implemented typeof() which is also a GCC extension. Both features have no use cases at this moment, but it is OK to be there since the amount of code I wrote for them is very small.|||
+

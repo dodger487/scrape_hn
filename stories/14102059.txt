@@ -1,0 +1,57 @@
+One primary goal of the infrastructure teams here at Yelp is to get as close to zero downtime as possible. This means that when users make requests for www.yelp.com we want to ensure that they get a response, and that they get a response as fast as possible. One way we do that at Yelp is by using the excellent HAProxy load balancer. We use it everywhere: for our external load balancing, internal load balance, and with our move to a Service Oriented Architecture, we find ourselves running HAProxy on every machine at Yelp as part of SmartStack.
+
+We love the flexibility that SmartStack gives us in developing our SOA, but that flexibility comes at a cost. When services or service backends are added or permanently removed, HAProxy has to reload across our entire infrastructure. These reloads can cause reliability problems because while HAProxy is top notch at not dropping traffic while it is running, it can (and does) drop traffic during reloads.
+
+As of version 1.5.11, HAProxy does not support zero downtime restarts or reloads of configuration. Instead, it supports fast reloads where a new HAProxy instance starts up, attempts to use to bind to the same ports that the old HAProxy is listening to and sends a signal to the old HAProxy instance to shut down. This technique is very close to zero downtime on modern Linux kernels, but there is a brief period of time during which both processes are bound to the port. During this critical time, it is possible for traffic to get dropped due to the way that the Linux kernel (mis)handles multiple accepting processes. In particular, the issue lies with the potential for new connections to result in a RST from HAProxy. The issue is that SYN packets can get put into the old HAProxy’s socket queue right before it calls , which results in a RST of those connections.
+
+There are various workarounds to this issue. For example, Willy Tarreau, the primary maintainer of HAProxy, has suggested that users can drop SYN packets for the duration of the HAProxy restart so that TCP automatically recovers. Unfortunately, RFC 6298 dictates that the initial SYN timeout should be 1s, and the Linux kernel faithfully hardcodes this. As such, dropping SYNs mean that any connections that attempt to establish during the 20-50ms of an HAProxy reload will encounter an extra second of latency or more. The exact latency depends on the TCP implementation of the client, and while some mobile devices retry as fast as 200ms, many devices only retry after 3s. Given the number of HAProxy reloads and the level of traffic Yelp has, this becomes a barrier to the reliability of our services.
+
+To avoid this latency, we built on the solution proposed by Willy. His solution actually works very well at not dropping traffic, but the extra second of latency is a problem. A better solution for us would be to delay the SYN packets until the reload was done, as that would only impose the latency of the HAProxy reload on new connections. To do this, we turned to Linux queueing disciplines (qdiscs). Queueing disciplines manipulate how network packets are handled within the Linux kernel. Specifically you can control how packets are enqueued and dequeued, which provides the ability to rate limit, prioritize, or otherwise order outgoing network traffic. For more information on qdiscs, I highly recommend reading the lartc howto as well as the relevant man pages.
+
+After some light bedtime reading of the Linux kernel source code, one of our SREs, Josh Snyder, discovered a relatively undocumented qdisc that has been available since Linux 3.4: the queueing discipline. Using the plug qdisc, we were able to implement zero downtime HAProxy reloads with the following standard Linux technologies:
+
+Smartstack clients connect to the loopback interface to make a request to HAProxy, which fortunately turns incoming traffic into outgoing traffic. This means that we can set up a queuing discipline on the loopback interface that looks something like Figure 1.
+
+This sets up a classful implementation of the standard queueing discipline using the qdisc, but with a fourth “plug” lane . A qdisc has the capability to queue packets without dequeuing them, and then on command flush those packets. This capability in combination with an iptables rule allows us to redirect SYN packets to the plug during a reload of HAProxy and then unplug after the reload. The handles (e.g ‘1:1’, ‘30:’) are labels that allow us to connect qdiscs together and send packets to particular qdiscs using filters; for more information consult the lartc howto referenced above.
+
+We then programmed this functionality into a script we call . This tool allows our infrastructure to “protect” a HAProxy reload where we plug traffic, restart haproxy, and then release the plug, delivering all the delayed SYN packets. This invocation looks something like:
+
+We can easily reproduce this technique with standard userspace utilities on modern Linux distributions such as Ubuntu Trusty. If your setup does not have nl-qdisc-add but does have a 3.4+ Linux kernel, you can manipulate the plug via netlink manually.
+
+Before we can do graceful HAProxy reloads, we must first set up the queueing discipline described above using tc and nl-qdisc-add. Note that every command must be run as root.
+
+We want all SYN packets to be routed to the plug lane, which we can accomplish with . We use a link local address so that we redirect only the traffic we want to during the reload, and clients always have the option of making a request to if they wish to avoid the plug. Note that this assumes you have set up a link local connection at .
+
+Once everything is set up, all we need to do to gracefully reload HAProxy is to buffer SYNs before the reload, do the reload, and then release all SYNs after the reload. This will cause any connections that attempt to establish during the restart to observe latency equal to the amount of time it takes HAProxy to restart.
+
+In production we observe that this technique adds about 20ms of latency to incoming connections during the restart, but drops no requests.
+
+This design has some benefits and some drawbacks. The largest drawback is that this works only for outgoing links and not for incoming traffic. This is because of the way that queueing disciplines work in Linux, namely that you can only shape outgoing traffic. For incoming traffic, one must redirect to an intermediary interface and then shape the outgoing traffic from that intermediary. We are working on integrating a solution similar to this for our external load balancers, but it is not yet in production.
+
+Furthermore, the qdiscs could also probably be tuned more efficiently. For example, we could insert the plug qdisc at the first prio lane and adjust the priomap accordingly to ensure that SYNs always get processed before other packets or we could tune buffer sizes on the pfifo/plug qdiscs. I believe that for this to work with an interface that is not loopback, the plug lane would have to be moved to the first lane to ensure SYN deliverability.
+
+The reason that we decided to go with this solution over something like huptime, hacking file descriptor passing into HAProxy, or dancing between multiple local instances of HAProxy is because we deemed our qdisc solution the lowest risk. Huptime was ruled out quickly as we were unable to get it to function on our machines due to an old libc version, and we were uncertain if the LD_PRELOAD mechanism would even work for something as complicated as HAProxy. One engineer did implement a proof of concept file descriptor patch during a hackathon but the complexity of the patch and the potential for a large fork caused us to abandon that approach; it turns out that doing file descriptor passing properly is really hard. Of the three options, we most seriously considered running multiple HAProxy instances on the same machine and using either NAT, nginx, or another HAProxy instance to switch traffic between them. Ultimately we decided against it because of the number of unknowns in implementation, and the level of maintenance that would be required for the infrastructure.
+
+With our solution, we maintain basically zero infrastructure and trust the Linux kernel and HAProxy to handle the heavy lifting. This trust appears to be well placed as in the months this has been running in production we have observed no issues.
+
+To demonstrate that this solution really works, we can fire up an nginx HTTP backend with HAProxy sitting in front, generate some traffic with Apache Benchmark, and see what happens when we restart HAProxy. We can then evaluate a few different solutions this way.
+
+All tests were carried out on a freshly provisioned c3.large AWS machine running Ubuntu Trusty and a 3.13 Linux kernel. HAProxy 1.5.11 was compiled locally with TARGET=linux2628. Nginx was started locally with the default configuration except that it listens on port 8001 and serves a simple “pong” reply instead of the default html. Our compiled HAProxy was started locally with a basic configuration that had a single backend at port 8001 and a corresponding frontend at port 16000.
+
+In this experiment, we only restart HAProxy with the ‘-sf’ option, which initiates the fast reload process. This is a pretty unrealistic test because we are restarting HAProxy every 100ms, but it illustrates the point.
+
+Only 0.25% of requests failed. This is not too bad, but well above our goal of zero.
+
+Now we try the method where we drop SYNs. This method seems to completely break with high restart rate as you end up with exponentially backing off connections, so to get reliable results I could only restart HAProxy every second.
+
+As expected, we drop no requests but incur an additional one second of latency. When request timings are plotted in Figure 2 we see a clear bimodal distribution where any requests that hit the restart take a full second to complete. Less than one percent of the test requests observe the high latency, but that is still enough to be a problem.
+
+In this experiment, we restart HAProxy with the ‘-sf’ option and use our queueing strategy to delay incoming SYNs. Just to be sure we are not getting lucky, we do one million requests. In the process of this test we restarted HAProxy over 1500 times.
+
+Success! Restarting HAProxy has basically no effect on our traffic, causing only minor delays as can be seen in Figure 3. Note that this method is heavily dependent on how long HAProxy takes to load its configuration, and because we are running such a reduced configuration, these results are deceivingly fast. In our production environment we do observe about a 20ms penalty during HAProxy restarts.
+
+This technique appears to work quite well to achieve our goal of providing a rock-solid service infrastructure for our developers to build on. By delaying SYN packets coming into our HAProxy load balancers that run on each machine, we are able to minimally impact traffic during HAProxy reloads, which allows us to add, remove, and change service backends within our SOA without fear of significantly impacting user traffic.
+
+Thanks to Josh Snyder, John Billings and Evan Krall for excellent design and implementation discussions.|||
+
+True Zero Downtime HAProxy Reloads Joseph Lynch, Software Engineer Apr 13, 2015 HAProxy: Cornerstone of Reliable Websites One primary goal of the infrastructure teams here at Yelp is to get...

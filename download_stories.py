@@ -1,22 +1,32 @@
+import sys
 import os
+
+mod, start = sys.argv[1:]
+start = int(start)
+mod = int(mod)
 
 import pandas as pd
 from goose import Goose
 
 # Load CSV and get stories
-data = pd.read_csv('output_0.csv')
-data.columns = fields = ["type", "id", "title", "score", "time", "url", "by", "text"]
-stories = data[data.type == 'story']
-stories = stories.dropna(subset=['url'])
+data = pd.read_csv('~/Downloads/stories_1000000.csv')
+stories = data.dropna(subset=['url'])
+stories = stories.sort_values("id", ascending = False)
 
 # Download stuff
 g = Goose()
 
 for index, story in stories.iterrows():
-    print story.id, story.title
+    story.id = int(story.id)
+    if int(story.id) % 3 != mod or story.id >= start:
+    	continue
+
     filename = 'stories/%s.txt' % story.id
+
     if os.path.isfile(filename):
         continue
+
+    print story.id, story.title
     
     try:
         article = g.extract(url=story['url'])                
@@ -28,4 +38,3 @@ for index, story in stories.iterrows():
             file.write(output)
     except Exception as e:
         print(e)
-

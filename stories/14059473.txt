@@ -1,2 +1,327 @@
-|||
+It’s high time to recheck FreeBSD project and to show that even in such serious and qualitative projects PVS-Studio easily finds errors. This time I decided to take a look at the analysis process in terms of detecting potential vulnerabilities. PVS-Studio has always been able to identify defects that could potentially be used for a hacker attack. However, we haven’t focused on this aspect of the analyzer and described the errors as typos, consequences of sloppy Copy-Paste and so on, but have never classified them according to CWE, for example. Nowadays it is very popular to speak about security and vulnerabilities that’s why I will try to broaden at the perception of our analyzer. PVS-Studio helps not only to search for bugs, but it is also a tool that improves the code security.
 
+You may find the report about the check of FreeBSD project in 2016 here.
+
+As the name implies, the article will describe those fragments that I found in one evening. I.e. I spent 2–3 hours looking for potential vulnerabilities. This shows the power of PVS-Studio static analyzer. I recommend using the analyzer to all who care about the code quality, and moreover the reliability and resistance against possible attacks.
+
+It didn’t take me long to find errors in the code, but it took me three weeks to sit down and start writing an article about that. During this time, we even fixed some of these errors that will be described in the posts of our new project: “Weaknesses detected by PVS-Studio this week” episode N2, episode N3.
+
+Of course, we fixed those errors where it’s clear how to fix them without digging deep into the algorithms. That’s why FreeBSD authors should really do a deeper analysis themselves, not just review that limited number of errors that we presented. I am ready to provide a temporary license key and also help to eliminate false positives that may hinder their work. By the way, speaking about the false positives…
+
+Having checked a project with PVS-Studio, there is a chance to get a wide spread of the number of false positives. For example, we have recently checked FAR project, and the number of false positives amounted to 50%. This is an excellent result, meaning that every second message indicates an error or extremely bad code. When checking Media Portal 2 project, the result was even better: 27% of false positives.
+
+The case with FreeBSD is more complicated. The thing is that the analyzer issued a large number of general analysis warnings:
+
+The majority of these messages are false positives. It’s hard to evaluate exactly, but I think that the number will be about 95%.
+
+What does it mean? It shows that there is no point in discussing the number of false positives on large projects without proper setting of the analyzer. The vast majority of false positives appears because of various macros and they can be easily eliminated by using a variety of mechanisms, provided by PVS-Studio. I’ll explain it using an example.
+
+You may see such an array in the FreeBSD code:
+
+The macro Q(1.5) is expanded into:
+
+The analyzer thinks that some of the comparisons are suspicious. For example, it issues a warning for the expression (((1.5) == 3).
+
+V674 The ‘1.5’ literal of the ‘double’ type is compared to a value of the ‘int’ type. Consider inspecting the ‘(1.5) == 3’ expression. tx_schedules.h 228
+
+The analyzer issued 96 warnings for this array.
+
+There are several more such arrays in the FreeBSD code. In sum total, the analyzer issued 692 warnings of High level for them. Let me remind you, that there were 3577 warnings of High level in the code. This means that these macros cause 1/5 of these warnings.
+
+In other words, you can eliminate 20% of incorrect messages of High level, by making certain settings of the analyzer. There are different ways to do this, but perhaps the easiest way would be to disable the V674 warning for those files that have arrays of this kind. To do this, write a comment //-V::674 somewhere in the file.
+
+I have already written on the topic of the false positives, but I will state once more, as we get constantly asked about the percentage of false positives. Even if we calculate the average percentage based on the analysis of a large number of projects, it will not have any practical value. This is the same as being interested in an average temperature in different cities of a large country.
+
+It all depends on a project. Some developers may be so lucky, that they won’t have to set up the analyzer much and work with the list of warnings right away. Others aren’t that lucky, as in the case with the FreeBSD project. They will have to do some configuration and marking the macros. But it’s not as scary as it may seem at first glance. I have just showed you how to remove a lot of false positives. We’ll have the same situation with other warnings caused by strange macros.
+
+If it was difficult to suppress this “noise”, I wouldn’t be able to find all these errors in one evening.
+
+We decided to see the world more broadly. In those fragments where we saw only errors and code smells we now try seeing as potential vulnerabilities. To do this, we decided to start classifying the warnings issued by PVS-Studio according to the Common Weakness Enumeration (CWE). More about this here: “PVS-Studio: searching software weaknesses”.
+
+Of course, only a small part of the bugs can be exploited. In other words, only a few found CWE errors can turn into CVE. However, the more bugs that fall under the classification of CWE are found by static analysis, the better.
+
+Use PVS-Studio to prevent vulnerabilities. This article will demonstrate that the analyzer copes with this task really well.
+
+In total I’ve seen 22 errors of this kind. Perhaps, I’ve also skipped about the same amount.
+
+PVS-Studio warning: V522 Dereferencing of the null pointer ‘ha’ might take place. ql_isr.c 750
+
+We see the error right away. If the pointer ha is equal to NULL, then it is dereferenced in the expression ha->pci_dev.
+
+The same situation can be seen in three more files:
+
+Now let’s look at a more complex situation:
+
+PVS-Studio warning: V595 The ‘ilt’ pointer was utilized before it was verified against nullptr. Check lines: 667, 669. ecore_init_ops.h 667
+
+Let’s take a closer look at it, because not everybody may understand the danger of this code.
+
+First, the pointer ilt is dereferenced.
+
+Then it is verified against NULL.
+
+Therefore, we may have null pointer dereference. This inevitably results in undefined behavior.
+
+Some may argue that there is no problem here, because the pointer doesn’t really get dereferenced. They may say that the code just evaluates the address of the array cell. They say yes, this address is incorrect and it cannot be used. However, there is a check below, and the function will exit, if the pointer ilt is zero. Thus, the invalid pointer ilt_cli won’t be used anywhere, so there is no error.
+
+They are not right. It’s not a correct way of thinking. Null pointer dereference causes undefined behavior. Therefore, the code is incorrect and you shouldn’t think of the ways it could work. It can do whatever it wants.
+
+However, this explanation is usually not very exhaustive, so I’ll try to develop this idea. The compiler knows that null pointer dereference is undefined behavior. Therefore, if a pointer is dereferenced, it is not NULL. If it’s not NULL, then the compiler has the full right to remove the redundant if (!ilt) check. As a result, if the pointer is equal to NULL, then the function won’t exit. That’s why the function will start handling invalid pointers, which can lead to anything.
+
+Some may object that the macro offsetof is sometimes
+
+Here we have null pointer dereference, but the code works. This proves that such constructions are quite valid.
+
+They are wrong again. This proves nothing.
+
+When considering the idiomatic implementation offsetof we should remember that the compiler is allowed to use non-portable techniques to implement this functionality. The fact that the compiler uses a constant of a null pointer in the offsetof implementation, doesn’t really mean that in the user code you can safely execute &ilt->clients[cli_num] when ilt is a null pointer.
+
+More details on this subject can be found in my article “Null Pointer Dereferencing Causes Undefined Behavior”
+
+As a result, the code described above, is a real error and should be fixed.
+
+Now, that we have sorted out the nuances of null pointer dereference it becomes clear that the following function is also incorrect.
+
+PVS-Studio warning: V522 Dereferencing of the null pointer ‘ccb’ might take place. The null pointer is passed into ‘iscsi_outstanding_add’ function. Inspect the third argument. Check lines: ‘iscsi.c:2157’. iscsi.c 2091
+
+First, it may be unclear, why the analyzer decided that the pointer ccb will be a null pointer. Therefore, note that the analyzer points to one more fragment: iscsi.c:2157.
+
+We see a call of the scsi_outstanding_add function that receives NULL as an actual argument:
+
+The analyzer had to do interprocedural analysis to find the defect.
+
+Now let’s take a brake from looking at the complex bugs and have a look at a simple case of an incorrect error handler.
+
+PVS-Studio warning: V522 Dereferencing of the null pointer ‘dev_priv’ might take place. radeon_cs.c 153
+
+The body of the if statement is executed only when the pointer dev_priv is zero. Thus, some strange address gets evaluated here: &dev_priv->cs.cs_mutex. And indeed this is UB.
+
+Oh. The troubles with the null pointers seem endless. It is a headache of many programming languages. So, get some coffee and continue reading.
+
+PVS-Studio warning: V595 The ‘mac’ pointer was utilized before it was verified against nullptr. Check lines: 6757, 6760. if_bwn.c 6757
+
+The pointer mac is dereferenced first and then verified against NULL. It’s all very simple here, so no comments.
+
+PVS-Studio warning: V595 The ‘ctl3_rewriters’ pointer was utilized before it was verified against nullptr. Check lines: 3206, 3210. ip_fw_sockopt.c 3206
+
+Note that in the beginning the pointer ctl3_rewriters is used as an actual argument of the memcpy function:
+
+And then suddenly a programmer remembers that it should be verified against NULL:
+
+Let’s look at another incorrect code, created to release resources:
+
+PVS-Studio warning: V595 The ‘mc’ pointer was utilized before it was verified against nullptr. Check lines: 2954, 2955. mly.c 2954
+
+I think we can stop looking at null pointers, as the description of such errors is getting more boring. I also see CWE-476 (NULL Pointer Dereference) in the following sections of code:
+
+But that’s not the end! I was just bored looking at this kind of errors, so I switched to the warnings of a different type. PVS-Studio is waiting for the heroes who will examine all the warnings that refer to null pointers.
+
+Let’s have a look at the definition of the pfloghdr structure:
+
+As you can see, this structure is quite large. It is a common practice for such structures when the whole structure is filled with zeros, and then the programmer sets the values for separate members.
+
+However, in the function nat64lsn_log a programmer failed to initialize the structure correctly. Let’s take a look at the code of this function:
+
+PVS-Studio warning: V512 A call of the ‘memset’ function will lead to underflow of the buffer ‘plog’. nat64lsn.c 218
+
+Note that sizeof(plog) evaluates the size of the pointer, not the size of the structure. As a result, only several fist bytes get zeroed, not the whole structure, all the other fields of the structure remain uninitialized. Of course, correct values get explicitly written into some members. However, a number of members in the structure remains uninitialized.
+
+The same error can be seen in the nat64stl.c file: V512 A call of the ‘memset’ function will lead to underflow of the buffer ‘plog’. nat64stl.c 72
+
+Let’s take a look at another error, because of which the variable cannot be initialized.
+
+If the macro __FreeBSD__ is declared (and it is declared), then the condition
+
+cannot be executed. As a result, the code inside the construction #if…#endif doesn’t get compiled and the variable status remains uninitialized.
+
+PVS-Studio warning: V512 A call of the ‘memcpy’ function will lead to the ‘“MPI Coredump”’ buffer becoming out of range. qls_dump.c 1615
+
+We had to cite quite a large piece of code to show how the types and structure members are declared. Please, don’t yawn, here is the most significant code:
+
+We’ll have 13 bytes of string copied and 3 more bytes, located after the string. In practice this code may even work. We’ll just have 3 bytes copied with some garbage or a fragment of another string. Formally, this is array index out of bounds and thus leads to undefined program behavior.
+
+Now here is a good cause to demonstrate one of the new diagnostics, implemented in PVS-Studio. The idea of the V781 diagnostic:
+
+In the beginning, the value of the variable is used as a size or an array index. Then this value is compared with 0 or with the array size. This may point to a logical error in the code or a typo in one of the comparisons.
+
+In its essence, this diagnostic is similar to the V595 that is already quite familiar to our readers.
+
+Let’s take a look where this diagnostic was triggered during the check of FreeBSD code.
+
+PVS-Studio warning: V781 The value of the ‘lun’ variable is checked after it was used. Perhaps there is a mistake in program logic. Check lines: 1617, 1619. sbp_targ.c 1617
+
+Firstly, a programmer used the lun index to access the Istate array. Only then we see a check if the index value exceeds the maximum value equal MAX_LUN. If it exceeds, then the situation is handled as erroneous. But it is already too late, since we already could access beyond the array bounds.
+
+Formally, this will result in undefined behavior. In practice, instead of correct handling of incorrect index value we may get Access Violation.
+
+Let’s consider a more interesting case of an incorrect array indexing.
+
+The analyzer issued three warnings for three statements, where we have an access to the pwr array:
+
+The value of the ridx index in the loop changes from RTWN_RIDX_OFDM6 to RTWN_RIDX_COUNT. Which means that the variable ridx takes the values in the range of [4..27]. At first glance, everything is ok.
+
+To find the error, let us look at the pwr member, which is a two-dimensional array:
+
+And take one more look at how the array is accessed in the loop:
+
+Something is clearly wrong here. We see array index out of bounds. However, I find it difficult to imagine how this code should work, and how it should be changed.
+
+PVS-Studio warning: V640 The code’s operational logic does not correspond with its formatting. The statement is indented to the right, but it is always executed. It is possible that curly brackets are missing. smbfs_vnops.c 283
+
+The code formatting doesn’t correspond with the logic of its execution. Visually it seems that the line smbfs_free_scred(scred); is executed only when the condition is true. But in reality this line will always be executed.
+
+Perhaps, there is no real error here and the code formatting would be enough, but this fragment deserves close attention.
+
+The analyzer issued 4 more similar suspicious code fragments, but I won’t cite them here, because they are all similar. Here is the text of the warnings:
+
+PVS-Studio warning: V519 The ‘a1’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 397, 400. ip_ftp_pxy.c 400
+
+The variable a1 will be assigned with the value ntohl(ip->ip_src.s_addr) regardless of the condition.
+
+It seems that the last assignment is not necessary. Perhaps, this is just a result of sloppy refactoring.
+
+Let’s continue looking at errors of the same kind:
+
+PVS-Studio warning: V519 The ‘rdata->sd_vlan_force_pri_flg’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 6327, 6328. ecore_sp.c 6328
+
+The situation is quite similar, so we won’t dwell on it. Let’s move on.
+
+PVS-Studio warning: V519 The ‘vf->flags’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 5992, 5994. if_ix.c 5994
+
+Most likely, the “|” is missing and the correct code should be as follows:
+
+In general, the detected errors look really scary. Their number, to be exact. Because I see, how many errors I’ve noted down and that the article isn’t really getting closer to the end.
+
+PVS-Studio warning: V519 The ‘lmask.__mask’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 594, 595. linux32_sysvec.c 595
+
+PVS-Studio warning: V519 The ‘sysctl_log_level’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 423, 424. alias_sctp.c 424
+
+Apparently, the code was written using Copy-Paste and the name of the last variable was forgotten to be changed. It should be written:
+
+See a philosophical research article on this topic: “The last line effect explained”.
+
+Let’s continue exploring how deep the rabbit hole goes.
+
+PVS-Studio warning: V519 The ‘chunk->flags’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 1566, 1567. if_uath.c 1567
+
+It’s time to insert some picture to relax. I think this one is just perfect.
+
+PVS-Studio warning: V519 The ‘lvds_pll_feedback_div’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 287, 290. dvo_ch7017.c 290
+
+To override a variable value by a magic number 35 is very strange and suspicious. It looks like someone wrote this line for debugging purposes, and then forgot to remove it.
+
+PVS-Studio warning: V519 The ‘pmuctrl’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 2025, 2026. bhnd_pmu_subr.c 2026
+
+Instead of the |= operator, it was accidentally written =.
+
+And here is the last issue of this kind for today:
+
+PVS-Studio warning: V519 The ‘msgbuf[0]’ variable is assigned values twice successively. Perhaps this is a mistake. Check lines: 422, 426. e1000_vf.c 426
+
+A variable cannot be less than 1 and greater than 32 at the same time. We should replace the && operator with || to check the range correctly.
+
+Because of an error, the function doesn’t check the input data and may work with incorrect data.
+
+Now here is a more interesting case. Firstly, let’s consider a prototype of the function LibAliasSetMode:
+
+The function returns the value of an unsigned type. In case of an internal error, the function will be returned the value -1. Thus, -1 turns into UINT_MAX.
+
+Now let’s see, how this function is used.
+
+PVS-Studio warning: V547 Expression is always false. Unsigned type value is never < 0. ng_nat.c 374
+
+Of course, the condition is always false. The value of an unsigned type cannot be less than zero.
+
+This error would be hard to notice for those who are doing simple code review. In case of an error, the function returns -1. There is a check if (foo() < 0). It seems that all is well.
+
+But the wrong type of function spoils everything. There are 2 variants to correct this:
+
+It’s up to the developers to decide which variant to choose.
+
+In the next fragment, there is probably no real error, and the code is just redundant. But who knows, it’s hard to say for sure, as I am not the developer.
+
+PVS-Studio warning: V547 Expression ‘value < 0’ is always false. Unsigned type value is never < 0. ar9300_xmit.c 450
+
+Try finding an error here yourself:
+
+PVS-Studio warning: V517 The use of ‘if (A) {…} else if (A) {…}’ pattern was detected. There is a probability of logical error presence. Check lines: 102, 109. dtrace_debug.c 102
+
+We should pay attention to these two lines:
+
+The programmer intended to write another condition, but he failed to do it. Therefore, the second condition will always be false.
+
+PVS-Studio warning: V547 Expression ‘cdb[0] != 0x28 || cdb[0] != 0x2A’ is always true. Probably the ‘&&’ operator should be used here. mfi_tbolt.c 1110
+
+The condition (cdb[0] != 0x28 || cdb[0] != 0x2A) is written incorrectly. If a byte is 0x28, it cannot be equal to 0x2A. And vice versa. As a result of the condition is always true.
+
+Now let’s consider two loops, implemented in a very complicated and scary way.
+
+Note that the variable j has an unsigned type. Therefore, the check (j >= 0) is meaningless. We could just as well write while (true).
+
+I don’t know for sure if this incorrect check can cause a glitch or the loops will be correctly terminated due to the break and return statements in their bodies. I reckon that this is a real bug and we should change the type of the variable j from u_int to int.
+
+Even if there is no error here, the code should be rewritten, so that it doesn’t confuse other developers and doesn’t cause any issues upon the further modifications.
+
+I personally like the bug described below. It’s a beautiful typo. Although no, stop, I decided to talk about CWE this time. So, here is a beautiful weakness.
+
+PVS-Studio warning: V560 A part of conditional expression is always true: 0x2002. sampirsp.c 7224
+
+The variable status is missing in the condition. Thus, the value of the status doesn’t get really checked and the condition is always true.
+
+Let’s consider one more similar case. Try finding the error in the function ugidfw_rule_valid yourself without reading the description.
+
+I think yes. That is why static analyzers are so important. They don’t yawn and don’t get tired viewing such functions.
+
+PVS-Studio warning: V617 Consider inspecting the condition. The ‘0x00000080’ argument of the ‘|’ bitwise operation contains a non-zero value. mac_bsdextended.c 128
+
+Firstly, let’s look at the macro MBO_TYPE_DEFINED:
+
+And now, look here:
+
+A part of the condition is always true. If we look at the code, written nearby, it becomes obvious, that the programmer had an intention to write as follows:
+
+Well, the article is already too long. We’ll have to reduce the amount of the code fragments. So just for information — I see four more CWE-571:
+
+PVS-Studio warning: V597 The compiler could delete the ‘memset’ function call, which is used to flush ‘dout’ object. The memset_s() function should be used to erase the private data. mlx5_qp.c 159
+
+There was an intention to zero a dout structure containing private data. The error is that this structure is not used further on. To be more exact, it is used here sizeof(dout), but it doesn’t count. Therefore, the compiler will remove the memset function call.
+
+Here is another sloppy zeroing of the struct: V597 The compiler could delete the ‘memset’ function call, which is used to flush ‘dout’ object. The memset_s() function should be used to erase the private data. mlx5_qp.c 323
+
+Every time I’m telling about an error of zeroing private data, there is someone who tells me something like this:
+
+So let me explain. Modern compilers really delete memset function calls for optimization. It’s not a compiler error. The details are given in the description of V597 diagnostic.
+
+PVS-Studio warning: V779 Unreachable code detected. It is possible that an error is present. if_wi_pci.c 258
+
+In the beginning of the program text we see a return statement, and then there is an attempt to unlock some resource.
+
+I have found ten more quite amusing bugs in the code. I don’t know how to classify them according to the CWE, so I won’t be calling them “potential vulnerabilities”, but still I will describe them here. Regardless of the fact that we can classify them or not, these are still errors.
+
+PVS-Studio warning: V646 Consider inspecting the application’s logic. It’s possible that ‘else’ keyword is missing. mac_process.c 352
+
+It seems to me, as it seems to the analyzer, that the else keyword was forgotten here:
+
+Now here is a nice case of sloppy Copy-Paste. Do you see the error?
+
+PVS-Studio warning: V778 Two similar code fragments were found. Perhaps, this is a typo and ‘cap_resy’ variable should be used instead of ‘cap_resx’. cyapa.c 1458
+
+Here it is:
+
+PVS-Studio warning: V523 The ‘then’ statement is equivalent to the ‘else’ statement. linux_ipc.c 353
+
+Finally, here are suspicious actual arguments during the call of the strncmp function:
+
+PVS-Studio warning: V666 Consider inspecting third argument of the function ‘strncmp’. It is possible that the value does not correspond with the length of a string which was passed with the second argument. ip_irc_pxy.c 140
+
+Note that in the beginning there is a check, if the string starts with the “PRIVMSG “ characters. A space is also taken into account.
+
+Then there is a check if the string starts with “\001DCC “. But if we don’t count the space, there are 4 characters, not 5 in this string. Note: \001 is a single character.
+
+FreeBSD code is regularly checked by Coverity (which is now a part of Synopsys). Still, it didn’t prevent me from finding 56 potential vulnerabilities and 10 more real bugs in one evening by running PVS-Studio on this code. With that, I didn’t have set a goal of finding as many bugs as possible. What does it show? That PVS-Studio is a serious competitor of Coverity in the diagnostic abilities. At the same time, the price of PVS-Studio is much less.
+
+Traditionally, I will repeat once more, that any static analyzer should be used regularly, not just occasionally. A one-time check, like the one I have described about in the article, can be a good way of showing the abilities of the analyzer, but it won’t be of real use to the project. The whole point of static analysis is that a lot of errors can be corrected at an early phase of the development. Additionally, it is much easier to keep the analyzer report “clean” and not to look for errors among hundreds of false positives. Here we have a complete analogy with the compiler warnings.
+
+That’s why it’s enough reading articles, it’s time to start using PVS-Studio in practice. So, I suggest downloading PVS-Studio without any delay and trying it on your projects. In case you have questions regarding the licensing, contact us at support[@]viva64.com or use a feedback form.|||
+
+It’s high time to recheck FreeBSD project and to show that even in such serious and qualitative projects PVS-Studio easily finds errors. This time I decided to take a look at the analysis process in…

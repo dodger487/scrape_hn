@@ -1,0 +1,47 @@
+Distribution and columnar storage are core to high-performance analytics databases like Redshift, CitusDB, and Snowflake. Understanding these features will help you write more efficient, faster queries.
+
+This post is the first of two parts: In this post, we’ll describe how queries run in distributed analytics databases, and changes you can make to your queries to take advantage of that knowledge.
+
+Previous generations of analytics databases could only run on a single machine. The obvious path for making your analytics database faster was to buy a bigger, faster machine.
+
+Unfortunately, cost scales superlinearly with high-end performance: it costs more than double to have a machine that is twice as powerful.
+
+The solution is distribution. New analytics databases are designed to run across a cluster of machines. Instead of one supercomputer, your analytics database can run on dozens of commodity machines at the same time. This lets you achieve greater performance at a lower cost.
+
+However, distribution comes with a new performance bottleneck. When all the data is on the same machine, the rate at which you can read and process data is limited by the speed of your hard drive.
+
+In a cluster, the network is the limiting factor. The nodes in your analytics cluster need to share information because no single node has all the data. And a hard drive is over 3x faster than gigabit ethernet:
+
+To show how network bandwidth can be the bottleneck in a cluster, we’ll make an example of a daily active users query:
+
+If we assume data is not distributed by user_id or date(created_at) in this table, the nodes are forced to redistribute the data to complete this query. Here’s the query plan:
+
+There are two steps. First the cluster must re-distribute the (date, user_id)pairs so that all records for a single date are on the same node. Only then can the distinct number of users be calculated for each date and sent to the leader node:
+
+Queries involving count(distinct) are particularly tough on clusters for that reason. Needing to re-distribute a lot of data is expensive and slow.
+
+If your your analysis can handle a small error (~2%), this inter-node communication can be entirely avoided! The Redshift syntax for an approximate count distinct is:
+
+Skipping the inter-node data transfer, the query can simply scan the relevant data and send the intermediate results to the leader node for combining:
+
+This approximate count distinct is based on the HyperLogLog Probabilistic Cardinality Estimator. It’s a complex algorithm for counting the number of distinct elements in a set.
+
+It’s widely used in distributed analytics databases because it can run in parallel on each node without any inter-node communication.
+
+Here’s a simplification of how the HyperLogLog estimator works on our Daily Active Users query:
+
+Imagine that each date is represented by an array of bits, and user ids are integers. If we see user 12 on Sept 30th, we mark the 12th bit in the array as true. Likewise, if we see user 58 on that same date, we’d mark the 58th bit in that array as true.
+
+If we see a user more than once for the same date, it doesn’t matter, their bit is already set to true. This way we never count a user more than once (critical for count distinct). The clever part of this algorithm is that every node in the cluster can do this in parallel.
+
+Once they’re all done, the bit arrays can be combined by OR’ing them together. If a user’s bit is set to true on one array but not another, that’s OK, it’ll be true in the final array. Then we count the true bits in the final array and we get the number of distinct users on that date!
+
+What we just described is called a Linear Counter. It will count the number of distinct users exactly, but takes up a lot of memory to do so. The HyperLogLog algorithm compresses the bit arrays to be much smaller, losing a little accuracy in the process.
+
+By rewriting queries to allow nodes to do all computation themselves, without having to communicate with their peer nodes, you can drastically reduce query times.
+
+For bonus points, minimize the amount of post-processing that must be done on the leader node. The leader node can often get bogged down in these calculations, which don’t take advantage of the database’s distributed architecture.
+
+Next week, we’ll explain how to adjust your data storage to take advantage of distributed columnar architectures!|||
+
+Distribution and columnar storage are core to high-performance analytics databases like Redshift, CitusDB, and Snowflake. Understanding these features will help you write more efficient, faster queries.

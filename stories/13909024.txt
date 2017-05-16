@@ -1,0 +1,104 @@
+While this part is technically not needed to start using Docker, I will talk about some fundamental concepts about Docker and how it works, so it’s really worth it.
+
+ I will talk about what’s under the hood of Docker and how it makes the magic happen.
+
+So everything we just saw is roughly how a virtual machine work and it’s really not the case of Docker. This is important, because you have to “forget” this, or at least, remember that this is different.
+
+All of this is very very simplified and I’m sure some specialists are hating me right now, but I think it’s enough to understand the concept. And even most importantly, to understand the differences with Docker containers.
+
+Let’s come back quickly to the virtual hard drive: as I said before, the virtual machine uses a (big) file on the host’s filesystem. When the OS inside the virtual machine writes data to disk (e.g. creates a file), it calls low-level, kernel routines (drivers) to write to the file. In a real machine, these kernel routines will call the hard drive driver and actually writes the data to the physical disk. In a virtual machine, this process is sort of “hijacked”: when the OS calls the low-level routines to write to disk, the virtual machine software will “catch” these calls, write the data to the host’s (big) file serving as the virtual hard drive and send back the appropriate answer to the virtualized OS.
+
+Since your virtual machine is “only” reading the hard drive’s data and executing it’s instructions, it can basically run “anything”, and in particular, it doesn’t matter what OS you install and run. This is the big strength of virtual machines. And with CPUs’ virtualization features, you can even run different processor architectures.
+
+When using a virtual machine, you generally create a virtual hard disk, which is a big file on the host’s filesystem, you allocate some of the host’s RAM and video memory to the virtual machine, by making it accessible through special, low-level routines. On the virtual hard drive, you install a complete operating system (Windows, Linux, etc.) from scratch. It means that from the point of view of the installer inside the virtual machine, it’s like it’s really writing to a disk (only it’s a file on the host, but it -the installer- doesn’t know it). But that doesn’t change much: you still partition it, you still create filesystems on the partitions (FAT, ext3, ext4, etc.). Then you typically write the MBR in the first few sectors of this file (or now you write your UEFI loader in the correct partition), and when you “start” your virtual machine, it read the host’s file as its hard drive, reading the partitions, the OS bootsector, etc.
+
+As I said before, Docker is not a virtual machine; let’s see how one roughly works, then. A virtual machine, as its name implies is like a real machine, only it’s “virtual”, as in “inside another machine”. It behaves very much like a real, fully-fledged machine (computer).
+
+In order to get rid of false ideas and our intuition (which, in this case, is most likely playing us), we’ll talk about how Docker does not work.
+
+Part of the magic behind Docker relies on this notion of user lands. To put it simply, each Docker container creates its own user land, that is separated from the host’s and the other containers’. A bit as if you booted your computer a second time on the same kernel. We’ll explore how it is achieved in the following sections.
+
+All other programs -the one you use, web browsers, terminal emulators, mail clients, etc- are all running in the user land, with unprivileged and restricted access. These are the “user programs”, this is why this is called the “user land”.
+
+In a running OS, there are generally two lands or spaces: the kernel space (a.k.a. “kernel land”) and the user space (a.k.a. “user land”). You can see the spaces as two levels -or rings- of privileges. There are a small number of programs running in privileged mode (i.e. in kernel space), these are called “system calls”: stat , splice , read , close , exit , mmap as well as device drivers. These programs have a complete, unrestricted access to everything: this is why there are only a very few allowed.
+
+Now we are getting serious; Docker relies on several features to make the magic happen. And most of them have to do with the Kernel. To summarize quickly, the kernel is the “core” of Linux (and any OS, for that matter, but Docker runs on Linux, so now I’ll mostly talk about Linux. If you are in OS X or Windows, don’t be sad and keep reading, all of this still applies. We’ll see how Docker works for these OSes). By “core” I mean that very low-level routines are implemented in the kernel: drivers to communicate with external peripherals, process schedulers, filesystems, etc. Everything that makes the OS work, is in the kernel. As you see, this is an important, crucial and heavy part of an OS.
+
+So what are those namespaces? We keep hearing about them, but what are they?
+
+ To answer this question, we need to have a little understanding of how the Linux kernel works. Especially about processes.
+
+Processes are instances of a program. When you run a program, it created a process. Now there are some programs that creates several processes, but you can think of it as if the program itself launched other small programs. Note that I am not talking about threads, threads are another beast. A single process can spawn several threads to make use of multi-threading, to parallelize operations. Here, I am talking about processes, programs.
+
+So, at any given time, there are a lot of processes running on your computer, you can have an idea: try running . It will return a number, this is close to the number of processes running at that time. Right now, I have processes running.
+
+It’s important to have an understanding of how these processes interact with each other.
+
+Let’s play a little bit. Launch your favorite terminal, it should present you with a shell. For the vast majority of people, this will be ; I’m using myself, but the principle will be exactly the same.
+
+ Now that you are in your shell, run to create a file named . Then run . What this does is launch the program in “follow” mode, which means that it keeps watching the content of (currently empty) for new output. We don’t really care about that, all that we care about is that won’t terminate: it will keep running.
+
+Now run another terminal, we will try to see what’s happening. As you probably already know, is what we can use to see the running processed. We will format a bit its output so that it is more readable. Run . This launches to print a snapshot of the current running processed, and format the output, to display, in the order: the “parent PID”, the PID, the user who executed the process and then the process name.
+
+ It should return a pretty long list, but toward the end, you should see something like this:
+
+Remember that the left-most column is the parent PID, and the second is the PID. Here we see something interesting: the process has PID and the process has Parent PID . The numbers will be different that mine, but you will still have those two numbers equal.
+
+ This is a very basic, and very important notion of processes: a process can have child processes and processes (the children) can have parent processes. This is pretty easy to understand: when we launched from our shell, it created a new, child process.
+
+ That’s one important concept. Let’s see immediately a new one, go back to your first terminal, the one from which you ran and hit . It should stop .
+
+ Now, launch this command: . The sign that we appended means that the command we launched, , runs in the background: indeed, you can see that your terminal is now available, even though is still running.
+
+Now from that terminal, hit . It is possible that it answers with somehting along the line of
+
+In which case, hit again. It should quit the terminal. Now that it is exited, let’s run our command again (in a new terminal): :
+
+There will be plenty of output of course, but toward the end, where we usually saw and we don’t see them. Let’s the result to be sure: you should see nothing.
+
+This a second, very important concept of processes: when you kill the parent (which we did by killing ), the child process is generally killed too. How does it work and how can this be possible?
+
+ To create the child process, the parent process generally called , which creates the child process (this is a basic summary, that will be enough to understand Docker). returned the PID of the child process.
+
+ When we kill the parent process, by sending it a SIGNAL, the parent can (and should) forward that SIGNAL to its child(ren): this is how the parent process can kill its child process.
+
+When a child process dies (either because its parent forwarded it a SIGNAL or because it received itself a SIGNAL), what really happens is that the child’s return code is set to a special code, called (this is the real, actual, official name!). At that point, the process still technically exists (it takes a slot in the maximum number of processes, etc), and a signal called (for SIGnal CHiLD) is sent to the parent. This signal basically tells the parent process that its child just died, and that it should do something about it. The parent then must the dead process child. Then, and only then, does the child process cease to exist.
+
+But what if the parent never gets a chance to reap the child process? Well, we will emulate this behavior: open a terminal, and run this command: . As before, the will make run in the background. the directive here prevents the parent ( ) from forwarding the SIGNAL to its child.
+
+We’re getting used to it: we can see has PID and had PID and has PID for parent, which is . Classic.
+
+Now hit . Your terminal will most likely complain with something like . Ignore that and hit again, it should work this time, and your terminal should exit, as before.
+
+Now, let’s see what happened to : :
+
+First, we see that doesn’t appear anymore, which is normal, because we killed it. But interestingly, we can see that still exists! It was not killed. We know it’s the same process, because it has the same PID (even though PID numbers can be re-used, in this case, this really is the same!). Even more interestingly, we can see that now ’s parent PID is . And this time, you should have too.
+
+This is another key concept of how Linux processes work: there really is one process to control them all. In Linux, there always is a top-most, parent-most process, called “the init process”. It used to really be called “init”, but it’s very likely yours is called “systemd” now. You can see it with (be sure to remove the ). It should return something like:
+
+The first three columns should be identical: we displayed the process with PID . This process is launched by and has no parent (hence as parent PID). What’s susceptible to change, is the name of the process. Most likely you should have , but it’s still possible that you have . Anyway, the very first process in a Linux system, is always the init process. And there can be only one.
+
+This process is the first one launched when the system boots, and the last one killed when the system shuts down. This is his first role.
+
+ His second role is precisely what we’ve just seen: his role to become the parent process of children who do not have a parent anymore. This just happened to : we killed (and prevented the forwarding of the SIGNAL) and so became (this is also the correct, official term!). Then, it, and it became its parent.
+
+You can always “go back” to the first process, the init process: run again, pick a PID, whichever you want, for me, so PID . It has parent PID . Now I’ll display information about the parent process: (replace with your parent PID).
+
+ It show . So the parent was . This has parent PID , let’s print its information: which returns: .
+
+ And here we are! The parent process is (this is my terminal emulator, yours might be or for instance), and this time, the parent PID is , init.
+
+Every processes have as a distant parent, may it be the direct parent, the grandparent, the great-grandparent, etc.
+
+What Does it Have to do With Namespaces? You thought I had forgotten?
+
+ We haven’t been avoiding namespaces, actually we have been laying the bricks to understanding them. Keep in mind everything we have seen about child and parent processes, and the init process as it will be useful in a minute. Now, there is something you and I have been doing for some time now and which will be crucial to understanding Docker containers and isolation. We have launched several terminals and several programs (like for instance). Then we have run which allowed us to observe (I should say “spy on”, really) other processes. And with we have, well… killed other processes. And believe it or not, this is the key to understand all that: we have made processes interact with each other. Which is fabulous because it allowed us to do everything but it is also a disaster, because it means that if we have some process that we want to have running, others could kill it, or inspect it. And this is the opposite of isolation! Well, all of this is possible, because all of these processes run in the same namespace. To put it simply, we can consider that a namespace is an init tree. Here, we have one process, which is the (more or less distant) parent of every other processes running: it defines one namespace. One key concept of Docker and process containerization in general is to create separate namespaces. A typical namespace, like you have right now on your computer looks like this: The top-most process has PID and is what we call the init process (most likely called on your machine). Then this init process has direct children, here we can see two: with PID and with PID .
+
+ both and have children of their own, as you can see. The figure above forms a tree. Now what happens with containerization and Docker? Well, if you want to run isolated processes, the first thing you need is for these processes not to be able to do what we have been doing up until now, i.e. spy on other processes and interact with them. You need to completely isolate them.
+
+ The way this is done is by creating a second init process tree, i.e. a second namespace.
+
+ Let’s say we want to containerize , a web server. Nginx is started from a shell, bash for instance. We’d like and to be isolated from the rest of the system, so we have to “make them believe” they are in their own namespace. So based on what we’ve seen so far, they need their own PID init process. In this case, can be the PID init process, and it will be ’s parent process. But of course, we actually have only one machine (the host) and one operating system (our Linux distribution), because we are not running a virtual machine, so whatever program we launch (that includes and ), they will be child processes of the “real” PID init process, the one running on our system, i.e. . Here is how the processes tree will look like: You recognize the first items of the tree: we have our machine PID process, . It started and as it previously did, and them have started child processed themselves.
+
+ Now the new part: we have our isolated process tree or -namespace which I have artistically ASCII-art-decorated. In this isolated tree, has PID (the number enclosed in parentheses). This started another process, , which has PID . Nginx is usually comprised of a core process which read its configuration and creates children as needed to handle requests, here it created a child -called a “worker”- whose PID is . When we are more experienced in Docker, we’ll come back to this and actually see it for ourselves, but now, believe me when I say that if we “logged in” this isolated environment and ran , we would only see this. But the truth is, all these and (everything that is part of the isolated process tree) actually runs on the host Linux system, right? They are “classical” processes, and they must have PIDs. This is the number I wrote before the parentheses. This extremely important and useful feature which allows a process to have several PIDs has been introduced in version 2.6.24 of the Linux Kernel, in 2008! So this is what we are talking about when we mention namespaces: nested sets of process trees in which processes can’t “get out”. From inside the isolated process tree, you cannot observe processes outside of it by running and you definitely can’t kill them with . This is the first step of program isolation which Docker uses. Why “the first step”? Why isn’t it enough? Well, there are still plenty of ways these isolated processes can interact with the host system: we haven’t protected the filesystem, so they can read/write to the host’s files, they can run very expensive computing operations and take all CPU and RAM, etc. As for now, we have isolated the processes from seeing and directly interacting with each other, but Docker goes even further. Let’s take a little break and enjoy the fact that we finally can put something concrete on the notions of “namespace” and “isolation”.|||
+

@@ -1,0 +1,50 @@
+As we saw previously, legis-graph is an open source software project that imports US Congressional data from Govtrack into the Neo4j graph database. This post shows how we can apply graph analytics to US Congressional data to find influential legislators in Congress. Using the Mazerunner open source graph analytics project we are able to use Apache Spark GraphX alongside Neo4j to run the PageRank algorithm on a collaboration graph of US Congress.
+
+While Neo4j is a powerful graph database that allows for efficient OLTP queries and graph traversals using the Cypher query language, it is not optimized for global graph algorithms, such as PageRank. Apache Spark is a distributed in-memory large-scale data processing engine with a graph processing framework called GraphX. GraphX with Apache Spark is very efficient at performing global graph operations, like the PageRank algorithm. By using Spark alongside Neo4j we can enhance our analysis of US Congress using legis-graph.
+
+Mazerunner is a powerful open source graph analytics project that enables us to run Apache Spark GraphX jobs on a subgraph exported from Neo4j. Mazerunner makes use of Docker to allow for easy deployment. From the Mazerunner GitHub README:
+
+Mazerunner was created by Kenny Bastani who has written some great posts about using Mazerunner for graph analytics with Neo4j.
+
+We’ll use Docker to run Mazerunner so be sure to install Docker before moving on. Docker will allow us to easily deploy Hadoop HDFS, Neo4j and Apache Spark. We’ll use docker compose to manage our containers and define the port bindings. To start, we’ll create a yaml file that specifies the containers we’d like to spin up, how they should be linked to each other and which ports should be exposed:
+
+The yaml file defines the three containers we’ll be using (Hadoop HDFS, Mazerunner service, and Neo4j), how they should be linked and what ports should be exposed so that we can access Neo4j. We can start this configuration with a single command:
+
+We now have Hadoop HDFS, an empty Neo4j instance and Mazerunner service running in separate containers, but linked together (with some docker magic…). We can connect to Neo4j easily since the Neo4j ports are exposed. Since I’m using docker on a Mac, there is actually a docker virtual machine running locally. To connect to Neo4j I can use the IP address of this VM. The default docker VM IP address is 192.168.99.100 but we can confirm with the command:
+
+We can now connect to the Neo4j Browser at to verify that Neo4j is running and there is no data in the database.
+
+Now we need some data…
+
+If you haven’t read my previous post about the legis-graph project you should at least skim it over to see the data model we are working with and some of the queries that are possible.
+
+Now that we have Neo4j running we can import legis-graph into the database, following the steps described here. The steps involve fetching GovTrack data with rsync, using Python scripts to parse the JSON, YAML and CSV files provided by GovTrack into a series of CSV files that we can then import directly into Neo4j using Cypher scripts. The screencast below shows the exact commands so you can follow along. It’s worth noting that we’re using to run the Cypher import scripts instead of the Neo4j Browser. To access the in our Docker container we can first get a bash prompt with the command
+
+where is the id of the container running Neo4j, which we can find with the command. See the first part of the gif below. Once we have access to the shell in the container the steps to import legis-graph are identical to the those described in the project readme).
+
+Once the import scripts have finished running we have data describing every US Congress Legislator, Bill and Committee for a given Congressional session (the results below are based on data from the 114th Congressional session, the most current session) in a Neo4j property graph. Our data model looks like this:
+
+In the data model we can see a relationship between our Legislator nodes and Bill nodes called . From our memory of Schoolhouse Rock we know that every Bill has an initial Sponsor who introduces the Bill and several Cosponsors who support the Bill as well. In a political sense we can think of the Sponsor as influencing the Cosponsors to support the Bill. Although it’s not explicitly modeled in our graph we can use this measure of influence to identify influential Legislators.
+
+We will start by finding these implicit relationships in the Congressional collaboration graph and creating explicit relationships. Anytime that a Bill was introduced by a Sponsor and then supported by Cosponsors, we will model that influence in our graph by creating an relationship from each Cosponsor to the Sponsor. For example, let’s consider a specific Bill, HR5393, which was introduced and sponsored in the House by Representative Sam Graves. This Bill was then cosponsored by Representatives Mick Mulvaney, Steve Chabot, Marsha Blackburn, and Scott Tipton. We can observe that Rep Sam Graves demonstrated political leadership and influence over the cosponsors of this Bill by garnering its support, so we create an relationship from each cosponsor to Sam Graves in the graph to represent this political influence.
+
+This Cypher query will update our graph and create these new relationships for all Bills:
+
+We can use these new relationships as inputs for the PageRank algorithm to find influential legislators. PageRank is an algorithm initially used by Google to measure the importance of webpages for Google Search. The same algorithm can be applied to many different types of networks to find significant nodes in the network. In our case we will be using PageRank to measure the political influence of legislators based on Bill sponsorship and cosponsorship.
+
+When we started our Docker containers earlier, one of those containers contained Mazerunner, a powerful tool for running Apache Spark GraphX jobs on HDFS with data from Neo4j. We can start a job in Mazerunner by making a simple request to Neo4j. The request only needs to specify the type of analysis we want to perform (in this case PageRank), and the relationship type on which we want to perform the analysis ( in this case). Mazerunner will then take care of exporting the relevant subgraph to Spark, running the Spark GraphX job and then writing the results back to Neo4j. We can trigger this analysis from within the Neo4j browser with this command:
+
+Once the PageRank analysis job is complete, each Legislator node will be updated with a new property that contains the value of that Legislator’s PageRank score based on the relationships. We can use this score as a proxy for political influence in Congress. Since this PageRank score was written back to Neo4j we can use Cypher queries to now take into account a Legislator’s political influence when querying the graph. In the next section we’ll answer some interesting questions about finding influencers in Congress using Cypher and our new Congressional PageRank score.
+
+Here is where things get interesting and we start really leveraging the power of the graph. Simply by traversing the graph, we can find Legislators who have significant influence in Congress over specific subjects given the Commitees on which they serve and the types of Bills referred to those Committees.
+
+Let’s take Hong Kong as a random example. Who are the Legislators with the highest level of influence (as measured by our Congressional PageRank score) who have influence over the subject of “Hong Kong”, based on the Commitees on which they serve?
+
+Here we can see Legislators who have influence over the subject “Hong Kong” through their membership on the House Committee on Foreign Affairs, sorted by PageRank. We should also take into account their rank on the Committee, a higher rank being another sign of a higher level of influence. We can run this query for any subject in our graph, just change the parameter and find Congressional influencers!
+
+Of course a Legislator might serve on multiple Committees that have jurisdiction over a certain subject. Here we examine Legislators who have influence over the subject “News media and reporting” and order the results by the number of Committees on which they serve that have jurisdiction over the subject.
+
+To take these multiple levels of influence into account we could create some sort of composite index of influence and order our results by that index, but I’ll leave that as an exercise for the reader…
+
+If you are a social scientist, or anyone interested in working with Congressional data in legis-graph please let me know your use-case and how I can help!|||
+

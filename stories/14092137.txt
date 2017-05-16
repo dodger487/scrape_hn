@@ -1,2 +1,48 @@
-|||
+Who does not love iOS? It’s a great operating system. However I can tell you about a type of person that has a love/hate relationship with iOS: engineers who have to debug crashes on iOS devices. iOS makes debugging crashes trickier than most environments which in turn makes the job of tools like Sentry and Crashlytics that much harder. In this blog post we want to give you a bit of insight into how Sentry deals with iOS crashes and what is necessary for you to have an enjoyable crash reporting experience.
+
+The first part that goes into a crash is to generate a report we can actually send to Sentry. For this to work you need something that can generate you a basic backtrace at the moment a crash happens. There are two popular libraries for iOS that can do that. One is KSCrash, the other is PLCrashReporter. Those two libraries hook into different parts of the OS to respond to errors and to extract a backtrace. This in itself is already a very complex undertaking and we’re glad that others have done this task for us.
+
+There are many different situations that can cause crashes and each of them has different characteristics. I don’t want to get too much into detail here but it’s important to understand that not all crashes will result in the same quality of reporting. An extreme case for iOS are C++ exceptions which will not create proper backtraces on iOS because of how the exception system works.
+
+When we manage to report a stacktrace and some important data on crashing we persist that temporarily on the device. Next time you start the application we send that information to the server. The stacktrace is the most interesting part and this also is the first complexity that spills over to the server side.
+
+To give you a bit of an idea what this looks like, here is an example stacktrace after you extract it:
+
+So the first step would be to find some names for those addresses. This process is often called “symbolizing” or “symbolicating”. We can already see where the addresses are located because the device sends us a list of loaded images (object files) and where they are loaded into memory. To find the names we need to look at symbol tables.
+
+So as you can see stacktraces are fairly incomplete. While we can easily find out what frameworks the addresses are contained in, it’s unlikely that you will be able to find the function names for them on the device. There are two cases you have to keep apart here. One case is where the symbols are in fact missing, the other one is where symbols are marked as redacted.
+
+Missing symbols are typically what you have in release builds for your own applications. In release builds most of the symbols you encounter are not actually on the device so if we were to try to locate the function names on the device we will not succeed. Instead they are stored in what is commonly referred to as a “dsym file”. Technically a dsym file is a macho file just like an executable but it only contains the symbol table and debug information. So while they could be in the same file, they usually are not. When I said that “most” symbols are not on the device, this refers to the fact that some symbols need to be in the file. This is because most applications on iOS are written in Objective-C. This is relevant because Objective-C implements methods through a mechanism that is based on the idea of sending messages from object to object. These messages are referred to as “selectors” and they are essentially the name of the method.
+
+PLCrashReporter and some other tools are often attempting to find such symbols even if the normal symbols are not on the device, however for the bulk of the symbols you need to do this on the server.
+
+The second case of missing function names we need to concern ourselves with is a weirder one: redacted symbols.
+
+Redacted symbols are symbols that are indeed available on the device but tools like KSCrash or PLCrashReporter cannot access. When iOS loads system libraries it removes symbols so that when one attempts to read the symbol by parsing the framework one will only come across a symbol with the name .This is most likely done to save some memory or for security reasons. Because all system frames will have the same constant string as a symbol there is a lot that does not have to be loaded into memory.
+
+The downside is that we are not able to tell you which function in UIKit caused your crash. When you hook your phone up to Xcode you can see such symbols though. So how does that work? The answer is a bit bizarre and requires some understanding of what happens when iOS loads the system libraries.
+
+When iOS redacts symbols it stores a copy of the original symbol on the file system in a cache file that is not accessible for non rooted devices. The file is named for arm64 etc. From the file name you can see that this is considered a cache file. This means the file is updated as redacted symbols are added to it. Apple built this system to primarily support the flow where you debug your own device. If you run your own app and you hook it up to the debugger all the frames that you are interested in will have their redacted symbols added to the cache file. When you connect the phone to Xcode, Xcode will go in and “prepare the device for development” and that will essentially download the cache file and run it through a process where dummy debug symbols are built for it. It will in fact create a folder structure below for your version of iOS and put new macho files in there with symbols recovered from the cache file.
+
+Now you can guess what the problem with this is: if you have never seen a symbol it won’t be in the cache file. This is particularly noticeable if you are working with “legacy” architectures. For instance if you hook up an arm64 device with Xcode it will be able to extract some armv7 symbols but it will most likely not find all. Your chances are most likely higher if you are running a lot of 32bit apps to populate the cache, but you might as well just hook it up with an older device instead. Whenever you add a device to Xcode it will merge together the symbols it extracts.
+
+This shows one of the core issues that come up with symbolizing on iOS: you need to collect as many of these debug symbols as possible.
+
+Sentry is using two separate systems for resolving functions. For customer debug symbols we are using our own LLVM based symbolication library for Python. We fetch debug symbols from our S3 backed asset storage and then symbolicate based on the symbols we have on our device. This scales quite well to the workload caused by apps. These are typically large symbol files but there are not that many per app.
+
+On the other hand dealing with symbols from the system libraries is a different story. There are thousands of symbol files and because the cache might be incomplete we actually want to be quite fuzzy over them. As example for this fuzziness is that we might be dealing with incomplete debug symbols for system libraries from one SDK. In that case we want to try a few older versions as well in case we find matches there.
+
+To achieve this goal we wrote a separate system we call the sentry symbol server and it is a simple HTTP service written in Rust that takes a batch request of addresses to symbolicate and then responds with the function names if it finds them. It uses a custom file format that can be memory mapped in. We then use a separate build process to create these mmap’ed files and put them to S3. In regular intervals the server checks back with S3 and fetches new memory maps if necessary.
+
+After symbolication our boring crash report from before looks more like this:
+
+And this allows us then to render the crash report in a more presentable way. Because we know which symbols are from your app and which ones are from the system we can by default hide frames you likely don’t care about:
+
+In an ideal world Apple would provide a web service that does what our symbol server does. You give it the UUID of the image you want to symbolicate and the address in it, and you get back a response of the symbol that is at that address. At present the process of collecting all the symbols from different SDK versions is slow, requires a lot of manual labour and is not even guaranteed to always succeed.
+
+Sadly we are limited to providing system symbol resolving on our cloud hosted version. There are some concerns about the redistribution of system symbol files which is why we currently cannot offer this service for on-prem customers.
+
+If you are interested for support for system symbol symbolication for on-prem installations leave your feedback in the forums. We are playing with the idea of making our symbol server a public API in case there is demand for it.
+
+If this article was of interest of you let us know. We might do a followup where we explain our heuristics and the technical challenges on doing server side symbolication.|||
 

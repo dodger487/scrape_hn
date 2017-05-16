@@ -1,2 +1,38 @@
-|||
+Whilst in the process of writing a webassembly VM for a personal project, an Undo Dev came across a strange bug that they couldn’t figure out. Using reversible debugging however, they were able to identify the root cause of the problem, and work back to the line of code that caused the bug.
+
+
+
+The process of writing the VM requires iterating through a sequence of opcodes and keeping track of various places (aka program counters) that are potential destinations of jumps. These locations are termed "labels".
+
+
+
+When certain opcodes (block, loop, if, etc.) are encountered, a label is recorded, by pushing the program counter onto a stack. When other opcodes (end, etc.) are seen, the label is no longer needed and is popped from the stack.
+
+
+
+In this case, we are using as the stack, and when we run a bit of the code we get a segfault:
+
+
+
+So, we can fire up undodb, the reversible debugger for Linux, to have a look at what's happening.
+
+So we're getting a segfault when adding a label to the stack. a-priori one might imagine that it would be the action of popping from an empty stack that is more likely to cause a segfault. But that's not what's happening. Sadly, the next guess as to what might be trashing the internal pointers in a would be some sort of awful stack corruption.
+
+
+
+Luckily, undodb can help with this. We just need to work out which pointers in the are invalid, and then work out when they became invalid. Let's have a look at the itself.
+
+There's a smoking gun if ever there was one. A with -1 elements? Let's look at the actual structure rather than what udb has pretty printed for us.
+
+Sadly, it looks like the size of the is a calculated value (there are no entries equal to -1 in the structure). However, the pointers look bogus. Let's guess that they are indicative of the problem. We can set a watchpoint on the pointers which will help us monitor their behaviour in the execution history more easily.
+
+Now we need to travel back in time and see where the corruption occurred. We do this in undodb by using the backwards-continue command, , which will continue running in reverse until the last time our watchpoint was changed.
+
+Bingo! It was a pop from an empty stack that has caused the problem, and we have the exact line ( ) where this occurred. Let's look at the offending code (with some uninteresting bits removed and replaced with ellipses).
+
+With the knowledge that it is the second that is the source of the problem, it is easy to appreciate the bug. If the "if" condition is false and there is no else clause (i.e. ) then we accidentally pop the label twice. Indeed, the final shouldn't be there at all and is the result of a sloppy cut-and-paste. On a first casual glance (we do a push at the start of the opcode, and a pop at the end) everything looks ok, but the insight given us by undodb allows the problem to be identified. It is in fact a lot more staightforward to see this error when removing chunks of code and replacing with ellipses!
+
+
+
+It should be noted that the segfault actually occurs at the next "if" opcode, and comes from the first . Although this bug is clearly avoidable by being a bit more careful in the writing stages, it is a tricky one to diagnose. Without the ability to go back in time (with watchpoints) we would have been barking up the wrong tree, perhaps for some considerable time.|||
 

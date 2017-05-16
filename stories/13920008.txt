@@ -1,0 +1,48 @@
+For most of the time web developers have used JavaScript for all client side scripting. But with the rise of asm.js and the upcoming WebAssembly it is possible to write applications in your language of choice.
+
+Rust is particularly well suited for in browser usage since it is easy to write correct application code, it is fast, well portable and requires no garbage collection. Since before 1.0 compilation to asm.js has been supported in Rust and since the 1.14 release WebAssembly is also supported (did not try this).
+
+As an exercise I have written a zoomable world map that uses vector data from OpenStreetMap through Mapzen to draw tiles in the browser. The vector data is supplied in protobuf format, and it is first decoded and then formatted as an SVG fragment with Rust. You can try out the app if you use a recent version of Firefox or Chrome.
+
+OpenStreetMap is a collaborative wiki world map. Anyone can add add and edit so called features that represent geographic things like roads, water, buildings, state borders and many others. These features are represented by points (a pair of latitude and longitude, for example a statue), lines (a list of points, for exammple a road) and polygons (a closed line, for example a lake). These features are stored in a giant spatial database and can be queried, but there is no way to get all information for a given area except downloading the entire database which consumes many GB of storage (to be fair you can download also only the data for smaller areas like countries but it is still hundreds of Megabytes).
+
+Here the Mapzen API helps by saying “just give me some coordinates and a zoom level and you get all relevant information to draw a beautiful map for this area”. To get some data you need to know the tile you are interested in. To simplify implementation and increase the speed all such services don’t accept coordinate ranges like “everything inside 49.9° N to 50.13° N and 8.41° E to 8.63° E” but expect you to specify quadratic tiles they can compute once and then cache for different zoom levels. Maptiler.org lets you actually view these tiles as an overlay to Google maps. Another thing the Mapzen API does for you is cartographic generalization: If you are looking at a map for all of Europe you probably do not want to know where exactly the Zeil in Franfurt is, a single point for a city is sufficient, individual streets don’t matter at this zoom level. These generalizations cut down tile size and help you selecting what to display at which zoom level.
+
+But why do we even care about vector tiles? Can’t you just send some images across the web? Yes this is possible and was done by all web maps (I know of) until a few years ago but it has several downsides:
+
+The Mapzen Vector Tile Service provides different serialization formats like GeoJSON, TopoJSON and Protocol Buffers and you can select layers that group different kinds of features together. Do not care about boundaries? Just exclude them from your query. (Even if you request all data you don’t need to draw them all, it is up to you.)
+
+A simple interface is used to process tiles: a function called takes a single tile in protobuf binary format and returns a string representing an SVG fragment for the tile.
+
+First the binary file is read with a generated rust-protobuf parser.
+
+Next a store for the generated SVG is created. Text can be written to the store on different layers. Each layer is represented by an integer between 0 and 500. This property is present as in the Mapzen data. Features with a low rank will be drawn first and will be eventually hidden by other features. For example a forest will have a low rank and a street crossing will have a higher rank.
+
+The processing of the layers happens in the for-loop. Each layer is “painted” to the storage.
+
+Last the storage is stringified and returned.
+
+To call the Rust code from JS some wrappers are neeeded. On the Rust side should consume a binary array. This is represented in c-like fashion as a pointer and a length: . The return value is a string, this can easily use a zero terminated string since the fragment won’t contain internal NULLs: . The complete function header is:
+
+Another helper function is . It takes a pointer to a zero terminated string and frees it. Why doesn’t the code just use normal ? The docs advise against it because if Rust frees the string it can assure the string is never used afterwards by zeroing the first byte. (Are there additional arguments against normal free?)
+
+To really make the functions callable from JS the following block is also needed:
+
+The important part are the , they tell the compiler to reexpose the named functions.
+
+A JavaScript wrapper is used to call . It takes a and writes it to memory accessible by Rust code. In line 6 is called.
+
+To call it needs to be described in JS: It is a function with two arguments (both numbers for pointer and length) and returns another number which is a pointer to the SVG fragment.
+
+After was called the result needs to be loaded to a JS string. Then both the array and the result string are freed. Forgetting this keeps them in memory and results in the script crashing with not enough memory after a few tiles loaded.
+
+The rest of the Javascript fetches the data and binds to Leaflet. I moved the Rust code to a Web Worker because otherwise the the web app freezes while processing a tile.
+
+The project shows that it is possible to write ordinary Rust code to be used in web apps as long as the code does not need to work directly with the DOM. (DOM Integration is planned for a later release of WebAssembly.)
+
+Usually the motivation to add Rust to a web app will be a better performance. In this case the map still renders somewhat slow when first visiting an area and is less responsive then the maps created by the Mapzen team with pure JavaScript. This is not Rusts fault because Mapzen made some different choices like Canvas instead of SVG, better caching and had a lot more time and knowledge to optimize their implementation.
+
+The map still misses labels. Labels need to be shown above all other map content and they may span multiple tiles. For this reason the tiles must all be drawn to the same element so labels can be rendered without errors. Another possibility is to use canvas for the output like the original Mapzen tools but this requires calling into JS and will be slow with Rust. Canvas is better than SVG in this case because the browser needs to keep track of all the nodes for a map Unfortunately I was not able to run compiled WebAssembly binaries in Firefox but they will reduce file size and source code parsing time much.
+
+It was a fun project since it combines to of my interests: Rust and mapping. Although using Rust did not really pay off in terms of faster map load times (It turns out parsing a binary tile and emitting SVG takes its time even with Rust, caching SVG was the biggest visible improvement) and learned a lot.|||
+

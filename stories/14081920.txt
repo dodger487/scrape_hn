@@ -1,0 +1,112 @@
+Like the bug that no one can solve, many issues occur on the interface between the user application and the operating system. But even in the good Open Source world, understanding what is happening at these interfaces is not always easy. In this article, we review some of the tools to trace the calls being made among the kernel, libraries and the user applications.
+
+
+
+
+
+strace traces both directions of the interaction between the kernel and the evaluated application, namely, it traces when an application executes a system call, and when the operating system sends a signal to the process.
+
+In its simplest form, strace runs the application passed in the command line and prints one line for each interaction with the kernel that occurred, like which syscall was invoked, with which parameters and what was the returned value. It can also attach to a running process, which allows you to reduce the amount of clutter by starting the tracer just before triggering the actions that concern you.
+
+strace uses the ptrace interface in the kernel, so it doesn't require recompiling the application. This characteristic makes strace an ideal tool to start reverse-engineering an application to understand how it works, even if you don't have the source-code. But it is also helpful as a debugging or as a test/validation tool, for instance to confirm the return of a specific system call without going through the effort of creating a custom tool.
+
+As usual, strace is available for major distros. In Debian, you can install it with:
+
+
+
+After installing, you are ready to trace the trivial hello-world application, which just prints "Hello World
+
+" to the stdout and exits.
+
+
+
+Above is the output of strace mixed with the actual output of the hello-world application. strace writes to stderr so to avoid mixing, we could have redirected the stderr output to a file.
+
+In this example, each line corresponds to a system call executed by the hello-world application, starting from the execve call that kickstarted the program. In each line, strace prints the system call name, followed by its parameters in parenthesis and the value returned by its execution. Close to the end of the output, you will find the write() call, which actually printed the "Hello Word" string. In the example above, it got wrapped with the actual output, which also went to the console.
+
+If we look separately at the line that traces the write and clean up the wrapped part, we have:
+
+
+
+We can compare this output to the signature of the write() syscall (man 2 write), and see that it tried to write the string passed in argument 2, which has a size of 12 characters (argument 3), to the file descriptor 1 (argument 1), which is the file descriptor for stdout. The value returned by the kernel was 12, indicating that the string was fully written.
+
+But, what about the other lines? As I mentioned above, the hello-world program only prints a string and exits, so what are all the other lines printed by strace? Turns out that even the most simple C program doesn't actually start to execute from the main() function. In fact, to get the usual C environment that we are used to have, a bunch of low-level code needs to execute beforehand to initialize the C library, resolve link-time dependencies and reserve memory regions from the kernel, and only then handle the control to the main() function. This code, which is spread across the libgcc and the C library, is responsible for the other system calls that we saw in the strace output. Similarly, when the main() function returns, the execution re-enters that code, which calls the exit_group() syscall to end the execution. That syscall never returns, thus there is no return value shown in the last line of the trace.
+
+As I mentioned before, we can also attach strace to a live application, by specifying the PID in the command line. For instance, I can snoop on my IRC messages by watching my IRC client's communication with the kernel:
+
+
+
+In the example above, I ran strace on my existing weechat instance, which had the PID 2270, and used the -e option to filter only for the sendto() syscall. In this case, I had a previous knowledge of what syscall to search, but strace allows you to search for a group of related syscalls, for instance, all the network related system calls or all the syscalls that operate on file names.
+
+
+
+
+
+If you need a more interactive approach to tracing system calls and signals for any reason, GDB is also up to the task. Since version 7.0, GDB supports the 'catch syscall' command, which receives a syscall name or number and sets a breakpoint when entering and leaving the system call. This allows you to thoroughly inspect registers and data structures that are going to be consumed by the kernel before they are submitted, as well as the kernel output after executing the syscall.
+
+For completeness, you can install the gdb package in Debian with:
+
+
+
+For catching system calls with GDB, you don't really need the program debug information installed but, as usual, life gets a bit easier when you have it. So, either install from your distro, or build you software with the usual -g3 -O0 flags.
+
+
+
+In the example above, GDB was started to debug ls. In this case, we lack debug symbols for ls, but it doesn't matter much. The first GDB command issued above, adds a breakpoint right before executing the trap instruction to enter open(), allowing the user to verify its arguments. If you then type continue, the syscall will be executed and once again a breakpoint will be hit on the syscall exit, allowing you to inspect the returned data.
+
+The latest GDB still can't decode the signature of syscalls, which makes the decoding of arguments and return values a bit harder, since you have to cast and de-reference structures explicitly. This feature has been on my wish-list for a while, but it is still not implemented.
+
+The syntax for catching syscalls in GDB is using the name or the number of the syscall:
+
+
+
+Be aware that syscall numbers change among architectures. Nowadays, most common architectures are already mapped by GDB syscall files, so you are likely safe using the syscall name, unless you are tracing a very new, or a custom system call.
+
+Like strace, GDB also supports catching groups of related syscalls. For that, you can use the 'group:' syntax, or 'g:' for shorter:
+
+
+
+Similarly, you can use the 'catch signal' command to break at the moment a signal is sent to the application:
+
+
+
+This stops the execution right at the moment the signal reaches the process, which can be quite useful for understanding hard race conditions.
+
+GDB can control the way a signal is delivered to the application. For instance, you can use the command 'handle signal' to stop the program from receiving the signal at all, or configure GDB to print a message and stop the execution when a signal is delivered.
+
+The command 'handle signal' also tells you the current configuration for that signal:
+
+
+
+In the example above, which is the default configuration, the program is configured to stop the execution as well as forward the signal USR1 to the inferior process, once it happens.
+
+
+
+
+
+Like strace, ltrace executes the program passed as parameter or, alternatively, attaches to an already existing process; but instead of system calls, it traces the library calls issued by the application, translating parameters and the return values.
+
+As usual, ltrace is also available in Debian, provided by the package with the same name:
+
+
+
+In the example below, I traced a demonstration program, which executed several common calls to the C library, like printing to stdout, sorting a vector, saving data to a file and allocating memory. ltrace printed each of these calls in sequence, with the arguments used and the returned value.
+
+Since we track the memory allocation and free() calls, it is easy to imagine how we could script something up to match those calls and create something like a poor-man's memory leak detector :)
+
+
+
+ltrace also doesn't require recompiling your program or compiling with debug information, so it is also a very useful tool for cases where you don't have access to the source-code. In fact, strace and ltrace are very similar tools in usage and features, the difference between them lies on the stack level where the data is collected. While strace investigates system calls issued to the underlying kernel, ltrace tracks library calls.
+
+GDB is also capable of tracing requests going to libraries, as it allows you to step through the library code in the same way you usually do with applications. Even in the GDB examples above, the breakpoint triggered inside the C library syscall wrappers, so instead of continuing the execution, one could just step over the next lines of code. Therefore, if you want an interactive approach, GDB is also a great option here.
+
+
+
+
+
+In this article we reviewed three tools that can be used to trace the applications interaction with the operating system at different levels of the stack. Strace and the GDB catch syscall/signal operate on the kernel-application interface, tracing the system calls that flow from the application to the kernel and the signals that flow in the opposite direction; while ltrace operates on a higher level of the stack, tracing requests flowing from the application to libraries.
+
+These tools can give you a much better understanding of what is going on at these interfaces in real-time, allowing you to understand, for instance, why exactly that well-crafted request is failed to execute. Since they don't require code recompilation, and usually won't even require debug symbols, these tools are also a great asset when reverse-engineering a binary to understand how it works, helping hackers and enthusiasts to write their own version of proprietary tools.
+
+Whether you use strace/ltrace or GDB is completely up to you, and there will always be use cases where one tool is better than the other. The goal should not be necessarily mastering every tool out there, but to have basic knowledge that they exist and what they can do, so you can know what to look for when debugging a real-world problem.|||
+

@@ -1,0 +1,52 @@
+Akka Actors aim to provide "simple and high-level abstractions for concurrency and parallelism." We've made good use of them at Localytics, but I found them in practice to be cumbersome and low-level. I looked for an alternative approach, and just as I was about to give up, an attractive option fell in my lap: Akka Streams. The following explores why Streams is a simpler, higher-level solution.
+
+My initial aversion came from just how much boilerplate you find in actor based code. Every line of code is another liability waiting to come back and bite me, so the less I have to write, the better. Let's see what a Hello World looks like with an Actor:
+
+Besides verbosity, there are subtle, yet serious, problems lurking in this actor code. A few examples of underlying problems are:
+
+Just as I was giving up hope and getting ready to begrudgingly subject another microservice to the gripes listed above, our Chief Software Architect Andrew Rollins gave an impassioned talk about reactive streams at one of our regular engineering lunch-and-learn sessions. Angels sang and I saw a light come down from the sky. This was the answer I was looking for.
+
+After a bit of googling and experimenting I had decided to bet the success of my microservice on the Akka Streams library. I found it solved each of the major problems I had with actor based code in the following ways.
+
+This makes it trivial to change your data flow, even at run-time, if your program calls for it. Cumulative ordered operations are as simple as chaining calls to . With minimal use of the FlowGraph DSL, we can achieve more interesting things such as the flow where each individual element is processed in multiple ways.
+
+This also seems like an appropriate time to come clean and admit that the title of this post is a lie. Akka Streams uses actors under the hood to implement the reactive streams pattern. The beauty of this is that I get the all the benefits of actors without having to worry about them in my code.
+
+When I first told Jacob Schlather, our resident Akka-tuning expert (and actor proponent), that I did not want to use actors in my code, he challenged me to keep CPU usage above 70 percent.
+
+His reasoning was that many of our services do their slowest work in IO. One of the biggest wins you can get is to free up CPU bound work from waiting on IO to complete.
+
+I was thrilled to find that my first crack at a streams-based implementation averaged 90 percent CPU consumption, with absolutely no tuning. Here's the current CPU profile for the stream-based service in production:
+
+This came for free! It's all thanks to the Reactive Streams implementation that Akka Streams gives you. This service is doing a significant amount of network IO in stream. It's remarkable that the underlying implementation is smart enough to optimize around the slower parts and maximize use of available resources.
+
+The next question in mind was "how will it scale?" We've tripled the amount of work we are doing with this service. Without having to scale up hardware, our throughput has increased along with it:
+
+Today, the service keeps up with our incoming data pipeline using a quarter of the resources required by a non-stream-based service doing comparable work. We are thrilled with the outcome.
+
+There were definitely a few challenges along the way. Here are a few takeaways that will make our next streams-based project easier to build:
+
+While you might never stream Units like this in real life code, comparing the output of these programs makes the behavior of -> apparent:
+
+Note that the second run, using -> does all the fast work first. As soon as the slow stage can't keep up with the fast stage, conflate kicks in. In this example, we build a list of results from the fast stage, which are then flattened back into individual stream elements for hand-off as the slow stage consumes them.
+
+This is a really nice way to optimize resource usage around a slow step in your program.
+
+This was almost a show-stopper for me. The service in question is a queue consumer, and has to process a large amount of work per queue message. Pulling all of that work in at once defeats the point of the stream. If I don't know where the work ends, how will I know where to tack on the queue message to be acknowledged?
+
+A bit of Googling showed that this is not exactly a solved problem, but it is a problem that a few people have clearly encountered.
+
+Tim Harper went as far as extending the core components provided by the Akka Streams library. His work provides a version that supports acknowledgement, discussed here.
+
+Just at the point where I was beginning to consider a different route altogether, I came up with this simple "hack":
+
+This small example is actually representative of the work we are now doing with streams:
+
+By creating a separate stream for the file, then concatenating the queue element to the end of the stream, I am guaranteed that the queue message will arrive at the Sink exactly after the last line of the input stream is produced. The Element type family is there to provide type consistency through the stream to the Sink.
+
+Running the code yields as follows:
+
+All said and done, Akka Streams has been a huge success for us. We've cut down our boilerplate, increased readability and maintainability, reduced time spent tuning performance, and picked up a few tricks to make our next stream based service faster to build.
+
+Have your own experiences with Akka Streams? Share in the comments.|||
+

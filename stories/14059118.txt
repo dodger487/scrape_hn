@@ -1,0 +1,139 @@
+or, JavaScript inline caches for unmaintainable fun and profit
+
+This is an overview of an optimization technique I've been using in JSIL for a while, where you create and update polymorphic inline caches in your JavaScript code at runtime so that it can stay fast while adapting to unexpected changes.
+
+This post is still a draft, so please share your thoughts and comments with me on twitter at @antumbral or via email (kg at luminance dot org).
+
+Already familiar with what an inline cache is, but not familiar with C# and you want to know why I'm using them?
+
+ Skip to Why are you using an inline cache in JavaScript?
+
+Want the benchmark timings and an explanation of how my JavaScript inline caches work?
+
+ Skip to Just how slow is your code without inline caches?
+
+How does it work?
+
+Why not just use or ?
+
+Just want to read some source code? Okay, let's see some source code.
+
+You may be familiar with the concept of an inline cache, or the term 'PIC' - polymorphic inline cache - used often in discussion of JIT compilers, like the ones used in the SpiderMonkey and V8 javascript runtimes.
+
+If you already know what an inline cache is, skip down to the next section!
+
+To summarize for the novice, a polymorphic inline cache takes an operation that typically requires a bunch of important checks and generates specialized code for specific, known scenarios, where the specialized code doesn't contain those checks. Conceptually, this can apply to much simpler scenarios!
+
+This test case is pretty simple, there are many ways you can optimize it. Let's choose a toy optimization to demonstrate what kind of code an inline cache might generate in this scenario - using bitwise arithmetic to do division.
+
+When dividing an integer by a power of two, you can use a bitwise shift instead of a divide to get the same result. A bitwise shift is considerably simpler to implement, so in cases where the divisor (the right hand side) is known to be a power of two, a compiler might turn a division into a bitwise shift.
+
+If we want to do this ourselves, we might introduce a lookup somewhere:
+
+Cool, that looks good. But wait! We replaced a call to a known method - - with a call to a method that is chosen at runtime. And that method depends on the arguments to our function! Did we just make it slower? Quite possibly - unless the JIT is smart enough, every call to will be a virtual call of some sort, and this might prevent inlining and other key optimizations.
+
+Let's take a look at a naive version of the code a compiler might generate for an inline cache:
+
+Now that dynamic call to 'divider' has been replaced: At the top of the function, we do a simple check to see whether we can use any of our existing bitshift functions, and if so, we call out to a specific function - this call's not dynamic - that calls one of our bitshift functions. Because none of these calls are dynamic, it is pretty easy for the compiler to go from this step to inlining everything, and the end result is one big function with fully-optimized sections for each power of two.
+
+Inlining enables all sorts of powerful optimizations, so an inline cache like this is essential to set an optimizer up so it can do even more work on your code to make it run quickly.
+
+JSIL is a compiler that translates .NET applications - statically typed, written in languages like C# - to JavaScript. At runtime it implements most of the semantics of .NET, including user-defined value types and overloaded methods. For simple applications, this is trivial - the first JSIL prototype was a C# decompiler, changed to produce JavaScript syntax.
+
+Things get complicated when you want to translate complex applications, and you want to make them fast. Specific operations in .NET are not easy to express in JavaScript, and they're particularly difficult to express if you want to expose .NET libraries to user-authored JavaScript, instead of just translate whole applications.
+
+For example, let's say you have an overloaded method in C#:
+
+There's no obvious way to express this in javascript. A compiler would probably assign them unique names, and then propagate them through the output code:
+
+Not great to deal with, but it works. Things get trickier when your language is statically typed, but allows you to manipulate types and methods at runtime. C# provides the concept of a 'generic type', where you define an abstract 'generic' form of a type, that has multiple placeholders for real types, and then you create a real type by combining the generic type with some real types. So, for example, the 'generic type' combined with the type argument produces the real type , which is a list containing a bunch of ints. This is all done statically, so there aren't any type checks at runtime and arrays will be nice and efficient. Great!
+
+Except C# has reflection. Reflection lets you examine types, methods & values, and manipulate them at runtime. In .NET, you can even create a new 'real' generic type at runtime, then create an instance of it! When you do this, .NET's JIT compiler helpfully obliges your request by compiling brand new code for that new type so you can use it.
+
+Suddenly the idea of generating a bunch of JavaScript functions with carefully mangled names isn't quite sufficient anymore. And it turns out that there are other scenarios like this where it's not easy to write code that handles everything correctly up front.
+
+So, where was I?
+
+Oh, right. So, once we give up and decide that some things have to happen at runtime - as it turns out they happen at runtime even in our nice static language, C# - we have to figure out how to make all this work. Where before you would have had the compiler do the heavy lifting, now we have to do a bunch of this type system magic in JavaScript and try to do it efficiently.
+
+One commonly used feature in C#, interfaces, turns out to require this kind of magic - albeit in a less common case. A simple C# interface and implementation would look like this:
+
+Given that implementation, it's probably obvious that this works:
+
+Run the above in your browser
+
+But what about this? Why does it work?
+
+Run the above in your browser
+
+The key feature at work here is called 'variance', or as the MSDN documentation refers to it specifically: Covariance and Contravariance in Generics. When code has been authored with it in mind, the compiler allows you to substitute more specific or less specific types than the original definition required. In our example, because is more specific than , and the interface described T as , the compiler knows that it's safe to let us change types that way, and everything works.
+
+Hold on a second, what...
+
+Run the above in your browser
+
+This's going to print and , right? It seems like that's the only logical thing that could
+
+Oh. Well then. Welcome to the wonderful world of generic interface variance: where a type can implement the same interface multiple times. The only way to implement this is to decide at runtime what method to call, and we have to decide by looking at all the valid candidates.
+
+Now we finally get to inline caches. We want to avoid doing this lookup every time we call a method, because it's incredibly slow!
+
+Great question! Here are some measurements from terrible microbenchmarks, truncated for readability:
+
+Doubling the execution time doesn't seem like the end of the world, but with an inline cache, they're about the same speed!
+
+Both tests are much slower than C# - sometimes JavaScript runtimes just won't cooperate - but with inline caches, again, we've killed the overhead from calling an overloaded method.
+
+At its core, this optimization is based on two key observations:
+
+From these two observations we can come up with a third one:
+
+In practice, we start by generating - on demand, the first time a method is asked for - a 'cold' inline cache that records what was asked for and does a normal, slow invocation. Here's an example from the overloaded method call test case:
+
+With the information recorded during this method call, we are able to compile a new 'warm' inline cache, specialized for the specific method being called:
+
+Because of the case, this will still work when called with a name we haven't seen before, and we will update the IC to add cases as appropriate. Once the IC gets too big, we can recompile again to tear it out entirely, and not even pay the cost of the function anymore.
+
+The best part is that this new inline cache can be inlined and optimized more aggressively than the code would be without the IC. If the caller passes the constant when calling our IC, and our IC gets inlined, the compiler can trivially identify that it wants the contents of that case block and throw everything else away.
+
+You can see that the warm inline cache contains the specific or 'mangled' name for the method being called; this means that we can be certain we're always directly calling the exact method we want, without relying on a compiler to figure everything out when we first generate our JS. Plus, this is something an end user can interact with when writing JS.
+
+The function updates the internal bookkeeping data for the inline cache and, if necessary, recompiles it:
+
+You'll notice that we make an effort to disable the IC once it has too many entries, on the premise that a large IC will not be eligible for inlining, and the switch statement is too expensive once inlining is disabled. This tends to be true in practice - V8 actually determines whether or not to optimize (inlining included) based on the number of characters in your source code, not even based on the actual complexity of the function - so it's worthwhile to be cautious here. Another reason to keep the ICs small is that some JITs fully disable optimization for a function if it's recompiled too many times - so if we were to keep updating the IC over and over, functions that call it would eventually stop getting optimized entirely.
+
+The cache miss handler also has to handle the corner case where a cache miss occurs even though the function in question is actually in the cache. This can happen if a cache miss & recompile occur, but an older version of the IC is still being used - because it was on the stack or cached in a variable. This means we end up paying the cost of the IC lookup and go through the slow method call path, but we don't end up doing extra pointless recompiles.
+
+If the cache miss results in updating or disabling the IC, we recompile it by calling :
+
+This function is also pretty simple: It invokes the function responsible for compiling ICs, updates the compilation cache (if it's enabled), then figures out where the old IC lived and replaces it (the operation at the bottom), typically on a class's prototype. Replacing it may cause code that uses it to get recompiled, but after all that is said and done, the new IC will be in use and the JIT will have an opportunity to inline and fully optimize functions that use it.
+
+A great question! In theory, you could just use or where these ICs are currently being used. The code would work, and modern JITs don't utterly fail on uses of those methods like they used to. There are a few reasons not to use them, however:
+
+These specialized ICs have a fixed list of arguments, and a fixed set of argument types. In this case, each instance of is a list of specific argument types, and you combine a method name with a method signature to call a specific overload of a specific method. This means that a compiled application has one instance for each unique combination of argument types, and any code path calling an overloaded method with those types will go through the signature.
+
+The downside to the shared objects is the need for the IC - we can't just hard-code the method name. But the upside is that the signature information being reused saves a considerable amount of memory, and makes it more likely that a signature's support code will be 'hot' (from being frequently used) enough to get fully optimized.
+
+Having the fixed list of arguments provided by the means that the JIT never has to guess or make an effort to infer types - once it's observed a MethodSignature in use a couple times, it knows that all the types are constant (with the exception of the object you're calling the method on; that type will tend to vary.) This makes it much easier for the JIT to generate efficient code (less type checks are necessary) and means it won't have to recompile as often.
+
+Given that we want to use the MethodSignature to provide good type information and be precise about what method we're calling, it makes sense to consider whether we can pass that type information all the way down the call chain.
+
+If we use or inside the MethodSignature to call the actual function body, we're effectively throwing away the type information: There's no easy way for a JIT to collect useful type information about arguments to those functions, because they are used to call all sorts of diverse functions, and even worse, 's arguments are inside an array.
+
+Worse still, and still tend to pose an issue when the JIT wants to inline functions, because it becomes very difficult to know the exact target of the method call. If you remember, we aid the JIT here with our inline cache by calling a specific named method ( ) to ensure that it's easy to inline. and are even worse than because not only is the target unknown, but it's possible that special care will need to be taken to deal with scenarios where the number or types of arguments don't match. (If you examine uses of and in the SpiderMonkey profiler, you will in fact see a considerable amount of time spent in the JS runtime dealing with argument lists.)
+
+All this put together gives us good reasons to try and generate a specialized function for each MethodSignature, responsible for calling a given target function with a provided name. That's where the IC comes into play. The end result after all this is put into action is that you can do something like this...
+
+... and in the real world, it is possible for everything that happens there to get inlined, producing code with very few type checks!
+
+Sure! This source file here, JSIL.Core.js, lines 7008-7413, contains most of the essential magic that implements my inline caches. It even has comments!
+
+When applying complicated optimizations like this - and in general, when trying to fine-tune performance for JavaScript - it's important to exhaustively and repeatedly test your changes.
+
+For most JSIL optimizations, I have a set of microbenchmarks extracted from real applications that I run on every commit, to make sure performance hasn't regressed. Alongside this, I run real applications compiled with the latest build of JSIL on a periodic basis, examining their overall framerate and taking a look at profiles to see if any new hotspots have appeared. Sometimes I run my performance test cases across a variety of browsers - release and development channels of Firefox and Chrome, occasionally IE - to see if a particular browser has dramatically improved or regressed. This often results in bug reports against a particular browser or JavaScript engine.
+
+If your goal is to write the fastest possible JavaScript for your libraries or applications, you may need to go to those same lengths. For many applications, it's not worth the trouble - so resist the temptation to go nuts micro-optimizing something that really isn't particularly slow to begin with :-)
+
+This post is still a draft, so please share your thoughts and comments with me on twitter at @antumbral or via email (kg at luminance dot org).|||
+
+JSIL - CIL to Javascript Compiler

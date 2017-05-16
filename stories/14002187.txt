@@ -1,0 +1,53 @@
+Whilst writing a previous blog post I stumbled across the .NET Interpreter, tucked away in the source code. Although, it I’d made even the smallest amount of effort to look for it, I’d have easily found it via the GitHub ‘magic’ file search:
+
+Before we look at how to use it and what it does, it’s worth pointing out that the Interpreter is not really meant for production code. As far as I can tell, its main purpose is to allow you to get the CLR up and running on a new CPU architecture. Without the interpreter you wouldn’t be able to test any C# code until you had a fully functioning JIT that could emit machine code for you. For instance see ‘[ARM32/Linux] Initial bring up of FEATURE_INTERPRETER’ and ‘[aarch64] Enable the interpreter on linux as well.
+
+Also it doesn’t have a few key features, most notable debugging support, that is you can’t debug through C# code that has been interpreted, although you can of course debug the interpreter itself. From ‘Tiered Compilation step 1’:
+
+You can see an example of this in ‘Interpreter: volatile ldobj appears to have incorrect semantics?’ (thanks to alexrp for telling me about this issue). There is also a fair amount of comments in the code, although I haven’t verified what (if any) specific C# code breaks due to the missing functionality.
+
+However, I think another really useful scenario for the Interpreter is to help you learn about the inner workings of the CLR. It’s only 8,000 lines long, but it’s all in one file and most significantly it’s written in C++. The code that the CLR/JIT uses when compiling for real is in multiple several files (the JIT on it’s own is over 200,000 L.O.C, spread across 100’s of files) and there are large amounts hand-written written in raw assembly.
+
+In theory the Interpreter should work in the same way as the full runtime, albeit not as optimised. This means that it much simpler and those of us who aren’t CLR and/or assembly experts can have a chance of working out what’s going on!
+
+The Interpreter is disabled by default, so you have to build the CoreCLR from source to make it work (it used to be the fallback for ARM64 but that’s no longer the case), here’s the diff of the changes you need to make:
+
+You also need to enable some environment variables, the ones that I used are in the table below. For the full list, take a look at Host Configuration Knobs and search for ‘Interpreter’.
+
+To test out the Interpreter, I will be using the code below:
+
+which on my machine, gives the following results for iterations:
+
+So yeah, you don’t want to be using the interpreter for any performance sensitive code!!
+
+In addition, a diagnostic output is produced. Note, this is from a single iteration of the loop, otherwise it becomes to verbose to read.
+
+So you can clearly see the interpreter in action, executing the individual IL instructions and showing the current values of any local variables as it goes along. Then, once the entire program has run, you also get some nice summary statistics (this time from a full-run, with iterations):
+
+Now we’ve seen it in action, let’s take a look at the code within the Interpreter and see how it works
+
+At the heart of the Interpreter is a giant switch statement (in ), that is almost 1,200 lines long! In it you’ll find lots of code like this:
+
+In total, there are 199 statements, corresponding to all the available CLR Intermediate Language (IL) op-codes, in all their different combinations, for instance , i.e. , , and . The large majority of the statements just call out to another function that does the actual work, although there are some exceptions, such as .
+
+The other task that takes up lots of code in the interpreter is handling method calls, over 2,500 L.O.C in total! This is spread across several methods, each doing a particular part of the work:
+
+In summary, this work involves dynamically generating stubs and ensuring that method arguments are in the right registers (hence the assembly code). It handles virtual methods, static and instance calls, delegates, intrinsics and probably a few other scenarios as well! In addition, if the method being called needs to be interpreted, it also has to make sure that happens.
+
+The interpreter needs to handle some of the key functionality of a runtime, that is creating and initialising objects. To do this it has to call into the GC, before finally calling the constructor:
+
+Another large chuck of code is dedicated to boxing/unboxing, that is converting ‘value types’ ( ) into references when needed. The .NET IL provides specific op-codes to handle this:
+
+That is, reading/writing fields in an object or elements in an array:
+
+There is also a significant amount of code (over 1,000 lines) that just deals with low-level operations, that is ‘comparisions’, ‘branching’ and ‘basic arithmetic’:
+
+In addition, the interpreter has to provide the GC with the information it needs. This happens when the GC calls Interpreter::GCScanRoots(..), with additional work talking place in Interpreter::GCScanRootAtLoc(..). Very simply the interpreter has to let the GC know about any ‘root’ objects that are currently ‘live’. This includes static variables and any local variables in the function that is currently executing.
+
+When the interpreter locates a ‘root’ object, it notifies the GC via a callback ( ):
+
+Finally, whilst the Interpreter is fairly self-contained, there are times where it needs to work with the rest of the runtime
+
+Discuss this post on HackerNews and /r/programming|||
+
+Whilst writing a previous blog post I stumbled across the .NET Interpreter, tucked away in the source code. Although, it I’d made even the smallest amount of effort to look for it, I’d have easily found it via the GitHub ‘magic’ file search:

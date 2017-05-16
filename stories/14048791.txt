@@ -1,0 +1,214 @@
+Welcome to my new post! Over the past several months I've been researching new phishing techniques that could be used in penetration testing assignments. Almost every assignment starts with grabbing the low-hanging fruit, which are often employees' credentials obtained via phishing.
+
+In today's post I'm going to show you how to make your phishing campaigns look and feel the best way possible.
+
+I'm releasing my latest Evilginx project, which is a man-in-the-middle attack framework for remotely capturing credentials and session cookies of any web service. It uses Nginx HTTP server to proxy legitimate login page, to visitors, and captures credentials and session cookies on-the-fly. It works remotely, uses custom domain and a valid SSL certificate. I have decided to phish Google services for Evilginx demonstration as there is no better way to assess this tool's effectiveness than stress-testing best anti-phishing protections available.
+
+Please note that Evilginx can be adapted to work with any website, not only with Google.
+
+Enjoy the video. If you want to learn more on how this attack works and how you can implement it yourself, do read on.
+
+Disclaimer: This project is released for educational purposes and should be used only in legitimate penetration testing assignments with written permission from to-be-phished parties.
+
+Let's take few steps back and try to define main obstacles in traditional phishing efforts.
+
+First and major pain with phishing for credentials is two-factor authentication. You can create the best looking template that yields you dozens of logins and passwords, but you will eventually get roadblocked when asked for verification token that arrived via SMS. Not only will it stop you from progressing further, but it will also tip off the account owner, when they receive login attempt alert.
+
+Second issue with phishing templates is, they must allow to accept any login and password, as they have no means of confirming their validity. That will, at times, leave you with invalid credentials.
+
+Third issue is having to create phishing templates. I don't know about you, but for me the process of copying site layout, stripping javascript, fixing CSS and writing my own replacements for stripped javascript code to make the login screen behave as the original, is extremely annoying. It feels bad to recreate something, which has already been done.
+
+In past several months I have worked on my own ettercap-like HTTP proxy software written in C++, using Boost::Asio library for maximum efficiency. I implemented SSLstrip, DNS spoofing and HSTS bypass. This solution worked perfectly in Local Area Network, but I wondered if same ideas could be repurposed for remote phishing, without a need to use custom-made software.
+
+I had a revelation when I read an excellent blog post by @i_bo0om. He used Nginx HTTP server's feature and module to proxy the real Telegram login page to visitors, intercepting credentials and session cookies on-the-fly using man-in-the-middle attacks. This article made me realize that Nginx could be used as a proxy for external servers and it sparked the idea of Evilginx. The idea was perfect - simple and yet effective.
+
+Allow me to talk a bit on Evilginx's research process, before I focus on installation and usage.
+
+The core of Evilginx is the usage of Nginx HTTP proxy module. It allows to pass clients' requests to another server. This basically allows Nginx server to act as a man-in-the-middle agent, effectively intercepting all requests from clients, modifying and forwarding them to another server. Later, it intercepts server's responses, modifies them and forwads them back to clients. This setup allows Evilginx to capture credentials sent with POST request packets and upon successful sign-in, capture valid session cookies sent back from the proxied server.
+
+In order to prevent the visitor from being redirected to the real website, all URLs with real website's domain, retrieved from the server, need to replaced with Evilginx phishing domain. This is handled by module provided by Nginx.
+
+Nginx implements its own logging mechanism, which will log every request in detail, including POST body and also and headers. I created a Python script named , that will parse the Nginx log and extract credentials and session cookies, then save them in corresponding directories, for easy management.
+
+There is one big issue in Nginx's logging mechanism that almost prevented Evilginx from being finished.
+
+Take a look at the following Nginx configuration line that specifies the format in which log entries should be created:
+
+Variable stores a value of response header. These headers will contain session cookies returned from the server on successful authorization and they have to be included in the output of Nginx's access log. 
+
+ Issue is, HTTP servers return cookies in multiple headers like so:
+
+For some reason Nginx's variable doesn't store header values as an array. Instead it stores only the value of the first seen header, which in our example would be . This is a huge problem, as it allows to log only one cookie and forget the rest. While searching the internet for possible solutions, I came across posts from 2011 about the same issue, reported by hopeless sysadmins and developers. I was positive that Nginx itself did not have any workaround.
+
+After a while, I knew neither of the two options were viable. They would have required me to spend huge amount of time, understanding the internals of Nginx. Neither did I want to do it or did I have that amount of time to spend on a side project.
+
+Thankfully, I came across some interesting posts about using LUA scripting language in Nginx configuration files. I learned it was OpenResty Nginx modification, which allowed to put small scripts into site configuration files to handle packet parsing and data output.
+
+OpenResty website describes itself as such:
+
+I found out that by using LUA scripting, it was possible to access headers as an array.
+
+Here is an example function that returns all header values as an array:
+
+The big issue with logging cookies was resolved and the best part of it was, LUA scripting allowed much more in terms of packet modification, which wasn't allowed by vanilla Nginx, e.g. modification of response packet headers.
+
+The rest of development followed swiftly. I will explain more interesting aspects of the tool as I go, while I guide you on how to install and set up everything from scratch.
+
+[UPDATE 2014-04-26] I've released a new version of Evilginx, which makes the installation process described in this post slightly out-of-date. For new installation instructions, refer to the latest post about Evilginx 1.0 Update.
+
+First of all, we need a server to host Evilginx. I've used a Debian 8.7 x64 512MB RAM VPS hosted on Digital Ocean. If you use this link and create an account, you will get free $10 to spend on your servers. I've used the cheapest $5/mo server, so it should give you 2 months extra and seriously Digital Ocean is the best hosting company I've ever used.
+
+Once our server is up and running, we need to log into it and perform upgrades, just in case:
+
+We will also need a domain that will point to our VPS. I highly recommend buying one from NameCheap (yes, this is my affiliate link, thanks!). They have never let me down and support is top notch.
+
+I won't cover here how to set up your newly bought domain to point at your newly bought VPS. You can find excellent tutorials on Digital Ocean:
+
+For the remainder of this post, let's assume that our registered domain is: notreallygoogle.com .
+
+Now we can proceed to install OpenResty. We will be installing it from source. At the time of writing, most current version was 1.11.2.2, so if you want a newer version, you can check the download page for more up-to-date links.
+
+With OpenResty unpacked, we need to install our compiler and dependency packages to compile it. The following will install Make, GCC compiler, PCRE and OpenSSL development libraries:
+
+Before we compile the sources, we need to configure the installation. The following line will do the job of putting the Nginx binaries, logs and config files into proper directories. It will also enable module and LuaJIT functionality.
+
+At this point, we are ready to compile and install.
+
+If all went well, we can verify that OpenResty was installed properly:
+
+From now on, I will refer to OpenResty as Nginx. I believe it will make it less confusing.
+
+Nginx is now installed, but it currently won't start at boot or keep running in the background. We need to create our own daemon service rules:
+
+Before we launch our service for the first time, we have to properly configure Nginx.
+
+We need to open Nginx configuration file with any text editor and make sure to add in the block. After modification, it should look something like this:
+
+Nginx, from now on, will look for our site configurations in directory, where we will be putting symbolic links of files residing in directory. Let's create both directories:
+
+We need to set up our phishing site configuration for Nginx. We will use the site configuration for phishing Google users, that is included with Evilginx package. Easiest way to be up-to-date is to clone Evilginx GitHub repository.
+
+Now copy Evilginx's site configuration template to directory. We will also replace all occurences of in the template file with the name of the domain we registered, which in our case is notreallygoogle.com. When it's done, create a symbolic link to our new site configuration file in directory:
+
+We are almost ready. One remaining step is to install our SSL/TLS certificate to make Evilginx phishing site look legitimate and secure. We will use LetsEncrypt free SSL/TLS certificate for this purpose.
+
+EFF has released an incredibly easy to use tool for obtaining valid SSL/TLS certificates from LetsEncrypt. It's called Certbot and we will use it right now.
+
+Open your file and add the following line:
+
+If all went well, we should be able to obtain our certificates now. Make sure Nginx is not running, as Certbot will need to open HTTP ports for LetsEncrypt to verify ownership of our server. Enter the following command and proceed through prompts:
+
+On success, our private key and public certificate chain should find its place in directory. Evilginx's site configuration already includes a setting to use SSL/TLS certificates from this directory.
+
+Please note, that LetsEncrypt certificates are valid for 90 days, so if you plan to use your server for more than 3 months, you can add command to your and have it run every day. This will make sure your SSL/TLS certificate is renewed when its bound to expire in 30 days or less.
+
+Everything is ready for launch. Make sure your Nginx daemon is enabled and start it:
+
+Check if Nginx started properly with and make sure that both ports 80 and 443 are now opened by the Nginx process, by checking output of .
+
+If anything went wrong, try to retrace your steps and see if you did everything properly. Do not hesitate to report issues in the comments section below or even better, file an issue on GitHub.
+
+In order to create your phishing URL, you need to supply two parameters:
+
+Let's say we want to redirect the phished victim to rick'roll video on Youtube and we know for sure that Google's session cookie name is . The URL should look like this:
+
+Try it out and see if it works for your own account.
+
+Nginx's site configuration is set up to output data into file. This file will store all relevant parts of requests and responses that pass through Nginx's proxy. Log contents are hard to analyze, but we can automate its parsing.
+
+I wrote a small Python script, called , which will parse Nginx's log files and extract only credentials and session cookies from them. Those will be saved in separate files in directories named after extracted accounts' usernames.
+
+I assume, you've now tested your Evilginx setup with phishing for your own account's session. Let's try to extract your captured data. Here is the script's usage page:
+
+All arguments should be self-explainatory apart maybe from and . Argument specifies the input config file, which provides info for the script, what kind of data we want to extract from the log file.
+
+Creds config file , made for Google, looks like this:
+
+Creds file provides information on sign-in form username and password parameter names. It also specifies a list of cookie names that manage user's session, with assigned domain names. These will be intercepted and captured.
+
+It is very easy to create your own .creds config files if you decide to implement phishing of other services for Evilginx.
+
+If you supply the argument, the script will truncate the log file after parsing it. This is useful if you want to automate the execution of the parser to run every minute, using .
+
+Example usage of the script:
+
+That should put extracted credentials and cookies into directory. Accounts are organized into separate directories, in which you will find files containing login attempts and session cookies.
+
+Session cookies are saved in JSON format, which is fully compatible with EditThisCookie extension for Chrome. Just pick Import option in extension's window and copy-paste the JSON data into it, to impersonate the captured session.
+
+Keep in mind that it is often best to clear all cookies from your browser before importing.
+
+After you've imported the intercepted session cookies, open Gmail for example and you should be on the inside of the captured account.
+
+I figured, many of you may not be familiar with the method of hijacking session tokens. I'd like to shed some light on the subject by answering some questions that I often get.
+
+Does session hijacking allow to take full control of the account, without the need to even know the user's account password?
+
+Yes. When you import other account's session cookies into your browser, the server has no other option than to trust that you are indeed the person who logged into his own account.
+
+How is this possible? Shouldn't there be protections to prevent this?
+
+The only variable, which is hard to control for the attacker is the source IP address. Most web services, handling critical data, should not allow the same session token to be used from multiple IP addresses at the same time (e.g. banks). It would be wise to detect such scenario and then invalidate the session token, requiring both parties to log in again. As far as I've tested, Google doesn't care about the IP address of the account that uses a valid session token. Attacker's IP can be from different continent and still it wouldn't raise red flags for the legitimate account owner.
+
+I believe the only reason why Google does allow to simultaneously access accounts from different IPs, using same session token, is user experience. Imagine how many users switch their IPs, while they have constant access to their Google services. They have Google signed in on their phone and PC, they move between coffee shop, work and home, where they use different wireless networks, VPNs or 3G/4G networks.
+
+If Google was to invalidate session tokens every time IP change was detected, it would make using their services a nightmare and people would switch to easier to use alternatives.
+
+And, no, Google Chrome does not perform any OS fingerprinting to verify legitimate owner's machine. It would be useless as it would provide less protection for people using other browsers (Firefox, Safari, Opera) and even if they did fingerprint the OS, the telemetry information would have to be somehow sent to the server, during user's sign-in. This inevitably would also allow hijacking.
+
+Does the account owner get any alerts when he tries to log into Google through Evilginx phishing site?
+
+Yes. On successful login, the account owner will receive a push notification to his Android phone (registered with the same Google account) and an e-mail to his address, with information that someone logged into their account from unknown IP address. The IP address will be the one of Evilginx server, as it is the one acting as a man-in-the-middle proxy and all requests to Google server originate from it.
+
+The attacker can easily delete the "Unknown sign-in alert" e-mail after getting access to the account, but there will be no way for him to remove the push notification, sent to owner's Android phone.
+
+Issue is, some people may ignore the alert, which will be sent exactly after they personally sign into Evilginx phishing site. They may understand the alert is a false positive, as they did sign in a minute earlier.
+
+How would this attack fare against hardware two-factor authentication solutions?
+
+Edit (2017/04/07): Apparently U2F "security key" solutions check the domain you're logging into when the two-factor token is generated. In such scenario the attack won't work as the user won't be able to log in, because of the phishing domain being present instead of the legitimate one.
+
+Thanks to kind readers who reported this!
+
+Two-factor authentication protects the user only during the sign-in process. If user's password is stolen, 2FA acts as a backup security protection, using an additional communication channel that is less likely for an attacker to compromise (personal phone, backup e-mail account, hardware PIN generators).
+
+On successful login, using any form of two-factor authentication, the server has to save session cookies in account's owner browser. These will be required, by the server, to verify the account owner of every sent, subsequent request.
+
+At this point, if the attacker is in possession of session cookies, 2FA authentication methods do not matter as the account has already been compromised, since the user successfully logged in.
+
+What will happen if I don't tick "Remember me" checkbox at Evilginx phishing page, which should make the session token temporary?
+
+Temporary session token will be sent to user's browser as a cookie with no expiration date. This lets the browser know to remove this cookie from cache when the browser is closed. Evilginx will still capture the temporary session token and during extraction it will add its own +2 years expiration date, making it permanent this time.
+
+If the server doesn't have any mechanism to invalidate temporary session tokens after a period of time. Tokens, they issued, may be used by an attacker for a long time, even after the account owner closes their browser.
+
+What can I do if I my session token gets stolen? How do I prevent the attacker from accessing my account?
+
+At this point, the best thing you can do is change your password. Mature services like Google will effectively invalidate all active session tokens, in use with your account. Additionally your password will change and the attacker won't be able to use it to log back in.
+
+Google also provides a feature to see the list of all your active sessions, where you can invalidate them as well.
+
+How do I not get phished like this?
+
+Do NOT only check if the website, you are logging in to, has HTTPS with secure lock icon in the address bar. That only means that the data between you and the server is encrypted, but it won't matter if benevolent attacker secures data transport between you and his server.
+
+Most important is to check the domain in the address bar. If the address of the sign-in page looks like this: , put the domain name directly in Google search. If nothing legitimate comes up, you may be sure that you are being phished.
+
+I need to stress out that Evilginx is not exploiting any vulnerability. Google still does a terrific job at protecting its users from this kind of threat. Because Evilginx acts as a proxy between the user and Google servers, Google will recognize proxy server's IP as a client and not the user's real IP address. As a result, user will still receive an alert that his account was accessed from an unknown IP (especially if the Evilginx server is hosted in a different country than phished user resides in).
+
+I released this tool as a demonstration of how far attackers can go in hunt for your accounts and private data. If one was to fall for such ploy, not even two-factor authentication would help.
+
+If you are a penetration tester, feel free to use this tool in testing security and threat awareness of your clients.
+
+In the future, if the feedback is good, I plan to write a post going into details on how to create your own Evilginx configuration files in order to add support for phishing any website you want.
+
+Do not hesitate to contact me if you happen to be working on projects that require:
+
+I am extremely passionate about what I do and I like to work with people smarter than I am.
+
+As always, if you have any suggestions, ideas or you just want to say "Hi", hit me up on Twitter @mrgretzky or directly via e-mail at kuba@breakdev.org.
+
+You can find Evilginx project on GitHub here: 
+
+ Evilginx on GitHub|||
+

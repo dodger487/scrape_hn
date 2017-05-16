@@ -1,0 +1,139 @@
+Enter GraphQL. Using GraphQL to power our backend, we were able to provide the mobile client exactly what it needed for each request, with no additional bloat, and were able to optimize the database and cache layer to do everything in an extremely performant way.
+
+Before getting into some of the specific details, here are a few common questions / misconceptions I often encountered or experienced myself while learning about GraphQL:
+
+GraphQL sounds like graph. Does my data need to be a “graph” or do I need a “graph” database? Does it work with relational databases?
+
+No, you do not need a graph database, it works just fine with whatever database you have.
+
+While IMO you can think about almost any “relational” database in terms of a “graph” — something like:
+
+You can use a graph database, a relational database, an in-memory array, a key-value store, whatever. At Playlist, we use Neo4j as a “primary” database, operating in full graph mode, and Redis, acting as a cache layer utilizing various different data structures including hashes, key-value pairs, and sets. Redis essentially represents the data in Neo as key-value stores by ID and ZSETs for associations by type, closely mirroring Facebook’s TAO model:
+
+This allows us to have an authoritative data source in Neo with the full power of Cypher queries but the performance of an in-memory key-value store for 90% of all queries.
+
+GraphQL sounds like “query language” which sounds like I’m exposing the ability to query my database on the client. This sounds dangerous. What about malicious clients?
+
+No, you’re not exposing your database queries to the client any more than you were with your REST API. Okay, maybe a bit.
+
+GraphQL is more or less a DSL on top of your own backend data fetching logic. It does not connect directly to a database. In fact, the schema you expose over GraphQL will likely not mirror your database exactly. It provides a way to describe a request for structured data, but it is then up to your backend to fulfill that request.
+
+One concern is that GraphQL supports “nested” fetching, so should a malicious client request a particular recursive nested relationship an arbitrary but large number of times (like user.followers.followers…), there could be a potential performance hit on the backend. See the final section for a few ideas on how to mitigate this risk.
+
+So, GraphQL doesn’t provide unauthenticated access to my database?
+
+No. Authentication is most likely handled outside of GraphQL entirely and your backend is still responsible for handling data fetching / authorization in a secure way, just like how you were doing before with REST.
+
+For our new GraphQL backend, we perform authentication outside of GraphQL entirely, passing it as a request header and having the server authenticate the request and then pass the authentication context down to the GraphQL data resolvers.
+
+At Playlist, we would eventually like to make our GraphQL backend “transport-agnostic”, so we could grab data over HTTP like normal or request data via a non-HTTP wire protocol. It would even be cool to implement some kind of live streaming updates for real-time data changes over something like MQTT. As such, we’ve considered embedding authentication information, either authentication tokens or username/password pairs, in the GraphQL requests themselves, but as of yet we have not fully explored those paths.
+
+Again, this is completely up to your backend and it not a primary concern of GraphQL. We will see an authenticated resolver below (the function that fetches and returns data). There seem to be two predominant approaches to handling a client attempting to access something they are not authorized to view.
+
+First, return null for the requested field. This seems to work well in cases where there is no real harm in asking for a particular set of data and no real harm in denying it.
+
+A good example would be asking for the email of a user where the backend only provides the user’s email to that user themselves. If I request my own user object with the email field included, I’ll get my email. If I request another user object, the email will be null, and I can code my application to be okay with that null.
+
+Second, return an actual error. This seems to work best if the client asking for the data needs to know why it was not provided the requested data so that it can take action on that information.
+
+A good example would be attempting to access an object that requires authentication, but no authentication was provided.
+
+“404s” are usually returned as nulls. As per convention (like on Github’s API), unauthorized objects are sometimes returned as null as well, like in the case of asking for a user’s profile when that user has blocked the currently authenticated user. A null mimics a 404 and does not leak the fact that the hidden user exists.
+
+The Github repositories are confusing! Which one is really GraphQL?
+
+facebook/graphql is the specification for the GraphQL language and its implementation — it is not tied to any specific language / backend. It’s great to read to fully understand the language, especially if you’re into those things or learn best by digging into concepts and theories.
+
+graphql/graphql-js is a reference implementation of that specification provided by Facebook, written in JS/Node. This is the place to start if you’d like to use GraphQL with a Node-based backend or just want to play around. To the best of my knowledge, this is the most complete implementation of the specification, being more or less the official reference implementation. Read the README.
+
+graphql/express-graphql is a middleware for Express.js to easily create a GraphQL server with Express. I’d highly recommend reading the entire source code as it’s not terribly long, is quite easy to understand, and lends itself to explaining how to use graphql-js, even if you don’t end up using express-graphql directly.
+
+graphql/graphlq-relay-js is a set of helpers to implement Relay-compatible IDs and “connections” (one to many associations, or array fields) — it is not required to use GraphQL, however we have found that being Relay-compatible has benefited us even though we’re not using Relay, with ID handling, pagination, etc. For more information on the Relay GraphQL specification, see the Relay docs.
+
+graphql/graphiql is a web-based IDE for GraphQL. This thing is freaking awesome. GraphQL provides schema introspection, and GraphiQL provides autocomplete and syntax validation using those introspection capabilities. You can download this project directly, embed it in your app, or my favorite, download it as a standalone app in an Electon-based wrapper at skevy/graphiql-app.
+
+facebook/dataloader is a utility module that has revolutionized data fetching in our Playlist backend. Its foundation is extremely simple — it collects the arguments of calls to load() while in the current frame of execution (an event loop tick) and then uses your custom provided logic to batch-fetch data based on the collected arguments. More on how we use DataLoader below.
+
+graphql/swapi-graphql is an example project exposing the existing SWAPI as a GraphQL server. It utilizes graphql-js, express-graphql, GraphiQL, and DataLoader.
+
+chentsulin/awesome-graphql is an awesome collection of links to GraphQL resources, projects, posts, and more. Check it out!
+
+What is Relay? Do I need Relay too?
+
+Relay is a framework for connecting GraphQL and React in an intelligent way. You absolutely do not need Relay to take advantage of GraphQL, though if you’re using React, check it out — it may be useful in your app.
+
+Relay requires a few special conventions in your GraphQL query design to support its operation, and at Playlist we’ve decided to be Relay-compatible, even though we do not use Relay itself. This has provided a consistent API for fetching by ID and representing and paginating collections of associations. The Relay documentation has more information.
+
+Is GraphQL only for React?
+
+Nope. You can use it anyplace you used HTTP/REST previously.
+
+Let’s delve into how we can solve the performance issues from the above playlist endpoint with GraphQL. We want to only return the data that is needed, and optimize our database queries so that we can avoid the N+1 bug.
+
+Our GraphQL query will look like the following:
+
+For simplicity, the playlist ID was embedded in the query, though in practice we’d be passing the ID as a typed parameter rather than embedding it inside the query. See the GraphQL docs for more info.
+
+We assume that authentication has taken place outside of GraphQL and the authentication state has been provided in the rootValue object of the GraphQL call so that our resolvers can access. See the docs for graphql-js and express-graphql for more information about rootValue, and see below for it in action.
+
+First, we have to define a root query object, which is the entry point for the query. The root query object should have a field called playlist, since that’s what we’re providing in the query above:
+
+Note that we’re using ES6 syntax here. We use babel with stage set to 0 to take advantage of all the latest and greatest ES7 stuff.
+
+We define a field that returns a playlist type (a GraphQL type definition that we define in another file and import here), set up a single argument named id of type non-null string, and then most importantly we define a function to “resolve” the object.
+
+The first argument to resolve is the current object itself (since we’re at the root level, we ignore this argument). The second argument is the args passed to the GraphQL call, so we extract out the id field. The third argument provides us access to the GraphQL context, so we extract out our backend instance that we passed down from the rootValue elsewhere in the app and use it to fetch a playlist by ID.
+
+It’s that simple! We load the playlist from the database, return a JS object, and we’re done at this level.
+
+So, here we define a new object type for Playlist. Since our root query resolver returned the playlist model instance, the first argument to our resolve functions at this level (named it) is that instance. So, for the id field, we are resolving by calling it.uuid thus exposing the uuid model field under the name id. Remember that your GraphQL schema does not need to mirror your database schema.
+
+For the name field, we do not provide a resolver, because the default for a field named x is model.x.
+
+For tracks, we call it.tracks() on the model to load tracks from the database.
+
+Note: there is a resolve function for every field, but this does not mean that an individual database query is required to fetch each field. You can fetch as much or as little on root.playlist, so each of the sub field resolvers can return something already fetched by their parent or issue further queries as necessary.
+
+Similar to before, we define the id and title fields as simple resolvers. We also add a field viewerHasLiked and check authentication. If the user has not been authenticated, we return null. Otherwise we call track.userHasLiked() with the currently authenticated user. Again, the auth object is coming from our app outside of GraphQL in an Express middleware.
+
+Given that Playlist.load() loads a playlist, playlist.tracks() loads the array of tracks for that playlist from the database, and track.userHasLiked() queries the database for the existence of an association between a user and a track, then our GraphQL query will resolve correctly and we have essentially duplicated the functionality of the REST API, once we get the other fields defined, omitted here for brevity.
+
+This solves one of our two issues with our REST API: clients can now request only the data they need, beneficial for mobile app performance in a variety of different ways. But we still have the problem of N+1 queries — if we request viewerHasLiked for all 50 tracks of this playlist, we will get 50 queries. We solved this using a quite ingenious little npm module from Facebook called DataLoader.
+
+DataLoader provides an API that consolidates any calls to load() in a frame of execution (event loop tick) and then batch-loads data based on the collection of calls. Additionally, it caches results by key, so subsequent calls to load() with the same arguments return cached directly.
+
+So, if we call myDataLoader.load(id) many different times in a frame of execution, then once that frame completes, the data loader would be provided with an array of all the IDs and can batch-load the requested data. I would highly recommend reading the README to better understand DataLoader’s workings.
+
+In our case, we can model track.userHasLiked() as a call to a DataLoader instance designed for resolving the the relationship between a user and track in bulk. Something like this:
+
+With this code in place, the 50 calls to likeLoader.load() will result in one call to the batch load function, meaning that our GraphQL query will now execute 3 database queries rather than 52.
+
+As indicated on the DataLoader README, we take this one step further by composing DataLoader instances all the way to the database query level.
+
+For example, if we wanted to fetch users by username, we would have:
+
+With this DataLoader composition, the batchQueryLoader, used by all other DataLoaders, ensures database activity is batched and latency is reduced. And since userByUsernameLoader resolves IDs then calls userByIDLoader, userByIDLoader becomes a shared cache, reducing queries overall. In our setup, we even added a DataLoader for Redis using pipelines and integrated it into our other loaders as a caching layer, further reducing query time.
+
+Also, as mentioned before, DataLoaders cache their results by the arguments of load(). Because of this fact, we initialize DataLoaders for each request, so during the life of a single request, data is cached, then it is discarded after the request completes.
+
+Using this architecture, the entire requested playlist from the beginning, the one that took 170 queries and around 15s to render, returns in about 250ms with only 3 database queries, and around 17ms reading data from the Redis cache. This solves both performance issues.
+
+Looking forward, here are a few things we are currently looking to solve:
+
+Our GraphQL server provides read capabilities for our entire API surface, but writes have yet to be implemented. graphql-js provides an easy DSL for handling GraphQL mutations, so we shortly will be integrating writes into the GraphQL system. This appears to be a straightforward task, but it will be interesting to discover what if any insights or best practices emerge from the implementation.
+
+We have yet to solve caching GraphQL responses on the client. Ideally the system fetching data from a GraphQL endpoint would understand the underlying schema by utilizing schema introspection and thus would be able to intelligently cache sub-resources, so updates to a model at one location would update everywhere. Further considerations like TTLs, forced updates, etc. would need to be implemented.
+
+If understand correctly, Relay may solve some of these concerns, however Relay is still new, does not currently support React Native, and does not run in a native code environment.
+
+There are several aspects of our platform that are “real-time,” and it would be awesome to integrate these aspects into our GraphQL backend, perhaps allowing live “subscriptions” to particular sets of data.
+
+If we expose something like the followers of a given user, then theoretically a malicious client could submit a request like user.followers.followers… until the server struggled to respond. We do not have a full solution for this yet, especially if we decide to expose our GraphQL endpoints as a public API at some future point. Three possible paths to explore come to mind:
+
+In conclusion, GraphQL is pretty awesome and has been solving some real-world problems at Playlist. For us, it is more than hype, and I wanted to share some of our findings in the hopes that it may help others understand. Cutting edge technologies and projects are fun, but can sometimes be difficult to comprehend and apply.
+
+One more thing — check out this video. It was immensely helpful for me in understanding some of the benefits of GraphQL and its real-world implementation at the Financial Times.
+
+If you have any questions, comments, pieces of advice, whatever, feel free to get in touch @jacobwgillespie on Twitter or at [email protected].|||
+
+Disclaimer: GraphQL is still new and best practices are still emerging. This post describes some of my journey with implementing a GraphQL backend service, so it is a snapshot of what I’ve learned so…

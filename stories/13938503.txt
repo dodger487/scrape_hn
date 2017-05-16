@@ -1,0 +1,93 @@
+Do you know how Git identifies what files have changed between two commits?
+
+It is a fairly common operation you probably do every day when you review pull requests, when you check staged files… It involves prefix trees and Merkle trees and many comparisons.
+
+In this blog post I will walk you through every step in the process in an intuitive way; I will skip some of the hairy details so I can focus on the main problems and solutions, and present them in a clear and understandable way.
+
+This blog post was inspired by my work on go-git, which in turn was inspired by Git itself and libgit2.
+
+I will use snippets of Go code here and there to illustrate some concepts, they all are simplified versions of the real Go code we use in go-git.
+
+Whenever you make a Git commit, you save a snapshot of your project into your repository, that is, Git remembers the state of all the files you have staged and stores all that information in a tree structure inside the commit.
+
+This tree structure is composed of nodes that represent your files and directories. I call this kind of tree a , as it has properties of both prefix trees (tries) and Merkle trees, let us get into the details!
+
+In a Git tree every node has a name, which is the filename portion of the path to the file or directory it represents, as in the figure below:
+
+An example of a Git tree with some names in their nodes.
+
+The practical implications of this are:
+
+Every node has a SHA-1 hash in a Git tree:
+
+If we add the hash information belonging to each node, in blue, to the previous figure, we get a more detailed view of the tree:
+
+An example of a Git tree with some names and hashes in their nodes.
+
+This means Git trees are Merkle trees, the practical implications for us are:
+
+Let us assume, for the sake of this blog post, that hash collisions are impossible, even though they are quite popular nowadays.
+
+In line with what we have explained so far, this is a sensible representation of Git trees in Go:
+
+The path to a node in a tree will look something like this:
+
+I recommend to implement so that you can treat paths as nodes when needed:
+
+Let A and B be two Git trees from consecutive commits. If we compare one with the other there are going to be quite a few changes we have to deal with, let us see a minimal set (changes depicted in red):
+
+In general, if we compare two Git trees we are likely to face several occurrences of the cases above, and maybe even some composite cases, like moving a file to another directory or replacing a file with an empty directory with the same name.
+
+The output of our tree comparator will be a list of changes, that applied to the A tree will turn it into the B tree. A change in this context is defined as an action and the involved paths. We can represent them as follows in Go:
+
+Here are some examples of how to represent a few popular kinds of changes between two trees:
+
+Now that we know how to represent changes between two trees, we can already write down the signature of our difftree function:
+
+That is, the function takes two trees indicated by their roots, compares them and returns the collection of changes needed to turn one into the other.
+
+Detecting insertions and deletions can be implemented by simultaneously walking both trees using the lexicographic depth-first traversal and comparing the paths of the returned nodes. The algorithm can be nicely summarized with the following animation that shows how to detect the insertion of .
+
+If both walkers are on the same path, the element is neither inserted nor deleted and we can advance both walkers to their respective next nodes. We still need to compare the hashes of both paths though, just in case the contents have changed; if the hashes differ, the modification change from the old path to the new one is issued.
+
+If the walkers are pointing to different paths then either the old path was deleted or the new one inserted, depending on which one comes first in the lexicographic depth-first sorting.
+
+I suggest adding the method to the type to find out which path comes first. That method returns whether the path comes before or after another under the particular sorting policy.
+
+This path comparison deserves some careful planning since the naive comparison of string representations of both paths would return wrong results in some corner cases. For instance should come before but the former is greater than the latter when they are compared as simple strings. The proper way to compare paths is to compare ancestor names between them, making one step at a time:
+
+The algorithm described above can be summarized as:
+
+Let us see how to implement each of them.
+
+This would be a regular depth-first tree iterator if it were not for some interesting details:
+
+Taking those into account, the iterator type will look something like this:
+
+Both and methods return the path of the next node in the tree, but each of them traverses the tree using a different policy:
+
+I have chosen the names for and in honour of the gdb commands.
+
+Here is how I recommend to implement such an iterator:
+
+The following animation shows a series of and method calls over a tree along with the states of the main stack and its frames:
+
+The path in both trees have the same name and hash in the figure above, because they represent the same unchanged file. No change has to be issued and we can proceed with both iterators to the next comparison.
+
+If they were directories instead of files, we would still want to advance both iterators but skip their contents to save some time.
+
+In the case of an inserted file like the one in the figure above, the name of the paths will be different. The path of the A tree iterator points to and B’s iterator points to .
+
+As A’s path is “bigger” than B’s path (comes later in the lexicographic depth-first sort), we know that B’s path was inserted, otherwise A’s iterator would have already reached a similar file. This means we need to issue the insertion and advance the B’s iterator while keeping A’s iterator intact, since the fate of has not been decided yet.
+
+If we keep doing this for all the possible cases we end up having the following table, with and being the current paths of the iterators and and being the iterators themselves:
+
+Here I wrote down all the possible combinations of nodes and situations you may encounter in paths comparisons and carefully arranged the combinations with similar outcomes in groups so they can be straightforwardly detected with simple checks in your code.
+
+Comparing Git trees becomes an easy task once you split it into the comfortably small pieces.
+
+Even if you don’t plan to implement your own version of Git, I hope that understanding the challenges and the proposed solutions at a conceptual level will help you solve similar problems in the future.
+
+P.S. Thanks to my reviewers, Miguel Molina and Vadim Markovtsev for their suggestions, proper English and clean code; the broken English and the convoluted code is all mine.|||
+
+Building the first AI that understands code

@@ -1,0 +1,72 @@
+Here at Addepar we push the limits of what the browser can do on a fairly regular basis. Our application has to render large amounts of aggregated financial data to our users quickly and efficiently, which means we have to pull out all the tricks to squeeze every last bit of performance out of the Javascript VM.
+
+For example, our open source addon Ember Table uses occlusion, a sort of technical sleight-of-hand, to render only the rows that the user is currently viewing in the table. If we were to load, say, 10 million rows, only the 40 or 50 that were visible on the screen would actually be rendered and incur the cost of instantiating the Ember components and DOM elements. As the user scrolls, the rows are recycled and seamlessly rendered on the other side without them noticing a thing.
+
+Addepar is currently on Ember 1.8, and as such our infrastructure and libraries are showing their age. We recently began working toward upgrading our main app to Ember 2, a long and arduous journey that will be the topic of many upcoming blog posts. One of the first tasks we decided to take on was updating Ember Table to a modern, component-oriented addon, and to do that we needed to find a suitable replacement for the occlusion layer. Originally, we used Ember.ListView, but that view was deprecated and stopped working around Ember 1.11. The replacement had to:
+
+Unfortunately, there were no mature occlusion addons out there: the only ones available were both pre-1.0.0 ( and ).
+
+is definitely the simpler of the two, but it has some stringent requirements. You must know the height and width of each element in the list before you render. In addition, because it renders and positions each item using , we would have very little freedom in styling our elements. Finally, there was no guarantee that it would work back to Ember 1.11, and ensuring that compatibility would have required some significant reworking of the internals.
+
+When I reached out to Chris Thoburn, author of Smoke and Mirrors, about our needs, he assured me that his end goal for the library would fit all of them. Smoke and Mirrors was going to be a highly performant without sacrificing flexibility. Its API was simple and understandable, and best of all he was determined to support 1.11 for those of us struggling to get off of Ember.ListView and move forward with Ember.
+
+However, the catch was that the library needed a bit of work. Smoke and Mirrors has had several point releases and lots of users, but its current rendering strategy doesn’t scale well as the collection grows, and there were some bugs in general. Chris was looking for maintainers to join the HTML Next organization and take over his work on the library, breaking it apart from one monolithic, general occlusion solution into targeted individual components – for vertical scrolling, for horizontal, for both dimensions, and others for more general use.
+
+Addepar has stepped up and wholeheartedly joined HTML Next and taken over the Smoke and Mirrors project, and after a few months of hard work I’m glad to announce that of our first component, is ready and available (just in time for EmberConf)!
+
+In the sections that follow, I’ll dive deep into how the new and improved component works under the hood. I’ll also share some embedded examples in pure HTML and CSS to illustrate certain mechanics.
+
+The first part of setting up occlusion is figuring out exactly how we can use a normal scrollbar when we’re only rendering a few of the elements. Let’s say that our scroll container (which could be any element on the page, or the viewport itself) is 250px high, and we have 1000 elements that each have a height of 50px. Basic math says we should only ever  have to render 6 items ( ), because as we scroll we will be rendering some portion of the 1st item and some portion of the 6th item at the same time. However, if we just render the 6 items, the scrollbar will be way off – it’ll only show 50px of extra area, when it should be showing 49750px:
+
+The item container, the child of the scroll container, needs to be 50000px tall for us to get an accurate representation. Since we know the heights of all of our items in advance, we could manually set the height of the item container:
+
+This gets us an accurate scrollbar, but it means we also have to position those items somehow as we scroll. Instead, a better solution is to use padding in the item container to simulate the heights that the culled (unrendered) items would have if they were rendered. In the following simple example we “move” the items as we scroll by adding or removing 50px of padding from the top or bottom of the item container:
+
+Now that doesn’t look too far off from a full occlusion solution! In fact, if we just pop the item off either end as we scroll, replace its content, and pop it back on the other end, we basically have it:
+
+This is fundamentally how the standard measurement strategy for now works. It’s similar to solutions used in other frameworks such as React Infinite.
+
+However, we also want to support variable item heights – heights which may not be know until render, and that may change when they are rendered. We also want to support any arbitrary styling that users could possibly put together, including margins (which are incredibly hard to measure due to margin collapsing).
+
+That’s a much taller order – let’s break it down a bit.
+
+Let’s just start with translating the above rendering strategy into one where item heights are arbitrary. When item heights are fixed, calculating the cumulative heights of the culled items is a constant time operation: , where for the items above and for the items below. But as soon as we have to account for variable heights things get a lot trickier.
+
+The old version of Smoke and Mirrors created a proxy for each item in the collection, rendered or not. The proxies would track the geometries of their items—the heights, widths, top and bottom position, etc.—and update them as the user scrolled, meaning we always knew the size and position of culled items. However, this was a very heavy solution ( operation per scroll) that was originally designed to support 2d and other forms of general occlusion. Because is restricted to one dimension, we can optimize further.
+
+What we’re looking for is a lightweight data structure that, given an ordered list of heights and an arbitrary offset, will find the first item in the list such that . We could do this with a binary search on a list of the precomputed sums (e.g. given the list of heights the list would be ). However, updating such a list would be an operation, and, since we need to be able to update the values quickly as we scroll and remeasure, it would be prohibitively expensive.
+
+What we want instead is a balanced binary search tree, where the leaf nodes of the tree are the individual heights, and each layer of nodes contains the sum of its children, up to the root node which contains the total height of all of our elements. Given some random offset, we can follow the tree down to get the closest item in time, and given a height we want to update, we can follow the tree back up in the same time.
+
+This is the most expensive operation in because it runs every single time we scroll, which is approximately a lot.
+
+However, we still would have to deal with the costs of instantiating that BST – 1 javascript object per node, nodes for each of our items, and nodes for the layers above them. This would definitely cause issues if we wanted to track 10 million+ items.
+
+A Skip List is an alternative way of building a BST: it’s simply  a 2d array of numbers, where each individual row represents a layer in the BST, and the children of a given “node” in a layer are found by doubling the index of the node into the next layer:
+
+Now that’s much lighter! We can improve on this data structure by using Typed arrays which allow us to use actual integers instead of Javascript’s `number` primitive and are much faster to instantiate.
+
+So, now we have a way to find out where we are as we scroll, and we have a way to update that information quickly and efficiently, and it’s about as space efficient as we can get. Now, how do we measure heights of changing items? And what do we do if we rendered an item and its height wasn’t what we were expecting? Won’t that throw everything off?
+
+Remeasuring items after they’ve rendered isn’t too hard: we could just schedule the task on the runloop in Ember. The tricky part, however, is when we remeasure an item that is above the current scroll area, only to discover that it’s a different height than we thought it was. If you recall, we set padding on top of the item container for each item that is supposed to be up there, but is currently culled, so  we don’t know the actual height of those items until they are rendered. If the actual height was different than the expected height, the list could appear to jump around.
+
+So, we need a way to be able to render everything, attach it to the DOM, and then make some measurements at the very last minute and make adjustments for anything that’s changed. And we need to do this fast enough that there isn’t any flickering or glitching.
+
+Luckily, a recent browser API was made exactly for this. allows us to schedule work that should occur just before the browser is going to paint (and finish all of it before it paints). Exactly what we need!
+
+Unfortunately, Ember schedules all of its rendering work to happen asynchronously. First class support for RAF will probably make its way into the Ember runloop at some point, but until then we’ve hacked together a temporary custom scheduler that wraps the runloop and allows Ember to render within the animation frame itself.
+
+So, we have all of the necessary components, now we just need to tie them into Ember. The main difficulty here is with Ember’s rendering engine. Glimmer is incredibly fast, but its algorithm for diffing loops can’t make as many assumptions as we can about the nature of our rendered components. Conceptually, we know that all we will ever be doing is moving some number of components from the top to the bottom, or from the bottom to the top, and replacing their content with whatever the new items are.
+
+We want to minimize diffing, rendering, and DOM manipulation—especially because we now know that all of that work must happen in a RAF, which means that if it takes too long the browser will hang very noticeably.
+
+To accomplish this, only ever updates the content of the components for Glimmer and Ember to rerender. The ordering of non-updated components, and their content, remains intact. The changed components are then manually moved. (This works because Glimmer only needs to maintain a stable reference to an existing DOM node, similar to the way that ember-wormhole works.)
+
+This operation takes a minimal amount of time, saving us a huge amount on performance without sacrificing flexibility in styling or structure. The final DOM is exactly the same as it would have been if there were no occlusion at all. This strategy will likely be revisited once the Custom Components API is finalized.
+
+In the title of this post I stated that can render 10 million items of variable, or even changing, heights quickly and efficiently. Actually, it may be able to handle more, but we weren’t able to test greater limits because Chrome started crashing when we tried instantiating 100 million objects before `vertical-collection` was even initialized!
+
+Needless to say, if you’re looking for a way to make your app more performant and you’re rendering huge amounts of data, may be your occlusion solution. Check it out on Github or view the demo here.
+
+And of course, if you’re interested in Ember.js and our open source work, drop us a line at build@addepar.com!|||
+

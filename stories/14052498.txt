@@ -1,2 +1,23 @@
-|||
+There are situations when applications keep the database connection for a long period of time. It seems to be not important. However, if this application makes many connections or there are several applications with such behavior — things are getting worse.
 
+This article is not a tutorial. It describes possible solutions to this issue. As usual, I will be glad to hear any alternative solutions.
+
+1. Create a stored procedure that closes all the connections or connections of a certain user to the specified database:
+
+USE [DATABASE_NAME] GO SET ANSI_NULLS ON GO SET QUOTED_IDENTIFIER ON GO CREATE PROCEDURE [srv].[KillConnect] @databasename nvarchar(255), -- database @loginname nvarchar(255)=NULL -- login details AS BEGIN /* deletes connections for the specified database and login details access */ SET NOCOUNT ON; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; if(@databasename is null) begin ;THROW 50000, 'A database is not specified!', 0; end else begin declare @dbid int=db_id(@databasename); if(@dbid is NULL) begin ;THROW 50000, 'The database does not exist!', 0; end else if @dbid <= 4 begin ;THROW 50000, 'To delete connections to a system database is forbidden!', 0; end else begin declare @query nvarchar(max); set @query = ''; select @query=coalesce(@query,',' ) +'kill ' +convert(varchar, spid) +'; ' from master..sysprocesses where dbid=db_id(@databasename) and spid<>@@SPID and (loginame=@loginname or @loginname is null); if len(@query) > 0 begin begin try exec(@query); end try begin catch end catch end end end END GO      deletes connections for the specified database and login details access ;THROW 50000, 'A database is not specified!' , 0; ;THROW 50000, 'The database does not exist!' , 0; ;THROW 50000, 'To delete connections to a system database is forbidden!' , 0;
+
+This stored procedure helps manually disable all the connections to the database or a certain user for further actions with the database.
+
+2. Create a stored procedure to remove all the stuck processes.
+
+USE [DATABASE_NAME] GO SET ANSI_NULLS ON GO SET QUOTED_IDENTIFIER ON GO CREATE PROCEDURE [srv].[KillFullOldConnect] AS BEGIN /* It deletes the connections which were executed a day ago. Attention! System databases such as master, tempdb, model and msdb do not take part in this process. However, it does not affect database distribution for replication. */ SET NOCOUNT ON; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; declare @query nvarchar(max); set @query = ''; select @query=coalesce(@query,',' ) +'kill ' +convert(varchar, spid) +'; ' from master..sysprocesses where dbid>4 and [last_batch]<dateadd(day,-1,getdate()) order by [last_batch] if len(@query) > 0 begin begin try exec(@query); end try begin catch end catch end END GO        It deletes the connections which were executed a day ago.        Attention! System databases such as master, tempdb, model and msdb        do not take part in this process.        However, it does not affect database distribution for replication.
+
+This stored procedure removes the connections that were completed more than 24 hours ago. In addition, this procedure does not affect the main system databases (master, tempdb, model, and msdb). If you try to access a database while the connection is disabled, a new connection for this application will be created.
+
+Now, it is necessary to run a stored procedure in the Agent task once a day:
+
+It would be better to wrap this query into the try-catch block to process a possible call for exceptions.
+
+In this article, I have analyzed how to implement stored procedures on closing a connection to a database (all or a certain user) and to delete stuck processes on a particular example. In addition, I have explored on a particular example how to automatically run a task on the stuck processes deletion on a daily basis. It allows decreasing an amount of ‘dead’ connections to a server. The deletion of all the connections to the database allows you to modify some properties, as well as close the process that causes any issue.|||
+
+This article describes possible solutions how to automatically delete stuck processes which decrease database performance in MS SQL Server

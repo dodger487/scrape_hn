@@ -1,0 +1,66 @@
+Many months ago I noticed photos on an apparel website, which all had a particular discoloration, making them desaturated and dull. Already being familiar with color management I suspected a misconfiguration in their image pipeline, but didn't investigate further. In the coming months I kept noticing similar discoloration on other websites, which eventually made me curious.
+
+I downloaded some of the images to confirm my suspicion of problems with color management, such as mangled color profiles, being the reason for the discoloration. As it turned out, none of the images had color profiles. Which is not unusual, as many images don't, but is problematic in cases when the color profile is essential to rendering images correctly. I tentatively patched in the likely missing color profiles, and the images I had sampled came back to life.
+
+Next I checked the HTTP requests of the images, and quickly noticed common fields in the HTTP response headers.
+
+So the images are apparently served through Cloudflare.
+
+Cloudflare operates a world-wide network, with which it offers services that improve performance, security, and reliability of websites. Some services are available for free, with either limited features or limited assurances. According to their advertising, nearly 10% of all internet requests are served through Cloudflare. Their mission statement is to help build a better Internet.
+
+One of the services that falls in the performance category, and which is already hinted at in the HTTP headers, is named Polish. It's only available to paying customers, with the lowest tier running at $20 per domain per month.
+
+It's advertised as follows. (Emphasis in quotes mine.)
+
+Polish automatically applies both “lossless” and “lossy” image optimization to remove unnecessary bytes from images. On average, image sizes are reduced by 35%.
+
+More information about Polish, in particular technical details, is difficult to find on their website. It's scarcely sprinkled across several pages. The most authoritative public source is a very brief support article which links to a blog post from some years ago. An interesting quote from that blog post follows.
+
+The Lossless mode removes all the unnecessary bloat from an image file, such as the image header and meta data, without removing any image data. This means images will appear exactly the same as they would have before.
+
+Some additional information is given in the Cloudflare Dashboard. Screencap below.
+
+Based on the provided promises, you would probably not hesitate to enable the Lossless setting of Polish for your website. Careful. From both the introduction to this page, and the emphasis in the quotes, you may have already guessed that some of the unnecessary bytes removed are color profiles.
+
+To demonstrate the problem in detail, I've made simple example images. Below is the source image, named RGB. It's in sRGB color space, which is the default color space of the Web. How this relates to color profiles I'll explain shortly.
+
+To make the effect of a missing color profile easily noticeable, I made a synthetic color space based on sRGB, with a key difference: red and blue primaries are swapped. Then I encoded that color space into a color profile, which turns it into bytes, according to a format defined by the International Color Consortium. (Which is why color profiles are often referred to as ICC profiles.) The result is a file of merely 446 bytes.
+
+I then used that ICC profile to convert image RGB into the color space defined in the profile. The conversion rewrites the actual image data: red and blue pixels are swapped. And finally I attached the ICC profile to the new image. The result shall be named image BGR.
+
+Before I get to how image BGR displays in browsers, a very brief introduction to PNG: it's a simple lossless image format organized in chunks. Below is the structure of image BGR, as displayed by pngcheck, with the chunk that holds the (compressed) ICC profile highlighted.
+
+$ pngcheck -v bgr.png File: bgr.png (375 bytes) chunk IHDR at offset 0x0000c, length 13 900 x 75 image, 2-bit palette, non-interlaced chunk iCCP at offset 0x00025, length 189 profile name = #, compression method = 0 (deflate) compressed profile = 186 bytes chunk PLTE at offset 0x000ee, length 9: 3 palette entries chunk IDAT at offset 0x00103, length 96 zlib: deflated, 32K window, maximum compression chunk IEND at offset 0x0016f, length 0 No errors detected in bgr.png (5 chunks, 97.8% compression).
+
+And now, image BGR, displayed in your browser.
+
+Where's the difference to image RGB you may wonder. There isn't any noticeable difference. Unless your browser doesn't support color management for images, and only few don't these days. I have a list further down the page.
+
+What happens is that the browser notices the ICC profile in the iCCP chunk, reads the color space from it, and then basically reverses the color space conversion previously applied. In practice it's a bit more complex, as a possible screen color space comes into play, but it makes no difference to the problem demonstrated.
+
+If BGR had its iCCP chunk removed, the browser would not be able to reverse the conversion applied to the image, and would simply display the raw image pixels, as simulated below. The same applies in any case to browsers that don't support color management.
+
+Now that was the theoretical part. I hadn't yet verified that Cloudflare does what I described. To do so, I hosted image BGR on a Polish-enabled domain in Lossless mode. As expected, it renders incorrectly. Polish removes iCCP chunks.
+
+$ pngcheck -v bgr.png File: bgr.png (174 bytes) chunk IHDR at offset 0x0000c, length 13 900 x 75 image, 2-bit palette, non-interlaced chunk PLTE at offset 0x00025, length 9: 3 palette entries chunk IDAT at offset 0x0003a, length 96 zlib: deflated, 32K window, maximum compression chunk IEND at offset 0x000a6, length 0 No errors detected in bgr.png (4 chunks, 99.0% compression).
+
+I've used a lossless format, but the problem does of course also apply to lossy formats, such as JPEG. One could argue however, that no promises are made regarding visual quality for lossy formats, and therefore discoloration can be expected. In fact, some discoloration is practically a feature of most lossy formats due to chrominance subsampling. Its discoloration however is only local, and does not apply uniformly to the whole image.
+
+For demonstration purposes I've used a synthetic color space with swapped colors. In practice the effect from Polish is less dramatic, albeit still significant. I will focus on two color spaces; one common, the other increasingly becoming so: Adobe RGB (1998) and Display P3. What both share is a so called wide gamut, which basically means color gamut larger than sRGB. Below is a visual comparison.
+
+To quantify the discoloration, I made images with the same color values as image RGB, but in the respective color spaces rather than in sRGB. I then simulated how the images, both with and without color profile, render on a display that perfectly matches sRGB. That yielded the images below, which show the correct color with color profile and the incorrect color without color profile next to it.
+
+Those were color spaces affected. Now to browsers, as mentioned earlier.
+
+On desktop, all major browsers support color management for images. Listed is the first non-beta version that did.
+
+On mobile, it's a more recent development.
+
+Some additional remarks are necessary.
+
+iOS received color management support in version 9.3, and so did Safari en passant. As all browsers on iOS have to use the same Apple-provided rendering engine, other browsers have also gained support automatically, in theory.
+
+On Android, browsers can only do relative color correction. Color space conversion in the browser works from the source color space of the image to the target color space of the display. On desktop, the display color space is provided to the browser by the OS, which gets it from a manufacturer-supplied color profile or reads it directly from the display through EDID. I don't know the mechanism on iOS, but the result is the same. Android does not support any color management by itself and cannot provide the display color space. It's therefore always assumed to be sRGB. So for non-sRGB displays, browsers color-correct images only relative to each other, but not absolute to the display.
+
+Firefox on Android has color management disabled by default, managed by option gfx.color_management.mode.|||
+

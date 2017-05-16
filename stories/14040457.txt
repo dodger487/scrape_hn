@@ -1,0 +1,82 @@
+At Our Machinery we have one simple rule that governs the physical design of the code:
+
+In other words, header files cannot depend on other header files for the types they need. (Except for and , we make exceptions for those to get the standard and types.)
+
+This is a pretty extreme choice. Let’s unpack why we made this decision and how we make it work.
+
+To begin with, if you are not familiar with the term, the physical design of a C++ project refers to how the code is broken down into individual and files and how those files are organized on disk — which files include which others, etc. It is related to, but separate from, the logical design which refers to how the components of the system are connected and interact.
+
+Just as with logical design, the primary goal of physical design is to reduce coupling. We want to minimize the dependencies, so that changes in one file don’t have a big impact on other files.
+
+Bad physical design is easy to spot. It happens whenever files pull in a lot of files that they don’t need. Most of the time this happens indirectly. The file includes something it needs. Then that thing includes more stuff. And the stuff includes even more stuff — completely unrelated to the original problem. Expanding the in such a project can be both scary and enlightening. A few innocent sometimes expand to megabytes of header data once all the recursive inclusion is resolved. This has a number of bad effects:
+
+All of these things make it harder and more cumbersome to make code changes, which is the worst thing you can do to a software project. Software needs to be nimble to stay alive. If the code gets too heavy you need an army of programmers to move it along, which is neither efficient nor fun.
+
+A large part of the reason why people are drawn to scripting languages is the ability to iterate over the code quickly, to make changes and immediately see the results. At Our Machinery, we believe the similar things are possible with high-performance static languages, if you just set things up the right way.
+
+Bad physical design tends to be a creeping issue. In the beginning, when your project is small, compile times are good no matter what, so who cares. When the project gets so big that it starts to be annoying, it is often too late to do anything about it.
+
+Fixing a bad physical design is hard, even if you have a tool that can pinpoint where you should focus your efforts. It typically goes something like this:
+
+That’s a lot of work to remove one single statement. And of course, removing a single doesn’t have any measurable effect on the compile time or anything else that people care about. You have to repeat this, again and again, hundreds, maybe thousands of times before you start seeing results. It’s thankless, unrewarding grunt work. And if the physical design is already bad, all those compiles you need to do to check if things still work will take a really long time.
+
+Also, while you are slaving away at this, the rest of the team is doing some other work, happily adding new statements everywhere. There is a reasonable chance that over the next few months, all the work you just did will be undone.
+
+Physical design is really easy to screw up, but requires concentrated effort and hard work to fix. This means that time and human nature will pretty much guarantee that you are screwed. It’s simple thermodynamics.
+
+So in a lot of large codebases, people essentially just give up and switch to unity builds or something. Once you are in that hole, it might even be the right decision, but that’s not where we want to end up with Our Machinery.
+
+Since the problem is so hard to fix, we need to stop it before it happens. We need rules that people can follow to avoid getting into this mess. But if you look online, most of the rules you find will boil down to something like:
+
+That is good advice, but it as a rule it sucks. It’s too vague. It doesn’t tell you what to do or how to solve problems you encounter. It’s not verifiable. A rule like that will not stop people from just adding until the code compiles. After all, that’s what they “need”. We have:
+
+Vague rules + no enforcement + path of least resistance + human nature → chaos
+
+Rules should be clear enough that it is obvious if the code follows them or not. Even better, they should be machine verifiable. That way, we can just put the rule in the pre-commit hook and be certain that it is always followed.
+
+This is why we use to format our code. It doesn’t do exactly what we want, but it is close enough that having automatic formatting is worth the trade-off.
+
+All that exposition explains why we went with a simple, unambigous and easy to remember rule:
+
+Header files (.h) cannot include other header files (except for and )
+
+This rule is simple and clear enough to be machine verifiable and it completely solves the problem of physical design.
+
+Not allowing any header file inclusions is a drastic choice, but that is also what I like about it. I think a lot can be learned by picking an interesting idea or philosophy and see just how far we can push it. Even if we don’t make it all the way we will learn a lot of new things by trying.
+
+But does the rule work in practice? Can we actually write header files that don’t depend on types defined in other header files? Let’s look some of the problems you encounter when trying to do that and how we deal with them.
+
+Classes are tricky. If you write your classes following a strict PIMPL idiom and only put abstract interfaces in the headers you might be able to get away with just forward declarations. But that is kind of a complicated way to write C++. And as soon as you want concrete classes, inheritance, templates or inline functions you start to get into trouble.
+
+Our solution to this is simple — we don’t use classes. Our header files are written in plain old C, C99 to be precise. The implementation files can be either C or C++ — whatever makes sense for that particular piece of code — but the APIs and interfaces are strict C. We have several good reasons for this approach, which I will detail in a future blog post, but the main one is that it gives us better logical decoupling. And presto, we get better physical decoupling too, as we don’t need to worry about class dependencies in the header files.
+
+One of the reasons why we allow C++ in the implementation files is that templates are a very convenient way of solving certain programming problems. But how can we use templates without having headers include other headers?
+
+First, the templates are only used in the files. Thus, the files never need to include them. Second, the templates themselves are written in files rather than files, and we don’t have any rule against files including other files. In other words, you can write a template that depends on another template.
+
+This may seem like just semantic trickery — if we allow file to include files aren’t we just recreating the whole rat’s nest again, just with files instead of files?
+
+Actually, I don’t think so. We use files very sparingly — only for template code. We’re in general very conservative about using “advanced C++” features and not at all into template-metaprogramming with trait classes, etc. But templates are convenient for things like arrays and hashes. In fact, we currently have exactly two files in the project — and . Granted, the project is still small, but we don’t expect to add many more.
+
+What about inlined functions then? Don’t we want to use inlined functions in our header files to improve performance? And in that case, don’t we want to allow headers to include other headers, so that one inlined function can call another and have all those calls optimized away?
+
+Not really. Inline functions are a C++ solution to a C++ problem. “Good C++ design” encourages having many layers of abstraction with simple functions doing trivial things. Then it promises that through inlined functions and optimizing compilers, all those levels of abstraction will be cost-free, since everything will compile down to a few simple assembly instructions. And it actually works most of the time.
+
+But we question the benefits of all those abstraction layers in the first place. As anyone who has tried to step into STL code in the debugger knows, adding abstraction layers does not necessarily make the code easier to understand. On the contrary it can sometimes make you feel lost in a maze, wondering where the real code is. What is the benefit of abstraction if it doesn’t help programmers?
+
+Sure, if you have an interface function , then that function better be inlined, because otherwise you are paying a heavy price for just retrieving a float. But we prefer to write meatier methods in the APIs, that operate on more than one item at a time. For example, instead of maybe we have a function for getting the positions of all objects:
+
+This is a part of our data-oriented design philosophy: where there is one, there are many.
+
+With “meatier” functions in the API we don’t have to worry about the function call overhead, because we won’t be calling them a million times. Another interesting thing to note is that while we have to pay the cost of the functional call, this API style makes much more important optimizations possible. For example, with direct access to the coordinate arrays, we can write our processing code using SIMD instructions and gain an immediate 4x speed boost.
+
+What about OS types then, such as , don’t we need to include in order to deal with them?
+
+In our API, we represent all OS types as opaque collections of bits:
+
+Then in the implementation files we just our , or whatever the type is for a particular OS, in and out of the . We make sure to make the structure “big enough” to fit the file handle type in all our supported OSes.
+
+So far, our decision not to allow header files to include other header files has been a great one. Not only has it kept compile times and dependencies down, but we have also found that the strictness that it imposes on the physical design tends to make the logical design clearer and simpler.
+
+We haven’t yet encountered a situation where this approach has led to trouble. We will continue to use it and try to take it all the way to the finished product.|||
+

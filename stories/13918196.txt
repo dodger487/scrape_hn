@@ -1,0 +1,108 @@
+Take a look at this logging checklist by Anton Chuvakin.
+
+Logs must be thought out. An application's log design should probably be signed-off by a software architect. Enhancements to the log design, as the system evolves, should be encouraged.
+
+There are only two things about a log that can be controlled by the application: the individual lines, and the separation into different log files.
+
+What is the end result that we want?
+
+We want a greppable log. This means log design is focused entirely on a single line of log. A SINGLE LINE. Remember that. A log entry SHOULD NEVER go over multiple-lines. The only exception is java stacktraces.
+
+We want a greppable log. In other words, what will we be asking of the log? Probably questions like:
+
+Make sure your log can answer questions like these.
+
+Also, if your application EVER reports a problem, make sure your application logs it. It's not enough to just show a webpage or send an email. You need the log (and hopefully the stacktrace/register-dump/diagnostics).
+
+Log design is primarily focused on the individual line of log. However, partitioning the lines into various files can make useful information even more accessible.
+
+So far my approach is to try and segregate quieter events (that occur seldom) from noisier events. For a 100 txn/second application I wrote I created three main logs: a message log, a connection log (disconnects/reconnects), and a stacktrace log.
+
+I don't worry about redundancy. I might log the same line in several files.
+
+Logs must contain timestamps, with timezone, to the millisecond or nanosecond.
+
+Answer: maybe half our servers are in Toronto. If our sysadmins decide every computer should use GMT (or PST), great, but let's give the sysadmins the option! Timezone also helps around daylight-savings changes.
+
+Answer: we want to minimize the number of lines occuring with identical timestamps. This is very important if you want to split logs into separate files covering different areas of interest (e.g. connection-history.log and messages.log). If your timestamps are to the nanosecond, you can re-merge these files together and usually not lose the order of events ("sort -m").
+
+Personally, for Java I prefer to use "yyyy-MM-dd/HH:mm:ss.SSS/zzz". (I would use nanoseconds if Java supported it).
+
+High Volume Logging: It is probably impossible for any logging system to guarantee logs get written chronologically (in same order as the original events). In an extremely highly loaded system you will sometimes see out-of-order events in your log, usually by a few milliseconds. If you only log to the second, you cannot reestablish the chronology. Log analysis tools also need to be aware of this and not blowup when fed data that is not strictly chronological.
+
+Applications should not try to log directly to the network. Don't be tempted by the syslog dream, and be careful not to accidentally (or overtly) log to a shared directory. So many times people say, "The network is not reliable." This means it's unsuitable for direct logging. Local disk is your loyal and trustworthy friend.
+
+We do want our logs to be ultimately centralized and archived, but that task is best accomplished with cron or some other batch-oriented background process using a reliable transport (e.g. ftp, scp, nfs, smbfs). Also, be sure to compress your logs before they hit the network.
+
+Keep a week or two of the archived files in both places (local-disk and archive server), both to make trouble shooting easier for sysadmins, and to give you some breathing room should your archival process break down temporarily. Having a couple weeks of logs on the local-disk can be quite convenient, especially when faced with a question like, "Did this problem start in the last few days?" The sysadmin will be happier if she doesn't have to always ssh into the central archive just to look at yesterday's logs.
+
+There are several logging frameworks available for java.
+
+I have worked with several applications that use home-brew logging, java.util.logging and log4j. In my opinion log4j is the easiest to program with, the easiest to configure, and the most flexible. I recommend log4j, and strongly discourage all others. (Note: this was written before Logback was available).
+
+Commons-logging and slf4j are interesting. The are both generalizations of logging, capable of supporting any underlying implementation. If you cannot decide on an implementation, or if you think you might want to change your implementation in the future, then commons-logging or slf4j are appropriate. Commons-logging is also good to know about, because many 3rd party tools (JBoss, HttpClient, Tomcat, etc...) use it.
+
+I recommend skipping the generalization if possible. You will have more control over log4j if you use it directly. You cannot execute log4j's PropertyConfigurator.configure( "/etc/log4j.properties" ) at your leisure if using "commons-logging".
+
+Every class must contain this line:
+
+EVERY CLASS! I've configured IntelliJ to automatically generate that code whenever I create a new class. Some people recommend against making that line static, but Logger.getLogger() is synchronized, so non-static can degrade performance. It's easier just to use "static" and not worry about it. Normally I don't try to avoid synchronized calls, but this really is one of those rare places in Java these days, even with Java6, where synchronized can hurt, since every object's constructor will now contend for the global log4j lock.
+
+DO NOT: create a single class "com.foo.app.Log" and run all logging calls through that! You are severely impairing log4j's flexibility if you do that.
+
+In log4j, all loggers are named. Dots in the name "." act as hierarchy dividers. Through configuration, you can turn off "com.foo", turn on INFO for "com.foo.abc" and turn on DEBUG for "com.foo.abc.Message". But you can only do this if every logger is named after the class calling it.
+
+There is also a "log.fatal()" but this is more intended for command-line tools that should stay quiet except for dire problems.
+
+If the Exception is significant, at the very minimum, always do this:
+
+If you're sending the stacktraces to a separate log file (more about this below), you can do this:
+
+This way the error is in both files, but the actual stacktrace itself is only in the "stacktraces" logger.
+
+Note to log4j developers: Please add the timestamp and level to each line of the stacktrace to keep it grep-friendly. I don't like doing "grep -C 15" (e.g. show 15 lines before and after)!
+
+Before assembling your greppable log statement you may want to check log.isInfoEnabled() or log.isDebugEnabled(). This way you save on some cpu cycles:
+
+For each file, you'll need a separate Logger.
+
+Log4j's main disadvantage is that the documentation is confusing and hard to navigate. If you are brave, the javadoc for PatternLayout is handy. So is the manual http://logging.apache.org/log4j/docs/manual.html.
+
+I find log4j configuration much easier to deal with once you have an example:
+
+Notice the use of property substitution! Very handy! Also, since I use single-character level strings (* instead of ERROR), I don't have to put spaces before and after %p.
+
+Log4j will automatically load the configuration if it is stored in a file called "log4j.properties" and is present on the classpath under "" (e.g. WEB-INF/classes/log4j.properties).
+
+I don't like that approach and prefer to load the configuration explicitly by calling:
+
+This way I can reload the configuration at any time as long as my application is still running. I like to add a button to an administrative jsp, "Reload Log4J".
+
+Many people complain that Log4j forces you to hard-code the location where your logs will be kept. Actually, it is possible to dynamically choose the log-file location, especially if you use the ${log.dir} property substitution technique above. Here's how:
+
+WARNING: Log4J has some catastrophic bugs (logs accidentally deleted) if more than one running JVM tries to rotate the same target log file. This is especially likely to happen if two instances of the same application are running in parallel in separate processes (e.g. two Tomcat instances), but both use identical log4j.properties.
+
+Logs should be rotated every hour, or every day. They should not be rotated by size (e.g. every 100MB). A log file containing only events between "13:00:00.000-13:59:59.999" is inherently organized in a way useful for humans, whereas a log file containing exactly 100MB of data is not.
+
+This particular config rotates the log every hour (yyyy-MM-dd.HH).
+
+Logs should be periodically gzipped and moved to a server devoted to log-archival. This should happen every night, or every hour. Archival is also a good stage to run all logs through the unix "sort" command to reestablish chronologically in case some events were logged out-of-order.
+
+You should be arhiving logs on QA as well as Production, so that you can make sure you got it right.
+
+Personally I prefer gzip to bzip2. bzip2 makes smaller files, but it is a lot slower! When viewing compressed logs, use zgrep (or bzgrep). In other words, don't decompress the logs to disk. Just decompress them to standard-out and run grep against that. You may also want to look into these related commands: zcat, zdiff, zcmp, zless.
+
+When a log file rotates (either because of size, or daily/hourly), the first line of the new log file should contain important version information about the running application:
+
+Additional log-related investigations become possible with this at the top of every rotated log file. For example, "Did the application encounter more of bug X when we upgraded the Linux kernel?" or "How much did response time improve after we upgraded Java?" Analyses like these are impossible without a "version-line" at the top of each log file.
+
+That version line should also print in the middle of the current log whenever the application restarts. The "version line" should be sent to all active log files. So if log4j.properties is managing 100 files, then all 100 should get this line. Personally, I would even recommend that during really quiet times logging frameworks should still create the file, and log the single version line, even if no other log events occurred during the day or hour in question. This way the absence of the file in the log archive would almost always mean "the application was shut down," rather than "the application was either shut down, or was not doing anything," as it currently means.
+
+Unfortunately, this "version line" feature is not possible in any existing Java logging framework. Hopefully one day someone will implement it. (Why is everyone looking at me?)
+
+I'm trying to keep earlier parts of the log statement aligned. Notice the "millisecond" response-time reads are aligned.
+
+I find ! * + and [space] more convenient to work with than the verbose "INFO, DEBUG, ERROR, WARN". They are a little trickier to grep for, though, since the shell will try to expand them. I use single-quotes to stop the shell from interfering:
+
+Even though LevelChanger is code I write and package in a separate jar file, as long as I declare it part of the "org.apache.log4j", it can change the level strings.|||
+

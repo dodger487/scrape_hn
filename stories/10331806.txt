@@ -1,0 +1,61 @@
+Opinions on how best to package and deliver applications are legion and, like many other aspects of the software world, are subject to recurring trend cycles. On the server-side, the current favorite is container delivery: a “full stack” approach in which your application and everything it needs to run are specified in a container definition. That definition is then “compiled” down to a container image and deployed by retrieving the image and passing it to a container runtime to create a running instance.
+
+Here, I’d like to talk about how we can apply lessons from experience of shipping code using many different formats in order to build effective, secure Container Delivery pipelines.
+
+
+
+The way it’s described above, container delivery does not sound much different from most other packaging and deployment models: replace container image with WAR file, AMI or OVA and the process looks pretty much the same. A trivial point, perhaps, but one worth making: the fact that containers aren’t that different from other full stack formats means that there are quite a few lessons that we’ve already learned which we can apply to the process of building and delivering containers.
+
+One thing certainly does stand out in the general discussion around container delivery, however: the strong emphasis on how containers apparently will “empower the developer” and “free them from the shackles of Ops.” Unlike delivering, say, a WAR file, .NET application or Rails app, however, a container is not just a bundle of traditional “application code”. It includes all the other levels of the software stack, right down to the operating system.
+
+Most container technologies provide nice mechanisms that mean that developers generally don’t have to bother with the actual details of configuring all the lower levels, but can inherit these from a base image instead. In most cases, though, the developer – as the “deliverer” of the final artifact – is still ultimately responsible for the entire container.
+
+The point being: application developers often aren’t expert at, or even particularly interested in, the levels of the system below the application tier. The tendency more frequently – and I’ve fallen victim to this temptation myself – is to “just quickly change this setting because I read in that Stack Overflow post that it might fix the problem we’re having.”
+
+This is especially tempting with containers as a distribution format because the “system levels” are encapsulated in the base image and so are practically invisible – a generally very desirable characteristic. With other full stack packaging formats – OVAs, Virtual Boxes, AMIs and the like – the system levels are not abstracted away as much, so it feels more logical that Ops should play a role in the production process of such packages.
+
+Not that the “in your face” presence of the system levels is something we want to repeat: arguably, one of the reasons the other formats haven’t caught on in the way many hope containers will is precisely because they have such a comparatively heavyweight feel. Still, as the recent discussions about the number of insecure images in the Docker Registry shows, we need to find a way to add more Ops-side input into the container delivery process than is common today.
+
+The points below assume that the development team is indeed ultimately responsible for the definition of the entire system. Different models are possible with containers, too. For example, you could have a PaaS-like model in which the developers provide app components that are automatically combined with an Ops-owned container definition. However, I would not call this a container delivery model because here the container definition is not the deliverable, but a runtime implementation detail.
+
+Here, then, are my “food for thought” discussion points for building effective, secure container delivery pipelines.
+
+The container definition – Dockerfile or other, higher-level definition that “compiles down” to a container descriptor – is the source deliverable, and so should be stored as a versioned artifact in a source control repository.
+
+Concretely: the build or CI system that generates the container images from the container definitions should not be owned or administered by the development team. This helps ensure that all Ops-related checks that need to be executed against the container definitions and associated dependencies are carried out correctly.
+
+Implementing this recommendation does not require the entire CI setup to be controlled by Ops. For example, you could limit direct publish access to your image registry to an Ops-managed “image build service”, which could be called from a developer-run CI server.
+
+Just as many build environments for application code enforce a whitelist of libraries and other allowed dependencies, your container pipeline should only process container definitions that inherit from a whitelisted set of supported base images. From a maintenance perspective, this whitelist should be as small as possible.
+
+If exceptions need to be made – a particular project requires a component that can only run on a specific OS, for example – these should be limited to container definitions for that specific project.
+
+Requiring development teams to manually update their container definitions in source control whenever the base image whitelist is updated, e.g. after a security patch, is tedious and creates unnecessary delay. Instead, the image build system should be able to automatically choose a different base image, if necessary, with suitable notification back to the development team.
+
+Container definition formats that allow symlink-style image references, such as Docker via the tag, can support this out-of-the-box. However, you may want to exert more fine-grained control over base image choice, such as automatically replacing a reference to an explicitly-specified version such as by if 10.4.9 contains an important security patch.
+
+In general, even though image inheritance means that developers generally don’t need to mess with lower-level system settings in their container definitions, nothing prevents them from doing so. For example, the container definition could change the security configuration of the OS, install insecure versions of libraries, create open mail relays etc. etc.
+
+Ideally, code review that includes Ops will prevent such changes from ever making it into the container definition. You will most likely also be running security scans against your running container instances to try to catch such problems after the fact. The ability to automatically check for “problematic” parts of a container definition at image build time – having a linter for container definitions, if you will – is an additional tool that should be in your toolbox, however.
+
+If the previous point can be described as “white box” testing of container definitions, then this point is about black box testing of the resulting image: ensure that your image build system is able to create instances of new container definitions in a safe/sandbox environment and run assertions (using a tool such as Cucumber or similar) against them.
+
+The ability to enforce a base image whitelist at build time should prevent any new container images from referencing insecure or otherwise unsupported base images. But what about all those images already in your registry that inherited from such a base image? How do you prevent new container instances being created from those?
+
+Consider implementing a system that allows you to check, just before spinning up a container instance from an image, whether that image is still “safe”. This can be as simple as creating a wrapper for your ‘instantiate container’ command that checks for the absence of an ‘unsupported’ tag or other piece of metadata on the image, or as advanced as a plugin or extension that hooks directly into your container runtime.
+
+When a base image is banned, you want to be able to immediately trigger new container image builds, using an updated base, for each container definition inheriting from the now banned base image. Otherwise, you won’t have any runnable container images for that application until the next code change, or until someone manually triggers the delivery pipeline for that app, since the latest version is now “unsafe”.
+
+Note that I’m not trying to recommend this as a “standard” part of the image build process – the correct way to create new container definitions once a base image is invalidated is definitely to update the container definition in source control and allow the pipeline to build a new image version based on that. Rather, this capability is a stop-gap solution to help bridge the gap until the new image is available.
+
+While all the new image versions are building, you’ll still have plenty of running container instances that use the now banned base image. In that case, it’s very useful to be able to specify commands to be run automatically against all container instances that meet a certain condition (such as inheriting from a particular base image).
+
+Modifying containers at runtime in this way is generally frowned upon, and this capability should again only be considered a temporary fix until new image versions based on updated container definitions in source control have been built, and all running instances have been updated.
+
+But if you have large numbers of running container instances and many images that need rebuilding (which might take quite some time – think build storm), the ability to quickly apply an “emergency band-aid” can be essential. Even if it only takes a few minutes until all the new images have been built and all running container instances have been updated, that can still be a big problem in the face of a critical security vulnerability.
+
+With thanks to Boyd Hemphill for his thoughtful review comments, and Reddit user squeaky19‘s feedback on the original pipeline diagram.
+
+XebiaLabs develops enterprise-scale Continuous Delivery and DevOps software, providing companies with the visibility, automation and control to deliver software faster and with less risk. Learn how…|||
+
+Opinions on how best to package and deliver applications are legion and, like many other aspects of the software world, are subject to recurring trend cycl

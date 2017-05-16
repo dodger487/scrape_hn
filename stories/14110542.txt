@@ -1,2 +1,61 @@
-|||
+CockroachDB recently gained support for Unicode collation, a standard for ordering strings in the different ways that our users around the world expect. This post describes the motivation for Unicode collation as well as the implementation challenges in providing collated strings as a first-class type.
 
+Collated strings are documented here. Note that CockroachDB doesn’t support every use of collation that PostgreSQL does, due in part to implementation deficiencies that we plan to address and in part because we believe that the bugs and performance problems caused by implicit type conversions outweigh their convenience. We’ve left the door open for full support, however.
+
+Here’s an excerpt from the Oxford 3000, a list of important English words in alphabetical order.
+
+Let’s see how CockroachDB orders these strings:
+
+Can you spot the difference?
+
+Like most software, CockroachDB defaults to ordering strings by their UTF-8 encoding, shown below in hexadecimal:
+
+is first because (capital ) is less than (small ). precedes because ( ) is less than ( ). By contrast, alphabetical order in English disregards capitalization and punctuation.
+
+Why doesn’t CockroachDB default to alphabetical order? Performance considerations aside (more on these later), no single order would satisfy all users. In German, for example, precedes , whereas in Swedish, precedes . There is also the small matter of what “alphabetical order” means in languages that don’t have an alphabet.
+
+Over the years, many standards organizations have defined language-, culture-, and usage-specific orders on strings, culminating in Unicode Technical Standard #10. #10 describes a generic algorithm for collation, which the Go project helpfully has implemented (golang.org/x/text/collate). Let’s see how English collation works in CockroachDB:
+
+now sorts alphabetically, though doesn’t. For true alphabetical order, the collator would have to ignore punctuation, and while #10 mentions this as an option, the Go library lacks support.
+
+The left operand of the operator can be a string type or a string value. The right operand is the collation locale ( for English). The result is a collated string with the same contents. Collated strings compare according to their shared collation locale.
+
+Let’s revisit the collation difference between German ( ) and Swedish ( ):
+
+In CockroachDB, , , and are three different types. PostgreSQL, by contrast, blurs the distinction. Both systems reject , and rightly so – should the comparison use English rules or German? Only PostgreSQL, however, allows the insertion of an English-collated string into a German-collated column.
+
+Although we usually strive for compatibility with PostgreSQL, we felt that our design
+
+As a special case of 3, we can switch to the PostgreSQL design later without breaking backward compatibility.
+
+Every column of a SQL table is either a (primary) key column or a value column. Storing collated strings in value columns is easy – just write out their UTF-8 encoding, as you would for ordinary strings. Let’s examine why storing collated strings in key columns is more difficult.
+
+From the post introducing CockroachDB as a SQL system, you may recall that CockroachDB encodes SQL primary keys as key-value store keys (byte strings) in such a way that the former and the latter sort identically (more precisely, the encoding function is an order embedding). Since CockroachDB uses UTF-8 order for ordinary strings, their key encoding is almost verbatim. The key encoding for collated strings, however, must reflect the collation locale.
+
+Fortunately for us, Unicode Technical Standard #10 defines collation in terms of an order embedding from (collated) strings to byte strings called collation keys. Let’s pretend for the moment that this embedding capitalizes all letters. This is not the actual procedure! When the column type is , the key-value pairs in the store look like this:
+
+When the column type is (English, ignoring case), the key-value pairs look like this:
+
+For each row, CockroachDB must store both the collation key and the original string because the former does not determine the latter (consider and ). We’ve adapted this procedure, which we call composite encoding, to floating-point and decimal numbers, the other types with nonidentical equal values (positive and negative zero, decimals with and without trailing zeros). To save space, only negative zero and decimals with trailing zeros have composite encoding.
+
+One wrinkle is that collation keys aren’t stable across revisions of the tables accompanying #10. The aforementioned Go library hasn’t been updated, but if that changes, we’ll most likely vendor it and ponder our next move.
+
+One rough edge of collation support is that most string functions and operators don’t accept collated strings:
+
+Our recommended workaround is casting to :
+
+We deferred the fix for this issue due to a limitation of our SQL type system, Summer, as well as the difficulty of writing high-performance generic code in Go.
+
+Summer has served us well, but its complex strategy for typing overloaded functions and operators has the unfortunate property that adding signatures can break backward compatibility. The present implementation, moreover, assumes that these signatures can be enumerated, whereas there are (in principle) infinitely many collation locales. Collated strings and other parametric types ( / , arrays, fixed-width integers) are leading us to rethink Summer.
+
+CockroachDB provides many functions that should accept both ordinary strings and collated strings. For performance reasons, ordinary strings and collated strings have different underlying Go types – collated strings should cache their collation key without incurring bloat in ordinary strings. This means that we get to touch on everybody’s favorite topic, writing generic code in Go.
+
+The usual suggestions are to
+
+Interfaces require an extra allocation for each string value – not acceptable. We tried duplicating code for and found it to be tedious and error-prone on a smaller set of functions. We’ll probably use a higher-order adapter function as a stopgap until we get around to generating code.
+
+As always, if you discover an issue with collated strings, please let us know on our GitHub.
+
+The implementation of collated strings required changes to a number of CockroachDB SQL subsystems. If you’re interested in how these subsystems work, see our (forthcoming?) blog post on the documentation in https://github.com/cockroachdb/cockroach/tree/master/docs/tech-notes.|||
+
+Detailing the challenges of implementing Unicode collation in CockroachDB, a standard for ordering strings in ways our users around the world expect.

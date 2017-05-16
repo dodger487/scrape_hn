@@ -1,0 +1,142 @@
+I taught myself some concurrent programming lately. I did it as part of my operating systems studies. In this essay, I will illustrate it by means of an example problem.
+
+I will be illustrating concurrent programming using operating system primitives. [1] There are a number of different ways to do concurrent programming that do not involve interacting with operating system kernel. Even if we restrict ourselves to using kernel primitives, there are a number of variants. I will mainly be concerned with concurrency using mutexes and condition variables. In literature, it is sometimes called concurrent programming using shared objects.
+
+I developed this program on a Vagrant VM using Virtualbox that ran FreeBSD 10.2. Even though I have a lot more experience with Linux [2], I feel I am more comfortable using FreeBSD, even though I don’t have a lot experience with it. There are a couple of reasons
+
+I am choosing a contrived problem so that we can focus on concurrency, without getting distracted by incidental details. The problem is this.
+
+We have a fixed number of integers. Our objective is to calculate the fibonacci number of all these integers. [3] The constraint is for, each integer, we will calculate the fibonacci number exactly once.
+
+We can solve this problem in a number of different ways. A straightforward way is to put all the integers in an array, loop over the array and calculate all fibonacci numbers. This is fine but we won’t be taking advantage of multiple cores. [4] If we can make our program concurrent using threads, it might increase it’s throughput, number of jobs processed per second.
+
+Concurrent programming is hard because of the data structures that are shared between multiple threads. We need to ensure that the threads access the shared data structures safely, without causing any inconsistency or corruption.
+
+Since the shared data structure is the central problem here, we will tackle that first. What data structure should we choose for this problem? Remember the problem is we have got integers and each integer has to be processed exactly once. For this problem, we can use a simple circular queue.
+
+It will look like this. We can have producer threads enqueuing the queue with integers and we can have consumer threads dequeuing integers from queue and process it.
+
+The struct for a sequential queue looks like this. [5][6]
+
+Of course, we will have problems with this if multiple threads access it simultaneously. But we won’t do it.
+
+The code that inserts and deletes elements from this queue, and mutates it’s state variables, would look like this.
+
+Now it’s very important that all state changes happens inside these functions only. It’s these functions responsibilty to do insertion/deletion of elements and do state changes (for example, changing front and rear properties) safely. For simplicity, I will call these functions “public functions” from now on. [7]
+
+Also, note that we have got two simple predicate functions, and . They will come in handy later on.
+
+The requirements of concurrency are as follows. We will refine these as go along.
+
+First, we will look at how to create and manipulate threads. The standard function to create a thread is . It is used like this.
+
+Here, is a variable of type , is a variable of type , is a function that takes an argument of type and returns and is a variable of type that is passed to function.
+
+Let’s take an example. Suppose we want to execute a function in a seperate thread. The declaration of looks like this.
+
+Suppose we want to calculate . We will call it in a seperate thread like this.
+
+Notice that the second argument, which was supposed to be a is NULL. This is what we do when we want default attributes . Also notice that the spec said I should use a function that takes a and returns a and instead I am passing a function that takes an and returns an . I want to keep things simple and I am relying on the compiler to do the type coercions for me. In my experience, these particular coercions are safe and do not lead to any corruption or information loss. Same thing with fourth argument .
+
+Suppose in our function, we create a thread that executes . It will look like this.
+
+The problem is can return before the thread finishes execution. To wait for the current thread to finish, we use the function .
+
+returns immediately if the thread has already finished executing. Otherwise, it will block till the thread finishes and then it will return. By induction, if you create n seperate threads, you can wait for all n of them to complete by doing on all the thread_ids. This is what I did for all producer and consumer threads.
+
+There is no guarantee that a thread created by will start immediately. Whenever we call , the operating system puts the thread into something called ready list of the schedular. The kernel schedular then picks a thread to run from the ready list based on some scheduling policy. So, creates a thread and puts it into ready list to be run later.
+
+Now let’s get back to our struct. We want make do some changes so that this data structure can be used by multiple threads safely. Let’s revisit our criteria for concurrency.
+
+Now let’s discuss these requirements in detail and implement them.
+
+The primitive that provides mutual exclusion is called mutex. Specifically, it’s a variable of type . We will consider two functions that operate on mutexes. They are and . Suppose they are used like this.
+
+Now, can only be executed by that one thread who has called and hasen’t called yet. If a thread calls while other thread is still using it, the thread is stopped and put into a wait list associated with . Once becomes free, one thread is popped from the wait list of and made available to run by putting it back to the ready list.
+
+Our queue struct will look like this now. We add a new field in called .
+
+We have got functions that modify the state variables of the . They are and . There is no state change outside of these functions.
+
+So we acquire the lock at the beginning of these functions and release at the end. We modify our and functions like this.
+
+This is where restricting state changes to these functions starts paying off. We only need to worry about mutual exclusion in these functions only. Now it’s very important to note that we hold the lock at the beginning and release the lock at the end of these functions. That is, don’t try things like
+
+You might think that this is inefficient and coarse grained. Or you might think that holding locks like this will increase lock contention (“It changes state only in those three lines so let’s just wrap those inside lock”). The problem with that approach is it makes it very hard to understand and modify existing code safely. Furthermore, it is not inefficient and won’t lead to lock contention as we will see right now.
+
+Suppose a thread is executing and finds that the queue is full. What should we do here?
+
+We should give up the mutex we are holding and go to the waiting state. The objects that helps us achieve this are called condition variables.
+
+Condition variables gives us the mechanism to atomically release the lock and go to the waiting state. A condition variable is a variable of type Each condition variable has associated with it a wait list of threads. . We have a function, that takes a mutex and a condition variable as argument and releases the mutex and put the running thread to the wait list of condition variable. The greatest value provided by is it does these two operations atomically. So if we have code like this.
+
+The thread running this snippet will give up and go to the wait list of .
+
+Now, when would we want to call ? We want to call it whenever we can’t make progress. Whenever we design a shared object and deciding on condition variables, we ask the question: When can a thread wait? For our problem, the answers will be
+
+Based on that, we would need two condition variables and for 1) and 2) respectively.
+
+Our queue struct will look like this now
+
+We added two new fields of type , and . Our state-changing functions look like this now.
+
+Let’s look at . atomically releases and go to the wait list of . It won’t return until we chose to wake up the threads in the waiting list of . We will discuss how to wake up waiting threads in the next section.
+
+Notice that we wrapped calls inside a while loop. This is important. We should always wait on a condition variable inside a while loop. This is because if later, we return from pthread_cond_wait, there is no guarantee that the current condition will still allow us to progress. Let’s consider an example.
+
+Suppose we only have space for one element in our queue. Suppose we have got an enqueue thread E1 and two dequeue threads D1 and D2. D1 runs first, sees that there is no element to dequeue and it releases the lock and go to the wait list. Now, E1 acquires the lock and fill up the queue with one element. Now, suppose that instead of D1, D2 runs and dequeues the thread and we switch to D1. Now, if we have our inside a loop, we will check the condition again and go to the wait list. If instead, we had our call inside an statement, we would have progressed further and might have corrupted some data below.
+
+Finally, we want to notify the threads in the wait list of condition variables if we think they can make progress. For example, after , there is a chance that some thread was waiting for it. For this, we use a function . It wakes up one thread from the wait list of a condition variable and puts it into the ready list. [8] Again, as above, there is no guarantee that the signalled thread will run immediately. It is put into the ready list and it’s the schedular’s job to run it according to scheduling policy. It’s called like this.
+
+Our and functions will look like this now.
+
+Concurrent programming has a reputation that we have to reason about the global structure of the program. If we wrap our condition variable checks inside a loop as we did above, we avoid some of that. In our case, can be regarded as a hint for other threads to check if they can run again.
+
+So, we can librally do calls whenever we think we changed something that might allow others to progress. We hope that the others will check the condition again on their end.
+
+The full impelementation can be found here.
+
+Thread programming using locks has got a bad reputation in recent years. Especially for I/O concurrency, if you propose a solution that involves threads, others would probably think you have gone nuts. Or maybe fire you while they are at it.
+
+However, I still think I would use threads, even for I/O concurrency. The reasons are
+
+I think this whole sentiment of threads suck originated from Dan Kegel’s landmark C10K paper. [10] It has been updated from time to time but I think the kernel implementations have come a long way since then. For example, how much do you think it costs to acquire an uncontended lock. It can be as fast as 10 instructions. In some implementations, it is as low as 2 instructions. [11]
+
+Speaking briefly about processes, is definitely pretty expensive right? You have to copy every opened file for the child process, right? Well, in recent Copy-On-Write (COW) implementations, [12] you don’t even copy those.
+
+It seems to me that despite all the mordenity of developers (using latest frameworks, latest libraries etc.), they are still programming using old ideas about the platforms on which their applications run.
+
+That’s for I/O concurrency. For CPU concurrency, I don’t think there is any debate. Thread programming is definitely the way to go.
+
+However, these abstractions of mutexes and condition variables were developed for operating system purposes. Are they suitable for application programs? I am not sure. For example, Erlang doesn’t use operating system threads or processes and it’s model sounds really promising. There have been successful companies/projects built on it. Personally, I would love to learn Erlang and maybe after that I will conclude that all these locks, condition variables etc. are not a good abstractions for normal programs. Or maybe I will conclude that there is a place for both kinds of abstractions. I am certainly looking forward to that.
+
+Incidentally, while I was writing this program, I spent much more time implementing sequential queue then concurency aspects. It’s pretty clear to me how much I suck in data stuctures and algorithms. In fact, until last year, I used to think of algorithms as a topic that people study to crack job interviews. Oh well, better late then never.
+
+If you are interested, these are good books to learn more about the topics covered here.
+
+[1] By kernel primitives, I mean C standard library functions that are interfaces to system calls.
+
+ [2] I basically used it in all my previous projects, official or personal.
+
+ [3] Fibonacci functions is useful to get a wide range of computational time. For example, there’s a noticeable time difference between calculating fibonacci of 1 and fibonacci of 32. I got this idea from one of the David Beazley’s talk.
+
+ [4] There are number of gotchas with using synchronization variables in multiple cores as well. But I will delve into that in some other essay.
+
+ [5] It’s often said that you cannot turn a sequential program into a concurrent one without changing program design in a major way. I haven’t faced this problem here.
+
+ [6] I am using C here. I have omitted details about memory allocation to focus on the ideas. I will give a link to the full implementation in the end.
+
+ [7] If you using an object oriented language, you can think of it as a queue class having a set of public methods and private state variables.
+
+ [8] There is another function that wakes up all threads in the waiting list at once. We won’t be using it for this problem. But they are useful in some problems, for example in a Readers-Writers lock implementation.
+
+ [9] I really like though and I am looking forward to learning and using it.
+
+ [10] http://www.kegel.com/c10k.html 
+
+ [11] I am not able to find specific code in FreeBSD that achieve this. However, the basic idea is if the lock is uncontested, we don’t have to go through the schedular, don’t have to acquire schedular’s spinlock and we don’t have to disable interrupts in order to acquire a lock. If the lock is busy though, we get a scheduling overhead. 
+
+ [12] They might be pretty old now.
+
+|||
+

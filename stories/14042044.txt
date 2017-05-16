@@ -1,0 +1,79 @@
+Before you sign the contract with your new CDN you want to know for a fact the CDN can do what you want and behave as you need it to behave. Right? Sure, you can read the CDN documentation and chat with support, but if you're like us, that is not good enough. You want to test rigorously, observe the CDN's behavior and match it to your functional requirements. Dummy Origin helps you do this better and with greater ease.
+
+Dummy Origin is a simple yet special server, written in Go. It was built specifically for the purpose of evaluating CDNs in an origin pull setup. Dummy Origin is easy to install, lightweight, stable and fast. And open source!
+
+Why use Dummy Origin and not simply put the CDN in front of your real origin with your real content?
+
+ The short answer: flexibility and ease-of-use.
+
+
+
+The key feature of Dummy Origin is arbitrary response header injection. In short: whatever you send as a query string parameter in the request will be served as a header with the response.
+
+Send in the request and get the header back.
+
+Sending a request to get back multiple headers is just as easy:
+
+
+
+The arbitrary response header injection gives you great flexibility in testing the CDN's behavior and there is no need to constantly change the server config and restart it.
+
+The other features of Dummy Origin:
+
+Put some files on the server. These should be similar to what you want to serve through the CDN. You may want to use dummy files, for example 15kb.jpg, 100kb.jpg, 15kb.png, 13kb.js, 160kb.js, 108mb.avi.
+
+Do NOT put an on the server so you can always see what files are on the origin by simply visiting the origin domain in your browser.
+
+Set things up on the CDN. Configure the CDN to treat query strings as unique ( is not the same as ). This is often the default behavior of a CDN but make sure to check. Also, make sure the CDN forwards all headers from origin to client including the header.
+
+Configure your DNS. Use a low TTL for the origin host (e.g. 300 seconds) as this will come in handy later when you want to find out how the CDN behaves in case the origin is down (more on this later).
+
+In these examples, is the CDN host and is the origin host.
+
+ Our tool of choice for testing is cURL. Our cURL commands always start with so we send a GET request and can see the request and response headers, but not be bothered with the response body.
+
+Do not use the flag to send a HEAD request to the CDN. The CDN may treat HEAD requests very differently from GET requests (and remember: your users will send GET requests not HEAD requests).
+
+Learn more about cURL by reading Using cURL when Troubleshooting with Cloudflare or the cURL manual.
+
+Not the typical CDN use case, but if this is what you need for your 'uncacheable' content, it needs to work well. The question here is: which Cache-Control directive(s) must be used to make the CDN behave as desired? Based on what is in RFC 7234 it seems logical to use . The RFC states: The "no-store" response directive indicates that a cache MUST NOT store any part of either the immediate request or response. This directive applies to both private and shared caches. Ok, let's try that
+
+Below you see the response headers from our tests with Fastly. Surprisingly, Fastly does not honor the and serves the file from cache after a first initial cache miss.
+
+Should we use or ? We don't want the CDN to cache the response and send conditional requests to the origin. It is important the CDN does not store the response in cache.
+
+Testing shows does not work (again, Fastly caches the responses) but does work.
+
+Getting a CDN to cache a file for 300 seconds is easy: . The key question here is: after the file expires in cache, will the CDN send a conditional or unconditional request to origin? One can argue the conditional request is optimal, because if the file on the origin has not changed, the origin can send a lightweight 304 response ("No, the file has not changed, it is fine to serve the cached object!") and the CDN can quickly respond to the client. This is faster than when the origin sends the full file to CDN.
+
+RFC 7234 does not state a cache must send a conditional request for cache validation. Therefore it should be not a big surprise if the CDN sends unconditional requests (although not great for performance).
+
+Fastly and CDNetworks play nice and send conditional requests. StackPath however sends unconditional requests to origin, meaning their caches always fetch the full file. We could see this in the origin logs and by inpecting the value of the header in the CDN to client response. We also tried with but no luck.
+
+We contacted StackPath about this behavior and they quickly responded to say the CDN can be configured to send conditional requests if the customer wants that.
+
+As far as we know, Fastly and CDN77 are the only CDNs that support the and Cache-Control extensions. We tested the behavior of Fastly in three situations:
+
+1. Origin host does not resolve in DNS (NXDOMAIN)
+
+ In summary: long after the DNS TTL of our origin must have expired in Fastly caches/systems, Fastly still served stale content. That's nice.
+
+More interestingly, Fastly also kept fetching fresh content from our origin that had not yet made it to their caches. Does Fastly remember the last known IP address of the origin and use that in case of origin resolution failure? Or was this behavior due to Fastly keeping a long-lived connection with the origin? We're not sure and need to dig in deeper.
+
+2. Origin serves 400 response
+
+ Something goes wrong at the origin and it starts serving responses. We expected the to kick in here but Fastly simply forwarded the 400 response to the client. As it turns out, our expectation was wrong because RFC 5861: HTTP Cache-Control Extensions for Stale Content states an error is any situation that would result in a 500, 502, 503, or 504 HTTP response status code being returned
+
+3. Origin drops all incoming traffic
+
+ In our third scenario we changed our origin DNS record to point to 72.66.115.13. This is the IP address behind blackhole.webpagetest.org. Pat Meenan, creator of WebPageTest.org set this up back in 2011 to enable testing for frontend SPOFs in WPT. The WPT blackhole will not return any response to any request.
+
+Did Fastly serve stale? No. Fastly served 503 responses after ~ 1 second and these 503 responses were served with the header. This is actually to be expected with Fastly out of the box. Their Serving stale content document describes the default behavior: If Varnish cannot contact the origin for any reason, a 503 error will be generated The doc then shows and explains the custom VCL code to have Fastly serve stale in this case (and two other cases).
+
+FYI: StackPath can serve stale content based on customer configured status codes (404, 502, 503 etc). This works as expected but StackPath does not serve stale in case of NXDOMAIN or blackhole.
+
+ Read more about serve stale in our Serve stale CDN Guide.
+
+Dummy Origin is on Github with MIT license. Fork away!|||
+
+Dummy Origin makes it easier to evaluate the (caching) behavior of a CDN. Open source, easy to install and a joy to use.

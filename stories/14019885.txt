@@ -1,2 +1,212 @@
-|||
+When debugging JavaScript bugs, web developers have Web Inspector which provides a debugger and many introspective tools to examine their code with. But when the bug is at a lower level in WebKit’s JavaScript engine, JavaScriptCore (JSC), WebKit engineers will need to use a different set of tools to diagnose the issue.
+
+Today, I’ll describe some of these tools that WebKit engineers use by telling the story of how we diagnosed a real bug in the JSC virtual machine (VM). This story will take us through …
+
+We use the WebKit Layout Tests as our primary regression tests for the full WebKit stack. While running this test suite on an AddressSanitizer (ASan) build of WebKit, and we discovered a crash on one of the layout tests:
+
+The crash stack trace is as follows:
+
+From the stack trace, it appears that the crash is in the JSC VM. The original bug has already been fixed in revision 200879. This post will recount how we fixed the bug.
+
+The first thing we should do in our investigation is to check if this crash still reproduces on the latest tip of tree of WebKit source. At the time of this investigation, that would be revision 200796.
+
+Since the crash was on an ASan build, we need to build WebKit with the ASan configuration:
+
+Next, we re-run the test:
+
+is a test harness script that ultimately invokes either the (WKTR) or (DRT) executables to run the tests. WKTR runs on WebKit2, which is a multi-process architecture. DRT runs on WebKit1 (a.k.a. WebKitLegacy), which is single processed. By default, runs WKTR because WebKit2 is what all modern WebKit browsers should be built on. But for our debugging purpose, it would be simpler to work with DRT instead.
+
+Here, we will try to reproduce the crash by running the test with DRT directly instead of going through the test harness:
+
+Result: the crash still reproduces. Yay! Now we’re ready to dive in and diagnose what went wrong.
+
+The first thing to do is to see what a debugger (lldb) can tell us about the crash:
+
+The debugger runs DRT and quickly stops due to a bad memory access here:
+
+At line 81 (where the debugger stopped), is effectively a constant, and should be a variable in a register. The only memory access we see there is the read of which accesses the VM’s field (see VM.h). Looking at the source code (in JITCode.cpp), we see that is an argument that is passed into by its caller:
+
+Looking at the code for (in Interpreter.cpp), we see that ’s value was used without triggering a crash before execution reached . This means had a valid value previously. also does not have any code that alters (note that takes a not a ).
+
+This is strange indeed. should be valid, but is not. Let’s look at what the machine code is actually doing at this crash site:
+
+We see that we’re crashing while trying to store to the address in the register. The value in was computed using register just two instructions before. Let’s look at the register values:
+
+Notice that contains a value that is close to the value of the stack pointer, . Comparing their values, we see that ( ) is pointing to a lower address than the stack pointer ( ). Since the stack grows from high to low addresses, that means is pointing to a part of the stack that is not allocated for use by this frame. That explains why ASan flags this memory access as invalid, thereby yielding a crash.
+
+This test run is on X86_64 hardware. Based on X86_64’s application binary interface (ABI), the register is a callee save register. For example, let’s say we have the following functions:
+
+Because is a callee save register, the ABI states that function must save ’s value before using it, and, accordingly, restore the value before returning to its caller. From function ’s perspective, it doesn’t have to save first before calling because it is the callee ’s responsibility to preserve the value of the register, hence the term callee save register.
+
+Searching for in the full disassembled machine code for JITCode::execute(), we see that is set to the stack pointer at the top of the function:
+
+… and never set again until it is restored at the end of the function:
+
+Throughout the function (including before the crash point), is used to compute stack addresses that are read from and written to. We didn’t crash on any of these prior uses of .
+
+Because is a callee save register and there are no other writes to it in this function (between the top of the function and the crash point), we know that some callee of must have modified and failed to restore it before returning. JSC does have code to save and restore callee save registers in LLInt interpreter and Just-In-Time (JIT) compiler generated code. Since serves as the entry point to LLInt or JIT generated code, maybe the bug is in LLInt or JIT code.
+
+JSC comes with multiple tiers of execution engines. You may have read about them here. To recap, there are 4 tiers:
+
+One way we can reduce the search area for the bug is by checking to see which of these tiers are required for the bug to reproduce.
+
+In JSC’s Options.h, you will find a list of options that can be used to configure how the JSC VM behaves at runtime. We can use these options by setting them as environmental variables when we invoke DRT like so:
+
+To test if any of the JIT tiers have any effect on the bug, we would like to disable each of the tiers and re-test for the bug. For that, we need the following options:
+
+Let’s start from the lowest tier and move upwards from there i.e. let’s only allow JavaScript (JS) code to run with the LLInt interpreter:
+
+Result: the crash does not reproduce. That means the bug must lie in one or more of the JITs. Next, allow up to the baseline JIT tier:
+
+Result: the crash still does not reproduce. Looks like the bug may lie in the DFG or above. Next, allow up to the DFG JIT tier:
+
+Result: the crash reproduces. Ah hah! We have a crash when we allow up to the DFG tier to run. So, let’s continue to leave the FTL out to simplify our debugging work. The next thing to do is to reduce our search area by compiling only a minimum set of functions. Hopefully, that minimum set will consist of only 1 function.
+
+But before we do that, let’s add one more useful option:
+
+The DFG and FTL JITs may do their compilations in background threads. We can disable the use of these concurrent background threads, and force all DFG and FTL compilations to be synchronous with the execution of the JS code as follows:
+
+Result: the crash still reproduces. Good. The bug is not due to any race conditions with JIT compilation threads. Now, we can proceed with investigating which compiled JS function is triggering the crash.
+
+We can reduce the set of compiled functions by applying compilation filters. But before we can apply a filter, we must first know which functions are being compiled. We can find this out by telling the JITs to report their compile times for each function:
+
+Since we think the bug lies in the DFG, let’s only report the DFG compile times. We do this by using JSC_reportDFGCompileTimes=true in combination with JSC_useFTLJIT=false:
+
+If any functions are DFG compiled, we should see logging on for each compiled function that looks like the following:
+
+We read this logging like this:
+
+The together is called the function signature. The is the size of the interpreter bytecode that JSC generated for this function. We will be using these below.
+
+Going back to our test case, we actually see no such DFG compile time logs. That’s strange. We needed the DFG enabled in order to reproduce the crash, but no function was DFG compiled.
+
+Let’s go down a tier to the baseline JIT and see what functions get compiled there:
+
+This time around, we get a few compile time logs:
+
+The next step is to reduce this set of functions down to a minimum.
+
+From the baseline compile times logging, we can see that the functions that were baseline compiled are in a range of bytecode sizes from 48 to 1031.
+
+We can filter functions to compile by limiting the bytecode size range to compile. We can do this using the following options:
+
+Let’s try starting with the range 1:100:
+
+Now, we only get the following logs:
+
+… and the crash still reproduces. We’re on the right track.
+
+We can continue to filter using reduced bytecode ranges, but let me take this opportunity to introduce you to another way to filter functions to compile …
+
+There are times when the minimum set of compiled functions needed to reproduce an issue is more than 1, and the bytecode sizes of those functions may not fit nicely in a contiguous range that excludes all other functions.
+
+For example, let’s say we have filtered a list of functions down to 3:
+
+… and we want to check if we can reproduce an issue with only and . For that, we can’t use the bytecode range filter since the range that contains and (10:100) will also allow to be compiled. Instead, for such cases, we need to be able to filter by function signature instead:
+
+Let’s apply this to the list of functions in our investigation. First, we’ll create a file with the remaining function signatures we saw from the compile time logs:
+
+Each of the signatures must be on their own line in the whitelist file, and each entry must start on the first character of the line. The whitelist mechanism supports C++ style comments that start with . When used, the must also start on the first character of the line. Notice that we commented out the 2nd and 3rd function signatures. This is so that we can test for one signature at a time. We’ll start with testing only the 1st one: .
+
+Since we’re looking at baseline JIT compilations, let’s use the JSC_jitWhitelist option:
+
+… and it still crashes. That’s exactly what we’re hoping for i.e. we only need to debug one compiled function: .
+
+Next, we can dump the compilation artifacts of the compiled function, and see if we spot anything wrong in them. We can do this using the following options:
+
+Let’s use JSC_dumpDisassembly=true to see what is being generated by the baseline JIT for our function .
+
+We get a dump for that looks something like this (for brevity, I have shortened this dump by omitting many sections of generated code):
+
+Note: we will also get dumps for lots of other pieces of code that aren’t our function (not shown in my excerpt above). This is because JSC_dumpDisassembly=true literally dumps all disassembly. The other dumps comes from JIT thunk code that we compile but are not generated by the baseline JIT. We can ignore those for now.
+
+Looking at the dump for , we see sections of code generated for each bytecode in the function. It’s a lot of code to inspect manually (324 lines in the dump).
+
+We need to reduce the search area further.
+
+Let’s take a moment to regroup and think through the facts that we have so far. In the beginning, we saw a callee save register, , corrupted in . is where JSC calls into JS code. It does this by calling a thunk named . Immediately after returning from , it did an exception check, and that’s where it crashed.
+
+is implemented in LLInt assembly using the macro (see LowLevelInterpreter.asm and LowLevelInterpreter64.asm). The JSC VM enters all LLInt or JIT code via , and it will exit either via the end of (for normal returns), or via (for exits due to uncaught exceptions).
+
+Here’s an idea … we should probe the value of at these entry and exit points. After all, the value of that we want to preserve comes from , which is the caller of / .
+
+One way to probe the value of is to set a debugger breakpoint at the points of interest in code, and inspect the register value when the debugger breaks. However, this technique is only good when we already know that the bug will manifest within the first few times that the debugger breaks.
+
+But if we’re not sure when the bug will manifest, we should probe the value of by logging it at the points of interest instead. This allows us to get a bird’s eye view of when the bug manifests. If necessary, we can go back and apply breakpoints thereafter in a more targeted way. Since we don’t know yet which VM entry/exit the bug will manifest on, let’s do some logging.
+
+For logging from LLInt code (which is hand written assembly), we’ll need a probe mechanism that preserves CPU registers, calls to a C++ function to do our logging, and then restores the CPU registers after the call. This way we can insert the probes in the LLInt code without perturbing its operation.
+
+Here’s a snippet of LLInt code (for X86_64 on OSX only) that will do the job:
+
+We add this LLInt probe macro at the top of LowLevelInterpreter64.asm. Next, we insert probes at various locations in LowLevelInterpreter.asm:
+
+… and add the corresponding callback functions for these probes at the bottom of LLIntSlowPaths.cpp:
+
+(see DataLog.h and DataLog.cpp) is WebKit’s equivalent of except that:
+
+ 1. it prints to , or to a file.
+
+ 2. it doesn’t take a formatting string. It just takes a variable list of items to print.
+
+ 3. it knows how to print any WebKit class that implements a method (e.g. ) or has an associated function (e.g. this one for ).
+
+We should also add a few lines to to count how deep we have entered into the VM:
+
+With this, we can now see the values of at each level of VM entry and exit. So, we rebuild WebKit and re-run the test. Here is an excerpt of the resultant logs:
+
+Looking at the logs from the crash point going backwards, we find the following:
+
+ 1. The last exit point before we crashed in is from the handler for .
+
+ 2. The value of when we entered is , which matches the at the last time we entered the VM at .
+
+ 3. However, the value of when we exited is a different (and incorrect) value, .
+
+How did the value of get corrupted between the entry to and exit from ?
+
+Looking in (in LowLevelInterpreter64.asm), we see that there’s a call to a macro. (in LowLevelInterpreter.asm) basically copies values from the buffer to the callee save register. That explains why ’s value changed while in . What remains unanswered is how that bad value got into the buffer.
+
+A quick search for in the source code later, and we see that is written to in only a few places:
+
+The next thing to do is to log the values that are written to . First of all, we can rule out the one in FTLOSRExitCompiler.cpp because we’ve disabled the FTL for our test.
+
+For the macro in LowLevelInterpreter.asm, we can add a LLInt probe like so:
+
+… and the following at the bottom of LLIntSlowPath.cpp:
+
+is C++ code. So we can just adds some logging like so:
+
+For and , we’re dealing with JIT generated code.
+
+JSC has its own macro assembler that the JITs use to emit machine instructions for the compiled JS functions. The macro assembler provides emitter functions for generating a machine instruction or a pseudo-instruction made up of a sequence of machine instructions.
+
+The emitter is one such pseudo-instruction emitter for debugging use only:
+
+takes a comma separated list of arguments that it will concatenate and print to . In addition to printing the usual data types (like strings, and s), it also knows how to print the runtime values of CPU registers, memory locations, or dump all registers. See MacroAssemblerPrinter.h for more details.
+
+To use , set (in Platform.h) to a non-zero value, and include in your file. Here’s how we use it in AssemblyHelpers.h:
+
+In the above, we’re using to log a string that looks like this:
+
+Note that in , the argument passed to is printed as instead. is the address , and is the runtime value found at that address at the time that the code generated for was executed.
+
+Similarly, the variable was printed as . Though is a variable at JIT compilation time, captures its value as the id of the register to print. In this example, that would be the register. It is printed as because is the id that the macro assembler uses to represent both the register on 32-bit x86 and the register on 64-bit X86_64 ports of WebKit (see the enum list in X86Assembler.h). is the value in the register at the time the code generated for was executed.
+
+With all this logging code added, the interesting parts of the logging output now looks like this:
+
+It appears that is the only one who is writing to , and overwriting the saved value for with (which matches the corrupted value that we restored to in later just before the crash point). The logging also shows that the corruption happened more than once (in fact, a lot more than the 3 times I chose to include in the above excerpt of the logs).
+
+A quick search for reveals that it is only called from 2 functions: and . Both of which generate code for the baseline JIT.
+
+Adding some s to these, we find that is the source of our corruption.
+
+From here, with a bit more logging and code searching, we will uncover the rest of the details needed to piece together the whole story of how the corruption happened. So, here’s the story of how the crash came to be:
+
+In other words, the bug is that the VM needs a buffer for each level of entry into the VM, but it only provided one that is used by all levels. If you’re interested, you can check out the fix here.
+
+We have seen how we can use the JSC options, in combination with logging to diagnose the root cause of a bug. We saw that the pseudo-instruction is available for doing logging from JIT generated code. These tools enables us to isolate VM bugs to specific tiers of execution engines, to do dumps that let us peek into the artifacts that the JITs generate, and also to easily add logging to do fine grain inspection of registers and values used by JIT compiled code at runtime.
+
+If you’re working on a port of JavaScriptCore or are simply interested in exploring how JSC works under the covers, I hope you’ll find these tools helpful in your adventure with JavaScriptCore.
+
+As always, if you encounter any bugs in the tools or have requests for enhancements, please file bugs at bugs.webkit.org. You’re also welcome to join the WebKit community and contribute fixes for the bugs or implement the enhancements yourself.|||
 

@@ -1,0 +1,153 @@
+IoT or “smart home” devices are probably the biggest current buzzword aside of “blockchain”. But why buy smart devices if you can turn your existing device into an IoT version. We decided to do exactly that and build an internet-enabled coffee machine using JavaScript and revive the Hyper Text Coffee Pot Control Protocol for its 19th birthday.
+
+My flatmate and I already have a few internet-enabled devices in our apartment that we can control using our Amazon Echo Dots. It’s definitely convenient (read lazy). But the thing that is really missing is being able to trigger the coffee machine right from the bed.
+
+Luckily my flatmate had a DeLonghi Latissima standing around that he wasn’t too emotionally attached to and that had electronic buttons which made this whole system seem hackable.
+
+But why would we use JavaScript? Well my flatmate isn’t a developer and I haven’t written a single line of C++ in 3 years. JavaScript on the other hand is a language that I’m quite comfortable with. Hardware and JavaScript also both have a very event-driven focus, both center around events like “was this button pressed?”. Additionally, it seemed like one more challenge since there is definitely less documentation about hardware-hacking with JavaScript.
+
+I was planning to do a hardware hack with JavaScript for a while and I had a couple of different options flying around my apartment already that we all considered for the hack:
+
+Espruino is an open source firmware that lets you run JavaScript on low power microcontrollers such as the ESP8266 or one of their own boards.
+
+Espruino comes with a Web-based IDE that allows you to easily write JavaScript and deploy it to your hardware. It also provides a variety of modules with module system similar to the Node.js one. However, it is not Node.js that is running on the microcontrollers.
+
+The only Espruino board that I had at home was an Espruino Pico which also doesn’t contain WiFi. I could have soldered an ESP8266 onto it for WiFi but who got time for that? We want coffee!
+
+The next alternative is another open source hardware project called Tessel. Part of the Tessel project is the Tessel 2. A piece of hardware that can not only be controlled with JavaScript but it can run full Node.js and it can store the whole program on the hardware so we don’t have to keep a computer connected to it.
+
+The third alternative was to use Johnny-Five. It is actually an npm module that can talk to a variety of microcontrollers. Initially it uses the Firmata protocol to talk to Arduinos, but there are also a variety of other platforms that can be controlled with Johnny-Five via I/O plug-ins. This way we could for example use a Particle Photon, a Raspberry PI or even the Tessel 2.
+
+We decided to go for the combination of Tessel and Johnny-Five. This way we can write code that is fairly platform agnostic and yet have code that can be run directly on the hardware without having to have a computer connected to it or run some code in the cloud.
+
+Alright now that we knew what tools we would use it was time to start hacking! Since hardware doesn’t have a version control systems let’s have a last look at our beautiful and working coffee machine and store it in our memories:
+
+Now let’s get going! We are both not electrical engineers and while I did study two semesters in university, I don’t remember anything.
+
+So how do you get started with hardware hacking when you have no clue?
+
+Well we decided to do the most obvious thing and just take it apart and have a look! So bye bye screws!
+
+There is quite some stuff to see here. But what is of interest? I mean we don’t want to change the way the coffee is brewed but just trigger the brewing process and turn the coffee machine on/off.
+
+Luckily this seems doable. Because if we look closely we can see that the control plate that holds the buttons and the microcontroller that controls the brewing process are connected via a cable a normal pluggable cable.
+
+So if we can emulate the signal that is sent between the control plate and the microprocessor we would be able to control the coffee machine. Now we only need to figure out what the signal is.
+
+To figure out what the signal is that is being sent around, let’s first take a look at the control plate:
+
+We can see the following interesting components on it:
+
+Our theory is that there must be at least one pin of those eight that has to provide power. Since the cable has one of the eight wires marked red we figured that this might be power. So what do the other 7 pins do? If we think like a programmer we could use a binary flag to represent the states of the 7 LEDs and 6 switches, we would need to use 3 pins for the LEDs and 3 for the switches. What is the last pin doing though?
+
+Based on our theory that the first pin is power, let’s connect some power to it and see what happens to the other pins when we press them. For that we connected the one end of the original wire to the control plate and jammed a bunch of jumper wires into the other end. This way we can connect the 7 unknown pins to our Tessel pins.
+
+For power we can choose from a 3.3V and a 5V connection. We tried connecting 3.3V first and saw that the LEDs barely lit up. So we tried 5V (very scientific work going on here) and it worked! Well it semi-worked. Three of our 7 LEDs ( , , ) lit up. It’s still progress!
+
+The Tessel comes with analog and digital pins. This means we can measure voltage at those pins just as well as a digital signal (high/low aka 0 and 1). Our first attempt was to measure the voltage on the remaining pins.
+
+We wrote a small script for our Tessel that would initialize the connection to the board using Johnny-Five and creates pin instances in analog mode ( ). It would then inject these pins into the Johnny-Five REPL so that we could measure their values whenever we wanted.
+
+Unfortunately, the analog reading wasn’t getting us where we wanted. The measurements were to fluctuating and therefore we couldn’t get any information out of it. So maybe digital readings would help us better:
+
+With this setup we were playing around for a bit to see if we can control the LEDs or figure something else out. And we did! After trying to set the digital pins to and respectively we figured out that Pin 4-6 were able to turn the LEDs , and on and off. We weren’t able to turn the other LEDs on though. But at least we knew these were connected to the LEDs. So we knew 4 pins. What’s with the others?
+
+Maybe they are buttons! We initialized the other pins as buttons and tried if that worked:
+
+This is also highlighting one strength of JavaScript and Hardware. Every JavaScript developer will immediately feel at home here. We have a based class that has a and event that we can listen on.
+
+And we measured something!!! If we pressed the top two switches we could detect and triggering their events, if we pressed the two bottom right ones also and trigger. And if we set to we can detect the behavior as for the other two.
+
+So what do we know?
+
+Alright that’s something but not great. How are we supposed to figure out which button is pressed? It’s great that we can (de)activate them but we want to know when they are pressed. After 5h of digging in the dark it’s time for a strategy change!
+
+Let’s approach this in a more systematic way and try to understand what is happening in the circuit on the board. To do so we took the picture of the board, zoomed into it and traced the lines on it. We then verified an assumed connection between to points by measuring the resistance between the two points using a multimeter. If we found a connection we used a tool called Fritzing to mark up the connection in a diagram. Fritzing is a great open source tool to mark up hardware setups. On our diagram we skipped everything that seemed like a resistor. The result was this beautiful diagram:
+
+I know what you are thinking. This looks worse than before. But it wasn’t. The first thing that was easier for us to figure out was the LED connections. The important thing about LEDs to know is that they let current pass through in only one direction. Having them marked up in the diagram allowed us to follow the current and get a better understanding of the whole circuit.
+
+Not only Pin 1 is power but also Pin 2 and 3 are power! That explains why the other LEDs weren’t lighting up. But what about the switches?
+
+After 8 hours of slow progress and staring on this tiny board we realized that we missed one thing all along!
+
+These three things weren’t resistors. They were diodes!!! Diodes allow just like LEDs (Light Emitting Diodes) for current to only flow in one direction. So we updated our diagram, removed the LEDs (since we solved that puzzle) and cleaned up the diagram.
+
+And we got it! We finally solved the secret of the mysterious protocol:
+
+How can we make coffee with this knowledge though? Since the switches dependent on the power that is being sent between two pins, faking the protocol entirely will be complicated. But there is an easier solution. We can use relays!
+
+Relays are like switches just that we can control them digitally with our microcontroller and since we know the full circuit of the control plate now, we can build the same circuit (or a part) ourselves and simply replace the switches with relays.
+
+We only had 4 relays and therefore we decided to go for the right three switches which control large coffee, espresso and power. Exactly what we needed! We also wired up the respective three LEDs to have visual feedback if everything is working.
+
+Our initial wire up obviously didn’t look as neat but more like this:
+
+We didn’t have enough jumper wires so we had to plug our relay board up-side-down into the breadboard (so professional).
+
+Now it was time to test our wire up. But before we turned on the coffee machine we had to write some code. We quickly threw together a small script that would allow us to manually control the three relays using the built-in class of and inject them into the REPL.
+
+With the code in place it was time to pour some water into the coffee machine, turn on the coffee machine via its master switch on the back of the device and power up our code. If everything worked we should be able to turn on the device by running . It has to heat up for 20 seconds (until the LED stops blinking). Afterwards it’s time to brew coffee! Or well water for our first test case:
+
+Yay it’s alive! It took 10 hours and the sun had started to rise but hey we got coffee!!! Or well we got hot water because we forgot to buy the capsules that we needed for the Nespresso but well it’s a first step.
+
+Great so we can brew coffee if my laptop is connected to the Tessel that is connected to the coffee machine and if I then write some code into the REPL. Now that’s not really the internet of coffee pots that we have here. Time to change that!
+
+Luckily on this day 19 years ago there were some smart folks that developed the most life changing protocol in the world! The Hyper Text Coffee Pot Control Protocol or short HTCPCP for the purpose of being able to control internet-enabled coffee pots. If that isn’t a sign that we should revive this forgotten protocol in 2017 and use it to control our coffee machine.
+
+So as you might have noticed HTCPCP is an April fools from 1998. The reason why it’s great is that it suggested as part of the RFC an HTTP status code . This status code is up to today not an actual standard, yet a lot of software uses it as small easter eggs. Take Google for example: google.com/teapot.
+
+But it suggests more than just this one status code so let’s look at a couple of things.
+
+In other words it’s destined to be implemented!
+
+But before we get started we need to talk about some uncertainities and shortcomings of this RFC.
+
+The document mentions twice two different values that should be used. One is and one is . Since we can’t use both we decided to to go for as the that will be sent to the coffee machine and is the response type.
+
+Additionally, we have to deal with the fact that our coffee machine supports multiple types of coffees contrary to a standard coffee pot from 1997. Therefore we have to modify our URI schema to deal with that: . This is important because the only supports and as official values.
+
+Since HTCPCP is based on HTTP we figured that for convenience and integration reasons we will just implement a standard HTTP server using Node.js and the module. In order to keep the code itself lightweight for the Tessel we decided to not use any library like Express and rather go with old school naive routing using the URL.
+
+We also split up all the logic to interact with the hardware into it’s own file. This way we can easily swap it out for another coffee machine later and use the same server logic.
+
+Some features of JavaScript that we used in here were not available in the Node version on the Tessel yet so we transpiled it to ES5 compatible code using TypeScript.
+
+As for the server we decided to implement the following subset of features:
+
+We implemented the acceptance of the method as well as traditional to get the status of the coffee machine and to issue commands.
+
+We only accept and as valid content types for and requests. We had to add for our later integration with Alexa.
+
+With just four relays we didn’t have enough to control the full functionality of the coffee machine and therefore our coffee machine doesn’t support any additions. However, we did add verification of the header and the correct behavior when someone orders an addition that our coffee machine doesn’t support. Which, at the moment, are all additions.
+
+Well obviously, we had to implement this trivial check that simply checks if the coffee pot that is connected to our server is in fact a disguised tea pot. In which case we return the appropriate status code.
+
+We are currently unable to programatically check for the state of the coffee machine. The LEDs are showing the respective state but we have to solve the problem of being able to detect this state inside the Tessel 2. Otherwise, we are not able to properly implement the header or the status.
+
+While we did implement a basic version of the schema we didn’t implement the full thing and had to alter it. Else, we would have had a way harder time using this with other platforms such as Amazon Alexa.
+
+In order to make the Tessel easily addressable we installed additionally the localtunnel module to create an externally addressable URL.
+
+And it works! You can see a working version of the HTCPCP protocol here:
+
+The full code is also available on GitHub.
+
+Now that we had a working HTTP server that we could use to control our coffee machine it was time to connect it to Alexa. The optimal solution here would be to build a Smart Home skill to be able to use it in combination with the other smart home devices in the household. However, time is valuable so let’s try a quicker approach: IFTTT (If-This-Then-That).
+
+Luckily, Alexa allows you to build simple skills using IFTTT and IFTTT allows you to make HTTP requests. That’s all we need to control our coffee machine!
+
+We spun up three skills. One that turns on the coffee machine if it’s in stand-by, one that makes a normal coffee and one that makes espresso.
+
+The great thing was that it was easy as it sounds. In just 3 minutes we had our Alexa integration done. But see for yourself:
+
+We are still super excited that we got this initial version but obviously there is so much work left of things we have to, should and can do. Some of the things on our agenda are:
+
+Basically every day this list is getting longer because we have some new cool idea and I’m certain you might have an idea, too, what we should do. If you do, make sure to send me a tweet @dkundel. We would love to hear your ideas!
+
+It was great doing this little side project. Our modern devices are so closed up that we rarely anymore open devices to check up what’s going on on the inside. I must also say that working with the Tessel 2, Johnny-Five and JavaScript was amazing. It’s a great way to get started in hardware hacking. I personally have a Johnny-Five Inventors Kit from Sparkfun at home and I can’t wait to find some time and play around with other pieces in the kit for more projects.
+
+I think JavaScript’s event-oriented approach is a perfect match for hardware. Sure if you want to build the most energy and space efficient project you should resort back to writing C++ but for hacking projects like this it’s a great solution.
+
+All in all, this was a fun project and it was great to combine finally exploring hardware hacking with reading and implementing the HTCPCP RFC. I hope we were able to inspire you to explore the field of hardware hacking and if you do something make sure to let us know on Twitter! Maybe somone of you will hack their toaster next|||
+
+Wouldn't it be great if you coffee machine could be controlled by an API? We hacked our coffee machine with JavaScript to be able to do exactly that! Here is the story how we did it.

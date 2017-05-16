@@ -1,0 +1,96 @@
+This piece is written for software designers, not end-users. If you’re an end-user looking for crypto advice: use Truecrypt, use Filevault, use dm-crypt. Also, use PGP, and Tarsnap. Read on only if you’re interested in crypto nerdery.
+
+Because it’s relatively new and high-profile, XTS looks like a desirable general-purpose mode. It isn’t. Be wary of applications that claim to use it for anything other than disk encryption.
+
+To see why, you need to understand what disk encryption is, why disk encryption sucks, and how XTS evolved.
+
+Disk devices are made of blocks. Block ciphers work on blocks. Unfortunately, they’re two different kinds of blocks (a “wide” disk block, and a “narrow” cipher block), and while it’s possible to design a wide-block cipher that directly works on disk blocks, nobody does that.
+
+So for clarity, I’ll oversimplify: a “sector” is a disk block, and a “block” is a ciphertext block.
+
+The idea is, you’ve accidentally left your (idling!) laptop on a park bench, or had your (idling!) home computer seized by the FBI. Data on the (inert!) encrypted drive is inaccessible to anyone without your key.
+
+This sounds like a powerful capability. It isn’t.
+
+Your encrypted drives are either unlocked & usable, or locked & unusable. Locked & unusable isn’t a very useful state. You’re carrying that disk around, probably because you use it. But while you’re using it, FDE can’t really protect you. If your laptop is stolen or seized while you’re using it (or maybe even if it’s simply powered on) , your secrets are exposed.
+
+Someday you’ll leave a laptop in the passenger seat of your parked car and lose it when someone cinderblocks the window. When that happens, you’ll be glad for the failsafe of locked-at-wakeup.
+
+Just be aware of the limitations.
+
+Think of sector-level FDE as “simulated hardware encryption”. It’s an obnoxious engineering problem. It must be transparent to end-users. Transparent to applications. Transparent even to the OS. So:
+
+Attackers will of course play every conceivable game with sectors, blocks, ciphertext/block/sector correspondences, cutting and pasting, and leaked information. We’ll see shortly how naive encryption schemes fall short against sophisticated attackers.
+
+All this machinery has to work so fast that users perceive no lag.
+
+Modern FDE schemes look sophisticated. But what they really are is a litany of difficult tradeoffs and messy compromises.
+
+Consider the “big three” block cipher modes: the default (ECB), CBC, and CTR. All three could form the basis of an FDE system.
+
+Though extremely simple and fast (chop a sector into blocks, jam each through the cipher core; done!) , any cryptographer knows that ECB can’t safely encrypt a disk. Any penguins on the disk would be visible in the ciphertext. Attackers could cut and paste blocks and sectors, rewriting /bin/ls into a bindshell. Nothing would bind an encrypted sector to an actual location on the disk.
+
+CBC (take a sector, figure out an IV, chop it into blocks, chain the blocks together) is used in some popular disk encryption software. CBC comes closer to a workable solution, but it too has problems:
+
+We can turn a block cipher into a stream cipher, and encrypt the whole disk a byte at a time. But:
+
+You’re now up to speed on what standard “straight out of Schneier and Furguson” block crypto has to say about disk encryption.
+
+In a perfect world we’d encrypt every block of every sector with its own key:
+
+But encrypting every block under its own key poses two problems:
+
+A typical cipher is a transformation function, E(k,d), taking two arguments: a key and a block of data.
+
+A tweakable cipher is E(k,t,d), including a third “tweak” argument. The intent of the tweak is explicit variability, for every invocation of the block transform. Think of a tweak like the “salt” in a password hash.
+
+You can derive a tweakable cipher from any block cipher with a variety of tweaking mechanisms (such as universal hashing, or encrypted nonces). A tweakable cipher is higher-level than a cipher core like AES, but lower level than a block cipher mode. You use a tweakable cipher to build tweakable modes of operation.
+
+LRW is a good place to start reading about this idea.
+
+XTS is a tweaked cipher mode that uses sector numbers and offsets into sectors as tweak inputs.
+
+XTS is derived from Rogaway’s XEX cipher. XEX stands for “XOR Encrypt XOR”. The kernel of XEX (and thus XTS) is
+
+… where E() is (typically) AES, X is the data block, ⊕ is XOR, and Δ is the tweak. The Δ tweak is defined as:
+
+… where E() is again AES, i is the tweak input, α is a primitive polynomial You don’t need to understand the polynomial math. It takes place in a binary field and resembles a CRC, but is even simpler. Just assume you can encrypt a number and multiply it by some other number and you’re fine. , and j is an offset. For now, think of i as a “master tweak” that changes rarely and j as a “subtweak”.
+
+XTS is a block mode built on top of the XEX cipher. NIST basically took XEX, added some fins to lower wind-resistance, and a pretty-sharp racing stripe.
+
+XTS consumes “wide blocks” (sectors). Sectors are big. XEX works in terms of the “narrow blocks” of the block cipher core. A sector might be 32 or more cipher blocks. XTS is basically ECB mode for the XEX cipher.
+
+So, to get your head around how this works, imagine we’re encrypting a whole hard drive:
+
+So, starting at sector 0, we’ll be doing:
+
+Observe that i increments with the sector, and j with the block offset into the sector. j changes a lot, i changes rarely. The XEX tweak is designed to be particularly fast to compute in successive calls. It minimizes calls to the block cipher core, but still behaves as if every block has its own key.
+
+Again: XTS works like ECB. It’s deterministic. If you’re looking for the penguins, they’re there, but you have to look for them across time instead of space: successive writes to the same sector-block location will repeat, but encryptions of the same plaintext at different locations will be randomized.
+
+There’s one more complication to XTS. What happens to partial blocks? What if your sectors are 520 bytes long instead of 512? To handle that case, XTS employs a technique called “ciphertext stealing”, which it borrows from CBC mode (where it’s called CTS).
+
+CTS is complicated, but more in the “hard to remember all the details” sense than in the “hard to get your head around it sense”. You can implement it straight from Wikipedia. Rogaway does a good job explaining why it works.
+
+Two things. Sector-level crypto is a painful problem you want to avoid. And XTS is an imperfect construction.
+
+First, the fiddly problems. XTS is not beloved of cryptographers:
+
+How much do these problems matter in practice? Probably not much. It’s certainly better than ECB, CBC, and CTR for FDE. For the crappy job we ask it to do, XTS is probably up to the task.
+
+But that’s the big problem: sector-level encryption sucks. It’s messy, provides fewer security guarantees than conventional message encryption, and makes tradeoffs tailored to the challenges of encrypting disk sectors.
+
+That problem is significant enough to be dispositive. If you don’t have the sector-level problem, don’t use sector-level crypto. So:
+
+Simulated hardware encryption sucks. If you free yourself from the idea that you need to encrypt a whole disk, you win a bunch of things:
+
+Encrypt things at the highest layer you can.
+
+Some application crypto problems look suspiciously similar to FDE. Take database encryption There are other big problems with database encryption, like online key storage. ; the persistent backing data for a database might be handled in terms of “pages”. Tweaked modes have some promise there. But XTS is probably not a good answer; wide-block authenticated tweaked modes are a better plan.
+
+If you take away just two things from this post, let it be:
+
+From what I can tell, Wikipedia does a pretty bad job of explaining disk crypto. Here’s a decent reading list:
+
+Thanks to Matthew Green, Nate Lawson, Sean Devlin, and Tim Newsham for reading drafts, catching errors, and good ideas.|||
+

@@ -1,0 +1,67 @@
+This post is part of a series of two posts about our migration from MongoDB to an AWS stack for our analytics feature. Head here to read the introduction post and know why we started this migration.
+
+Here is the full ingestion and aggregation mechanism we will present in this blog post.
+
+Redshift can be very powerful if you take the time to properly design your database schema. There is a nice tutorial made by AWS to learn how to “Tune Table Design”. The documentation helps the reader designing a coherent and adapted database schema by explaining important concepts like distribution key and sort key. In order to find the best schema (types, compression, distribution key and sort key) for our data, we made some hypothesis regarding the schema. We exported our production data and inflated it 10 times in order to have a data distribution and quality similar to our production, but with a higher volume. Then, we ran different queries with different columns compression encoding, data distribution, etc. We automated this using a ruby script ran on EC2 and compiled the results into a spreadsheet which helped us choose the best schema.
+
+Initially, our MongoDB instance used to store objects with different meanings (web and native connections, apps downloads, …) in the same collection. Time showed us that it was not the smartest move. In order to ease the filtering process of data aggregation, we split our data into two tables, specified different columns and chose different sort keys for each table ( and ) following results of our previous benchmarks.
+
+AWS recommands using Kinesis Firehose to ingest data into Redshift. It’s advertized as the easiest solution to insert data into AWS so that’s what we used.
+
+Because we wanted to have the ability to perform more actions on the incoming data stream in the future, we jumped to Kinesis Stream and used a lambda developed by Ian Meyers from AWS. We forked the original lambda and made some changes to fit the data format provided by our backend adapter.
+
+To handle the migration, we did what any sensible developer would do: we decided to run the old and new stacks in parallel and compared the data. That way we would have total confidence in our new stack. With that goal in mind, we wrote the backend adapter to insert data inside Redshift. For every data inserted into MongoDB, we inserted it into Redshift as well.
+
+We then wrote a ruby script to compare the data in both stacks. Ran on Jenkins, it takes 6 seconds to complete and publishes the results in a Slack channel every day.
+
+The ruby script shed light on a small amount of duplication in our Redshift database. The data were duplicated when Kinesis shards were read. We get around 0.015% row duplication. This is related to the “at least once” mechanism of Kinesis stream. There are several ways to handle this problem:
+
+To us, the sanest solution would be to have a clean database without any duplicates.
+
+We chose to deal with duplicates before inserting them into the final table. Thanks to Brent Nash who mentions this solution in this blog post!
+
+Here is our process:
+
+Redshift isn’t meant to be directly exposed to clients. It’s a common pattern to have another database in front of it when you want to expose data to customers.
+
+At the beginning we started a POC using DynamoDB
+
+It was quite complicated but we wanted to use DynamoDB for easy migrations. But the biggest problem was changing writing provision. As you can see on the schema we wanted to increase the write IO capacity of DynamoDB before inserting aggregated data, then decrease it. It would have helped us cut the cost of DynamoDB a lot. But DynamoDB has an annoying limitation: you can increase ReadCapacityUnits or WriteCapacityUnits of the table as often as necessary but…
+
+This limitation with all the complexity of the lambdas led us to seek another solution.
+
+Thanks to Tony Gibbs who wrote this blog post : JOIN Amazon Redshift AND Amazon RDS PostgreSQL WITH dblink
+
+We finally used RDS Postgres with foreign-data wrapper and dblink extensions and created materialized views with aggregated logs. It’s much faster and very easy to use.
+
+The table is created with an unique index to accept concurrent refreshes. Refresh stats is as easy as :
+
+We created a lambda that runs every 15 minutes to refresh stats. It takes a parameter (the name of the materialized view to refresh), and runs the REFRESH SQL query on the chosen materialized views.
+
+MongoDB provides two export formats: JSON and CSV. Hopefully, Redshift allows data insertion from raw CSV and JSON files. We wrote a ruby script that uses and uploaded the exported CSV to S3.
+
+Redshift implements the COPY operation, which allows us to import data into a Redshift cluster from a CSV file stored on AWS S3. We COPYed our CSV file into a temp table and then inserted data into specific tables. The slowest step was the .
+
+Tips: If you are importing data into Redshift that comes from another database hosted on AWS (which is the case for our MongoDB provider), run the export/import script from an EC2 instance to be physically closer to both servers.
+
+Before our migration, the analytics data were inserted into MongoDB with Sidekiq workers. In order to copy data from one stack to the other, we stopped the Sidekiq queue that was queueing all the insertion jobs, ran the copying script on EC2 and once the export/import operation was done, let Sidekiq process the queued jobs.
+
+This migration leads us to a cheaper and more efficient way to generate analytics for our customers. Using the postgres extensions and , it’s very easy to create new aggregated stats from Redshift. Lambdas offer a cheap and modular way to consume Kinesis streams and run database tasks. We are confident about the future and the growth of our analytics stack.
+
+We also enjoy the dashboard that each AWS component offers, especially Redshift’s, which enables us to dig into slow queries and verify database health status. The AWS CLI helped us a lot to build and deploy lambdas, a real time saver.
+
+We’ve contacted the support for issues related to Redshift and it was also very helpful.
+
+As these technologies are quite new, there are still a few drawbacks that we hope will be addressed in the future:
+
+Now it takes around 6s to make our aggregate tasks. It’s much easier to change and add new aggregated stats and it costs around 30% less.
+
+Thanks a lot to Ian Meyers, Brent Nash, Tony Gibbs, Vitaly Tomilov (pg-promise) and AWS Support.
+
+This article was written by Appaloosa’s dev team:
+
+Benoît Tigeot, Christophe Valentin, Alexandre Ignjatovic
+
+Want to be part of Appaloosa? Head to Welcome to the jungle.|||
+
+This post is part of a series of two posts about our migration from MongoDB to an AWS stack for our analytics feature. Head here to read the introduction post and know why we started this migration…

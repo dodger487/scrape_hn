@@ -1,0 +1,74 @@
+Do you want to code a chat app? Here you’ll see how to do it the hard way. I show how Redis Pub/Sub works in detail, all the way down to the bits and bytes! This is the first part of a series of deep dives into Redis.
+
+At Pusher, instead of treating our system as a stack of black boxes, we like to get our hands dirty and poke around. Today we’ll roll up our sleeves and dismantle the drivetrain of Pusher’s pub/sub system: Redis. Redis is best known as a key-value server. Clients open a TCP connection to a redis-server process, and start sending commands to it which modify the database:
+
+But Redis is also a messaging server! A client interested in donuts can open a TCP connection to the Redis server, send “SUBSCRIBE donuts”, then wait for donut-related news. A news outlet can then connect to the Redis server, send “PUBLISH donuts 3-for-$1”, and the subscribing client will be notified of this lucrative offer:
+
+Now let’s zoom in. We can imagine the Redis process keeping track of each socket’s subscription set:
+
+But what does the inside of Redis really look like? Read on to find out!
+
+Today we’ll show how Redis Pub/Sub is implemented by following the source, which is clean ANSI C. To follow along, clone the repository and run (yes, it is that simple to build). In this post, I’ll be using the latest release, 3.2.6.
+
+Pub/Sub was introduced in early 2010 in this little commit, back when Redis was just a single C file, . It’s a few hundred lines of code and the implementation has not changed much since. The original Pub/Sub implementation lets clients send three new kinds of command: , , and . To track subscriptions, Redis uses a global variable which maps channel names to sets of subscribed client objects. A client object represents a TCP-connected client by tracking that connection’s file descriptor.
+
+When a client sends a command, its client object gets added to the set of clients for that channel name. To , Redis looks up the subscribers in the map, and for each client, it schedules a job to send the published message to the client’s socket.
+
+Client connections can drop. Perhaps the client closed the connection, or a network cable was pulled. When this happens, Redis must clean up the client’s subscriptions. Let’s say Client A disconnects. To remove the client from the structure, Redis would have to visit every channel (“donuts” and “bagels”) and remove the client from each channel’s subscription set.
+
+But visiting every channel is inefficient: Redis should only need to visit the “donuts” channel, because that is the only one that Client A is subscribed to. To enable this, Redis annotates each client with its set of subscribed channels, and keeps this in sync with the main structure. With this, instead of iterating over every channel, Redis only needs to visit the channels which it knows the client was subscribed to. Let’s draw these sets as red circles:
+
+I’ve described the data structures as “maps” and “sets”: the global variable is logically a , and each client’s subscription set is a . But these are abstract data structures; they do not say how we represent them in memory. Let’s start zooming in to allocated memory blocks.
+
+The map is actually a hash table. The channel name is hashed to a position in a -sized array, like this:
+
+The array, with buckets from to , is a single allocated block of memory. To publish to a channel, we hash the channel’s name to find its bucket, then iterate over that channel’s set of clients. But different channel names can hash to the same bucket. Redis handles these collisions by “hash chaining”, which means each bucket points to a linked list of channels.
+
+In the example, both channels hashed to bucket . But anything could happen, because Redis picks a random seed for its hash function at start-up, to protect you against collision attacks, in which a malicious user could subscribe to a large number of channels which all hash to the same bucket, causing poor performance.
+
+The keys in the channel hash table are strings, colored green, and the values are sets of clients, colored red. But “set” is also an abstract data structure; how is it implemented in Redis? Well, the set of clients is another linked list!
+
+It’s nice to think of the strings “donuts” and “bagels” as embedded in the hash chain objects. But this is not true: each string has a separate allocation. Redis uses strings extensively, and has its own representation for them: “Simple Dynamic Strings”. This is a character array prefixed by its length and the number of free bytes. We can draw it like this:
+
+We are almost at the level of memory blocks, except for one thing: each client’s set of channels. Redis chooses to not use a linked list here; instead, Redis uses another hash table. The channel names are the keys of the table:
+
+Why does Redis use a linked list to represent the channel’s client set, but a hash table to represent the client’s channel set? We’re not sure. We suspect the channel’s client set is a linked list because it’s optimized for publishing, where it iterates over the set. The client’s channel set is a hash table because it’s optimized for subscribe/unsubscribe, where it does a lookup in the set. Let us know if you have insights on this.
+
+Notice also that the value pointers in each client’s hash chain (yellow) are ignored; they are unused memory. Only the keys are used when using a hash table to represent a set. The memory waste is okay compared to the code reuse we gain.
+
+Finally, we’re pretty close to the truth: each block in the diagram represents a memory allocation in the redis-server process. Let’s recap our and algorithms:
+
+Notice that the hash tables are different sizes, roughly proportional to how many elements they have. Redis resizes hash tables in response to their number of elements. But Redis is built for low latency, and resizing a hash table is a time-consuming operation. How can it resize the hash table without causing latency spikes?
+
+Answer: Redis gradually resizes the hash table. It keeps two underlying hash tables, the old and the new. Consider this hash table in the middle of a resize:
+
+Whenever Redis performs an operation on the hash table (lookup, insert, delete …), it does a little bit of resizing work. It keeps track of how many old buckets have been moved to the new table, and on each operation, it moves a few more buckets over. This bounds the amount of work, so that Redis remains responsive.
+
+There’s one more important command in Redis Pub/Sub: . does the inverse of : the client will no longer receive messages published to that channel. How would you write , using the data structures above? Here’s how Redis does it:
+
+The operation is therefore O(n), where n is the number of subscribed clients. With a very large number of clients subscribed to a Redis channel, an can be expensive. This means you should either limit your clients or the number of subscriptions that they are allowed. One of Pusher’s important optimizations is de-duplicating subscriptions: millions of Pusher subscriptions are collapsed into a much smaller number of Redis subscriptions.
+
+Redis could optimize this by using a hash table instead of a linked list to represent the set of subscribed clients. However, this might not be desirable, because publishes will be a little slower: iterating over a hash table is slower than iterating over a linked list. Redis optimizes for operations, since they are more common than subscription changes.
+
+The original Redis Pub/Sub API provides , , and . Shortly afterwards, in this commit, Redis introduced “pattern subscriptions”. Pattern subscriptions let a client subscribe to all channels matching a Regex-like pattern, instead of only subscribing to a single literal channel name.
+
+The important new command is . Now, if a client sends , and a news outlet sends , the subscribed client will be notified, because matches the pattern .
+
+The pattern subscription system is completely separate to the normal channel subscription system. Alongside the global hash table, there is the global list. This is a linked list of pubsubPattern objects, each of which associates one pattern with one client. Similarly, each client object has a linked list of the patterns it is subscribed to. Here’s what memory looks like after client B subscribes to , and clients A and B subscribe to :
+
+There is a global linked list down the left-hand side, each pointing to a (deep red). Each pattern is represented as its literal string in memory. On the right-hand side, each client has its own linked list of patterns.
+
+Now, when a client sends , Redis will iterate through the global list, and test the string against each pattern. For each successful match, Redis will send the message to the linked client.
+
+This system may surprise you: multiple clients subscribed to the same pattern do not get grouped together! If 10,000 clients subscribe to , you will get a linked list of 10,000 patterns, each of which is tested on every publish! This design assumes that the set of pattern subscriptions will be small and distinct.
+
+Another cause for surprise is that patterns are stored in their surface syntax. They are not compiled (e.g. to DFAs). This is especially interesting since Redis’s matching function  has some … interesting worst-cases.  Here is how Redis tests the pattern against the string :
+
+This malicious pattern with many “globs” causes an exponential blowup in the running time of the match! Redis’s pattern language could be compiled to a DFA, which would run in linear time. But it is not.
+
+In short, you should not expose Redis’s pattern subscriptions to untrusted clients, because there are at least two attack vectors: multiple pattern subscribes, and crafted patterns. At Pusher, we tread very carefully with Redis pattern subscriptions.
+
+Redis Pub/Sub is an efficient way to distribute messages. But you should know what it is optimized for, and where the pitfalls are. To truly understand this, study the source! In short: only use Redis in a trusted environment, limit the number of clients, and handle pattern subscriptions with gloves.
+
+In this post, we only looked at Redis as one single-threaded process. But Pusher handles billions of messages per day: too many for a single process. In our next post, we’ll see how Pusher scales Redis Pub/Sub. Stay tuned!|||
+

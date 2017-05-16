@@ -1,0 +1,71 @@
+Last year our iOS team overhauled the architecture of our entire app. This was a massive effort which resulted in an app that’s quicker for developers to iterate, easier to scale and 3x faster for Pinners around the world. Our new system relies heavily on concurrency. UI rendering, image downloading, GIF decoding and network response processing are just a few of the areas that leverage multiple threads to boost performance. This means objects that were used by these components had to be thread-safe to avoid bugs and potentially crashes. Since model objects are passed around through nearly all components of our application, it was important that our model layer could safely be used across threads.
+
+To address this we moved to an immutable model layer. Immutable objects differ from mutable objects in that they’re unable to be modified once they’re created, which inherently makes them thread-safe. This allows developers to write code that’s easier to reason about since invariants cannot change once they’re established. Today we’re open-sourcing Plank, an immutable model generator for iOS we created to achieve this. Plank is a command-line tool written in Swift that generates immutable Objective-C models. Throughout this post we’ll highlight a few of the main capabilities and the motivation behind its creation.
+
+Designing and maintaining a model layer can be tedious and error-prone. Missing a simple null check or trying to serialize objects containing properties that can’t be serialized can lead to undefined behaviors and crashes. Hand-written models can also suffer from inconsistencies in their implementations and can lead to different behaviors and policies when serializing.
+
+Here are a few examples of common bugs and crashes due to issues in hand-written models.
+
+When we set out to build our immutable model layer we were embarking on new territory. A few of us were familiar with the benefits of immutability but had no prior experience building immutable objects.
+
+Given that we have hundreds of types of models in our application schema, any error in the design of our models, like adding a new feature-like serialization, could be a big pain to fix. Even the simple task of adding a new field for a model type would be error-prone and tedious when you take into account updating methods that handle JSON parsing, serialization, equality and other common operations.
+
+If we define our models as strictly a representation of a set of values, features like merging and serialization can be derived from that schema. This means our model code is quite predictable, and so we chose to generate them.
+
+When we started we had a few main goals for the generated code:
+
+Plank schemas are based on JSON, a well-defined, extensible and language-independent specification. Defining schemas in JSON allowed us to avoid writing unnecessary parser code and opened up the possibility of generating code from the same type system used on the server.
+
+Similar to a compiler, we translate these JSON schemas into an intermediate representation (IR) we refer to as the “Schema IR.” Once we have the Schema IR, we translate it to an Objective-C IR. This additional IR level is important, because while Plank generates Objective-C code today, it’s designed to support more languages in the future.
+
+Let’s create model that represents a Pin with these fields.
+
+Plank takes a schema file as an input, so we’ll need to create one. Here’s our schema for the Pin type. You’ll notice we specify the name of the model and a list of its properties. Note that link specifies an additional attribute which tells Plank to use a more concrete type like or  .
+
+Assuming this schema is saved as we generate our model by running . Below we’ll highlight a few capabilities Plank generates from your schema.
+
+The first thing you’ll notice is all properties are . This makes the class immutable, but it isn’t really useful since we don’t have a way to populate an instance of with any values. To address this, we need an abstraction that will take a set of values and produce an immutable object.
+
+Mutations in Plank-generated models are performed through a builder class. This is a straightforward implementation of the builder pattern, and Plank will generate it for you. The builder class is a separate type which contains properties and a method that will create a new object.
+
+Now we have an immutable model and a builder class to create new instances. However, most applications are not static and depend on JSON data returned from an API. Here’s a sample JSON response for our Pin model.
+
+To handle this response properly, we need to not only assert that the response types are correct, but we’ll also need to add additional logic to represent the link as an instance of . It’s also important to handle values carefully to avoid setting properties to a value of or passing to APIs which expect arguments. These bugs can lead to unpredictable behavior and crashes.
+
+Plank will create an initializer method called that handles parsing objects that conform to your schema.
+
+If you want to build offline support for your application or persist data across application launches you need to store models to disk. The most conventional way on iOS to go about this is to implement on every model. At Pinterest we use PINCache to serve as a redundant write-through model cache that also manages persistence via .
+
+Plank generates the implementation for you. Since all native types are already serializable, you get this capability for free.
+
+With this implementation objects are serialized using
+
+If your team decides to adopt a fancy new backend API that allows the consumer to specify exactly which fields they require, similar to the Pinterest Developer API or GraphQL, the Pin we may have requested before could now return only the or or both! An example of this in Pinterest is when you tap a Pin and we load more information.
+
+There are a few considerations we have to make here:
+
+Plank uses a conventional “last writer wins” approach to solving consistency by preserving the properties set in the most recent instance of that entity. We use the value as a primary key which is used to determine if two objects represent the same entity. To know which properties are set, we internally track this information in the model itself during initialization or through any mutation methods.
+
+With immutable models, you have to think through how data flows through your application and how to keep a consistent state. At the end of every model class initializer, there’s a notification posted with the updated model. This is useful for integrating with your data consistency framework. With this we track whenever a model has updated and can use internal tracking to merge the new model.
+
+As your application becomes more complex so will your data model. You may find yourself needing to model a property that could be one particular variant among a collection of types more commonly referred to as a Algebraic Data Type (ADT).
+
+At Pinterest, we show the reason or attribution for a Pin that tells the user why they’re seeing it. This could be because it’s from another Pinner or board they follow or it might be a recommendation based on their interests.
+
+Let’s update our Pin schema to have an property that will be either a , or . Assume we have separate schemas defined in files , and , respectively.
+
+Plank takes this definition of and creates the necessary boilerplate code to handle each possibility. It also provides additional type-safety by generating a new class to represent your ADT.
+
+Note there’s a “match” function declared in the header. This is how you extract the true underlying value of your ADT instance. This approach guarantees at compile-time you have explicitly handled every possible case preventing bugs and reducing the needs to use runtime reflection which hinders performance. The example below shows how you’d use this match function.
+
+Plank is built from the ground up in Swift, an ideal language for this task because of its strong type-safety features and elegant syntax. We leveraged recursive enumerations to define all permutations of our schema. Moreover, trailing closures and inline string interpolation were utilized to make an elegant DSL for generating code.
+
+Here’s a taste of how we leveraged Swift’s language features to create a DSL for expressing generated Objective-C switch statements:
+
+Here’s an example using the statement DSL we just created. Let’s assume we have variable that’s an integer from 1–7 representing Monday to Sunday respectively. The switch statement below could be generated to say if is a weekend.
+
+Plank is a valuable tool for building and scaling an immutable model layer. Generating code has saved us a lot of developer time and eliminated risk for common errors. It’s been tested heavily in production at Pinterest over the last year, and we’re excited to share this technology with the community. If you have suggestions for improving Plank feel free to submit an issue or PR on Github. If these are the kinds of problems that excite you, we’re hiring.
+
+Acknowledgements: Thank you to all our iOS developers for using and giving feedback on plank, especially my teammates Wendy Lu, Brandon Kase, Levi McCallum, Bill Kunz, Jon Parise, Tim Johnsen, Connor Montgomery, Harry Shamansky and Garrett Moon for feedback on this post, and to Laurie Berger for designing the logo for Plank.|||
+
+Last year our iOS team overhauled the architecture of our entire app. This was a massive effort which resulted in an app that’s quicker for developers to iterate, easier to scale and 3x faster for…

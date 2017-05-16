@@ -1,0 +1,37 @@
+Core Data is a powerful framework for all kinds of data persistence, and its NSFetchedResultsController is a key class in many an app. However, its API – especially its delegate protocol – is aimed mostly at table views, and can be a little difficult to connect to other UI classes.
+
+In this post, I’ll walk through the process of hooking up a Core Data stack to an MKMapView. While mostly straightforward to display NSManagedObject instances on a map, there are a few tricks to building a solid app and keeping your map data up to date.
+
+The genesis of this article was in trying to maintain an MKAnnotation for each managed object fetched by a given FRC. (For the sake of argument, let’s call the managed objects here Points.) Right off the bat, this puts a few constraints on the problem:
+
+The Core Data setup was fairly straightforward: I wanted Point to store latitude, longitude, and title, so I added two numeric and one string attribute to the Point entity. A quick class-generation pass later, and I was in business, ready to tackle the map.
+
+Right off the bat, it seemed like the easiest thing to do was to make the Point instances themselves conform to MKAnnotation. They already had , , and ; all that was left was to merge the former into a property. This wound up taking the following form:
+
+Then, in the UIViewController managing the map, it was straightforward to create an NSFetchedResultsController fetching Points; become its delegate; and populate the map with its , all of which could be passed straight to .
+
+This seemed promising: Point instances appeared on the map on launch. What’s more, with a small implementation of a single NSFetchedResultsControllerDelegate method, the map could dynamically update its pin annotations with Core Data changes:
+
+On the surface, this seemed like it would work well, even if updates were a little heavy-handed. (I’d like to explore a way of leaving annotations alone on Core Data update if the change didn’t affect a visible property of the pin annotation, but that’s a topic for another day.) Most importantly, we’re not creating any additional objects to keep track of – the Point instances themselves serve as MKAnnotations here.
+
+In testing, though, this soured quickly: a critical operation in everyday use was deleting a Point from the database. However, telling the map view to remove a Point annotation wasn’t quite as prompt as it should have been. Annotations would remain on the map for a few seconds, or in rare cases much longer.
+
+At first, this problem had all the symptoms of a threading issue. Manipulating views off the main thread is a common error, and can produce long-delayed view updates (or crashes, in more recent iOS releases). However, setting breakpoints in the FRC delegate method revealed that it was always called on the main thread – which made sense, given that the FRC’s managed object context was a main-thread context.
+
+Further debugging led me in circles, and I began considering more complex approaches to the problem. At one point, the app in question was maintaining a set of model-like MKAnnotation-conforming objects, and manually mapping between them and the source Points for most map operations – a complex situation that was rapidly growing unmaintainable. It wasn’t until I went back to the MKAnnotation documentation that I found the answer.
+
+In the “Discussion” section of the docs for , there exists this critical qualifier:
+
+As soon as I noticed this, everything clicked: the map was likely using KVO to watch for changes in an annotation’s coordinate, in order to update its location. Deleting a Point changed its coordinate, but didn’t post the right KVO notifications, so the map’s display would lag until it noticed the change in annotation through some other means.
+
+Thankfully, KVO has a mechanism meant for precisely this situation. When one property’s value is derived from others, implementing a specifically-named class method can express that dependency, allowing the KVO machinery to notify observers of changes flowing from the original property or properties.
+
+The format for this method’s name is , and it needs to return a set of strings. In our specific case, we can add this method alongside the implementation of in the Point extension as:
+
+This tells the KVO system that changes to and will both affect the value of . Any changes coming up the Core Data stack to those two properties – such as deleting a Point – will trigger KVO notifications for any observers of , including the MKMapView.
+
+After this change, deleting a Point (using a separate UI, or just by poking the managed object context directly) caused its annotation to disappear from the MKMapView immediately. From there, all that’s left is a little more UI polish, and we’re ready to ship an app that can show Core Data objects on a map!|||
+
+Putting Core Data on the Map
+	Core Data is a powerful framework for all kinds of data persistence, and its
+NSFetchedResultsController is a key cl...

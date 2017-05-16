@@ -1,0 +1,48 @@
+I work on a services team. We don’t do websites, generally. Of course, this doesn’t mean we don’t have a need for websites. But it is somewhat odd to hear that a design-centric company has a small team of developers who really don’t work on websites. We spend most of our time deep in the depths of RESTful API development or server-side multi-threaded processing. Now, granted, all of us on the team have worked on websites in the past. We know how, we just don’t do it very often.
+
+Recently, we were tasked with building a simple service to act as an overall service catalog. As we built out the service-catalog, which would have some interactions with a chat-bot ultimately, we realized that to interact with updating and viewing data, we needed a front-end. This required much discussion. Here’s a team of non-website folks, arguing over building a site in various technologies. We all come to the table with some ideas, but we came to using React because other teams in our company were starting to build out internal and external sites with React.
+
+Myself, I felt very comfortable with this decision. I’ve build a lot of things using React and am very familiar with it. My most popular open source project was at my last company and it was written for React Native. Never thought that something I worked on would have a whole 200+ stars on Github. Anyhow, I digress. Building a website in React is not a hard task, in my opinion. Building it with all the Javascript dependencies, proper build, navigation, data management, and all the extras can be another story, however. Deployment can be difficult. NPM packaging and versions can be difficult. Building it as a single-page application can be difficult. And ultimately, serving it can be difficult.
+
+What we wanted was this: we wanted to serve our single-page application from our Golang written API server. PLUS, we’d really like to not have to copy assets into our Docker container that relied on any other dependencies… like or or or anything that wasn’t just the executable sitting in an Alpine Golang docker image. This is what we wanted, and this is how we solved it: using InVision Rye, serving static files and then figuring out how to bundle those static files into one Golang executable.
+
+So, we went about creating a single-page Application using React. This required a metric-ton of named Javascript projects. We setup NPM, then created a webpack configuration, then built out an index.html that would load our single-page application. Of course we needed some commands specifically to build our React application in and then deliver a to a folder. Additionally, with React, we added , and to manage data interactions. On top of that we had static resources we wanted to deliver such as which included fonts and images. Great! This is all fantastic and works great in a folder ~ as long as you have some way to SERVE it. For the time being, I would just use Python to serve it. Our Webpack was built out to deliver all the assets in a single folder.
+
+One command pointed at your folder, and you’re off to the races:
+
+This worked pretty well for development. But at some point we were going to have to deploy this. Since our service, Astro, was written in Golang using the Rye middleware library, we needed to figure out how to properly serve this from there. The plot thickens.
+
+So, we needed to figure out how to easily deliver static files for our UI from Rye. We also use Gorilla as a router, so getting the right mix was a big part of that. There were actually some tricky bits around this, in regard to serving out of a Rye handler. Golang provides which was our first approach. Since Python’s was working for the most part, we figured this would be simple. However, not true. We kept having bugs with React-Router. You couldn’t navigate to paths in our app using . You could visit the homepage, and even navigate in the app using our Bootstrap Nav Bar, but you could not go DIRECTLY to a link. Why? Our Gorilla router was interrupting the request and not allowing to do its work.
+
+Finally, we realized that to get what we needed out of the single-page application, we needed to:
+
+Since we were building this as an add-on to the service, we wanted our main-path to be . Therefore, we decided that other static assets would get served from such as fonts, images, , CSS, etc.
+
+The configuration for this, using Rye, ended up not being terribly difficult (found in static_example.go).
+
+We required a middleware that could always serve one file and a middleware that could serve a whole filesystem. This led to: and .
+
+Taking in an absolute path local to the server, you can serve a single file. Using the in the Gorilla Mux sample above, this allows you to have a path ALWAYS load this single file. The handler is really simple:
+
+Taking in an absolute path local to the server, you can serve a full path. Using the in the Gorilla Mux sample above, this allows you to serve INDIVIDUAL files in that filesystem on that prefix. Another simple handler:
+
+Since our static directory in the sample above is called , we want to strip that prefix from the request path BEFORE searching the file system for the file. The function is described here: StripPrefix from http package in Golang. This ultimately means that since you’re pointing at a folder on the filesystem, the matching of the URL will go straight to the sub-path.
+
+Well, from HTML (index.html), that’s being served from the above, how do you point at your bundled javascript, or CSS? An example can be found in the static-examples folder in the Rye project. What you do here, is point at the static assets under the URL prefix. Here’s an example with a reference to a static CSS:
+
+Now, we had a way, using Rye, to deliver our single-page application. NIFTY! But, we would build out the Astro executable in Go as a single file, and then we’d need to point at files in the file system to run the dashboard. YUK! Since we run everything in Docker, this got worse! We would have to copy the filesystem of the folder to the Docker image, and then configure the paths in our route handlers to point at the local location. This added a lot of complexity.
+
+What we really wanted was to serve our single-page application directly from the executable. EMBEDDED RESOURCES! What if we had a way to bundle our entire application in one executable and still be able to serve the single-page application?
+
+There are various resource bundling options for Golang. This article had some great examples and some added complexity: Embedded resources in Golang. However, there’s a great project out there created by Jaana B. Dogan called Statik. The project is super simple. It uses a command line tool, to take an entire filesystem and stuff it into a single Golang package that you can bundle and build with your application. All we needed was to add to our build pipeline and build some Rye middlewares to support it. These middlewares are not found in the Rye library, but you can use the code yourself if you want to try it out!
+
+You’ll notice below, there’s also a . This is a requirement so that the handlers can get at the static assets. NOTE, sometimes some IDE’s will have trouble with this syntax. You can ignore it, it works just fine.
+
+Finally, how can you develop your single-page application if it gets bundled into bytes in a Golang file? You need a DEV MODE. The way we solved this was simple. We created a command-line flag to represent dev mode. That meant that we could serve the ACTUAL assets (and could hot-load changes) when in DEV mode and then when we ran in production we could run off the STATIK assets. This allows us an easy way to make modifications and yet still be able to deliver a great bundled experience for our docker container.
+
+So, there we have it. If Astro wasn’t a super secret project, I’d drop a screenshot here. However, the UI (from a service team) is managable, updatable and usable. But, not super pretty. We learned a ton in delivering this and were able to spread the idea to other projects.
+
+One of those other projects is an Open-Source project called 9Volt which uses Rye as it’s mechanism for Middleware. In the UI is different but there is a React application using Redux and Semantic-UI for a dashboard experience. This example is public and fully-fleshed out if you would like to see how it all hooks together (including a build pipeline). The setup of the routing is here: api.go, the setup of the UI middlewares (doesn’t use the new Rye static middleware) is here: ui.go, the single-page application is here: 9Volt/ui, the MAKEFILE, builds out the UI in target and supports dev in , and finally, to see a statik build, look here: 9Volt/statik/statik.go.
+
+We will likely build more dashboard user interfaces using this technique. We hope this will help you out in building easily deployable web applications along with your RESTful APIs.|||
+

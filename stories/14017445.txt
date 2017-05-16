@@ -1,0 +1,26 @@
+One of the things I’ve been doing this quarter is removing Gecko’s dependence on NSPR locks.  Gecko’s (non-recursive) mutexes and condition variables now use platform-specific constructs, rather than indirecting through NSPR.  This change makes things smaller, especially on POSIX platforms, and uses no dynamic memory allocation, so there are fewer untested failure paths.  I haven’t rigorously benchmarked things yet, but I suspect various operations are faster, too.
+
+As I’ve done this, I’ve fielded questions about why we’re not using something like or the Rust equivalent in .  My response has always been some variant of the following: the benchmarks for the blog post were conducted on OS X.  We have anecdotal evidence that mutex overhead can be quite high on OS X, and that changing locking strategies on OS X can be beneficial.  The blog post also says things like:
+
+This is certainly true for mutexes on OS X, as the measurements in the blog post show.  But fairness is not guaranteed for all OS mutexes; in fact, fairness isn’t even guaranteed in the pthreads standard (which OS X mutexes follow).  Fairness in OS X mutexes is an implementation detail.
+
+These observations are not intended to denigrate the work: the blog post and the work it describes are excellent.  But it’s not at all clear that the conclusions reached in that post necessarily carry over to other operating systems.
+
+As a partial demonstration of the non-cross-platform applicability of some of the conclusions, I ported WebKit’s lock fairness benchmark to use raw pthreads constructs; the code is available on GitHub.  The benchmark sets up a number of threads that are all contending for a single lock.  The number of lock acquisitions for each thread over a given period of time is then counted.  While both of these qualities are configurable via command-line parameters in WebKit’s benchmark, they are fixed at 10 threads and 100ms in mine, mostly because I was lazy. The output I get on my Mac mini running OS X 10.10.5 is as follows:
+
+Each line indicates the number of lock acquisitions performed by a given thread.  Notice the nearly-identical output for all the threads; this result follows from the fairness of OS X’s mutexes.
+
+The output I get on my Linux box is quite different (aside from each thread performing significantly more lock acquisitions because of differences in processor speed, etc.):
+
+The counts vary significantly between threads: Linux mutexes are not fair by default–and that’s perfectly OK.
+
+What’s more, the developers of OS X have recognized this and added a way to make their mutexes non-fair.  In , there’s a OS X-only function, .  (pthread mutex attributes control various qualities of pthread mutexes: normal, recursively acquirable, etc.  This particular function, supported since OS X 10.7, enables setting the fairness policy of mutexes to either (the default) or .  The firstfit policy is not documented anywhere, but I’m guessing that it’s something akin to the “barging” locks described in the blog post: the lock is made available to whatever thread happens to get to it first, rather than enforcing a queue to acquire the lock.  (If you’re curious, the code dealing with firstfit policy can be found in Apple’s pthread_mutex.c.)
+
+Running the benchmark on OS X with mutexes configured with the firstfit policy yields quite different numbers:
+
+The variation in these numbers are more akin to what we saw with the non-fair locks on Linux, and what’s more, they’re almost an order of magnitude higher than the fair locks. Maybe we should start using firstfit locks in Gecko!  I don’t know how firstfit policy locks compare to something like on my Mac mini, but it’s clear that saying simply “OS mutexes are slow” doesn’t tell the whole story. And of course there are other concerns, such as the size required by locks, that motivated the work.
+
+I have vague plans of doing more benchmarking, especially on Windows, where we may want to use slim reader/writer locks rather than critical sections, and evaluating Rust’s on more platforms.  Pull requests welcome.
+
+This entry was posted on Wednesday, March 29th, 2017 at 11:25 am and is filed under Uncategorized. You can follow any comments to this entry through the RSS 2.0 feed. Both comments and pings are currently closed.|||
+

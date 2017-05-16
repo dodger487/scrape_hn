@@ -1,0 +1,176 @@
+In the sequel of my previous post adding struct inheritance to C# with CoreCLR and Roslyn, I would like to share here a proposal and a prototype for a new operator to allow the allocation of a reference type on the stack instead of the heap, all of this again integrated into CoreCLR and Roslyn!
+
+Before going into the details about how it can be used and how it is actually implemented, I would like to explain a bit more why this is an important feature, as it may be obvious for some, It is often something that is not well enough considered by programmers using managed languages like .NET
+
+Performance of an application is related to how well algorithm and data are designed to efficiently work together or said differently How much your process/data is in harmony with your data/process?
+
+No matter how much we optimize our code, if datas are not well organized and don’t match the “way of thinking” of the code, the program will experience stalls and cache misses all around. While this can be quite easily spotted with an advanced profiler like Intel VTune Amplifier, it is quite often not easy to fix it afterwards. It may also be quite difficult to balance the way datas are organized, because of orthogonality mismatch: While we may have a generic set of input datas, we may have to organize differently these datas for a particular process, and differently for a sub-sequent process working either on the original set, or the result of the previous set, or a mix of the two. This is often what makes the process of optimization an exponential workload.
+
+This harmony between code and data is directly influenced by how the processor and memory are actually designed to process them efficiently:
+
+While the first point is obviously something that we tend to consider first, the second point has a much wider impact on everything. We often put lots of emphasis on the merit of “data-oriented” programming and this is absolutely what this is all about, even more if we are considering that code is always data for someone else (e.g machine instructions are data for processors)
+
+So talking about memory, if we recall some famous figures that you have most likely already seen around like: “Latency Numbers Every Programmer Should Know” or from this gist:
+
+Considering that currently on a modern Intel Skylake processor:
+
+If we think more about it, these numbers give vertigo: We have computer with GBytes of main memory, storing code and data, and sometimes a large part of it at some point should go through the pipes of the L1/L2/L# caches to ultimately end-up running at full speed using 128 bytes on a chip! (16 x 64 bits CPU registers on x64), not even talking of the terabytes floating around on hard drives, ready to jump into the RAM.
+
+If we take both memory latency and size into regard, we can see immediately that a program performance is in the end a problem of efficiently managing data locality.
+
+So back to our subject when we talk about “Managed Language” we are effectively talking about a runtime/language that manages the memory for us, in the ultimate purpose of safety while we realize that it doesn’t necessarily imply the purpose of locality.
+
+Note that JIT is for example not a pure criteria of efficiency of a “Managed Language”, as we have seen in recent years with the rise of native compilers for managed languages - starting with NGen, then .NETNative or the more recent and promising LLILC initiative.
+
+Incidentally, when I went to the MVP summit last year, I remember during a Q&A session with the .NET runtime team someone asking about any major GC improvements coming to .NET. While he didn’t got any precise answers, because the GC in .NET is something already quite optimized… what I wanted to answer him - but didn’t get a chance to - is that:
+
+If you are curious about how the GC in .NET is working, take a look at the fundamentals of Garbage Collection in .NET
+
+So how can we improve our control over memory and locality? For example, .NET has structs that are already a language feature backed by a runtime that allows us to control a bit this locality… but this is far from enough and there are several others trails to explore like:
+
+In this post I will just focus on (1) but hopefully will give more details on other points in some next posts.
+
+The stack is, by its nature, data locality friendly: whenever we call a method and push method arguments, or work on some local variables, all these datas will most likely be stored in a memory location (not only registers, starting from the Program Counter return address to the callee). Also the memory is growing/shrinking along the life of entering/exiting methods into a continuous block of memory, so it is most of the time already in a cache line of the Lx caches. Nowadays, processors are also quite well equipped at prefetching main memory to cache lines when there is a predictable memory access pattern.
+
+In .NET, there are many cases where this would help a lot. Typically for example, with Linq, which is an API that I usually forbid for any critical runtime, mainly because whenever you need to perform this simple match on a list:
+
+This harmless code above actually generates 2 allocations on the heap (!):
+
+while the following code is more verbose, but would not generate any allocations:
+
+I have seen for example a brilliant recursive descent parser that was using monads/generics in C#, unfortunately, performance wise, It was actually really bad, due to the allocations occurring at each methods just to feed the parser state.
+
+Even if allocation on the gen 0 is quite fast (at least, way faster than a ), and the allocated object is temporary (not store in a field/property), it is still slower than a local allocation on the stack (which is almost free, apart for a zeroing of the memory, that is part of the method prolog in .NET). Allocation on the heap will also force a at some point, a “stop the world” that will have to scan references on the stack (also called stack-roots: if any objects allocated on the heap is referenced by a variable on the stack).
+
+When we know for sure that an object is instantiated in a method for the sole purpose and use for the life of the current method, we should be able to instruct the compiler and runtime to generate an optimized path in this case.
+
+So in order to support this scenario, we need to define how this is going to work in the CLR and how this will be declared and used from the language (C#).
+
+Lets start by defining the concept of a variable:
+
+When compiling the keyword, it would only be stored to a for method parameters while all local variables would just be statically verified at compile time. The compiler should only ensure the rules defined above, nothing more.
+
+This is introducing a new keyword, something that the language team is not going to take easily for granted!
+
+If you have never used the operator, it allows to instantiate an array of blittable valuetypes on the stack:
+
+But we notice that:
+
+In I ideal world, I would replace completely this old operator by a new behaviour that would allow both allocation on class/reference type on the stack, as well as array of class/structs (and not only blittable structs, as it is today). This is what I have chosen for in this prototype as I found it much cleaner and I don’t have to introduce a new keyword.
+
+Basically, the new operation should allow exactly the same calling constructors conventions then the operation.
+
+In order to use the operator, you can only assign it to a variable, like this:
+
+In the case of the lambda above, I haven’t work out how the syntax would be used. The compiler could allow an implicit operator when the parameter of the method receiving the argument is transient. But we still need a way to define how a lambda is declared transient, like prefixing by transient may be fine (but haven’t checked in terms of parsing coherency):
+
+There is a case where a class is allocated on the stack and used through a transient variable. But if we call a method on this variable, within the method, we can’t ensure statically that we are in the context of a transient call and we may be able to store the pseudo variable to a location that is not declared as , which would violate one of the rule defined above.
+
+Here is a example of the problem:
+
+So It seems (all this post needs lots of peer review!) that it is possible to solve this problem at the cost of making the CLR runtime and the Roslyn compilation to cooperate:
+
+Note that this code has not been tested/implemented in the current prototype!
+
+Hope that there is not too much other devils in the details! (Hey @jaredpar! ;)
+
+I have seen many comments suggesting that escape analysis would be ideal for this, to make it more transparent and less cumbersome. While escape analysis can be of course handy (should I say “candy”?), there are many reasons why I prefer to have an explicit declaration (a must) rather than an implicit one (a nice to have):
+
+You will notice from the list of commits for this feature as implemented in the prototype that they are relatively small.
+
+The reason is that I haven’t taken the time to implement the full syntax verification of the rules above (e.g a transient variable can only be assigned to another transient variable), but just wanted to support at least the keyword and generate proper IL bytecode for the operator. It means that you need to be careful to respect the rules of a transient variable when trying this with this custom Roslyn version!
+
+Also, in terms of IL code gen, I wanted the changes to be very limited and avoid completely any new IL opcodes. While I’m beginning this post with the changes done in Roslyn, in practice, I had to make changes first to the CLR, and once I was sure It could make it into the runtime, I implemented the convenient bits into Roslyn.
+
+I will try to explain the changes with a simple program. Let’s compile this little code using the regular operator:
+
+The main method will be translated to the following IL bytecode:
+
+If you are not familiar with IL, it is a set of very basic instructions using a stack-based IL (load variable, store variable, take address, push arguments, call virtual method… etc.). In the generated code above, you will see that the local variable is declared as a (on the slot 0).
+
+IL code manipulation is something that I have abused a lot at the very beginning of SharpDX to allow, for example, to take the pointer to a generic parameter or transform a method call to a calli instruction in order to support COM mehod call. As someone asked on Twitter, I should one day write a little bit about it…
+
+So, let’s go back to our little program. Now, if we replace the operator by our new (doh!) operator:
+
+It will generated the following IL bytecode:
+
+First, the changes to the declaration of local variables:
+
+We are introducing a shadow variable [1] declared as a but using a token that is actually a class (!). If you try to run this assembly with a regular CLR, It will generate an invalid error with “unexpected valuetype”, but in CoreCLR, we will ensure that the IL code reader/importer will allow this syntax. The rule here is that there is one shadow variable allocated per call site.
+
+Then we are going to initialize the class on the stack, exactly the same way a struct would be initialized. Note that unlike the IL opcode instruction, we are not passing constructor parameters. This bytecode ensure that the class allocated on the stack is actually zeroed at the callsite (suppose the stackalloc is used within a loop, we want a fresh zeroed object on each loop items)
+
+After this, we can actually call the constructor for the class, and storing the pointer/reference to the class on the stack to the variable program (our now variable):
+
+Finally, we can just call a regular method exactly like for an object allocated on the heap:
+
+Note that my requirements of not introducing a new IL opcode was mainly motivated by the fact that I was not confident about the implications in the CLR, so I wanted to rely on stuff already working. I had only to patch existing code paths in CoreCLR in order to allow class to pass on the stack. It may be relevant that a new opcode could be used with a more compact syntax.
+
+While it is a basic support of the operator (notice that I haven’t implemented anything for array allocations for example), that’s all we need to do to generate IL bytecode for at least our simple use case.
+
+Again, this whole series of prototypes should not be considered as fully tested or safe. They are just a proof of concept!
+
+As I expected from my previous post, and unlike struct inheritance that was requiring just 2 lines of code changes, bringing for class to the CoreCLR required significantly more trial and crash steps in order to progressively reach a stable runtime.
+
+As I’m not familiar with the CoreCLR codebase, It took me a bit of time to figure out where I should actually make these changes. Someone from the CoreCLR team would have most likely done this a bit more cleanly and less hacky (and even differently)
+
+In summary, I made the choice to initialize the class on the stack with the same layout than as it would have had on the heap: It means that the class is prefixed by the 8 bytes struct which is holding some information required by the GC (more about it later why it has been implemented like this).
+
+In practice, it means that whenever the GC finds a variable on the stack (transient or not), it will first check if it is actually an object allocated on the stack. If yes, the GC will not scan fields for the class from this reference, because instead, we rely on the fact that the class is flatten on the stack (as a struct would be flatten), and ultimately, the GC will scan the fields of the class allocated on the stack (so we rely on the already existing infrastructure that allows the GC to scan fields of a struct on allocated on a stack)
+
+I’m gonna try to give a bit more details about the commits to support this operator, what are the main changes to CoreCLR and what kind of problems I have encountered. In all the code changes, I have tried to prefix them by a message (here is just an highlight of the commits, there are a bit more in the branch):
+
+First step was to get rid of the exception that is verifying that a local variable cannot be declared with a class token. This is not super clean to allow token class for valuetype in all circumstances (it may be an invalid code not related to stackalloc), but in my case I didn’t bother about this.
+
+This commit is modifying the to introduce two methods that will be used later by the code.
+
+Basically, we need to be able to:
+
+This is where we are starting to store the information about local variables declared as class on the stack:
+
+This is a first commit that is generating some x64 code in order to initialize the method table of the object.
+
+It is a first step to generate a compliant class layout on the stack. A class is only differentiated by the presence of this methodtable pointer (or commonly called ) at the . This is through this pointer that we can find type information, perform cast, find and call virtual methods…etc. This initialization of the methodtable of a class on the stack is only done once per stackalloc call site (or shadow variable) at the prolog of the method (just after the JIT has generated zeroing code)
+
+Notice that in the generated code here, I still don’t output the small that is required for a GC object. It required a bit more changes…
+
+The commit 265453c4fd is making the following changes:
+
+The idea here is that I wanted to store the information of whether this instance is allocated on the stack directly on the object. So I’m using the and using an unused part of it (on x64 platform, while on x86, it is only 4 bytes so we would have to expand it). If the lower bit is set to 1, this current object is actually on the heap.
+
+This information is later used in GCHeap::Promote and GCHeap::Relocate, in order to skip reference that are allocated on the stack when performing a Garbabe Collect cycle
+
+I’m also making sure that when the class is allocated on the stack, we are allocating the space for the , and setting the flag allocate on stack in this , again all of this is done just once per stackalloc call site in the prolog of the method.
+
+Then there are a couple of commits to make object.Validate() working. Lots of these checks are done in debug mode, but we still don’t want to crash here. I have made the choice to almost bypass everything, but their could be relevant checks to keep, or even additional checks for an object allocated on the stack…
+
+This commit is mostly dealing with generating proper code for the keyword. The changes mostly consist in shifting the current address loaded from the shadow variable to feed (recall above the ), as it is pointing to the start of the object (including the methodtable pointer), but we don’t want the generated code to clear this methodtable that is setup just once at the prolog of the method. So in the case of a performed on a class on stack, we are shifting by a pointer size the start where things are zeroed (and we decrease of course the size of the data to zeroed)
+
+This was my last commit in order to get something working correctly with the GC. The is basically a small shell around the regular WriteBarrier (a write barrier is used in the context of generational GC: whenever an object is stored in the field of another object, the write barrier allow to store somewhere in a cardtable the reference to the object that is receiving the reference source object in order to quickly identify which object should be scan - the object receiver - and which source object is most likely to be promoted - in case of the gen0 allocation)
+
+The code of the is:
+
+It is basically ensuring that we are not going to use a write barrier if our pointer is not on the HEAP, and this is exactly what we want for our class instantiated on the stack. If we start to store a heap object to a field of an object allocated on the stack, we want to early exit (without it, it would try to flag a cardtable bit into an invalid memory location).
+
+I haven’t measured the performance impact of getting through this small shell on all field assignments ( is actually used for ref pointers, as we don’t know if a ref is on the stack - ref to a field struct - or the heap, so it is less used than ) so it may be an issue, but considering all the code involved afterwards for the barrier itself, it is still small, so that might not be a big issue after all.
+
+Woot, And that’s all! If you compile the CoreCLR on this branch, you will get a basic support for stackalloc for class!
+
+This is the sample program I used to test the implementation of the stackalloc for class:
+
+If you run this sample without any args, it will allocate on the stack, otherwise if you pass an argument, it will allocate on the heap.
+
+So? What are the results of these changes? If you run the program above:
+
+I don’t claim that using stackalloc is always going to give you 10x times performance, but it is just to demonstrate that allocation on the heap hurts more than you would think and your program may benefit allocating class on the stacks in such scenarios.
+
+This prototype demonstrates that stackalloc for class is something that could become real for .NET CoreCLR and could bring lots of opportunities for optimizations!
+
+As it is only a prototype, I don’t expect it to be back ported to CoreCLR anytime soon as-is, though I will push this to a PR, just to get some feedback about the things that might be problematic in this proposal.
+
+I’m also very happy to be able to play with the .NET CLR, such a pleasure to be able to experiement things like this! Even if you don’t agree with the changes, take this series of CoreCLR/Roslyn posts as educational - don’t be shy getting your hands dirty with CoreCLR!, at least, it is the case for me.
+
+Not sure I will prototype all the other features soon (like the embed in class), but at least that you can find interesting bits here and there!
+
+Anyway, there is a new toy in town, stackalloc for class, happy coding!|||
+

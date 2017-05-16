@@ -1,0 +1,28 @@
+Allocating memory is expensive. It is expensive in managed code, and it is expensive in native code, it is just expensive. There are many ways to alleviate those costs, but at some point, any generic allocation scheme is going to run to ground with the harsh reality of the cost of bookkeeping.
+
+Many managed programs are actually much faster than their native counterparts precisely because of that. Manage runtimes have more information about the allocations, and can defer / batch and optimize memory usage accordingly. For example, in .NET the amount of code that you would typically run for allocation is miniscule. Effectively a pointer bump and that is it. And the garbage collector can do really good work on collecting those allocations if they are short lived, and the generational nature means that we typically have far less cost of memory book keeping than in most native applications, and when we do, we can optimize things by doing that all at once.
+
+All of which is great, except that there is still a cost to it, a decidedly non trivial one if you are writing high performance software. So what is the answer?
+
+Put simply, you cheat, and you cheat like mad. The issue is with the problem statement, if any generic allocation scheme is problematic, throw the generic portion out the window and specialize like an insect.
+
+With RavenDB, we have quite early on realized that the cost of memory allocation was too prohibitive to allow us to use it for most common tasks. So we manage our own memory, but we do that with a pattern. All operations are always done inside a scope, that scope define the boundary of the operation. An operation can be something like writing a single document, or answering a query, etc. The idea is that this is (usually) short lived and well scoped. And that turns out to be key.
+
+We use the notion of context and context pool. A context is just a holder for a bunch of (native) memory that we get from the OS and holds on to. And when we start an operation, we grab a context from the pool and start using it. Whenever we need to grab some memory, we go to the context and ask it for some.
+
+The code that typically run in this case is:
+
+Amusingly enough, we are actually doing a managed allocation as part of are unmanaged allocation. This is fine, because we typically allocate things in the ~KB range, so we don’t have a lot of individual AllocatedMemoryData instances to manage.
+
+But the key here is that when the operation scope is over, we return the context to the pool. The key here is that when we return the context to the pool, we already reset _ptrCurrent to its initial value. So all the memory we used during that operation is available to be used again very cheaply.
+
+Now, this is actually almost the entire story. As it turns out, this works very well for a lot of scenarios, but in some cases we have a context open for a long while ( bulk insert, indexing, etc). That means that an operation would go through quite a lot of memory if we didn’t have some way to recover it on the fly. And we do. When we are done with the memory, we return it to the context. Now, this is usually where things starts to get hairy. But we made sure that there is an O(1) cost for both allocation & deallocation in the context.
+
+When you return memory to the context, we check if this is the top most section, and if so, we just reduce _ptrCurrent by the amount of memory that was used. But there are times when we return memory that isn’t on the top of the context, what then? Instead of leaving this memory unused until the next context reset, we’re adding that to a linked list. But this linked list is actually stored in the memory that was freed. This looks like this:
+
+The _freed is an array that hold the most recent value for that size. So when we allocate, we can do:
+
+And if we don’t find returned memory, we’ll go to the cheap-alloc code above and bump the pointer. So during the lifetime of the context, we get pretty cheap memory reuse, and we don’t worry too much about it because the context reset will clear everything anyway.
+
+A side benefit of this is that because the context goes to the pool, we are not going to release that memory, so when the next request comes, we’ll have relatively hot memory right there & available. And, of course, all of it is going to be with high locality.|||
+

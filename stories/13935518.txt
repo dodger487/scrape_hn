@@ -1,0 +1,55 @@
+The method to deploy on MAAS is the same I described in my previous blog about DIY GPU Cluster
+
+Once you have MAAS installed and Juju configured to talk to it, you can adapt and use the bundle file in src/juju/
+
+for AWS, use the k8s-aws.yaml bundle, which specifies c4.4xlarge as the default instances.
+
+When it’s done, download he configuration for kubectl then initialize Helm with
+
+LXD on AWS is a bit special, because of the network. It breaks some of the primitives that are frequently used with Kubernetes such as the proxying of pods, which have to go through 2 layers of networking instead of 1.
+
+However, transcoding doesn’t require network access but merely a pod doing some work on the file system, so that is not a problem.
+
+The least expensive path to resolve the issue I found is to deploy a specific node that is NOT in LXD but a “normal” VM or node. This node will be labeled as a control plane node, and we modify the deployments for tiller-deploy and kubernetes-dashboard to force them on that node. Making this node small enough will ensure no transcoding get ever scheduled on it.
+
+I could not find a way to fully automate this, so here is a sequence of actions to run:
+
+This deploys the whole thing and you need to wait until it’s done for the next step. Closely monitor juju status until you see that the deployment is OK, but flannel doesn’t start.
+
+The adjust the LXD profile for each LXD node must to allow nested containers. In a near future (roadmapped for 2.3), Juju will gain the ability to declare the profiles it wants to use for LXD hosts. But for now, we need to build that manually:
+
+If you’re watching juju status you will see that flannel suddenly starts working. All good! Now download he configuration for kubectl then initialize Helm with
+
+We need to identify the Worker that is not a LXD container, then label it as our control plane node:
+
+Now this is where it become manual we need to edit successively rc/monitoring-influxdb-grafana-v4, deploy/heapster-v1.2.0.1, deploy/tiller-deploy and deploy/kubernetes-dashboard, to add
+
+in the definition of the manifest. Use
+
+After that, the cluster is ready to run!
+
+We have a lot of tests to run, and we do not want to spend too long managing them, so we build a simple automation around them
+
+This will run the tests about as fast as possible. Adjust the variables to fit your local environment
+
+Without any tuning or configuration, Kubernetes makes a decent job of spreading the load over the hosts. Essentially, all jobs being equal, it spreads them like a round robin on all nodes. Below is what we observe for a concurrency of 12.
+
+The same spread is realized also for larger concurrencies, and at 192, we observe 32 jobs per host in every case. Some screenshots of kubeUI and Grafana of my tests
+
+This is where it becomes a bit tricky. We could use an ELK stack and extract the logs there, but I couldn’t find a way to make it really easy to measure our KPIs.
+
+Looking at what Docker does in terms of logging, you need to go on each machine and look into /var/lib/docker/containers/<uuid>/<uuid>-json.log
+
+Here we can see that each job generates exactly 82 lines of log, but only some of them are interesting:
+
+For advanced performance geeks, line 64 also gives us the transcode speed per frame, which can help profile the complexity of the video. For now, we don’t really need that.
+
+The raw log is only a Docker uuid, and does not help use very much to understand to what job it relates. Kubernetes gracefully creates links in /var/log/containers/ mapping the pod names to the docker uuid.
+
+So here is what we do:
+
+2. Extract import log lines (adapt per environment for nb of nodes…)
+
+Once we have all the results, we load to Google Spreadsheet and look into the results…|||
+
+During her tests, made on a default Kubernetes installation on bare metal servers with 40 cores & 512GB RAM, she allocated 5 full CPU cores to each of the transcoding pods, then scaled up to 6…

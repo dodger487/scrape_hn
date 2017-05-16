@@ -1,0 +1,267 @@
+This summer I spent some time talking with Edward Kmett about lots of things. (Which really means that he was talking and I was trying to keep up.) One of the topics was operads. The ideas behind operads are not that hard, if you’ve heard about category theory. But the Haskell wizardry to implement them and their related monads and comonads might be quite challenging. Dan Piponi wrote a blog post about operads and their monads some time ago. He used the operad-based monad to serialize and deserialize tree-like data structures. He showed that those monads may have some practical applications. But what Edward presented me with was an operad-based comonad with no application in sight. And just to make it harder, Edward implemented versions of all those constructs in the context of multicategories, which are operads with typed inputs. Feel free to browse his code on github. In case you feel a little overwhelmed, what follows may provide some guidance.
+
+Let me first introduce some notions so we can start a conversation. You know that in a category you have objects and arrows between them. The usual intuition (at least for a programmer) is that arrows correspond to functions of one argument. To deal with functions of multiple arguments we have to introduce a bit more structure in the category: we need products. A function of multiple arguments may be thought of as a single-argument function taking a product (tuple) of arguments. In a Cartesian closed category, which is what we usually use in programming, we also have exponential objects and currying to represent multi-argument functions. But exponentials are defined in terms of products.
+
+There is an alternative approach: replace single-sourced arrows with multi-sourced ones. An operad is sort of like a category, where morphisms may connect multiple objects to one. So the primitive in an operad is a kind of a tree with multiple inputs and a single output. You can think of it as an n-ary operator. Of course the composition of such primitives is a little tricky — we’ll come back to it later.
+
+Dan Piponi, following Tom Leinster, defined a monad based on an operad. It combines, in one data structure, the tree-like shape with a list of values. You may think of the values as a serialized version of the tree described by the shape. The shapes compose following operad laws. There is another practical application of this data structure: it can be used to represent a decision tree with corresponding probabilities.
+
+But a comonad that Edward implemented was trickier. Instead of containing a list, it produced a list. It was a polymorphic function taking a tree-like shape as an argument and producing a list of results. The original algebraic intuition of an operad representing a family of n-ary operators didn’t really fit this picture. The leaves of the trees corresponded to outputs rather than inputs.
+
+We racked our brains in an attempt to find a problem for which this comonad would be a solution — an activity that is not often acknowledged but probably rather common. We finally came up with an idea of using it to evaluate game trees — and what’s a simpler game than tic-tac-toe? So, taking advantage of the fact that I could ask Edward questions about his multicategory implementation, I set out to writing maybe the most Rube Goldberg-like tic-tac-toe engine in existence.
+
+Here’s the idea: We want to evaluate all possible moves up to a certain depth. We want to find out which ones are illegal (e.g., trying to overwrite a previous move) and which ones are winning; and we’d like to rank the rest. Since there are 9 possible moves at each stage (legal and illegal), we create a tree with the maximum branching factor of 9. The manipulation of such trees follows the laws of an operad.
+
+The comonadic game data structure is the evaluator: given a tree it produces a list of board valuations for each leaf. The game engine picks the best move, and then uses the comonadic to generate new game states, and so on. This is extremely brute force, but Haskell’s laziness keeps the exponential explosion in check. I added a bit of heuristics to bias the choices towards the center square and the corners, and the program either beats or ties against any player.
+
+All this would be a relatively simple exercise in Haskell programming, so why not make it a little more challenging? The problem involves manipulation of multi-way trees and their matching lists, which is potentially error-prone. When you’re composing operads, you have to precisely match the number of outputs with the number of inputs. Of course, one can have runtime checks and assertions, but that’s not the Haskell way. We want compile-time consistency checks. We need compile-time natural numbers, counted vectors, and counted trees. Needless to say, this makes the code at least an order of magnitude harder to write. There are some libraries, most notably , which help with type literals and simple arithmetic, but I wanted to learn type-level programming the hard way, so I decided not to use them. This is as low level as you can get. In the process I had to rewrite large chunks of the standard Prelude in terms of counted lists and trees. (If you’re interested in the version of an operad, I recommend browsing Dan Doel’s code.)
+
+The biggest challenges were related to existential types and to simple arithmetic laws, which we normally take for granted but which have to be explicitly stated when dealing with type-level natural numbers.
+
+The board is a 3 by 3 matrix. A matrix is a vector of vectors. Normally, we would implement vectors as lists and make sure that we never access elements beyond the end of the list. But here we would like to exercise some of the special powers of Haskell and shift bound checking to compile time. So we’ll define a general n by m matrix using counted vectors:
+
+Notice that and are types rather than values.
+
+The vector type is parameterized by compile-time natural numbers:
+
+This definition is very similar to the definition of a list as a GADT, except that it keeps track of the compile-time size of the vector. So the constructor creates a vector of size , which is the compile-time representation of zero. The constructor takes a value of type and a vector of size , and produces a vector of size , which stands for the successor of .
+
+This is how natural numbers may be defined as a data type:
+
+Here, and are the two constructors of the data type . But and occur in the definition of as types, not as data constructors. What happens here is that GHC can promote data types to kinds, and data constructors to types. With the extension:
+
+can double as a kind inhabited by an infinite number of types:
+
+which are in one-to-one correspondence with natural numbers. We can even create type aliases for the first few type naturals:
+
+Now the compiler, seeing the use of and in the definition of , can deduce that is of kind .
+
+The kind is inhabited by types, but these types are not inhabited by values. You cannot create a value of type or . So, in data definitions, these types are always phantom types. You don’t pass any values of type , , etc., to data constructors. Look at the two constructors: takes no arguments, and takes a value of type , and a value of type .
+
+So far we have encoded the size of the vector into its type, but how do we enforce compile-time bound checking? We do that by providing special access functions. The simplest of them is the vector analog of :
+
+The type signature of guarantees that it can be called only for vectors of non-zero length (the size has to be the successor of some number ). Notice that this is different from simply not providing a definition for:
+
+An incomplete pattern would result in a runtime error. Here, trying to call with produces a compile-time error.
+
+A much more interesting problem is securing safe random access to a vector. A vector of size can only be indexed by numbers that are strictly less than . To this end we define, for every , a separate type for numbers that are less than
+
+Here, is a type whose kind is (this can be deduced from the use of acting on ). Notice that is a regular inhabited type. In other words its kind is and you can create values of that type.
+
+Let’s see what the inhabitants of are. Using the constructor we can create a value of type , for any . But is not a single type — it’s a family of types parameterized by . is an example of a polymorphic value. It can be passed to any function that expects , or , etc., but not to one that expects .
+
+The constructor takes a value of the type and produces a value of the type — the successor of .
+
+We will use values of the type to safely index vectors of size :
+
+Any attempt at access beyond the end of a vector will result in a compilation error.
+
+In our implementation of the tic-tac-toe board we’ll be using vectors of size . It’s easy to enumerate all members of . These are:
+
+We’ll also need to convert user input to board positions. Of course, not all inputs are valid, so the conversion function will return a value:
+
+Our tic-tac-toe board will be a 3×3 matrix of fields, optionally containing crosses or circles put there by the two players:
+
+An empty board is filled with .
+
+A move in the game consists of a player’s mark and two coordinates. The coordinates are compile-time limited to 0, 1, and 2 using the type :
+
+The game engine will be dealing with trees of moves. The trees are edge labeled, each edge corresponding to an actual or a potential move. The leaves contain no information, they are just sentinels.
+
+A is either a with a nullary constructor, or a , whose constructor takes :
+
+is defined as an empty list , or a cons of a branch consisting of a and a followed by a tail of :
+
+You may recognize this data structure as an edge-labeled version of a rose tree. Here are a few examples of s.
+
+The last tree describes two possible branches: A circle at (0, 0) followed by a cross at (1, 0); and a circle at (0, 1) followed by a cross at (1, 0).
+
+The compile-time parameter in counts the number of leaves.
+
+Of special interest is the infix constructor which has to add up the number of leaves in all branches. Here, the addition must be performed on types rather than values. To define addition on types we use a multi-parameter type family — type family serving as a compile-time equivalent of a function. Here, the function is an infix operator . It takes two types of the kind and produces a type of the kind :
+
+The implementation of this compile-time function is defined inductively through two families of type instances. The base case covers the addition of zero on the left:
+
+The inductive step takes care of adding a successor of , also on the left:
+
+Notice that the compiler won’t be able to deduce from these definitions that, for instance, is the same as . We’ll have to do something special when the need arises — when we are forced to add a zero on the right. Compile-time arithmetic is funny that way.
+
+The nice thing about move trees is that they are composable. It’s this composability that allows them to be used to speculatively predict multiple futures of a game. Given a current game tree, we can extend it by all possible moves of the computer player, and then extend it by all possible countermoves of the human opponent, and so on. This kind of grafting of trees on top of trees is captured by the operad.
+
+What we are going to do is to consider our move trees as arrows with one or more inputs. Here things might get a little confusing, because a natural interpretation of a move tree is that its input is the first move, the root of the tree; and the leaves are the outputs. But for the sake of the operad, we’ll reverse the meaning of input and output.
+
+In Haskell, we define a category by specifying the hom-set as a type. Then we define the composition of morphisms and pick the identity morphisms. We’ll do a similar thing with the operad. The difference is that an arrow in an operad is parameterized by the number of inputs (leaves of the tree). Continuing with the theme of compile-time safety, we’ll make this parameterization at compile-time.
+
+The analog of the identity arrow will have a single input.
+
+But how do we compose arrows that have multiple inputs? To compose an arrow with n inputs we need something that has n outputs. We can’t get n outputs from a single arrow (for n greater than 1) so we need a whole forest of arrows (with apologies for mixed metaphors). Composition in an operad connects an arrow to a forest. This is the definition:
+
+Here, is a compile-time function from to a regular type — in other words, a data type parameterized by . The identity has one input. Composition takes an n-ary arrow and a forest with m inputs and n outputs. As usual, the obvious identity and associativity laws are assumed but not expressible in Haskell. I’ll define the forest in a moment, but first let’s talk about the additional constraint, .
+
+Conceptually, a data type provides a way to retrieve its grade — or the count for a counted data structure — at runtime. But why would we need runtime grade information? Wasn’t the whole idea to perform the counting at compile time? It turns out that our compile-time s are great at parameterizing data structures. Types of the kind can be used as phantom types. But the same trick won’t work for parameterizing polymorphic functions — there’s no place to insert phantom types into definitions of functions. A function type reflects the types of its arguments and the return type. So if we want to pass a compile-time count to a function, we have to do it through a dummy argument.
+
+For that purpose we need a family of types parameterized by compile-time natural numbers. This time, though, the types must be inhabited, because we need to pass values of those types to functions. These values don’t have to carry any runtime information — they are only used to carry the type. It’s enough that each type be inhabited by a single dummy value, just like it is with the unit type . Such types are called singleton types. Here’s the definition of the singleton natural number:
+
+You can use it to create a series of values:
+
+You can also define a function for adding such values. It’s a polymorphic function that takes two singletons and produces another singleton. It really performs addition on types, but it gets the types at compile time from its arguments, and produces a singleton value of the correct type.
+
+The typeclass is defined for counted types — types that are parameterized by s:
+
+With those preliminaries out of the way, we are ready to implement the instance for the . We pick the single leaf tree as our identity.
+
+Before we define composition, we have to define a forest. It’s a list of trees parameterized by two compile-time integers, which count the total number of inputs and outputs. A single tree (our multi-input arrow) is parameterized by the number of inputs. It has the kind .
+
+The constructor creates an empty forest with zero inputs and zero outputs. The constructor takes a tree with inputs (and, implicitly, one output), and a forest with inputs and outputs. The result is a forest with inputs and outputs.
+
+Composition in the operad has the following signature:
+
+It produces a tree by plugging the outputs of a forest in the inputs of a tree.
+
+We’ll implement composition in multiple stages. First, we make sure that a single leaf is the left identity of our operad. The simplest case is when the right operand is a single-leaf forest :
+
+A little complication arises when we want to compose the identity with a single-tree forest. Naively, we would like to write:
+
+This should work, since the leaf has one input, and the single-tree forest has one output. Looking at the signature of , the compiler should be able to deduce that in the definition of should be replaced by . Let’s follow the arithmetic.
+
+The forest is the result of ing a tree with inputs, and a forest with inputs and outputs. By definition of , the resulting forest has inputs and outputs. So the s in match. The problem is with unifying the s. The one from the forest is equal to , and the one on the right hand side is . And herein lies the trouble: we are adding on the right of . As I mentioned before, the compiler has no idea that is the same as . We’re stuck! The solution to this problem requires some cheating, as well as digging into the brave new world of constraint kinds.
+
+We want to tell the compiler that two types, and are the same. Both types are of the kind . Equality of types can be expressed as a constraint with the tilde between the two types:
+
+Constraints are inhabitants of a special kind called . Besides type equality, they can express typeclass constraints like or .
+
+The compiler treats constraints as if they were types and, in fact, lets you define type aliases for them:
+
+Here, , just like and , is of the kind . Unlike regular types of kind , constraints are not inhabited by values. You can use them as contexts in front of the double arrow, , but you can’t pass them as runtime values.
+
+This situation is very similar to what we’ve seen with the kind, which also contained uninhabited types. But with we were able to reify those types by defining the corresponding singletons. A very similar trick works with s. A reified constraint singleton is called a :
+
+In particular, if is a typeclass constraint, you can think of as a class dictionary — the generalization of a virtual table. There is in fact a hidden singleton that is passed by the compiler to functions with typeclass constraints. For instance, the function:
+
+is translated to a function of two variables, one of them being the virtual table for the typeclass . When you call with an , the compiler finds the virtual table for the instance of and passes it to .
+
+The difference is that now we are trying to do explicitly what the compiler normally hides from us.
+
+Notice that has only one constructor that takes no arguments. You can construct a from thin air. But because it’s a polymorphic value, you either have to specify what type of you want to construct, or give the compiler enough information to figure it out on its own.
+
+How do you specify the concrete type of a ? is a type constructor of the kind so, to define a specific type, you need to provide a constraint. For instance, you could construct a dictionary using the constraint that the type is the same as the type :
+
+This actually works, but it doesn’t generalize. What we really need is a whole family of singletons parameterized by :
+
+But the compiler is not able to verify an infinite family of constraints. We are stuck!
+
+When everything else fails, try cheating. Cheating in Haskell is called . We can take a dictionary that we know exists, for instance that of and force the compiler to believe that it’s the right type:
+
+This is to be expected: We are hitting the limits of Haskell. Haskell is not a dependent type language and it’s not a theorem prover. It’s possible to avoid some of the ugliness by using , but I wanted to show you the low level details.
+
+To truly understand the meaning of constraints, we should take a moment to talk about the Curry-Howard isomorphism. It tells us that types are equivalent to propositions: logical statement that can be either true or false. A type that is inhabited corresponds to a true statement. Most data types we define in a program are clearly inhabited. They have constructors that let us create values — the inhabitants of a given type. Then there are function types, which may or may not be inhabited. If you can implement a function of a given type, then you have a proof that this type is inhabited. Things get really interesting when you consider polymorphic functions. They correspond to propositions with quantifiers. We know, for instance, that the type is inhabited for all — we have the proof: the identity function.
+
+A type like is even more interesting. It explicitly specifies the condition under which it is inhabited. The type is inhabited if the constraint is true. For instance, is true, so the corresponding dictionary, , can be constructed. What’s even more interesting is that, if you can hand the compiler an instance of a particular dictionary, it is proof enough that the constraint it encapsulates is true. The actual value of is irrelevant but its existence is critical.
+
+So how do we bring it to the compiler’s attention? One way is to pass the dictionary as an argument to a function, but that’s awkward. In our case, the signature of the function is fixed. A better option is to bring a proof to the local scope by pattern matching.
+
+Notice how we first introduce into the scope by explicitly typing inside the pattern for . We fix the type of to be:
+
+Then we explicitly type the value of , our global singleton, to be:
+
+This lets the compiler unify the in the original definition of with our local . Finally we pattern-match to its constructor, . Obviously, the match will succeed. We don’t care about the result of this match, except that it introduces the proof of into the inner scope. It will let the compiler complete the type checking by unifying the actual type of with the expected return type of .
+
+So far we have dealt with the simple cases of operadic composition, the ones where the left hand side had just one input. The general case involves connecting a tree that has k inputs to a forest that has k outputs and an arbitrary number of inputs. A that is not a single is a of , which can be further split into the head tree and the tail. This corresponds to the pattern:
+
+We will proceed by recursion. The base case is the empty :
+
+In the recursive case we have to split the forest into the part that matches the inputs of the tree , and the remainder. The number of inputs of is given by its — that’s why we needed the operad to be .
+
+If was a simple list of trees, splitting it would be trivial: there’s even a function called in the Prelude. The fact that a is counted makes it more interesting. But the real problem is that a is parameterized by both the number of inputs and outputs. We want to separate a certain number of outputs, say , but we have no idea how many inputs, , will go with that number of outputs. It depends on how much the individual trees branch inside the forest.
+
+To see the problem, let’s try to come up with a signature for . It should look something like this:
+
+But what are and ? All we know is that they exist and that they should add up to . If there was an existential quantifier in Haskell, we could try writing something like this:
+
+We can’t do exactly that, but this pseudocode suggests a neat workaround. The existential quantifier may be replaced by a universal quantifier under a CPS transformation. There is a Curry-Howard reason for that, which has to do with CPS representing logical negation. But this can also be easily explained programmatically. Since we cannot predict how the inputs will split in the general case; instead of returning a concrete result we may ask the caller to provide a function — a continuation — that can accept an arbitrary split and take over from there. The continuation itself must be universally quantified: it must work for all splits. Here’s the signature of the continuation:
+
+As usual, when doing a CPS transform we don’t care what the type is — in fact, we have to universally quantify over it. And since we have a local constraint that involves , we have to bring into the inner scope. The way to scope type variables in Haskell is to explicitly quantify over them. And once you quantify over one type variable, you have to quantify over all of them. That’s why the declaration of starts with one giant quantifier:
+
+Putting it all together, here’s the final type signature of :
+
+We will implement using recursion. The base case splits the forest at offset zero. It simply calls the continuation with a pair consisting of an empty fragment and the unchanged forest:
+
+The recursive case is conceptually simple. The offset at which you split the forest is the successor of some number represented by a singleton . The forest itself is a of a tree and some tail . We want to split this tail into two fragments at — one less than . We return the pair whose first component is the of the tree and the first fragment, and whose second component is the second fragment. Except that, instead of returning, we call the continuation. And in order to split the tail, we have to create another continuation to accept the fragments. So here’s the skeleton of the implementation:
+
+To make this compile, we need to fill in some of the type signatures. In particular, we need to extract the number of inputs and from the constituents of the forest. We also have to extract the number of inputs and of the fragments. Finally, we have to tell the compiler that addition is associative. I won’t go into the gory details, I’ll just show you the final implementation:
+
+But what’s this business? The compiler is having — again — a problem with simple arithmetic. This time it’s the associativity of addition. We have to provide a proof that:
+
+But this time we can’t fake it with a polymorphic value; like we did with , which was parameterized by a single type of the kind . We have to fake it with a polymorphic function:
+
+Here , , and , are some arbitrary type constructors of the kind . It doesn’t matter what the values of the arguements are, as long as they introduce the three (uninhabited) types, , , and , into the scope. is a very simple polymorphic singleton type:
+
+We create three values and call the function , which returns a dictionary that witnesses the associativity of the addition of the three s.
+
+Equipped with the function , we can now complete our instance:
+
+A comonad is the dual of a monad. Just like a monad lets you lift a value using , a comonad lets you a value. And just like a monad lets you collapse double encapsulation to single encapsulation using , a comonad lets you the encapsulation.
+
+In other words, a monad lets you put stuff in and reduce whereas a comonad lets you take stuff out and reproduce.
+
+A list monad, for instance, implements by constructing a singleton list, and by concatenating a list of lists.
+
+An infinite list, or a stream comonad, implements by accessing the head of the list and by creating a stream of consecutive tails.
+
+An operad can be used to define both a monad and a comonad. The monad combines an operadic tree of n inputs with a vector of n elements.
+
+Monadic combines the operadic identity with a singleton vector, whereas grafts the operadic trees stored in the vector into the operad using and then concatenates the vectors.
+
+The comonad is also pretty straightforward. It’s defined as a polymorphic function, the evaluator, that takes an operad and produces a vector :
+
+Comonadic calls the evaluator with the identity operad and extracts the value from the singleton vector:
+
+The implementation of is a bit more involved. Its signature is:
+
+it has to produce another evaluator:
+
+This function, when called with an operadic tree , which I’ll call the outer tree, must produce new evaluators.
+
+What should the th such evaluator do when called with the inner tree ? The obvious thing is to graft the inner tree at the th input of the outer tree. We can saturate the rest of the inputs of the outer tree with identities. Then we’ll call the evaluator with this new larger tree to get a larger vector. Our desired result will be in the middle of this vector at offset .
+
+This is the complete implementation of the comonad:
+
+As usual, we had to help the compiler with the arithmetic. This time it was the associativity of the successor:
+
+Notice that we didn’t have to use the trick in , since we had the singletons handy.
+
+The comonad works with any operad, in particular it will work with our .
+
+We want the evaluator for this comonad to produce a vector of s, which we will define as:
+
+The scoring is done from the perspective of the computer. A move is a move that falls on an already marked square. A move carries with it an integer score:
+
+includes a single-branch , which is the list of moves that led to this evaluation. In particular, the singleton returned by will contain the history of moves up to the current point in the game.
+
+Let’s see what does in our case. It produces a vector of games, each containing a new evaluator. These new evaluators, when called with a move tree, whether it’s a single move, a tree of 9 possible moves, a tree of 81 possible moves and responses, etc.; will graft this tree to the corresponding leaf of the previous game tree and perform the evaluation. We’ll call after every move and pick one of the resulting games (evaluators).
+
+This blog post is mostly about operads and comonads, so I won’t go into a lot of detail about implementing game strategy. I’ll just give a general overview, and if you’re curious, you can view the code on github.
+
+The heart of the operadic comonad is the evaluator function. To start the whole process running, we’ll create the initial board. We’ll use the function that takes a board and returns an evaluator (which is partially applied to the board).
+
+The evaluator is a function that takes a and returns a vector of . If the tree is just a single leaf (that’s the identity of our operad), the evaluation is trivial. The interesting part is the evaluation of a of branches.
+
+The function iterates over branches, applying a branch evaluator to each tree and concatenating the resulting evaluation vectors. The only tricky part is that each branch may end in a different number of leaves, so the branch evaluator must be polymorphic in :
+
+The branch evaluator must account for the possibility that a move might be invalid — it has to test whether the square has already been marked on the board. If it’s not, it marks the board and evaluates the move.
+
+First, there are two simple cases: the move could be a winning move or a losing move. In those cases when the result is known immediately, that is , , or , returns a vector of the size determined by the number of leaves in the branch. The vector is filled with the appropriate values ( , , or ).
+
+The interesting case is when the move is neither invalid nor decisive. In that case we recurse into with the new board and the sub-tree that follows the move in question. We gather the resulting evaluations and adjust the scores. If any of the branches results in a loss, we lower the score on all of them. Otherwise we add the score of the current move to all scores for that tree.
+
+At the very top level we have the game loop, which takes input from the user and responds with the computer’s move. A user move must be tested for correctness. First it’s converted to two values (or ). Then we create a singleton with that move and pass it to the evaluator. If the move is invalid, we continue prompting the user. If the move is decisive, we announce the winner. Otherwise, we advance the game by calling , and then pick the new evaluator from the resulting tree of comonadic values — the one corresponding to the user move.
+
+To generate the computer response, we create a two-deep tree of all possible moves (that is one computer move and one user move — that seems to be enough of the depth to win or tie every time). We call the evaluator with that tree and pick the best result. Again, if it’s a decisive move, we announce the winner. Otherwise, we call again, and pick the new evaluator corresponding to the selected move.
+
+Does it make sense to implement tic-tac-toe using such heavy machinery? Not really! But it makes sense as an exercise in compile-time safety guarantees. I wouldn’t mind if those techniques were applied to writing software that makes life-and-death decisions. Nuclear reactors, killer drones, or airplane auto-pilots come to mind. Fast stock-trading software, even though it cannot kill you directly, can also be mission critical, if you’re attached to your billions. What’s an overkill in one situation may save your life in another. You need different tools for different tasks and Haskell provides the options.
+
+The full source is available on github.
+
+Thanks go to André van Meulebrouck for his editing help.|||
+
+This summer I spent some time talking with Edward Kmett about lots of things. (Which really means that he was talking and I was trying to keep up.) One of the topics was operads. The ideas behind operads are not that hard, if you've heard about category theory. But the Haskell wizardry to implement them…

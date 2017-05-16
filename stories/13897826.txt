@@ -1,0 +1,53 @@
+PipelineDB has shipped! Download it here.
+
+This release contains some minor but necessary catalog improvements, so to migrate your existing installation to PipelineDB you'll want to use the binary upgrade tool.
+
+Without further ado, here's what PipelineDB gives you:
+
+Delta streams are the most interesting new feature in this release. Output streams were released a couple of versions ago, which give you a stream of the incremental changes made to a continuous view in the form of and tuples. Delta streams build on this abstraction by introducing another tuple into the output stream: the tuple.
+
+tuples contain the "difference" of the and tuple. For something like a aggregate, would simply be . Taking this idea further, tuples are generalized to work with any aggregate value supported by PipelineDB, and the values can be combined downstream with new groupings.
+
+Perhaps the most powerful capability this enables is the sharing of work between continuous views for greater efficiency and simpler, more elegant continuous topologies.
+
+Let's briefly look at an example. Suppose we have a continuous view that maintains a few metrics that require non-trivial state to maintain over time (e.g., not aggregates such as and , which require no intermediate state to maintain), and they're aggregated at a relatively high dimensionality:
+
+A very common pattern involves maintaining similar sets of metrics, but at different aggregation levels and dimensionalities for performance reasons, long-term archiving, etc. For example, we might have an hourly global rollup of the above metrics that we want it to be very fast to query at a glance, while remaining compact for archival data. If we only care about our metrics across all browsers and urls, the naive solution would be something like:
+
+While its on-disk footprint is much smaller, still must read the same number of input events as from , which is obviously sub-optimal.
+
+But we can do better now. Delta streams in conjunction with the aggregate make this kind of re-grouping very easy and efficient:
+
+These "down aggregated" combined metrics only require reading the stream of updates made to (which is much less intensive than reading from the granular stream), and lose no information in the process. That is, the output of is precisely equivalent to .
+
+Check out the delta stream docs for additional information.
+
+The previous release introduced time-to-live (TTL) support for continuous views. TTL expiration requires deleting expired rows in the background, which was previously done in the autovacuumer. This approach proved to be problematic, mainly because it wasn't conducive to aggressive enough deletions. By design, the autovacuumer is fairly considerate about the load it incurs on tables, and can often be canceled completely under certain conditions. Ultimately this meant that TTL deletions could be delayed for quite a while, leading to continuous views growing beyond their intended bounds and increasingly long-running delete transactions when deletions would eventually execute.
+
+Unfortunately we learned this the hard way. One of our customers began to observe TTL'd continuous views becoming unexpectedly large, happily maintaining many rows that were far outside of the TTL window. This cascaded into a number of other unexpected problems, so an interim solution was devised that would do deletions from these large CVs manually from . While not pretty, the approach worked very well, ultimately leading us to break out TTL expiration into its own process, called the "reaper" process.
+
+The reaper's only job is to execute deletions on TTL-expired rows as smartly as possible. It also limits the number of rows that can be deleted in a single transaction, preventing indefinitely long-running transactions.
+
+Check out the docs for more information, and take a look at some of the configuration options reaper processes expose.
+
+HyperLogLog is a fairly integral part of any PipelineDB deployment. It's implicitly used by , and generally very useful for any kind of analytics workload involving counting unique things in different ways. PipelineDB exposes a few different ways to build and manipulate HyperLogLog objects.
+
+One very common use of HyperLogLog objects with PipelineDB is to combine many of them together, ultimately allowing users to count uniques across different dimensions while not losing any information. PipelineDB internally combines them as well in order to incrementally update continuous views backed by HLLs.
+
+These combinations are done by unioning the HLLs, and this release adds an internal optimization for these unions. Without getting into the sorcery of how HyperLogLog works, basically you end up with a bunch of registers containing small integers jammed into an array of bytes. A union of two HLLs works by iterating over all of their registers, taking the of each. For compactness, these registers span word boundaries and therefore require quite a lot of bit packing/unpacking (CPU) to manipulate.
+
+So what this optimization does is "unpack" HLLs being unioned into a representation for which the registers are directly addressable as elements of an array, reducing the cycles required for unions by quite a bit. The tradeoff is obviously more memory usage at union time, which is more than worth it because the union result is presumably an aggregate result anyways, so it's already "small".
+
+Thanks to the thoughtful work of ankoh, the official PipelineDB Docker image got a facelift in this release. A few of the highlights:
+
+Check out the PR for more details.
+
+Last but not least, we've committed to making PipelineDB a standard PostgreSQL extension by version . The majority of PipelineDB's code is actually in its own modules at this point, but our plan is to incrementally roll out the remaining refactoring work over the upcoming , and releases.
+
+In terms of timeline, we're tenatively aiming to release PipelineDB simultaneously with PostgreSQL , which is currently slated for some time during the third quarter of 2017 (July - September). But if we can ship it earlier than that, we will. And if it takes a bit longer than that to get it right, then that's okay too. We'll keep you posted!
+
+But first, we need your help! The internal refactor work is relatively straightforward and specc'd out, but we want to be as careful and thoughtful as possible about getting the higher-level PostgreSQL <-> PipelineDB interface just right. And the best way for us to do that is to consider as much input from our amazing userbase as possible. You all have given us countless great ideas, and we'd apprecaite a few more as PipelineDB nears the big .
+
+We've created a generic issue here that we hope will serve as a sounding board for some of these fundamental design considerations, and we sincerely welcome your thoughtful input as we figure out just the right way to map existing PipelineDB functionality onto PostgreSQL's extension interface. Again here's the discussion:|||
+
+PipelineDB is an open-source relational database that runs SQL queries continuously on streams, incrementally storing results in tables.

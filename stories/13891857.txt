@@ -1,0 +1,44 @@
+Everyone uses GitHub. If you have huge amount of green paper or you are very paranoid about your code, you can run your own GitHub. For $2,500 USD per 10 user years you get GitHub Enterprise: A virtual machine containing a fully-featured GitHub instance. Despite a few edge cases that are handled with an occasional invocation, it runs the same code base as the original.
+
+When you download GitHub Enterprise, you will get a VirtualBox image which you can deploy on your own box. I booted some random recovery image to take a look inside the machine. Inside in the directory, there is the GitHub code:
+
+Unfortunately, it’s obfuscated. Most of the code looks like this:
+
+Turns out that there is a ruby module named that just runs on the binary string and then and XORs with the key "This obfuscation is intended to discourage GitHub Enterprise customers from making modifications to the VM. We know this 'encryption' is easily broken. " . They are right. The following tool deobfuscates the code:
+
+Now that I got my hands on the code, I started looking for vulnerabilities. I thought the management console would be a promising target. If you are the admin, you can add SSH keys (for root access), shut down services, etc. To the mere mortal however it looks like this:
+
+Not suprisingly, the code can be found in .
+
+Since the management interface is a rack app, the first thing I did was to look into the file to learn more about the architecture of the application, I noticed that the it uses . As you may have guessed from the name, that is the rack middleware that dumps session data into a cookie.
+
+The inner workings basically do nothing more than this:
+
+When the rack application is done, saves the session data into a cookie using this algorithm:
+
+Let’s have a closer look on the opposite direction (including an example): To load the data from the cookie, does the following. For example, let the cookie be set to this value.
+
+It splits the string on , runs a reverse url escape and decodes the result with base64 to get the binary data and the signature.
+
+Then it computes the expected hmac:
+
+If the computed hash matches the expected one, the result is fed into . Otherwise, it is discarded:
+
+There are two problems with the code above.
+
+To run arbitrary code, I needed to generate input to that runs my code upon deserialization. To achieve this, I need to construct code that runs on access to the object. This is composed of two stages:
+
+The way templates are parsed is that reads them and generates a object which contains the code in the template in the instance variable. So if I put my code there, I just need something to call and my code will be run.
+
+In there is a convient way to tell users that things have changed. It’s called . You can use it to deprecate an instance variable. If you run a method on that instance variable, it will call the new one for you and give a warning. That was exactly what I needed. See for example this session:
+
+If I now access it calls , which then runs the embedded shell command and returns 1.
+
+Now we just pack that into a session cookie, sign it with the secret and we have a remote code execution.
+
+Here is the full exploit code I sent to GitHub. For educational purposes only.
+
+Special thanks to joernchen of Phenoelit, who wrote a nice article on ruby on rails security. I used his technique for the exploit. Thank you!
+
+Special thanks also to Orange, whose blog article on Hacking GitHub Enterprise got me interested in GitHub Enterprise.|||
+

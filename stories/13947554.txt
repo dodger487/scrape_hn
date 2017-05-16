@@ -1,0 +1,99 @@
+NB: The usual blog disclaimer for this site applies to posts around HoloLens. I am not on the HoloLens team. I have no details on HoloLens other than what is on the public web and so what I post here is just from my own experience experimenting with pieces that are publicly available and you should always check out the official developer site for the product documentation.
+
+In my previous post I experimented with the basics of sharing holographic experiences by writing my own network pieces based on TCP and going through the basics of the APIs that let an application create an anchor for a hologram which can then be shared with another device such that multiple devices can have a shared co-ordinate system and enable holograms and interactions with them to span multiple devices.
+
+That was mostly about my own experimentation and I ended up building quite a bit of code but it was mostly for learning.
+
+In this post, I wanted to follow up on that by solely using pieces from the HoloToolkit to achieve a much more flexible and capable solution and with much less work on my part. My aim is to enable a scenario whereby;
+
+Clearly, there’s a lot more that you can do with shared holographic experiences but I just wanted to get this up and running to see how it looks if implemented purely with the HoloToolkit.
+
+Here’s the steps that I went through. As always with these posts, please refer back to the official documentation that I linked to extensively from my previous post and specifically this page on github;
+
+I’m going to share data between HoloLens devices by using the SharingService piece of the HoloToolkit-Unity which you’ll find in this folder;
+
+I think the sharing componentry in the HoloToolkit also has the capability to share data across devices without having a separate service acting as a server but I haven’t experimented with that to date and so I’m going to focus on using the sharing service in this post.
+
+This service can be run as either a simple command line exe (via the –local argument) or it can be run as a Windows Service via the –install/-remove arguments. To date, I’ve run it using the –local argument where it displays output something like;
+
+You can see here that the service listens on port 20602 on the various IP addresses that it finds on my system. This sharing service is quite a complex piece of kit and, as a minimum, it offers features including;
+
+The service can do more than this but that’s the core functionality that I’m going to make use of within this post.
+
+Before using the service, I’d strongly recommend making sure that you can connect to it from another machine to ensure that your firewall settings are ok. To help with that, in this folder;
+
+You’ll find a ‘Session Manager’ GUI tool which connects up to that server and offers quite a bit of functionality but, to start with,  it’s a useful, visual way of checking that things are working.
+
+Here’s an example screenshot below although note that I wasn’t running this from one PC to another – both apps here were running on the same PC;
+
+In the screenshot above, you can see that this tool has connected to a session on the localhost, port 20602 and the command line emits debug information to that effect;
+
+With this server up and running, how does an app connect to it?
+
+With a new project in Unity, I can bring in the HoloToolkit and then make sure that I have set up the project and scene settings as in this video;
+
+and then I can make sure that I have the right capabilities in my project which for my example here means;
+
+as below (plus the spatial perception capability which is just off screen here);
+
+From there, I can add some kind of blank 3D object (called ‘Placeholder’ below) into my scene;
+
+and then I can add a couple of components from the toolkit;
+
+The big component here is the SharingStage which brokers/owns the connection to the sharing service and has a tonne of functionality. You’d notice in the above screenshot that I have set up;
+
+but there’s a lot of options that you can set here.
+
+I’ve also added the Auto Join Session script which (as the name suggests) works on top of the Sharing Stage so as to attempt to automatically join a session named ‘Default’ here and to create it if it’s not already found on the sharing service.
+
+With that in place, I can run this code on my HoloLens and I see this sort of output from the Sharing Service;
+
+and so very quickly I’ve enabled multiple HoloLens devices to connect to this service and also to join a session on the service.
+
+The sharing service will then manage devices joining, leaving sessions.
+
+Now that I potentially have multiple HoloLens devices all talking to the same Sharing Service, I need to establish some reference point in the environment which all those devices can use to establish a shared coordinate system such that each user sees holograms in the right place.
+
+That’s what spatial anchors are for and I worked through the basics of sharing these across devices in my previous post and it runs something like this;
+
+In my example here, I want to be able to dynamically create some hologram (e.g. a cube) on one device and have it be visible on other devices and I can achieve this by setting up some parent object whose position and orientation is synchronised across the devices and which all other holograms can then take as their common reference point to position themselves relative to.
+
+If I make my synchronised parent object (an empty 3D object) as below along with an AnchorText prefab from the toolkit;
+
+then I can add a script called Import and Export Anchor Manager from the Toolkit to that SynchronizedParent;
+
+then this script does quite a lot of work for us including;
+
+So, this script (which lives in the Sharing\Tests\Scripts folder) is pretty much a one-stop shop in the sense that I can attach it to this SynchronizedParent game object and this script will ‘automatically’ try and make sure that this object is anchored across all the devices that are present in the named room. Note that the Anchor Debug Text here is very useful for monitoring what’s going on here. Note also that there’s a reasonable state machine inside of this script to go through all the stages of importing/exporting world anchors like making sure they are ‘located’ and so on. It does quite a few things for you.
+
+If I then run this code on my device then I see;
+
+and so on a second (and third) device, this anchor would be downloaded, imported and the associated object (SynchronizedObject) would be locked to be in the same position in the room on those devices as it was on the originating device.
+
+That means that it is now possible to create holograms relative to this parent object which will show up in the same position on all devices.
+
+It’s pretty easy to put a script onto the SynchronizedObject to handle the Tapped event. There are other ways, but here’s one;
+
+and then in that script, I can handle the Tapped event;
+
+but how to create a hologram here such that hologram will be replicated to the other devices that are connected to the Sharing Service? There are manual ways but it turns out that the sharing part of the toolkit has already thought of this and there’s a base class SpawnManager<T> and a derivation PrefabSpawnManager which helps with this. This is part of a larger set of functionality around having shared data models across devices but I’m only going to use this piece of it in this post.
+
+I can then tailor that previous script to use this support;
+
+and so rather than using the regular Instantiate method here to create an instance of a prefab, we call into the PrefabSpawnManager and ask it to do the work for us and it takes on the heavy lifting to do that in a way that is synchronized across the network. In order to make use of the GazeManager, I added in the InputManager prefab as it brings with it all the necessary dependencies;
+
+and the essential configuration here tells the script that when asked to create a SyncSpawnedObject it should use the test cube prefab set up in the Prefab property and so we have a mapping that says “SyncSpawnedObject” <-> “SpawnTestCube”. That test cube prefab itself comes from the toolkit so I just borrowed it rather than making my own cube.
+
+With that in place, I can configure it as the Spawn Manager property of my Tapped Handler;
+
+and that’s pretty much all that’s needed to enable the scenario where cubes created by one device will show up in the ‘same position’ on the other devices that are part of the sharing session.
+
+When multiple users are in a shared environment, it’s useful to be able to see the position and orientation of their heads (and sometimes also their gaze). There’s a script in the HoloToolkit which provides a starting point for this called Remote Head Manager and I added it to my SynchronizedParent object as below. It makes use of a custom message type containing the head position and rotation and so there’s a need to also bring in the Custom Messages script which goes with it;
+
+The script here is hard-wired to automatically create a cube to represent the user’s head position which could easily be changed but I left it as it was although I did make a minor change to move the cube vertically upwards by 30cm so that the cube wasn’t covering the user’s face.
+
+I happened to be in the same place as my colleague Pete and so we tried this code out to see how it came together and it works out quite nicely;
+
+There’s a lot more to the sharing support in the HoloToolkit but, for now, this was a good experiment to add to my previous post as there’s almost no code for me to write here and the functionality is increased. I’ll come back to this in follow on posts.|||
+
+NB: The usual blog disclaimer for this site applies to posts around HoloLens. I am not on the HoloLens team. I have no details on HoloLens other than what is on the public web and so what I post here is just from my own experience experimenting with pieces that are publicly available and you…

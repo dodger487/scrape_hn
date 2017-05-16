@@ -1,0 +1,78 @@
+You can offer the best technology in the world, but if you don’t document it properly, the only engineers that will use it are the ones that are paid to do it, or that enjoy adventure. Sure enough, your goal is to attract every type of developer.
+
+Building a great documentation search seems very easy at first but there are several pitfalls that you need to be aware of and avoid. This blog post explains those pitfalls and describes the recipe we have used to develop the Laravel documentation search.
+
+UPDATE: we have launched DocSearch, the easiest and fastest way to add search to your documentation. Take a look, it’s free!
+
+Developer documentations often mean lengthy pages filled with a lot of content. Most people try to index the complete page as one entry in their search engine. But, they discover later on that there were a lot of edge cases and they try to fix them through relevance tuning but it quickly becomes an endless story as the issue comes from the actual indexing itself:
+
+For example the query will match the QuickStart page because the menu contains and the first paragraph contains the word. This is not the kind of match that provides a good user experience.
+
+Developers don’t like to change web pages too often and they like to have long pages containing a lot of information. If such a page is indexed as one document, it will almost systematically trigger relevance issues. This is why we do not recommend to use a standard web crawler, but rather a scrapper to have access to the original content (most of the time available in Markdown).
+
+For example, querying  will match the Query Builder page because it contains a paragraph with the word and another paragraph with the words and . This is a false positive because it is not relevant: the more text you have on a page, the more irrelevant results you will get.
+
+In order to deliver the best user experience, it is key to open the page  at the exact position of the match. This is made very difficult if you only index one document per page. That’s why there are so many documentation searches that just open the page at the top and the user needs to scroll or use the search of his browser to jump to the right section. This not always easy and is a waste of time.
+
+Indexing the titles of your documentation page will probably answer common queries but this is not enough. The underlying paragraphs contain most of the words your users will search for. To obtain a great level of relevance, it’s important to index the whole content, body text included.
+
+In this example, the text is required to correctly answer to the or queries.
+
+With most search engines, relevance is the trickiest part of the configuration because it is often defined by a unique and complex formula that mixes a lot of information almost impossible to manage. Engineers often adjust the formula or add some bonus/malus scoring to improve the results on one specific query. Since they don’t have any non-regression tools, they cannot measure the real impact for all queries. The consequences can be significant.
+
+In order to keep the ranking under control, it is key to split the ranking formula in several pieces that you understand and will tune independently. In practice we are able to split the ranking formula with a Tie-Breaking algorithm.
+
+Let’s imagine your ranking formula is split in 2 parts:
+
+You can then first apply the textual relevance and only if two hits have the same value move to the use-case/business relevance (importance). This is the best way to ensure your end-users will always have relevant hits first (from a text POV, matching exactly their query words) and then – in terms of relevance equality – tie the results using the business relevance.
+
+Since you’re not mixing together the text & the business relevance (but applied them one after another), you can modify the business relevance without impacting how the text relevance is working.
+
+ Getting Started With Realtime Search
+
+In order to solve all those pitfalls, we split the page in a lot of smaller chunks indexed as separate records by using the HTML structure of the page (H1, H2, H3, H4, P).
+
+The first record generated will be the Validation page title. It will be transformed into the following JSON object. The “link” attribute only contains the last part of the URL, the first part being easily rebuilt with the tag:
+
+Then, the first section of the page (The Introduction) will be turned into the following record. The link now contains an anchor text and that keeps the title of the page:
+
+A paragraph of this page under a H3 section would be translated into the following record:
+
+This approach fixes pitfalls #1 and #2. We have solved the problem by indexing each chunk of text as an independent record while keeping the titles hierarchy in each record.
+
+Algolia is designed natively to use a Tie-Breaking algorithm to make sure everyone understands & is able to tune the ranking. Now,Pitfall #3 can be easily resolved by applying the settings we recommend for a documentation search implementation:
+
+Matching hits will now be sorted against those six ranking criteria: the first 5 are related to text relevance and the last one is the custom business relevance.
+
+First, we sort the number of query words found in the records. We have decided to process the query with all words as mandatory (AND between query terms). If there are not enough matching words, we run the query again with all words as optional (OR between query terms). This process is configured with a single index setting and allows your to get the best of both worlds: AND guarantees to reduce the number of false positives while OR allows to return results even if the query is too narrow.
+
+If two records match with the same number of search terms, we use the number of typos as the differentiator (so we have exact matches first, then matches with 1 typo, then matches with 2 typos, …).
+
+For example if the query is “validator”, the record that contains “validate” will match with some typos but will be retrieved after the record containing “validator”.
+
+When two records are identical for the words and typos ranking criteria, we then move to the next criteria which compares the proximity of the query terms in the record. It will basically count the number of words in between them until a limit is reached (after a certain point they are considered as “too far”).
+
+For example, the query will have a proximity of 1 when it matches the sentence: and will have a proximity of 2 when it matches the sentence . We sort this value by increasing order as we prefer records that contains the query terms close together first.
+
+If two records are identical for the 3 first ranking criteria, we use the name of the matched attribute to determine which hit needs to be retrieved first. In the index settings, just order the attributes you want to search by order of importance:
+
+That means that if the match is identified inside h1, it will be better than in h2, better than in h3, etc. You can also notice there is an “unordered” flag on each attribute. It means that the position of the match inside the attribute is not considered in the ranking. That’s why the query will match with the same attribute score for a record that contains   or   for the same attribute.
+
+If two records are identical for the first 4 criteria, then we use the number of query terms  that match exactly in the record to determine which hit needs to be retrieved first. Because we’re returning results after each keystroke, the last query term will mostly match as a prefix (it will match beginning of words). This criterion is used to rank an exact match before a prefix match.
+
+For example the query “valid” will retrieve the records containing “valid” before the ones containing “validation”.
+
+There is still one important thing missing: your use-case/business criterion. If all previous criteria are identical for two records, we use the custom ranking which is defined by the user.
+
+For example, searching for  will match the two following records using the most important “h1” attribute. That results in a tie on all previous criteria but we want to retrieve the page title first because the other record is a paragraph. This is how the attribute plays out when added to the records.
+
+The “importance” value is a integer that goes from 0 (page title) to 7 (text section under h4) and that we use in the custom ranking in an ascending order (the smaller, the better):
+
+The complete scale of importance is the following:
+
+We have successfully applied this recipe on several technical documentation,namely the Laravel documentation and Bootstrap documentation search. The way results are displayed differ but we use exactly the same approach and the same API.
+
+Get DocSearch for your website
+
+One of our missions is to help all developers to better access and navigate technical documentations. If you are working on an open source project we’d be happy to help you! We will provide you with a free Algolia account and with any support to make your implementation a best-in-class reference. Drop us a note!|||
+

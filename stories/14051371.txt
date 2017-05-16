@@ -1,0 +1,52 @@
+Do you want to know what your Go program is really doing? can show you: it visualizes all the runtime events over a run of your Go program, in exquisite detail. This under-documented tool is one of the most useful tools in the Go ecosystem for diagnosing performance problems such as latency, poor parallelisation, and contention. In my previous blog post I mentioned that we used at Pusher to track down long pause times in Go’s garbage collector. In this blog post, I’ll give you a deeper dive into .
+
+displays a lot of information, so it is hard to know where to start. Let’s get a rough overview of the interface first, and then we’ll look at how you can investigate specific problems with it.
+
+The UI is a web app. Below, I’ve embedded a live example of this web app! This example visualizes a trace of a parallel quicksort implementation:
+
+Note: the viewier is only compatable with Chrome.
+
+Play around with the example! For help navigating the UI, click the “?” in the top right. Click any event on the screen to get more information below the trace. Quiz time! Here are some things you can find out from this trace:
+
+You must instrument your program to emit runtime events to a binary file. This involves importing the package from the standard library, and adding a few lines of boilerplate. This quick video walks you through it:
+
+Here’s the code to copy-paste to follow along:
+
+This will cause your program to emit events in a binary format to the file . You can then run . This will parse the trace file and open a browser with the visualizer. It will start a server which will respond to the visualizer with the trace data. Once the initial page is loaded in the browser, click “View trace”. This will load a trace viewer like the one embedded above.
+
+Let’s run through examples of how you would track down typical problems using this tool.
+
+Latency problems can be introduced when a goroutine that is critical to completing an operation blocked from running. This can happen for a number of reasons: it is blocked on a syscall; it is blocked on a shared memory (channel/mutex etc); it is blocked on the runtime system (e.g. the GC), it’s even possible the scheduler is not running the critical goroutine as frequently as you would like.
+
+All of these can be identified using . You can track the problem down by looking at the PROCs timeline, and finding periods of time where a critical goroutine is being blocked for an unacceptably long period of time. Once you have identified this period of time, whatever is being run instead of the critical goroutine should give you a clue as to what the root cause is.
+
+As an example of a latency issue, let’s see what a long GC pause looks like from the previous blog post:
+
+The red-colored events represent when the one and only program goroutine is running. The goroutines running in parallel on all four threads are the MARK phase of the garbage collector. This MARK phase blocks the main goroutine. Can you see how long it blocks the goroutine for? 12 milliseconds, from 626 milliseconds until 638 milliseconds.
+
+I investigated this latency problem soon after the Go team announced typical GC pause times of less than 100 microseconds . So the long pause times I was seeing with looked odd, particularly because I could see they were occurring in the concurrent phase of the collector. I mentioned this to the go-nuts mailing list, and it appears to be related to this issue, which is now fixed in Go 1.8. My benchmark also surfaced another GC time pause problem, which is actively being worked on at the time of writing. This investigative work would be impossible without !
+
+Let’s say you’ve written a program which you expect to be using all CPUs, but it runs slower than you expect it to. This could be because your program is not as parallel as you expect. This can be caused by running too much of the critical path in serial, when parts could be run asynchronously (and in parallel).
+
+Example time! Say we have a pub/sub message bus that we want running in a single goroutine so that it can safely modify a of subscribers without a mutex. Request handlers write incoming messages to the message bus queue. The bus reads messages off the queue, looks up in the map which subscribers to send them to, and writes the message to their sockets. Let’s see what this looks like in for a single message:
+
+The initial green-colored event is where the http handler reads the published message and writes it into the message bus event queue. After that, the message bus runs in a single thread – the second green-colored event – writing the message out to subscribers.
+
+The red lines show where messages are written to subscriber’s sockets. How long does it take the process to write to all the subscribers? 16 milliseconds, from 4671 milliseconds until 4687 milliseconds.
+
+The problem is three out of four threads are sitting idle while this is going on. Is there a way we can make use of them? The answer is yes! We don’t need to synchronously write to each subscriber; these could be run concurrently in separate goroutines. Let’s see what happens if we visualize it with this change:
+
+As you can see, the period of time where messages are being written to subscribers is now happening on all threads, in many different goroutines.
+
+But is it faster? The message writing time previously took 16ms. It now takes 10ms (at least for these two messages). So that’s a win.
+
+It’s interesting to see that the speedup is modest, given that we are using 4X as much CPU. This is because there is a lot more overhead in running code in parallel: starting and stopping goroutines; sharing memory; separate caches. There is also a theoretical limit on the speedup which prevents us from achieving a 4X reduction in latency: Amdahl’s Law.
+
+In fact, it may often be less efficient to run code in parallel; particularly if the goroutines are very short lived, or there is a lot of contention between them. This is another reason to use this tool: try both approaches and check which works best for your use case.
+
+Of course, can’t solve everything. It’s not appropriate if you want to track down slow functions, or generally find where your program is spending most of its CPU time. For that you should use , which shows the percentage of CPU time spent in each function. is better suited at finding out what your program is doing over time, not in aggregate. Also, there are other visualizations offered by alongside the “View Trace” link, and these are particularly useful to diagnose contention issues. There’s also no substitute to knowing your program’s performance in theory (with old-fashioned Big-O analysis).
+
+Hopefully this post has given you a taste of how useful can be for diagnostics. Even if you don’t have a specific problem to solve, visualizing your program is a great way of checking that the runtime characteristics of your program match up with your intuition. I encourage you to fire up your Go program and give it a whirl. The examples I showed in this post were simple, but symptoms in your more complex programs should be surprisingly similar.
+
+This blog post gave you an introduction to using , but you may wish to dive deeper. The official docs for are currently quite sparse. There is a Google Doc that goes into more detail. Beyond that, I found it useful to refer to source code in order to figure out how worked:|||
+

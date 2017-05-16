@@ -1,0 +1,45 @@
+At Amplitude, we are always striving to improve our systems to provide better product analytics to our customers. One such system is Nova, a distributed query engine optimized for answering complex queries over aggregated sets of users. However, we have another set of queries that are focused on individual users, queries like retrieve a user’s timeline (stream of events performed by the user) or retrieve aggregate statistics (total number of events, total revenue, etc.) of a user. For such queries, we have a separate system called User Activity.
+
+Similar to our other systems, User Activity is also based on the lambda architecture design pattern. To recap, lambda architecture is a data-processing architecture designed to handle massive quantities of data by taking advantage of both batch and stream-processing real-time systems. User Activity’s real-time layer is served by PostgreSQL, where data is indexed by project-id, user-id and batch-date. The batch layer runs off Amazon S3 and we will be concentrating primarily on the batch layer in this blog. User Activity’s batch layer stores a file per user per batch-day. We store a new file per batch-day to keep our data files immutable, which helps us avoid complex cache invalidation problems.
+
+Initially, User Activity was hacked together as a quick, simple solution for customers to easily verify their instrumentation. But, as our event volume grew, this improvised solution became very costly and inefficient to query, because of the following limitations:
+
+Even though User Activity was designed to help people with instrumentation, it quickly became one of our most widely used features. We spoke to our customers to better understand their use-cases and pain-points with the existing system before designing the new system.
+
+Taking into account how important this feature was for our customers, the pain-points associated with it and the enormous S3 cost, we concluded that it needed a complete redesign.
+
+As this new system empowers us to traverse along the time dimension for an individual user, we call it Kronos, the God of Time.
+
+To achieve our goals of supporting flexible queries, improving query performance and reducing S3 costs, storing the batch results in the right storage format was crucial.
+
+We continued to use Amazon S3 as our canonical data store for Kronos, since S3 is durable and cost-effective.
+
+After a day rolls over, we run a batch job for each project to process all the data received on the previous day. The batch job transforms the raw data into a query-friendly data format and creates immutable storage units called tablets.
+
+The S3 filename follows a directory like structure and our ideal filename for a tablet would look like project-id/partition-key/primary-key/batch-day. Partition-key would help us parallelize work as it will partition data across folders and primary-key would help us to filter out users. As we wanted to parallelize along the time dimension for a user, we chose time as our partition-key and user-id as our primary-key. 
+
+The granularity we choose for our time-bucket would determine the level of parallelism and the number of files we generate. Trying to strike a good balance between parallelism and storage cost, we chose monthly time-buckets as our partition-key. The S3 filename evolved into 
+
+project-id/monthly-time-bucket/user-id/batch-day. This key looked promising and would have been great for query purposes, but we still hadn’t solved the S3 cost issue.
+
+We could reduce the cost by a factor of X if we could store X users in a single tablet; but that would make our queries be slower as it would require us to download and scan X timelines to find the right timeline. It would be great if we could read partial data from S3 and fortunately, AWS does support a partial-object-read. If we have access to the start-offset and the length of a user’s timeline inside a tablet, we can reduce costs significantly with minimal impact to query speeds. So, we partition users into groups and store a tablet per group to reduce S3 costs. We store the start-offsets and lengths of timelines in the tablet metadata.
+
+The final key for an S3 tablet looks like project-id/monthly-time-bucket/group-id/batch-day and the final structure is visualized in the diagram below.
+
+As we have already discussed above, Kronos is responsible for retrieving information associated with a single user. There are two types of queries supported by the Kronos Query API:
+
+The query layer is based on the MapReduce framework. As our query nodes are stateless, any node can act as the master node for the query. The master node receives a request on the Kronos API and is responsible for the final result of the query. It spawns a new map job for each time bucket and distributes these jobs across the query cluster. Each map job iterates through all the batch-days for the month, finds the right group tablet inside the batch-day and retrieves data for the user from the tablet.
+
+Example Query: Retrieve all events performed by a user (user-id: ‘123’) between Jan 15, 2017 and March 15, 2017. 
+
+Query Execution: The master node receives the request and spawns three map jobs, one each for January 2017, February 2017 and March 2017. Each map job iterates through all the batch-days and finds the right group-tablet for the user. To query data from a single tablet, we download the 
+
+S3-metadata associated with the file, that gives us the size of the tablet-metadata. We use S3 partial-object-read to download the tablet-metadata and deserialize it. If the tablet-metadata doesn’t contain the user-id, this tablet doesn’t have any data for the user and we move on to the next tablet. If the tablet-metadata contains the user-id, we retrieve the start-offset and the length of the timeline and use partial-object-read to download the raw events of the user and move on to the next tablet. The master node aggregates all the results received by the Map jobs and responds with the aggregated timeline of the user.
+
+We also have a cache layer on the query side that caches tablet-metadata(s) read from S3.
+
+We have replaced our legacy User Activity System with Kronos and it has been responsible for all of our user-level queries for the last three months.
+
+We’ve found incredible success in leveraging the performance and cost efficiency of S3 to build systems like Nova and Kronos. Because of the scale of our data at Amplitude, we’re always working on interesting distributed systems challenges. If you are interested in reading more, check out our engineering blog. If you’re excited about working on problems like this, please reach out to us at careers@amplitude.com!|||
+
+At Amplitude, we are always striving to improve our systems to provide better product analytics to our customers. One such system is Nova, a distributed query engine optimized for answering complex…

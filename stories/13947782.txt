@@ -1,0 +1,49 @@
+In the first part of this series we wrote a small process launcher as a base for our debugger. In this post we’ll learn how breakpoints work in x86 Linux and augment our tool with the ability to set them.
+
+These links will go live as the rest of the posts are released.
+
+There are two main kinds of breakpoints: hardware and software. Hardware breakpoints typically involve setting architecture-specific registers to produce your breaks for you, whereas software breakpoints involve modifying the code which is being executed on the fly. We’ll be focusing solely on software breakpoints for this article, as they are simpler and you can have as many as you want. On x86 you can only have four hardware breakpoints set at a given time, but they give you the power to make them fire on just reading from or writing to a given address rather than only executing code there.
+
+I said above that software breakpoints are set by modifying the executing code on the fly, so the questions are:
+
+The answer to the first question is, of course, . We’ve previously used it to set up our program for tracing and continuing its execution, but we can also use it to read and write memory.
+
+The modification we make has to cause the processor to halt and signal the program when the breakpoint address is executed. On x86 this is accomplished by overwriting the instruction at that address with the instruction. x86 has an interrupt vector table which the operating system can use to register handlers for various events, such as page faults, protection faults, and invalid opcodes. It’s kind of like registering error handling callbacks, but right down at the hardware level. When the processor executes the instruction, control is passed to the breakpoint interrupt handler, which – in the case of Linux – signals the process with a . You can see this process in the diagram below, where we overwrite the first byte of the instruction with , which is the instruction encoding for .
+
+The last piece of the puzzle is how the debugger is notified of the break. If you remember back in the previous post, we can use to listen for signals which are sent to the debugee. We can do exactly the same thing here: set the breakpoint, continue the program, call and wait until the occurs. This breakpoint can then be communicated to the user, perhaps by printing the source location which has been reached, or changing the focused line in a GUI debugger.
+
+We’ll implement a class to represent a breakpoint on some location which we can enable or disable as we wish.
+
+Most of this is just tracking of state; the real magic happens in the and functions.
+
+As we’ve learned above, we need to replace the instruction which is currently at the given address with an instruction, which is encoded as . We’ll also want to save out what used to be at that address so that we can restore the code later; we don’t want to just forget to execute the user’s code!
+
+The request to is how to read the memory of the traced process. We give it a process ID and an address, and it gives us back the 64 bits which are currently at that address. zeroes out the bottom byte of this data, then we bitwise that with our instruction to set the breakpoint. Finally, we set the breakpoint by overwriting that part of memory with our new data with .
+
+is easier, but still has a subtlety to it. Since the memory requests operate on whole words rather than bytes we need to first read the word which is at the location to restore, then overwrite the low byte with the original data and write it back to memory.
+
+We’ll make three changes to our debugger class to support setting breakpoints through the user interface:
+
+I’ll store my breakpoints in a structure so that it’s easy and fast to check if a given address has a breakpoint on it and, if so, retrieve that breakpoint object.
+
+In we’ll create a new breakpoint, enable it, add it to the data structure, and print out a message for the user. If you like, you could factor out all message printing so that you can use the debugger as a library as well as a command-line tool, but I’ll mash it all together for simplicity.
+
+Now we’ll augment our command handler to call our new function.
+
+I’ve simply removed the first two characters of the string and called on the result, but feel free to make the parsing more robust. optionally takes a radix to convert from, which is handy for reading in hexadecimal.
+
+If you try this out, you might notice that if you continue from the breakpoint, nothing happens. That’s because the breakpoint is still set in memory, so it’s just hit repeatedly. The simple solution is to just disable the breakpoint, single step, re-enable it, then continue. Unfortunately we’d also need to modify the program counter to point back before the breakpoint, so we’ll leave this until the next post where we’ll learn about manipulating registers.
+
+Of course, setting a breakpoint on some address isn’t very useful if you don’t know what address to set it at. In the future we’ll be adding the ability to set breakpoints on function names or source code lines, but for now, we can work it out manually.
+
+A simple way to test out your debugger is to write a hello world program which writes to (to avoid buffering) and set a breakpoint on the call to the output operator. If you continue the debugee then hopefully the execution will stop without printing anything. You can then restart the debugger and set a breakpoint just after the call, and you should see the message being printed successfully.
+
+One way to find the address is to use . If you open up a shell and execute , then you should see the disassembly for your code. You should then be able to find the function and locate the instruction which you want to set the breakpoint on. For example, I built a hello world example, disassembled it, and got this as the disassembly for :
+
+As you can see, we would want to set a breakpoint on to see no output, and to see the output.
+
+You should now have a debugger which can launch a program and allow the user to set breakpoints on memory addresses. Next time we’ll add the ability to read from and write to memory and registers. Again, let me know in the comments if you have any issues.
+
+You can find the code for this post here.|||
+
+Personal blog and CV for Simon Brand

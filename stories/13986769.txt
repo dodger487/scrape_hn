@@ -1,0 +1,117 @@
+For our products, like the trivago hotel search, we are using Redis a lot. The use cases vary: Caching, temporary storage of data before moving those into another storage or a typical database for hotel meta data including persistence.
+
+The main parts of the hotel search are built with PHP and the Symfony Framework for the frontend (web) and Java for the backend part. In this article, we will focus on the collaboration between our PHP application and Redis. Both are running fine, but it was a long and hard way up to the current situation. This is the story of how we learned to use Redis, including our failures and experience.
+
+This story began on Friday, September 3, 2010. At 10:33am the first classes of Predis, a Redis client library for PHP, were committed into our codebase.
+
+This moment can be marked as the introduction of Redis into our PHP stack. Fast forward to February 2013. We replaced the library Predis (PHP implementation) with the PHP extension phpredis (C implementation). The reason was simple: Performance. The replacement went well. Everything with Redis was fine and we enjoyed the summer that year.
+
+The real fun started exactly one year later in February 2014. Around this time, we launched new features and added new languages to our platform. The result of this: The HTTP traffic doubled in a short time. Due to good capacity planning on the hardware side, we were able to handle the growth. On the software side however, we were confronted with 40% of the incoming requests resulting in HTTP 500: Internal Server Error.
+
+After investigating our logs, we saw errors related to the PHP <-> Redis connection handling. Most of them were read error on connection and Redis server went away. Our logging was verbose and gave us enough detail to start our debugging session:
+
+A quick google search showed that we were not alone with this issue. See debug read error on connection #70 and ‘read error on connection’ #492.
+
+Based on the discussion in the tickets, we thought: Congratulations, we got ourselves a nasty bug there.
+
+We had no clue what the root cause was. Redis had been working fine for more than 3.5 years, and had never caused us any trouble before. Leaving us with the question: How do we continue from here? Our first attempt was to try everything that was mentioned in the Github issue:
+
+Nothing helped to solve this issue in a reliable way. So back to traditional debugging! We tried to reproduce the issue in our pre-production environments. Sadly, we were not successful. We thought that those issues only appeared with much higher traffic. So we continued to deep dive into our applications …
+
+PHP applications are usually stateless. Everything you allocate in a request is gone once the request finishes. At this time, we were not using php-fpm and persistent connections. This means that every HTTP request would create a new Redis connection. While checking our connection handling to Redis, we opened a connection, but never closed it.
+
+This should not make a difference in newer PHP versions. PHP will automatically close the connection when your script ends. In older versions, however, this could lead to problems like stale connections or memory leaks. Besides that: It is good practice to close your connections, so we fixed it. But that did not help us with our initial problem.
+
+We kept on searching and asked ourselves if we hit a bug in phpredis (php extension). To verify this hypothesis, we implemented an A/B-Test. The necessary infrastructure to run A/B-Tests was already there. So we used it and switched from the C extension back to the library.
+
+We were pleased to find that was still being maintained and had received a lot of development love.
+
+Due to good code structure, this change was done quickly. We implemented one interface, replaced the phpredis connection implementation with predis and reconfigured our dependency injection container.
+
+We deployed the test to 20% of our users in one datacenter. The errors occured again. In both libraries! Was this another failure on our road to fix this bug? No! We considered it a partial success. We were able to exclude the extension ( ) as a possible root cause.
+
+Our next step was to have a deeper look at the Redis side. Common steps in an investigation of a bug are checking out the issue tracker of the project or getting in contact with one of the maintainers. The first thing they will ask is “What version are you running?”. Once you mention a version that is not the latest in the upstream, they will answer “Please upgrade and check if it still occurs”. This is what we did.
+
+At this time we were running Redis v2.6. The latest upstream version was v2.8.9. We thought that maybe we hit a bug that was already resolved. Unfortunately, this was not the case. We made no progress related to our problem, but at least our Redis servers were up to date. :)
+
+After reading a lot of documentation, we came across a feature for debugging latency problems. It’s called Redis Software Watchdog. It was (and still is) marked as experimental in the official documentation but we wanted to give it a try. The idea was to identify long running and blocking commands.
+
+So we activated Watchdog, waited a few seconds and Murphy’s law kicked in. We hit a bug and our Redis server crashed. In production! See Software watchdog crashes redis during rdb save point #1771. Again: Related to our main problem, we made no significant progress at this time. Instead, we had a new problem: An offline Redis database (which was immediately restarted, of course). So we kept going.
+
+We started the next try by measuring the latency baseline of our Redis setup. The numbers of the intrinsic-latency looked pretty good. The base latency looked horrifying.
+
+We checked the Redis logs and discovered that Redis was saving data to disk every few minutes:
+
+We run Redis on bare metal servers with (nearly) default configuration, because it is shipped with sane defaults. Our first question was Why did the fork of a background saving process take ~400ms? (have a look at the first two log lines). After reading a few mailinglist posts and the implementation of BGSAVE, we understood why. Redis is forking a background process and needs to copy the page table. So, if you have a big Redis instance with many keys, it will take time. Even on bare metal, without virtualization. By now, this behaviour has been added to the offical documentation. See Fork time in different systems.
+
+As a follow-up we deactivated Redis snapshots for services where persistence was not needed. This reduced the amount of by more than 30%.
+
+For instances where persistence is needed, the usage of snapshot points can be tricky. If you have a lot of traffic on your instances and your application is doing write operations per request you will have more key modifications. This leads to more triggers and (possibly) a bigger amount of rejected connections. The reasons are higher process fork times and blocked Redis instances.
+
+This was the case in our situation. Our application is reading and writing keys, but we didn’t want to deactivate persistence globally. We deactivated the snapshot points in those Redis instances and activated cronjobs that will call the command at a specific time (rolling BGSAVE). With this we know when a dump is triggered and can avoid those during high traffic times. An alternative to rolling BGSAVE operations would be a separate slave instance for persistence. This slave will not handle real traffic and its only purpose is to take care of persistence. In use cases with higher persistence requirements we prefer to use AOF. If you want to know more about “rolling BGSAVE” we started a small post on the old Redis mailinglist to discuss this topic. See Rolling BGSAVE instead of (pre)-configured save points.
+
+This change was considered a success. We reduced our error/timeout problems immediately (even in non-peak traffic times). But we still saw errors popping up here and there, so we were not done yet.
+
+Since Redis has been introduced into our web stack, it was adopted by more and more teams for various use cases.
+
+They used the existing Redis instances and stored their data in a different database. This way, they could start right a way. This was great for several reasons, but led us to our next challenge.
+
+One team had a cronjob running every 15 minutes that dumped data from a MySQL database into a shared Redis instance via the Pipelining feature. Due to the single threaded nature of Redis the shared Redis instance was blocked every 15 minutes for several seconds.
+
+We moved the cronjob to its own Redis instance. As a result, the (former) shared instance threw a lot less connection and timeout errors than before. Due to the split of data contexts the amount of commands per instance was reduced. Furthermore, starting several Redis instances per server leads to a better utilization of computing resources. Why? Again: Redis is single threaded! And modern servers have a lot of cores.
+
+Side note: The usage of SELECT and multiple databases inside one Redis instance was mentioned as an anti pattern by Salvatore.
+
+Okay, we found several causes and reduced the amount of connection and timeout errors by an order of magnitude. Everything went well for a long time and our Redis setup was healthy. The time went by, teams implemented new features into our application and our traffic continued to grow. The traffic growth went fast and the connection and command timeout errors came back.
+
+Our first thought: Really? Murphy? Are you there?
+
+Luckily we saw a pattern in the occurrence of the message. It occurred periodically every 5 minutes. Based on our knowledge from the last investigation we started right away. We measured the base latency, enabled watchdog and read the SLOWLOG documentation.
+
+In a very short time, compared to previous investigations, we identified a cronjob that fires the KEYS * command against a big Redis instance. Luckily the Redis documentation describes the Time complexity per command with the help of the Big O notation. The time complexity of the KEYS command is defined as:
+
+In big databases and depending on the pattern you apply on the KEYS command this operation can lead to a long blocking Redis instance.
+
+Back in 2014 there was only a small note in the Latency generated by slow commands documentation, which said the KEYS command should only be used for debugging purposes. In the meantime the command reference was extended and a warning related to this was added.
+
+Based on this new experience we had a look at our application code again. We checked all Redis commands with a special attention to the use case, used data structure and their time complexity. This was a lot of work, but it paid off. We optimized over 40% of the executed commands which led to less time spent in the communication with Redis. In the end this led to an overall faster response time of our web stack. We were fine again.
+
+We accepted the challenge with the ever growing amount of traffic in the following months and further optimized our application and stack in several ways. Some of our goals were tackling the consumption of memory per request, optimizing our database queries (slow query log), tuning our caching layers and adding more hardware (web servers) to our datacenters. Especially the last change, adding more web servers to our stack, created yet another challenge.
+
+As mentioned earlier, we were dealing with stateless applications. Without the usage of php-fpm and persistent connections this means:
+
+This worked great so far and this is the way many applications work. But if you scale the number of servers that can accept incoming requests, your traffic grows and you don`t pay special attention to your 3rd party components this can go wrong. Very wrong.
+
+Depending on the request, the application creates third party connections, executes one or two commands and disconnects again. 50% up to 75% of the commands we execute are used for connection handling. Remember Redis is single threaded. If you have a lot of clients that try to connect to your Redis instance continuously, you will keep your instance busy with connection handling instead of executing the commands you run your business logic on. This may lead to a slowdown/blocking of your Redis instance. The (simplified) image above visualizes the problem. Every arrow represents one HTTP client request.
+
+This problem sounds like a typical proxy problem. Subsequent research showed that we were not alone and that this problem had been solved before. One solution is twemproxy by twitter. twemproxy was created specifically for this use case. You install this proxy on every webserver and twemproxy holds a persistent connection to your Redis instance(s). Your application will only connect to the local proxy which should be a lot faster, because it connects to a unix domain socket instead of an external service via network. And even better: It supports memcached as well. This was good news for us, because memcached is part of our stack and might face this problem in the future.
+
+So we introduced twemproxy into our stack. It was not a “put it in and everything is working” project. We had several small adjustments to make before it was a success, like
+
+As described earlier the usage of multiple databases was marked as an anti pattern. At this time we were not able to move all our applications away from connecting to different databases on one Redis instance so the capability to SELECT a database other than the default one was still a requirement for us.
+
+Another advantage of twemproxy is its ability to block expensive commands. So it can act like a circuit breaker for commands like KEYS and dangerous operations like FLUSHALL and FLUSHDB.
+
+The downside of this: Every new command of future Redis versions needs to be supported by twemproxy as well. If you upgrade your Redis installation to use new features, like GEO commands, twemproxy support needs to be added and deployed as well.
+
+The deployment of twemproxy was a great success. We eliminated all timeout and connection errors that were left (without buying new hardware).
+
+All known root causes for the connection and command timeouts were solved. The growth and traffic of our platform still continued and we continued to optimize our Redis usage.
+
+Two of our Redis use cases were caching of calculated data and short term (~1 min.) storage. At some point in time one machine will not be able to handle those use cases alone anymore, because
+
+As a follow up we started to shard our data over several machines using consistent hashing. Luckily this way of sharding is natively supported by twemproxy. This resulted in:
+
+Both points are a big win, especially the second one. If a machine fails (e.g. hardware failure) our service is able to operate normally. Only a small percentage of compute and storage power is sacrificed. We applied this pattern to every use case where it made sense or was applicable We didn’t regret it. Most prominently, due to a node failure in this component last year this optimization had its debut.
+
+In this post, we told you our painful story of how we learned to use and benefit from Redis. During the time of identifying and fixing these issues, we faced multiple challenges like the constantly increasing HTTP traffic to our platform and understanding the implications of operating such a database.
+
+Looking back this was not only a technical issue and now this seems to be obvious. The root causes of these errors were more a conceptional issue. The way we used Redis was not ideal for this kind of traffic and growth.
+
+After understanding the issues more and more it was clear that there is no “silver bullet” to solve this problem. There were several important lessons like
+
+We had a hard but exciting time and all of us learned a lot. Ever since we applied the changes described here to our setup we didn’t face any bigger issue. But be aware: There are many other things you have to take care of when you run Redis in production like
+
+Did you experience similar issues/problems? Or were you able to use any of the tips mentioned here? Let us know in the comment section.|||
+
+Technology blog of trivagos tech departments

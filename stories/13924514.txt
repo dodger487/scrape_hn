@@ -1,0 +1,39 @@
+Last year we released TrailDB, a library we use extensively at AdRoll to efficiently store event data. Today we’re open sourcing trck, a query engine complementary to TrailDB that we use to analyze trillions of discrete events in TrailDBs every day.
+
+As you may remember, the TrailDB data schema is very simple:
+
+Every user (or “trail”) has a sequence of timestamped events associated with it. Every event has a number of fields, and the set of fields is fixed per TrailDB.
+
+For example, a dataset of Wikipedia edits may contain a user’s IP address and page title as fields:
+
+Right now, if you want to query these data you can use Python or R bindings to TrailDB. So, if we want to count the number of user sessions in a TrailDB we could do this in Python:
+
+Here, a user session is defined as a series of events no more than 30 minutes apart. If we run this script on a sample database from the TrailDB tutorial, it processes wikipedia-history-small.tdb in about 100 seconds on my laptop.
+
+It doesn’t sound like a lot, but that database is pretty tiny: it contains 6.5M events and 450K trails, and takes about 100MB on disk. We routinely use multi-gigabyte TrailDBs containing billions and trillions of events.
+
+At large scale, Python starts to struggle to process all the data quickly enough. And it is not so much the Python interpreter itself; if you use PyPy, or even a completely different language, there is substantial overhead that comes just from decoding and marshalling event data since it is so granular.
+
+That made us realize that it would be nice to have a way to query TrailDBs in some way that can bypass all that marshalling. After all, many queries are not so complicated to require a full-blown Turing complete language to express them. Conceptually, something like , , or a regular expression engine would do, except it has to work on structured events with fields and have a concept of time.
+
+One thing to note is that many queries on event-based data have much in common. Usually you want to keep some kind of minimal state per trail (that’d be in the above example) and then depending on what events you see down the line, you take some kind of action, such as incrementing a session counter.
+
+That sounds very similar to regular expressions, or, speaking more generally, finite state machines. For example, the above script can be expressed as a state machine:
+
+We start at the state. Then, when we see an event in the trail, we transfer to the state and then on any following event, we keep coming back to . If we sit in for 30 minutes and nothing happens, we transfer back to (and increment session counter).
+
+And that’s what our small query language called does: you can express your query as a state machine, with some actions, like incrementing a counter, attached to edges.
+
+Then we can easily compile this to C code that works with TrailDB directly. If we save the above snippet as , call the compiler to produce a binary, and then run it on :
+
+Note that the evaluation of a state machine can be also trivially parallelized, as there are almost no data dependencies between state machines for different users. The compiler employs OpenMP for that.
+
+As a result, this example produces the same result as the Python script, except it runs on wikipedia-history-small.tdb in about 800ms, or 100x faster. And if you run it on a much larger dataset wikipedia-history.tdb that contains the full edit log of Wikipedia for fifteen years (5GB, 600M events), it takes about 90 seconds on my laptop and scales very well with the number of cores. On a reasonably sized 16-core EC2 instance, the same query runs in 40 seconds.
+
+There is a lot more you can do with : for example, in addition to counters it supports set and multiset types. There are also nested timeouts on states and some interesting higher-level optimizations that allow it to skip parts of trails that have no chance of altering the state. Check out the README.md in the repository.
+
+The compiler front end is implemented in Python using PLY. It takes the state machine and compiles it to C code, that is then linked with the runtime library (written in C99), producing a static binary. It is tested on Linux and on OS X. It is now available under the MIT license on GitHub .
+
+If you have questions, you’re welcome to join our TrailDB Gitter channel.|||
+
+We're open sourcing trck -- a state machine-based query language for TrailDB

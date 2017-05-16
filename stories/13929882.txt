@@ -1,0 +1,55 @@
+HCE allows an Android app to act like a Smartcard. Before Android 4.4, doing this was generally not possible for typical developers, because it required installing a JavaCard applet in the Secure Element (SE) of the phone, which is something that normally only the device vendor can do. You can find out a lot more on this topic in the official Android documentation on HCE.
+
+With HCE, an app can register an Android Service that can communicate with an NFC terminal through exchange of APDUs (Application Protocol Data Units). The service is identified by an AID (Application Id), a unique byte string that identifies an NFC application, similar to an IntentFilter. The NFC terminal initially queries the Android NFC stack if it supports the AID it expects. If Android finds a service supporting the AID, it will establish a link between the Android Service and the NFC terminal for the duration of the session.
+
+After the link is set up, the Service and the terminal can exchange arbitrary data through APDUs (Application Protocol Data Units). What you put in these APDUs is up to you.
+
+The diagram below shows the flow of data between the phone, the NFC terminal and the HTTP server.
+
+As the average HTML file will be far larger than the maximum size of an APDU of 255 bytes, the data is split over a number of packets. Every packet transmission carries the sequence number and also the total number of packets (there is obviously optimization potential in this). The APDUs exchanged between the terminal and phone in hex representation are listed below.
+
+The specification allows for extended length APDUs (up to 64 KB), but Android does not seem to support them (see issue: https://code.google.com/p/android/issues/detail?id=76598), even though most NFC controllers do.
+
+For the NFC terminal, we decided to use an Adafruit PN532 breakout board, connected to a RaspberryPi 3 via SPI (serial peripheral interface). The PN532 is the most popular chip according to Adafruit, and we have a gazillion RaspberryPi’s lying around so this seemed like a good setup, not to mention that both are 3.3v systems so no level-shifting is required. The code should work with other setups too, since libnfc provides a hardware abstraction layer for the NFC reader (we just happen to use the PN532 SPI driver), and libnfc supports plenty of other platforms as well.
+
+We used SPI to interface the PN532 with the RaspberryPi. Wiring the RaspberryPi and the PN532 is straightforward:
+
+The PN532 also supports UART and I2c but we did not try this out. Special thanks to Andreas Schweizer for soldering some connectors!
+
+You also need to enable the SPI interface on the RPi. The easiest way to do it is by using raspi-config. If it worked, the SPI kernel module should appear in the lsmod output. You might need to reboot your Pi for this.
+
+Now let’s build libnfc. Your distribution may already have a package for it, but by building it ourselves we can make sure that the pn532_spi driver is included. Log in to your RaspberryPi, download libnfc from https://github.com/nfc-tools/libnfc/releases and build and install it based on the libnfc documentation.
+
+Next, configure the PN532 as the default device that libnfc uses. Create a configuration file at /etc/nfc/libnfc.conf with the following contents:
+
+To test if it works correctly, use libnfc’s nfc-poll test tool, which waits for an NFC device to appear and dumps some information about it. In our case, the following output appears when holding the sample MIFARE tag included by Adafruit to the reader:
+
+Great! If you got this far, you’ll probably stick around.
+
+We won’t dive into the implementation of the terminal application and just provide some pseudocode.
+
+If you want to dig deeper, feel free to look at the source code, it’s contained in a single C file. The application generates console output detailing the exchanged packets. In the example below, the application receives the URL https://www.classycode.com from the phone, downloads it, and spreads it over 21 packets of 250 bytes size each.
+
+You may need to lower the packet size for your phone, but this value worked reliably on Google Pixel and Samsung Galaxy S6 and S7 phones.
+
+The Android app consists of two components:
+
+We need to let Android know that we provide an APDU service, i.e. want to do Host Card Emulation. Like other services, it needs to be mentioned in the AndroidManifest.xml:
+
+In addition, Android also needs to know which AIDs the service will be responsible for. This is provided in a separate XML file (res/xml/http_tunnel_aid.xml):
+
+The processCommandApdu method contains all the communication logic between the app and the terminal. The method is given below, but the details are not important and straightforward.
+
+As Android Activities and Services are instantiated by Android and have separate life cycles, they need to communicate between each other using Intents. We use the LocalBroadcastManager class to broadcast messaging between the two. You could also use a shared EventBus. The service broadcasts the following events for the Activity to receive:
+
+Note: we store the received data in a byte array and put it into an extra (basically a bunch of user-defined key-value pairs) of the DATA_RECEIVED Intent. This will not work for larger payloads, you would need to use a file handle in this case.
+
+The activity communicates with the service indirectly, by saving the URL to be downloaded by the service in the SharedPreferences. The service reads the URL from SharedPreferences, or falls back to a default URL if none is present. Alternatively a broadcast could also be used here, but this way the setting is persisted and a custom URL does not have be entered over and over again.
+
+Note that there is no user interaction during the NFC session, as the user would typically move the phone out of the reader’s range. Fingerprint reading is the exception, and we’ll look at that in our next post.
+
+The aim of this post was to show that NFC can be used for other things than just loyalty cards and payment. By implementing a simple URL download facility, we showed that it’s easy to exchange arbitrary data in both directions. What are you building with NFC? Let us know in the comments section.
+
+Please recommend this story if you enjoyed reading it!|||
+
+Update: This post has a follow-up that generalizes the idea shown here so that anything can be tunneled through NFC. https://blog.classycode.com/sockets-over-nfc-on-android-c294b6c58bbf This post is…

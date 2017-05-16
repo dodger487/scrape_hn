@@ -1,0 +1,62 @@
+In a previous post we discussed the performance limitations of the Linux kernel network stack. We detailed the available kernel bypass techniques allowing user space programs to receive packets with high throughput. Unfortunately, none of the discussed open source solutions supported our needs. To improve the situation we decided to contribute to the Netmap project. In this blog post we'll describe our proposed changes.
+
+At CloudFlare we are constantly dealing with large packet floods. Our network constantly receives a large volume of packets, often coming from many, simultaneous attacks. In fact, it is entirely possible that the server which just served you this blog post is dealing with a many-million packets per second flood right now.
+
+Since the Linux Kernel can't really handle a large volume of packets, we need to work around it. During packet floods we offload selected network flows (belonging to a flood) to a user space application. This application filters the packets at very high speed. Most of the packets are dropped, as they belong to a flood. The small number of "valid" packets are injected back to the kernel and handled in the same way as usual traffic.
+
+It’s important to emphasize that the kernel bypass is enabled only for selected flows, which means that all other packets go to the kernel as usual.
+
+This setup works perfectly on our servers with Solarflare network cards - we can use the API to achieve the kernel bypass. Unfortunately, we don’t have this functionality on our servers with Intel IXGBE NIC’s.
+
+This is when Netmap comes in.
+
+Over the last few months we’ve been thinking hard about how to achieve bypass for selected flows (aka: bifurcated driver) on non-Solarflare network cards.
+
+We’ve considered PF_RING, DPDK and other custom solutions, but sadly all of them take over the whole network card. Eventually we decided that the best way would be to patch Netmap with the functionality we need.
+
+Usually, when a network card goes into the Netmap mode, all the RX queues get disconnected from the kernel and are available to the Netmap applications.
+
+We don't want that. We want to keep most of the RX queues back in the kernel mode, and enable Netmap mode only on selected RX queues. We call this functionality: "single RX queue mode".
+
+The intention was to expose a minimal API which could:
+
+The patch to Netmap is awaiting code review and is available here:
+
+The minimal program receiving packets from RX queue #4 would look like:
+
+This code is very close to a Netmap example program. Indeed the only difference is the call, which uses the new syntax .
+
+Once again, when running this code only packets arriving on the RX queue #4 will go to the netmap program. All other RX and TX queues will be handled by the Linux kernel network stack.
+
+You can find a more complete example here:
+
+In multiqueue network cards, any packet can end up in almost any RX queue due to RSS. This is why before enabling the single RX mode it is necessary to make sure only the selected flow goes to the Netmap queue.
+
+To do so it is necessary to:
+
+Here we are setting the indirection table to prevent traffic from going to RX queue #4. Then we are enabling flow steering to enqueue all UDP traffic with destination port 53 into queue #4.
+
+Here's how to run it with the IXGBE NIC. First grab the sources:
+
+Load the netmap-patched modules and setup the interface:
+
+At this point we started flooding the interface with 6M short UDP packets. shows the server being totally busy with handling the flood:
+
+To counter the flood we started Netmap. First, we needed to edit the indirection table, to isolate the RX queue #4:
+
+This caused all the flood packets to go to RX queue #4.
+
+Before putting an interface in Netmap mode it is necessary to turn off hardware offload features:
+
+As you see the netmap program on a single RX queue was able to receive about 5.8M packets.
+
+For completeness, here's an showing only a single core being busy with Netmap:
+
+We would like to thank Pavel Odintsov who suggested the possibility of using Netmap this way. He even prepared the initial hack we based our work on.
+
+We would also like to thank Luigi Rizzo, for his Netmap work and great feedback on our patches.
+
+At CloudFlare our application stack is based on open source software. We’re grateful to so many open source programmers for their awesome work. Whenever we can we try to contribute back to the community - we hope "the single RX Netmap mode" will be useful to others.
+
+You can find more CloudFlare open source here.|||
+

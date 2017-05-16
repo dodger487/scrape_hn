@@ -1,0 +1,88 @@
+TL;DR: when configuring a Linux bridge, use the following commands to enforce isolation:
+
+A network bridge (also commonly called a “switch”) brings several Ethernet segments together. It is a common element in most infrastructures. Linux provides its own implementation.
+
+A typical use of a Linux bridge is shown below. The hypervisor is running three virtual hosts. Each virtual host is attached to the bridge (represented by the horizontal segment). The hypervisor has two physical network interfaces:
+
+The main expectation of such a setup is that while the virtual hosts should be able to use resources from the public network, they should not be able to access resources from the infrastructure network (including resources hosted on the hypervisor itself, like a SSH server). In other words, we expect a total isolation between the green domain and the purple one.
+
+That’s not the case. From any virtual host:
+
+There are two main factors of this behavior:
+
+After turning an incoming Ethernet frame into a socket buffer, the network driver transfers the buffer to the function. The following actions are executed:
+
+For a bridged interface, the kernel has configured a device-specific receive handler, . This function won’t allow any additional processing in the context of the incoming interface, except for and frames or if “brouting” is enabled. Therefore, the protocol handlers are never executed in this case.
+
+After a few additional checks, Linux will decide if the frame has to be locally delivered:
+
+In this case, the frame is passed to the function. A VLAN-related check is optionally performed. The socket buffer is attached to the bridge interface ( ) instead of the physical interface ( ), is evaluated by Netfilter and sent back to . It will go through the four steps a second time.
+
+When a device doesn’t have a protocol-independent receive handler, a protocol-specific handler will be used:
+
+Therefore, if the Ethernet type of the incoming frame is , the socket buffer is handled by . Among other things, the three following steps will happen:
+
+Reverse-path filtering (also known as uRPF, or unicast reverse-path forwarding, RFC 3704) enables Linux to reject traffic on interfaces which it should never have originated: the source address is looked up in the routing tables and if the outgoing interface is different from the current incoming one, the packet is rejected.
+
+When the Ethernet type of the incoming frame is , the socket buffer is handled by .
+
+When the Ethernet type of the incoming frame is , the socket buffer is handled by .
+
+There are various methods to fix the situation.
+
+We can completely ignore the bridged interfaces: as long as they are attached to the bridge, they cannot process any upper layer protocol (IPv4, IPv6, ). Therefore, we can focus on filtering incoming traffic from .
+
+It should be noted that for IPv4, IPv6 and protocols, the MAC address check can be circumvented by using the broadcast MAC address.
+
+The four following fixes will indistinctly drop IPv4, and IPv6 packets.
+
+Linux 3.9 introduced the ability to use VLAN filtering on bridge ports. This can be used to prevent any local traffic:
+
+This is the most efficient method since the frame is dropped directly in .
+
+It’s also possible to drop the bridged frame early after it has been re-delivered to by . The ingress policy of an interface is evaluated before any handler. Therefore, the following commands will ensure no local delivery (the source interface of the packet is the bridge interface) happens:
+
+In my opinion, this is the second most efficient method.
+
+Just before re-delivering the frame to , Netfilter gets a chance to issue a decision. It’s easy to configure it to drop the frame:
+
+However, to the best of my knowledge, this part of Netfilter is known to be inefficient.
+
+Isolation can also be obtained by moving all the bridged interfaces into a dedicated network namespace and configure the bridge inside this namespace:
+
+The frame will still wander a bit inside the IP stack, wasting some CPU cycles and increasing the possible attack surface. But ultimately, it will be dropped.
+
+Unless you require multiple layers of security, if one of the previous workarounds is already applied, there is no need to apply one of the protocol-dependent fix below. It’s still interesting to know them because it is not uncommon to already have them in place.
+
+The easiest way to disable processing on a bridge is to set the flag on the device. The packet will be dropped as the very first step of the handler.
+
+can also drop the packet quite early:
+
+Another way is to set to 2 for the given interface. The kernel will only answer to requests whose target IP address is configured on the incoming interface. Since the bridge interface doesn’t have any IP address, no requests will be answered.
+
+Disabling processing is not a sufficient workaround for IPv4. A user can still insert the appropriate entry in its neighbor cache:
+
+As the check on the target MAC address is quite loose, they don’t even need to guess the MAC address:
+
+The earliest place to drop an IPv4 packet is with Netfilter:
+
+If Netfilter is disabled, another possibility is to enable strict reverse-path filtering for the interface. In this case, since there is no IP address configured on the interface, the packet will be dropped during the route lookup:
+
+Another option is the use of a dedicated routing rule. Compared to the reverse-path filtering option, the packet will be dropped a bit earlier, still during the route lookup.
+
+Linux provides a way to completely disable IPv6 on a given interface. The packet will be dropped as the very first step of the IPv6 handler:
+
+Like for IPv4, it’s possible to use Netfilter or a dedicated routing rule.
+
+In the above example, the virtual host get replies because they are routed through the infrastructure network to Internet (e.g. the hypervisor has a default gateway which also acts as a NAT router to Internet). This may not be the case.
+
+If you want to check if you are “vulnerable” despite not getting an reply, look at the guest neighbor table to check if you got an reply from the host:
+
+If you didn’t get a reply, you could still have issues with IP processing. Add a static neighbor entry before checking the next step:
+
+To check if IP processing is enabled, check the bridge host’s network statistics:
+
+If the counters are increasing, it is processing incoming IP packets.
+
+One-way communication still allows a lot of bad things, like attacks. Additionally, if the hypervisor happens to also act as a router, the reach is extended to the whole infrastructure network, potentially exposing weak devices (e.g. ) exposing an agent. If one-way communication is all that’s needed, the attacker can also spoof its source IP address, bypassing IP-based authentication.|||
+

@@ -1,0 +1,79 @@
+As of last June FreeBSD is officially supported on Azure and available on the Marketplace, so everyone can simply launch a FreeBSD 10.3 (as of writing) VM in a few clicks and play with the OS. Obviously, I couldn’t miss the chance to test one of the most appreciated features of FreeBSD.
+
+The ZFS filesystem, which was originally created by Sun Microsystem for Solaris and later open-sourced, has a lot of great features that make it perfect for servers. In particular, it is designed to protect data integrity and has built-in support for snapshots, replication, compression and deduplication, and much more. ZFS has a lot of supporters — and for good reasons — and can be used to provide storage for anything where losing data would be incovenient: from document repositories to transactional databases.
+
+FreeBSD has supported ZFS since the release 7.0, and its implementation is really mature, making it the best free and open source OS to use this filesystem. Beside Oracle Solaris (which is now closed-source) and forks of OpenSolaris such as OpenIndiana, there are community efforts to bring ZFS to Linux (see the ZFS on Linux project, now considered production-ready) and macOS (OpenZFS on OS X) too.
+
+To start, launch a FreeBSD 10.3 VM, directly from the Azure Marketplace. The configuration process is essentially identical to a Linux VM, and once the server is up you can connect to it using SSH.
+
+In order to have storage space for the ZFS volume, once the VM is running we can attach some data disks to it; the official documentation does an excellent job at explaining how to do that. Add as many 1,023GB disks as you want and can (the rule of thumb is that a VM supports two data disks for each CPU core), remembering that using Standard Storage (HDD-based) on Azure you are charged only for the amount of space actually consumed, regardless of how much is provisioned.
+
+In the examples in this article we’ll be using a VM with two data disks attached. In total, the VM will have four disks:
+
+When attaching data disks to the Azure VM for use with ZFS, it’s important to ensure that the host caching is set to None, as that will conflict with ZFS caching.
+
+Administrators that are used to creating RAID arrays, volume groups and filesystems on Linux/UNIX might find ZFS a little bit confusing at first, as ZFS is doing all those tasks and more. All the relevant concepts and terminology are clearly explained in the FreeBSD documentation, but I’d like to particularly call out three of them:
+
+When working with ZFS, we will treat our data disks as single vdevs and combine them into a zpool. Each zpool has a name, for example , and automatically creates a root dataset with the same name. You can add more datasets in the same pool, hierarchically: for example, is a child of , from wich it inherits all properties. You can expand it further by creating a dataset named , etc.
+
+For the first configuration, we’re following the simplest possible one, with the two data disks configured in a striped array (in traditional RAID terminology, that would be the same as RAID-0).
+
+Open a terminal as superuser (root) and start the ZFS service:
+
+Create then the first ZFS pool (zpool) named on the two data disks ( and ):
+
+…and that’s it! The command should complete almost instantly and you’ll have your zpool created and configured to stripe across multiple disks. You can check the status with :
+
+When creating the zpool , we also get a root dataset with the same name, which is automatically mounted at boot in (no need to modify ). You can check that with the command:
+
+Let’s create a child dataset of to store our shared files, and then specifically two sub-datasets for documents and photos:
+
+You can see that our datasets for documents and photos are automatically mounted in and respectively. The “USED” column represents how much storage the dataset is using, and “AVAIL” is the free space. Interestingly, unlike traditional filesystems which have to be confined within their own partitions, ZFS datasets are not fixed in size by default and are much more flexible.
+
+ZFS datasets are highly configurable, and as mentioned before properties are inherited by child datasets by default (but each child can overwrite them). Properties can be set on datasets at any time, but it’s recommended to set them during creation (use the switch on the command) or immediately after, before writing any data.
+
+You can get a full list of configuration properties on the man page for the zfs command ( ); I’m going to list only a few interesting ones.
+
+Let’s set some options for our datasets:
+
+One last option, , is one one of the most interesting features of ZFS, but it should be used with caution. Deduplication comes at a high cost, as it requires a lot of memory to store the deduplication table: it’s recommended to have 5 GB of RAM for every 1 TB of data stored. Deduplication can help saving disk space when the data contains lots of duplicated blocks, for example when ZFS is used on a SAN for VM hard disks - something that will never happen on Azure! In most scenarios users are much better off relying on compression (for example with lz4, which has barely any impact on the CPU) than enabling deduplication. In any case, if you want to understand more about deduplication and how to enable it on ZFS, I’d suggest reading this blog post on the Oracle website.
+
+With ZFS you can leverage two different kinds of disk cache to improve the I/O performance. At a very high level, those are L2ARC for read cache (in addition to “level 1” ARC cache, which is kept in RAM) and SLOG (the separate intent log) to speed up synchronous write calls. In both cases, you should use fast SSD-based storage for the cache.
+
+The L2ARC cache is used to store data that is read from the filesystem, and acts as a second tier after the data cached in the RAM (ARC). L2ARC is a great use case for the temporary SSD drives that come with Azure VMs: these disks are directly attached to the host server, so they offer the smallest latency possible, and in most VMs (excluding only A-series ones) they are based on fast solid-state disks. As they’re temporary disks, their contents might be lost at any time if the host servers crashes or when the VM is stopped from the Azure Portal or resized. Since the L2ARC is read-only, it doesn’t matter if the data inside it is lost, however.
+
+Enabling L2ARC on the local SSD ( ) is really easy. To start, we need to make sure that the Azure Agent (which is installed by default on FreeBSD images deployed from the Azure Marketplace) isn’t mounting the temporary disk automatically: edit the file and set the following parameter to :
+
+Next, restart the Azure Agent (waagent) and then unmount the temporary disk if it’s mounted:
+
+Lastly, add the geom as L2ARC for the zpool:
+
+You can check the status with:
+
+The purpose of the SLOG is to make synchronous write calls faster by first caching them on high-performance SSD drives and then committing data into the final storage. The SLOG is essentially a separate storage for the ZIL (ZFS Intent Log), which is otherwise kept on the same disks as the data.
+
+Unlike the L2ARC, the SLOG must not be put on the temporary, local disks, or system crashes might cause a loss of data. Persistent, SSD-based storage, such as Premium Storage, should be used instead to guarantee data integrity.
+
+You can use one or more disks for the SLOG, and ZFS will stripe across them. Although one disk is enough, in this example we’re adding two more P30 disks to the Azure VM to use as SLOG, and , to double the IOPS. When attaching the disks using the Azure Portal, make sure you select Premium Storage (SSD) disks and disable Host Caching.
+
+When the disks are attached, attach them as log devices for the zpool with:
+
+The results can be checked in the usual way:
+
+One of the nicest features of ZFS on Oracle Solaris is the support for built-in encryption. Sadly, however, that was added after Oracle closed the source of ZFS again, so the OpenZFS implementation that FreeBSD uses does not support encryption out of the box. There’s a lot of interest around this feature and the community is hard at work on implementing it – however, it’s far from an easy task and encryption isn’t likely to appear too soon. For the time being, ZFS users on FreeBSD (and Linux, macOS, etc) need to encrypt the underlying disks and then create a ZFS filesystem on top.
+
+In this example we’ll be using the same Azure VM as before, with two data disks on and .
+
+Before turning on encryption, we need to generate a new key. In this example, we’ll be using a keyfile stored on the OS disk – unencrypted. In a production environment this might not be acceptable, and you may want to leverage services such as Azure Key Vault to store your key instead. Execute the following commands to generate a new key and save it in (and make a backup copy of it!).
+
+We’re now ready to encrypt our disks:
+
+Ensure the partition is decrypted automatically at boot, by adding the following lines to :
+
+Finally, create a zpool named in the new encrypted volume:
+
+We now have a zpool that is ready to accept new ZFS datasets, like in the examples in the previous sections.
+
+Cover photo by William Warby (Flickr) released under Creative Commons BY|||
+
+Write your site description here. It will be used as your sites meta description as well!

@@ -1,0 +1,112 @@
+As a more detailed explanation of using KLEE, we will look at how we did our testing of GNU Coreutils using KLEE.
+
+This tutorial assumes that you have configured and built KLEE with and runtime support.
+
+These tests were done on a 64-bit Linux machine.
+
+First you will need to download and unpack the source for coreutils. In this example we use version 6.11 (one version later than what was used for our OSDI paper).
+
+Before we build with LLVM, let’s build a version of coreutils with gcov support. We will use this later to get coverage information on the test cases produced by KLEE.
+
+From inside the coreutils directory, we’ll do the usual configure/make steps inside a subdirectory ( ). Here are the steps:
+
+We build with because this adds a lot of extra initialization in the C library which we are not interested in testing. Even though these aren’t the executables that KLEE will be running on, we want to use the same compiler flags so that the test cases KLEE generates are most likely to work correctly when run on the uninstrumented binaries.
+
+You should now have a set of in the directory. For example:
+
+In addition, these executables should be built with support, so if you run one it will write a into the current directory. That file contains information about exactly what code was executed when the program ran. See the Gcov Documentation for more information. We can use the tool itself to produce a human readable form of the coverage information. For example:
+
+By default will show the number of lines executed in the program (the files include code which was compiled into ).
+
+One of the difficult parts of testing real software using KLEE is that it must be first compiled so that the final program is an LLVM bitcode file and not a native binary. The software’s build system may be set up to use tools such as ‘ar’, ‘libtool’, and ‘ld’, which do not in general understand LLVM bitcode files.
+
+For coreutils, we use whole-program-llvm (WLLVM), which provides tools for building whole-program LLVM bitcode files from an unmodified C or C++ source package. WLLVM includes four python executables: a C compiler and a C++ compiler, the tool for extracting the bitcode from a build product (either object file, executable, library, or archive), and the sanity checker for detecting configuration oversights. In this tutorial, we use WLLVM version 1.0.17.
+
+To install whole-program-llvm the easiest way is to use :
+
+To successfully execute WLLVM it is necessary to set the environment variable to the underlying LLVM compiler (either or ). In this tutorial, we use :
+
+To make the environment variable persistent, add the export to your shell profile (e.g. ).
+
+As before, we will build in a separate directory so we can easily access both the native executables and the LLVM versions. Here are the steps:
+
+Notice that we made two changes. First, we don’t want to add gcov instrumentation in the binary we are going to test using KLEE, so we left of the flags. Second, when running make, we set the variable to point to .
+
+If all went well, you should now have Coreutils executables. For example:
+
+You may notice that instead of LLVM bitcode files, we obtained executable files. This is because WLLVM works in two steps. In the first step, WLLVM invokes the standard compiler and then, for each object file, it also invokes a bitcode compiler to produce LLVM bitcode. WLLVM stores the location of the generated bitcode files in a dedicated section of the object file. When object files are linked together, the locations are concatenated to save the locations of all constituent files. After the build completes, one can use the WLLVM utility to read the contents of the dedicated section and link all of the bitcode into a single whole-program bitcode file.
+
+To obtain the LLVM bitcode version of all Coreutils, we can invoke on all executable files:
+
+At its core, KLEE is just an interpreter for LLVM bitcode. For example, here is how to run the same command we did before, using KLEE. Note, this step requires that you configured and built KLEE with and runtime support (if you didn’t, you’ll need to go do that now).
+
+We got a lot more output this time! Let’s step through it, starting with the KLEE command itself. The general form of a KLEE command line is first the arguments for KLEE itself, then the LLVM bitcode file to execute (cat.bc), and then any arguments to pass to the application (–version in this case, as before).
+
+If we were running a normal native application, it would have been linked with the C library, but in this case KLEE is running the LLVM bitcode file directly. In order for KLEE to work effectively, it needs to have definitions for all the external functions the program may call. We have modified the uClibc C library implementation for use with KLEE; the –libc=uclibc KLEE argument tells KLEE to load that library and link it with the application before it starts execution.
+
+Similarly, a native application would be running on top of an operating system that provides lower level facilities like write(), which the C library uses in its implementation. As before, KLEE needs definitions for these functions in order to fully understand the program. We provide a POSIX runtime which is designed to work with KLEE and the uClibc library to provide the majority of operating system facilities used by command line applications – the –posix-runtime argument tells KLEE to link this library in as well.
+
+As before, cat prints out its version information (note that this time all the text is written out), but we now have a number of additional information output by KLEE. In this case, most of these warnings are innocuous, but for completeness here is what they mean:
+
+In general, KLEE will only emit a given warning once. The warnings are also logged to warnings.txt in the KLEE output directory.
+
+We’ve seen that KLEE can interpret a program normally, but the real purpose of KLEE is to explore programs more exhaustively by making parts of their input symbolic. For example, lets look at running KLEE on the echo application.
+
+When using uClibc and the POSIX runtime, KLEE replaces the program’s main() function with a special function (klee_init_env) provided inside the runtime library. This function alters the normal command line processing of the application, in particular to support construction of symbolic arguments. For example, passing –help yields:
+
+As an example, lets run echo with a symbolic argument of 3 characters.
+
+The results here are slightly more interesting, KLEE has explored 25 paths through the program. The output from all the paths is intermingled, but you can see that in addition to echoing various random characters, some blocks of text also were output. You may be suprised to learn that coreutils’ echo takes some arguments, in this case the options (short for ) and (short for ) were explored. We can get a short summary of KLEE’s internal statistics by running klee-stats on the output directory (remember, KLEE always makes a symlink called klee-last to the most recent output directory).
+
+Here ICov is the percentage of LLVM instructions which were covered, and BCov is the percentage of branches that were covered. You may be wondering why the percentages are so low – how much more code can echo have! The main reason is that these numbers are computed using all the instructions or branches in the bitcode files; that includes a lot of library code which may not even be executable. We can help with that problem (and others) by passing the option to KLEE. This will cause KLEE to run the LLVM optimization passes on the bitcode module before executing it; in particular they will remove any dead code. When working with non-trivial applications, it is almost always a good idea to use this flag. Here are the results from running again with enabled:
+
+This time the instruction coverage went up by about six percent, and you can see that KLEE also ran faster and executed less instructions. Most of the remaining code is still in library functions, just in places that the optimizers aren’t smart enough to remove. We can verify this – and look for uncovered code inside – by using KCachegrind to visualize the results of a KLEE run.
+
+KCachegrind is an excellent profiling visualization tool, originally written for use with the callgrind plugin for valgrind. If you don’t have it already, it is usually easily available on a modern Linux distribution via your platforms’ software installation tool (e.g., or ).
+
+KLEE by default writes out a file into the test output directory which is actually a KCachegrind file. In this example, the is from a run without , so the results are easier to understand. Assuming you have KCachegrind installed, just run:
+
+After KCachegrind opens, you should see a window that looks something like the one below. You should make sure that the “Instructions” statistic is selected by choosing “View” > “Primary Event Type” > “Instructions” from the menu, and make sure the “Source Code” view is selected (the right hand pane in the screenshot below).
+
+KCachegrind is a complex application in itself, and interested users should see the KCachegrind website for more information and documentation. However, the basics are that the one pane shows the “Flat Profile”; this is a list of which how many instructions were executed in each function. The “Self” column is the number of instructions which were executed in the function itself, and the “Incl” (inclusive) column is the number of instructions which were executed in the function, or any of the functions it called (or its callees called, and so on).
+
+KLEE includes quite a few statistics about execution. The one we are interested in now is “Uncovered Instructions”, which will show which functions have instructions which were never executed. If you select that statistic and resort the list of functions, you should see something like this:
+
+Notice that most of the uncovered instructions are in library code as we would expect. However, if we select the function, we can look for code inside itself that was uncovered. In this case, most of the uncovered instructions are inside a large statement guarded by the variable . If you look a bit more, you can see that this is a flag set to true when is passed. The reason that KLEE never explored this code is because we only passed one symbolic argument – hitting this code requires a command line like .
+
+One subtle thing to understand if you are trying to actually make sense of the KCachegrind numbers is that they include events accumulated across all states. For example, consider the following code:
+
+In a normal application, if the statement on Line 1 was only executed once, then the statement on Line 4 could be (at most) executed once. When KLEE is running an application, however, it could fork and generate separate processes at Line 2. In that case, Line 4 may be executed more times than Line 1!
+
+Another useful tidbit: KLEE actually writes the file periodically as the application is running. This provides one way to monitor the status of long running applications (another way is to use the klee-stats tool).
+
+Let’s step away from KLEE for a bit and look at just the test cases KLEE generated. If we look inside the we should see 25 files.
+
+These files contain the actual values to use for the symbolic data in order to reproduce the path that KLEE followed (either for obtaining code coverage, or for reproducing a bug). They also contain additional metadata generated by the POSIX runtime in order to track what the values correspond to and the version of the runtime. We can look at the individual contents of one file using :
+
+In this case, the test case indicates that values “\x00\x00\x00\x00” should be passed as the first argument. However, files generally aren’t really meant to be looked at directly. For the POSIX runtime, we provide a tool which can be used to read the file and invoke the native application, automatically passing it the data necessary to reproduce the path that KLEE followed.
+
+To see how it works, go back to the directory where we built the native executables:
+
+To use the tool, we just tell it the executable to run and the file to use. The program arguments, input files, etc. will all be constructed from the data in the file.
+
+The first two and last lines here come from the tool itself. The first two lines list the test case being run, and the concrete values for arguments that are being passed to the application (notice this matches what we saw in the file earlier). The last line is the exit status of the program and the elapsed time to run.
+
+We can also use the tool to run a set of test cases at once, one after the other. Let’s do this and compare the coverage to the numbers we got from :
+
+The number for here significantly higher than the number because is only considering lines in that one file, not the entire application. As with , we can inspect the coverage file output by to see exactly what lines were covered and which weren’t. Here is a fragment from the output:
+
+The far left hand column is the number of times each line was executed; - means the line has no executable code, and ##### means the line was never covered. As you can see, the uncovered lines here correspond exactly to the uncovered lines as reported in .
+
+Before moving on to testing more complex applications, lets make sure we can get decent coverage of the simple . The problem before was that we weren’t making enough data symbolic, providing echo with two symbolic arguments should be plenty to cover the entire program. We can use the POSIX runtime option to pass multiple options. Here are the steps, after switching back to the directory:
+
+The format of the option actually specifies a minimum and a maximum number of arguments to pass and the length to use for each argument. In this case says to pass between 0 and 2 arguments (inclusive), each with a maximum length of four characters.
+
+We also added the option to the KLEE command line. By default KLEE will write out test cases for every path it explores. This becomes less useful once the program becomes larger, because many test cases will end up exercise the same paths, and computing (or even reexecuting) each one wastes time. Using this option tells KLEE to only output test cases for paths which covered some new instruction in the code (or hit an error). The final lines of the output show that even though KLEE explored almost ten thousand paths through the code, it only needed to write 57 test cases.
+
+If we go back to the directory and rerun the latest set of test cases, we finally have reasonable coverage of :
+
+The reasons for not getting perfect 100% line coverage are left as an exercise to the reader.
+
+For visualizing the coverage results, you might want to use the zcov tool.|||
+

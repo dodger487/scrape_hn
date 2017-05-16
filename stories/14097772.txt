@@ -1,0 +1,102 @@
+or, Building a platform agnostic cross-compiling toolchain for an ARM based robot.
+
+In the last couple of months I’ve had the pleasure of working with a young, and very interesting robotics company here in Beijing. They are called Vincross, and they are building a robot called HEXA. HEXA taking on a Lion
+
+What’s interesting about this startup is that they are providing HEXA owners with an SDK which they can use to build their own applications for the HEXA, called Skills.
+
+HEXA owners can then publish their Skills to the Skill Store, where they can also download other developers Skills.
+
+When I arrived at Vincross, they had just shipped their first batch of HEXA’s to customers together with an SDK and command-line interface for Skill development.
+
+The reason it had to be compiled on the robot is because the robot is using an ARM processor, while the developer’s machine most likely is using an x86 processor.
+
+Golang supports cross compiling to ARM architecture, but abstracting away the build process of Golang applications on all the platforms supported by MIND SDK (Windows, Linux and macOS) is not trivial. Add to that, compilation of C++ libraries like OpenCV, and bindings to these libraries using SWIG/CGO, and it’s easy to see why the decision of “let’s just compile on the robot instead” makes a lot of sense.
+
+The benefits we would reap from cross-compiling are:
+
+As we all know, Apple supports cross compilation of iOS applications to both the simulator running on x86, as well as to the actual phone, which is running on ARM. However, it’s easy to see why it’s not possible to develop iOS apps on Windows or Linux. Apple just doesn’t want to spend the time porting their own toolchain, dealing with the ins and outs of a 3rd party operating system, and keeping up with breaking changes when they already have their own hardware, operating system and XCode.
+
+So how can we build a cross-compiling toolchain that will support cross compiling to x86 and ARM and at the same time be platform agnostic?
+
+We do virtualization where it’s needed. And who does that? Docker does.
+
+As long as we can get the whole cross-compiling toolchain working in Linux, we can ship as a binary, which responsibilities are very simple:
+
+So as far as platform agnostic goes, we trust that docker will provide us with that abstraction, and we pray that they do not mess up too often.
+
+The first goal was to cross-compile C/C++ applications, more specifically, we wanted to cross-compile OpenCV since it has a lot of features that are useful when you are building a robot that is suppose to visually understand the world.
+
+We decided that, if we manage to cross compile OpenCV and get Go bindings to OpenCV working, our users should be able to do the same for any other library of their choice.
+
+To cross compile C++ for ARM, all you need is the correct gcc cross compiling toolchain for your ARM processor. In our case, the HEXA is equipped with an ARMv7 processor with support for hardware floating point calculations. Thus, we want the arm-linux-gnueabihf version of the cross compiling tools.
+
+We also want to install Go and set it up for cross compilation.
+
+Above is a snippet of the Dockerfile in our (Open sourced cross compiler image. The full version also ensures that future packages installed with will include their respective ARM architecture version of that package, which is required when installing the build dependencies of OpenCV)
+
+With this Dockerfile in place and built, all we have to do is to it with the OpenCV source mounted into the container, install a few dependencies with , and execute on the OpenCV provided cmake file as such:
+
+After a pretty long compile time (Luckily we only have to compile once), the now contains all of OpenCV’s dynamic libraries and header files.
+
+To generate Golang bindings for C libraries, one would typically use CGO, and when binding for C++ libraries, one would use SWIG. Writing the Golang bindings can be a pretty mundane process, and in our case we were lucky. Some cool people had already gone through the effort of writing Golang bindings for OpenCV using SWIG.
+
+Now, to cross compile our Golang application using the Golang bindings to OpenCV, all we need to do is to our container with our source mounted, tell Go how to find its dependencies…
+
+…and then compile our application as usual.
+
+If OpenCV was compiled as a static library, we would just have to upload the binary to the HEXA, execute it and be done with it.
+
+However, since we are linking against a C++ library, we now don’t have a statically linked executable anymore, and it will to try to find the shared libraries it’s depending on.
+
+But its an easy problem to solve.
+
+Done ! We can now cross compile C/C++/Golang applications on our PC, and pack it together for upload and execution on the robot.
+
+However, we for sure don’t want our dear users to have to go through this whole process, so we need to provide them with some sweet abstractions:
+
+Through the MIND Command-line interface, users have everything they need to develop *Skills for the HEXA.*
+
+Let’s start by showing a very basic example of a Skill. All it does is make the HEXA stand up.
+
+As seen above, we are importing and the driver which we use to make the HEXA stand up using its 6 legs. These two packages are part of the MIND Binary Only Distribution Package, which previously came prebaked on the HEXA.
+
+Since we now are compiling inside of a docker container instead of on the HEXA, we don’t need to ship the package prebaked on the HEXA. Instead, we just put it inside of our on the cross-compiling capable container.
+
+All of the things that the previous CLI used to do, like entrypoint generation, packaging, uploading, installation, execution, log retrieval, communication with HEXA over websockets etc, can now be accomplished with Linux tools and shell scripts instead of thousands of lines of Golang code.
+
+The key to this functionality is this Golang function.
+
+We can implement by doing a on the container with the current folder mounted, injecting some environment variables and execute the following shell script inside the container.
+
+We can pack the Skill together as an file using zip like this:
+
+And then serve the file to the HEXA using Caddy.
+
+In addition, all of the websocket logic was rewritten and simplified using The WebSocket Transfer Agent
+
+As I mentioned earlier, the only thing the MIND CLI has to do is forward subcommands into the docker container. The only exception is scanning the local network for HEXAs.
+
+When scanning the network for HEXAs, the CLI will send UDP packets to the networks multicast address and wait for a UDP packet to be sent back by the HEXA containing its name and serial number. When doing this we can not NAT to the docker container since it would cause us to lose the packet source address. (Maybe we will run the container on host network in the future)
+
+The MIND SDK consists of the following parts:
+
+All of the parts listed above go through different build pipelines, to finally be packaged into a single docker image published on docker hub
+
+In front of this docker image stands the MIND Command-line Interface abstracting away all of the docker commands.
+
+Since Docker is providing the host operating system abstraction layer, we had, after getting it to run on macOS and Linux, close to 0 issues getting the whole toolchain working in Windows, both with and without Hyper-V.
+
+Here is an example showing how a user would go about developing a new Skill for the HEXA using the SDK.
+
+To use OpenCV inside a Skill, we can create a simple Makefile or shellscript for building OpenCV:
+
+and build OpenCV inside the cross compiling container by executing , followed by copying the generated libraries and headers into the folder before building the Skill.
+
+And lastly, by executing a , the latest version of the MIND SDK container will pulled down from docker hub.
+
+We opensourced the whole MIND Software Development Kit on GitHub and hope that it will be useful to HEXA owners as well as other robotics developers.
+
+If you have any comments or suggestions please feel free to post them in the comment section below.
+
+See you next time!|||
+

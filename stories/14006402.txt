@@ -1,0 +1,77 @@
+It’s all in title: I argue that the use of a plain pointer should be avoided as I believe they are generally harmful.
+
+Before an army of disagreeing C++ programmers come at me angry with torches and pitchforks, I want to preface this with saying that I primarily care about C++ interfaces. What I mean is if I have some function which takes arguments, plain pointers make that function interface require more knowledge than its C++ signature to understand correctly.
+
+I come from the perspective of wanting to express intent by specifically selecting C++ features to aid understanding. In other words, the “better code” heuristic I use is: “does this feature make my code easier to use and harder to misuse?”. This means that I am arguing for a way to judge one design choice against another, not a hard-and-fast rule. Thus if you are writing the implementation to some function foo() and need to use pointers for some provable reason, do not worry; a hidden function implementation is the last place I think this overall suggestion applies, though it is certainly not to be excluded.
+
+For clarity, I define a “plain pointer” as the pointer types C++ inherits from C. Other folks in the C++ world have indicated that pointers in general (plain or smart) are harmful, but I am not asserting that position.
+
+Therefore, I will address the categories of plain pointer misuse that I have seen in my career and list alternatives which encode more meaning than a plain pointer for each situation.
+
+Note that some of the pitfalls found with each situation will overlap, which is partly the point! If you look at any one usage of a plain pointer in isolation, there are issues with each of them. However, do not forget that you first have to isolate which intent is encoded with the pointer (i.e. which of the below categories is intended by the author): a problem which applies to all situations of plain pointer usage. Keep this in mind as you look through each category of using plain pointers.
+
+Dynamic memory allocation is a core part of writing C++. One of C++’s advantages over other languages is that we can use object lifetimes to track when resources should be obtained and released through object construction and destruction. However, given that C++ gives us this level of control it can often be misused.
+
+Plain pointers which track dynamically allocated memory (using either ‘new’ or ‘malloc()’) require manual calls to ‘delete’ or ‘free()’. This makes it easier to misuse as the programmer must remember to free memory, which may sound innocuous at first, but can be very sneaky with only moderately complicated control flow or thrown exceptions.
+
+The other issue with plain pointers is that they do not express who is responsible for freeing memory. For example, given some function that creates a ‘Widget’:
+
+There is no way of knowing based on the ‘createWidget’ signature if the returned Widget* should be deleted by the caller. That is an interface ready to be misused!
+
+In the world of modern C++, we have ways of directly communicating the ownership rules around dynamically allocated memory: std::unique_ptr and std::shared_ptr. Each has a specific semantic meaning, where its usage tells us what the interfaces intends. A std::unique_ptr can only be moved around and a std::shared_ptr says that I am not the only one potentially pointing to the allocated object. In either case, they are harder to misuse because freeing the underlying memory is done by the unique/shared ptr’s destructor and not the user’s responsibility. Proper cleanup even happens when exceptions are thrown, something very tricky to get correct with plain pointers.
+
+Furthermore, when using a std::unique_ptr or std::shared_ptr, carefully understand which type you should use. I tend to lean toward std::unique_ptr first as it is more restrictive. In other words, I want to avoid incidental shared state and only choose to enable that through a std::shared_ptr. Thus the above example can be rewritten to express two different intents:
+
+Arrays are another core part of writing C++. It is difficult to imagine a “real world” problem that will not touch some form of an array or collection of objects. Plain pointers make representing arrays both confusing and easy to misuse. I will start with an example:
+
+Many programmers who have read or watched tutorials on HPC programming may think they recognize the above function signature (I think you are crazy if you knew it right away). I intentionally changed the function and parameter names to focus attention on what the signature tells you. In this case, you cannot tell from the signature that ‘t’, ‘h’, or ‘g’:
+
+I also intentionally left out the implementation details of function because having to read the implementation to understand the interface is problematic because:
+
+In C++ we have ways of communicating arrays directly: std::array and std::vector. Both of those containers are guaranteed to be stored contiguously in memory, where std::array’s size is known at compile-time and std::vector is resizable at run-time. Here is a rewrite of the previous example, using canonical names and more expressive representations of arrays:
+
+Now it is very clear that ‘x’ and ‘y’ are fixed-size arrays of size ‘N’, where they both are considered “read only” by being marked ‘const’. This version does require that N is known at compile-time, which I think should be preferable if given the choice because it can help catch certain errors during compilation.  Furthermore, we can guarantee that ‘x’ and ‘y’ do not overlap, making the compiler happier to optimize the implementation with vector instructions. Vectorization is a topic in itself that heavily applies here, but I will save that for a future post!
+
+Finally, while I do not think it is ideal, I think even C-style arrays are better than plain pointers as they still indicate that the type is an array and not some possibly null pointer. I urge you to consider avoiding C-style arrays too, but I would at least rank them above plain pointers.
+
+Occasionally we want some parameters to be optional, but default values may not be appropriate. In this case, it is common to use a plain pointer, where ‘nullptr’ is a special value to indicate that the parameter can be ignored. For example, consider the following (adapted and simplified) code found in OSPRay:
+
+While the above example came from ISPC and not C++, I still think it illustrates the point. There are several issues surrounding this usage of plain pointers, as we cannot know:
+
+Furthermore, I think these issues also fall under the ‘magic values’, which is much better described in C++ Coding Standards: 101 Rules, Guidelines, and Best Practices. Here ‘nullptr’ is indicating something other than a “null address”, which forces other programmers to remember that fact.
+
+There are a couple of ways to fix the problem, where my favorites are: 1) use overloading to create intentional interfaces, or 2) use an optional type wrapper to communicate the parameter is optional.
+
+Looking at the first fix, the previous example could be re-cast into the following:
+
+This new version provides two interfaces which are harder to misuse: there will be cases where you do have a PassInfo instance, and other times you will not. Each overload makes it clear what it takes to call it. While it is not ideal, you could publish the two overload version as what you intend other programmers to call, then have them forward to a common internal version which contains the optional parameter, hiding that easier to misuse version from callers.
+
+The second way to fix the problem is to use a type wrapper which directly states that the parameter is optional. In C++17, a new type std::optional is coming to the standard library. For those of us that cannot use compilers which already implement std::optional, it is simple enough to write one yourself. Here is the previous example using std::optional:
+
+There are some nice advantages to a type wrapper like std::optional, where my favorite is std::optional::value_or(). Here you can ask for the value held by the wrapper, and use a given default if the value is not set. This greatly cleans up logic that checks for ‘nullptr’ and sets some default value if none was given.
+
+Lastly, I will also point out that you could use the std::optional version as the internal implementation of the overloaded versions. That might look something like this:
+
+The use of plain pointers to subvert the C++ type system with ‘void‘ is very straightforward to understand: casting to-and-from ‘void‘ allows programmers to tell the compiler “do not track type information here, I know what I am doing”. However, ‘void*’ makes even trivial systems annoyingly difficult to understand and use correctly. I look at it like this: if I need to throw out the type system in my C++ code, I am not thinking through my API carefully and should take a step back before continuing on.
+
+One of the strongest characteristics of C++ is its type system. C++ gives programmers the ability to check at compile-time whether APIs are being called correctly. The more a code base decides to throw out the type system, the less it is able to take advantage of C++’s strengths.
+
+The only place I see type erased pointers being intentionally useful is for implementing very low-level APIs, where the tools available may not have types strongly associated with them. I will point out, though, that the surface area of problems that need ‘void*’ are much less common than I see them used in the wild.
+
+Occasionally it comes up where function parameters are intended to be mutable and those changes to exist in memory passed from the caller. This is commonly known as an ‘out’ parameter or, as Uncle Bob said in chapter 3 of Clean Code, an “output argument”.
+
+Many of the pitfalls here center around confusion of what the interface communicates, similar to previous issues. Here’s a trivial example:
+
+Again, I intentionally used the generic name ‘doSomething’ to have you focus on what the signature tells you. Because we happen to be in the section about mutable parameters, you probably guess that the intention of ‘b’ being a pointer is to have it mutate a caller’s variable.
+
+This version is slightly cleaer, where it is easier to see that a may be added into b. Specifically, we can see that the intention is to take a reference to an existing int, where the lack of ‘const’ on ‘b’ indicates that ‘b’ may be changed after add() is called. This illuminates the point of ‘out’ parameters being confusing in general. A way to reduce confusion is to use return values instead of mutable parameters, where programmers should be aware of return value optimization to quiet their fears of efficiency problems. Thus I think the following is an even clearer version:
+
+I hope that you now understand that plain pointers in C++ simply do not communicate much on their own: they force other programmers to read (potentially wrong) comments or other code to understand exactly what a plain pointer means and how it should be used. Again,
+
+Lastly, keep in mind that each of the above categories of plain pointer usage are not mutually exclusive. That means it is possible to write an function interface which is all of them combined! That would be crazy a interface to conceive now, but I have tragically witnessed projects which liberally mix-and-match uses for plain pointers.
+
+I know that C-style pointers are a near-and-dear part of many C++ programmers’ toolkit. My point is not that there is never a use for them, rather that there is a human communication cost. I will never be impressed by how little your code tells me about your solution.
+
+That said, until next time…happy coding!|||
+
+It's all in title: I argue that the use of a plain pointer should be avoided as I believe they are generally harmful. Before an army of disagreeing C++ programmers come at me angry with torches and pitchforks, I want to preface this with saying that I primarily care about C++ interfaces. What I mean is if…

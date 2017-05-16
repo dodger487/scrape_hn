@@ -1,0 +1,29 @@
+Many people on the Web had the same problem but no one provided a comprehensive answer to that problem so I had to dig into MySQL documentation and internals to understand how to fix that.
+
+Replication lag is a frequent issue with loaded MySQL clusters. It can become critical when the lag gets too important: missing data when the slaves are used for reading, temporary data loss when losing the master… In our case, it blocks the cluster migration to GTID until the replication fully catches up.
+
+A few weeks ago, we added a new slave to a 22TB MySQL server. The time to transfer the data, play innobackupex apply_log, the slave was already way behind the master. Things started to worsen during the weekend as the server performed a RAID check which slowed down the replication even more. With about 100 million writes a day on that cluster, we started the week with a good 500.000 seconds lag.
+
+MySQL introduced multi-threaded replication with version 5.6. MTR has since then been improved with MySQL 5.7. It still needs to be used with caution when not using GTID or you might get into trouble.
+
+First, we enabled parallel replication using all available cores on the server:
+
+You don't need to stop / start slave to change the slave_parallel_workers but according to the documentation MySQL won't use them until the next start slave.
+
+Parallel replication was useless first, as the host has only one database, and the default parallel replication type works on a database lock. We switched slave_parallel_type to LOGICAL_CLOCK, and the result was tremendous.
+
+Before we found the LOGICAL_CLOCK trick, we tuned the flushing a bit.
+
+First, we make sure that MySQL never synchronizes the binary log to disk. Instead, we let the operating system do it from time to time. Note that sync_binlog default value is 0, but we used a higher value to avoid problems instead of crash.
+
+Now comes the best part.
+
+For ACID compliance, MySQL writes the contents of the InnoDB log buffer out to the log file at each transaction commit, then the log file is flushed to disk. Setting innodb_flush_log_at_trx_commit to 2 makes the flush happen every second (depending on the system load). This means that, in case of crash, innodb will have to replay all the non commited transactions (up you one second here).
+
+innodb_flush_log_at_trx_commit=2 works in pair with innodb_flush_log_at_timeout. With this setting, we ensure MySQL writes and flushes the log every 1800 second. This avoids impacting performances of binary log group commit, but you might have to replay up to 30 minutes of transaction in case of crash.
+
+MySQL default settings are not meant to be used under a heavy workload. They aim at ensuring a correct replication work while ensuring ACID. After studying how our database cluster is used, we were able to decide that ACID was less a priority and catch up with our lagging replication.
+
+Remember: if there's a problem, there's a solution. And if there's no solution, then there's no problem. So:|||
+
+A few weeks ago, we added a new slave to a 22TB MySQL server. The time to transfer the data, play innobackupex apply_log, the slave was already way behind the master. Things started to worsen during…

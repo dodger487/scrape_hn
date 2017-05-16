@@ -1,0 +1,55 @@
+Dropbox employs traditional cross-site attack defenses, but we also employ same-site cookies as a defense in depth on newer browsers. In this post, we describe how we rolled out same-site cookie based defenses on Dropbox, and offer some guidelines on how you can do the same on your website.
+
+Recently, the IETF released a new RFC introducing same-site cookies. Unlike traditional cookies, browsers will not send same-site cookies on cross-site requests. At Dropbox, we recently rolled out same-site cookies to defend against CSRF attacks and cross-site information leakage. We concluded that same-site cookies are a convenient way to reduce a website’s attack surface.
+
+Many attacks on the web involve cross-site requests, including the well-known cross-site request forgery (CSRF) attack. These attacks trick the victim’s browser into performing an unintended request to a trusted website. Because users trust Dropbox with their most sensitive data, it’s critical that we make our defenses against these attacks as strong as possible.
+
+What does a CSRF attack look like? As an example, let’s pretend Dropbox was naively not protecting against CSRF attacks. The attack starts when a victim visits an attacker-controlled website, say . The evil website then returns a page with a malicious payload. The browser executes this malicious payload, which makes a request to and attempts to remove user data.
+
+A classic CSRF defense is to introduce a random value token — called the CSRF token — and store its value in a cookie, say , on the first page load. The browser sends the CSRF token as a request parameter on every “unsafe” request (POSTs). The server then compares the value of to the request parameter and throws a CSRF error if these values do not match.
+
+Even if a website has CSRF defenses, it could be vulnerable to cross-origin information leakage attacks like cross-site search attacks and JSON hijacking. For example, let’s assume has an AJAX route . A GET request to gets all of the logged in user’s filenames. and the size of the response can leak side channel information about how many files are there in a user’s Dropbox.
+
+We now describe how we designed and implemented defenses against cross-site attacks on Dropbox using same-site cookies.
+
+For reliability and security, our design for same-site cookie protections should have the following requirements:
+
+Cookies become same-site by setting the attribute to one of two values, or . When , browsers will not send the same-site cookie on any cross-site request. When it’s , the browser will only prevent sending the cookie on “unsafe” requests (POSTs) but will allow “safe” requests (GETs).
+
+Let’s say Dropbox stores two cookies: a and a (we’re simplifying a tad).
+
+Further, a POST request to on the Dropbox site takes as input the user’s credentials and logs the user in (or equivalently, writes ). Dropbox also has many “shared links” on pages with the format . Users can share these links over email and restrict access to these links.
+
+While brainstorming on how to add same-site cookie protections to Dropbox, we came up with the following naïve designs but quickly figured out that they were flawed:
+
+Instead, we opted to introduce a new cookie, . This cookie is with enforcement mode as . We set this cookie on all browsers that support same-site cookies, and we validate this cookie on every relevant request on the same browsers.
+
+The value of this cookie is derived from the CSRF token. We validate the same-site cookie by checking for its presence as well as the correctness of its value. We check for the value to defend against session fixation in case a cookie with the same name got set by an attacker previously.
+
+has an enforcement mode , which means it does not get sent on benign cross-site GET requests (e.g. visiting a Dropbox public link from an external page). This is fine, as we can control enforcement on server-side. If the request is a benign GET request but is absent, we can still allow the request to pass through. However, if it’s a state-changing POST request and is absent, we can treat this as a CSRF error.
+
+As an aside, we made a __Host-prefix cookie. A prefix cookie is a cookie that must only be sent to the host that sent the cookie. JavaScript on a subdomain of cannot set this cookie. If both and are valid, we can be confident that no session fixation attacks have occurred.
+
+Dealing with cookie authentication is very risky. It could create many availability and security issues. In the worst cases, it could lock many users out (and force them to manually reset their cookies), log users into another user’s account, or completely disable our CSRF defenses!
+
+Therefore, we decided to roll out same-site cookie defenses in two stages: first in “warnings-only” mode, where we log all errors, and later in “enforcement” mode when we see no unexpected errors. Further, we would want to be flexible in terms of what kinds of requests we would like to enforce the same-site check for. Enabling the same-site check for POST requests only would be equivalent to our current CSRF check, but wouldn’t necessarily be a defense against cross-origin information leakage or be helpful with entry-point investigation.
+
+To recap, we added a new cookie for browsers that support the cookie. The cookie is with enforcement mode . Its value is derived from . For the following requests, we check for presence of and validate:
+
+In case (1), we noticed minimal false alarms, so we switched from warnings to enforcement mode, raising an HTTP 403 in case of a violation.
+
+For case (2), we noticed that a few AJAX GET requests, such as the ones used by the Saver are cross-site by design. We whitelisted these few endpoints from the same-site check. Further, we noticed on service worker AJAX GET fetches, wasn’t sent. We filed a bug report on Chrome. For those service worker routes, instead of relying on the cookie check, we added an additional header to block cross-site requests. After this, we were confident that we could roll this out in enforcement mode.
+
+For case (3), most websites have very few “toplevel” pages like and , and many pages users navigate to from these base pages, e.g. , but do not visit directly. We call these toplevel pages entry points. Enforcing that users can visit non-entry points only by navigating to from entry points can reduce the attack surface of a website.
+
+By leveraging same-site checks for all non-AJAX GET routes, we found a few non-entry points, such as:
+
+However, we noticed that our website has much fewer non-entry points than we expected. We suspect that modern web applications might not have many non-entry points, but we’d love to hear your thoughts.
+
+Same-site cookies are a convenient way to defend against a variety of attacks using cross-origin requests. Because it’s not supported on all browsers, it’s best as a defense in depth measure. We hope that other browsers will implement this feature in the future.
+
+Rolling out out same-site cookie defenses on top of existing CSRF defenses should give added security benefits without disrupting availability. For reasons outlined in this post, we recommend adding a new cookie, with in enforcement mode, and controlling the actual same-site enforcement on the server side. This cookie should preferably be a __Host-prefix cookie and its value should preferably be derived from the CSRF token.
+
+Dropbox is leveraging the security benefits of same-site cookies made possible by new browsers. Security is core to our company, and we’re excited to add another layer of protection for our users and their data.|||
+
+Our comms team told us we need an image; our legal team told us it needed to be freely licensed. Credit: Carsten Schertzer (Creative Commons Attribution 2.

@@ -1,0 +1,53 @@
+Last week we explored using Postgres as a central communication nexus between several data sources. At the time, I made a fairly hand-wavy allusion to REST interfaces. Since I hadn’t really explored further, I had assumed PLV8 could use core node.js or other similar libraries to invoke HTTP APIs. Of course as a trusted language, PLV8 isn’t allowed to do that. It’s more of a language for easily manipulating JSON and JSONB objects within Postgres.
+
+So we need some other way of calling out to an external HTTP resource, wrapping it in column trimmings, and sending the data to Postgres. As demonstrated last week, we could do this directly with a Python (or some other language) function. Alternatively we can use an extension that has access to Python. Then all we would need to do is write a python library, and suddenly we can interact with the REST interface as if it were an actual Postgres table. This is where Multicorn comes in.
+
+One of the easiest ways to install Multicorn is through PGXN. It goes something like this:
+
+Otherwise users of Red Hat variants have a yum repo or Debian/Ubuntu can rely on the apt repo. Multicorn is popular enough that it’s included in both of these resources, which is very handy for us.
+
+In any case, we need a basic REST service to poll. In the interests in keeping things simple, let’s use Flask to whip up an API for fetching all the words in a UNIX dictionary file. Since the method is extremely slow, it’s probably a good idea to cache the output too. The end result might look something like this:
+
+Our REST interface replies to only one URL and accepts no parameters. It’s not exciting, but it does the job of transmitting data to HTTP requests. With this “service” running in the background somewhere, we can continue with our task of turning that output into a Postgres table.
+
+The next thing we need to do is make use of the Multicorn Python libraries. In this arena, Python setuptools are our friend. With them, we can write a Python library that imports Multicorn and it will automatically install everything in a compatible location. Here’s a bare-bones file that might work:
+
+That takes care of actually installing the project library files. Next we need to actually use the Multicorn API. As a pure foreign data wrapper API, it has a lot more capability than we actually need. By default it can represent direct access to CSV files, filesystem objects, RSS feeds, and a bevy of other cute implementations.
+
+Unfortunately none of these use cases apply to wrapping up . Multicorn can interact with authentication, pass predicates to help pre-optimize matches, and has several other capabilities we simply won’t leverage here. We just need one table from one file, with very little in the way of parsing.
+
+To that end, we only need to define a single method in a class derived from . With that in place, Python has a very capable protocol request handler we can leverage to actually interact with our REST API. It provides everything we need to get the data and convert the HTTP response from JSON into Python dicts that represent each row of the dictionary contents.
+
+There isn’t much exciting here:
+
+To install it, we merely invoke :
+
+Everything is now in place. As a Python library, Multicorn has access to other Python tools installed on the system. This means the primary option to the wrapper will be a named Python class. So long as that class is compatible, we will have a functional Postgres extension.
+
+It just so happens that Multicorn implements this at the level. This makes sense as each server generally has its own defined interaction model. The CSV server would take filenames as parameters for foreign tables, RSS feeds would need the URL for each external resource, etc. Our wrapper is somewhat less… sophisticated. It takes no parameters and offers no advanced functionality. As such, once we define the server that invokes the library, we’re basically done.
+
+Here’s the code that would create our dictionary table and a sample invocation:
+
+It works! Beyond that, notice how slow the results are. Though there are only about 100k rows, even fetching a mere handful takes an exorbitant amount of time. This happens for a few reasons.
+
+First consider that this is an external API call. Each request must trigger an HTTP request, parse the results, and then encode and return each row. While we know what our REST process does, others may not be so forthcoming and are essentially black boxes. At least some of the delay is due to whatever work the REST service performs on its end. Then we have the unfortunate fact that, bless its heart, Python is generally a dog’s breakfast when it comes to performance.
+
+We could fix some of these problems. Multicorn does have the ability to pass along predicates after all. A more advanced library could implement basic regular expression, equality, or other logic to pass along clauses like these:
+
+While in our case Postgres manually removed all inapplicable matches, a more advanced wrapper could transform these into parameters to the API call itself. In such a case, the REST call might return a much smaller (and faster) row subset. Barring that, there’s another way to cheat the system: materialized views!
+
+We have, after all, already used these to represent regularly updated external snapshots. If we treat the API like a rolling data window, we can just refresh a materialized view with its contents and enjoy direct manipulation of instantiated contents. That means indexes and all the trimmings! A major benefit to this approach over spending all of our time optimizing our wrapper, is that we don’t have to duplicate existing Postgres functionality.
+
+We would naturally want to eventually fix the more obvious inefficiencies in our wrapper interface. Yet until that happens—and even afterwards, since performance enhancements are cumulative—we can do something like this:
+
+One cool trick Postgres has up its sleeves is that it can use leverage quirky index types. One of these is based on word trigrams. It’s a lossy format that will inevitably return more matches than we actually want on the first iteration, but remember that Postgres will apply a post-filter to remove excess matches. We can see that in the line from the execution plan above, which yanked one row that didn’t match our clause. That’s a small price to pay for reducing a 326ms runtime to 6ms!
+
+Implementing trigram logic in our Python library or REST service would be a huge headache, as would duplicating handling. Since words are most likely to have inexact and fuzzy searches, we may want to avoid the whole mess. With a materialized view, we can let Postgres do all of the complicated data manipulation while the REST API focuses on bridging the gap to our extrernal resource.
+
+Once again, we’re left with a database that contains none of our own data. Tables we create by wrapping and caching external contents gives us a transitive scratch zone and staging area for actual analysis.
+
+In a real-world scenario, we could only hope the REST interface and its corresponding foreign data wrapper component wouldn’t be as lazy as the one presented here. Perhaps a better alternative would be to write a full REST-specific foreign data wrapper in Go. In such a world, feed sources and parameters, column decoding, caching layers, and any number of other optimizations would be efficient and native to web-driven content. One wrapper and server combination could represent any number of foreign tables instead of ours which only works with a single service.
+
+The options, like Postgres, are endless and varied. That’s the world foreign data wrappers give us.|||
+
+Last week we explored using Postgres as a central communication nexus between several data sources. At the time, I made a fairly hand-wavy allusion to REST

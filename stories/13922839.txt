@@ -1,0 +1,131 @@
+On this new post series, we will analyze hundreds of thousands of articles from TechCrunch, VentureBeat and Recode to discover cool trends and insights about startups.
+
+These are the types of questions we aim to answer with this analysis.
+
+On this first post, we will cover how Scrapy can be used to get all the articles ever published on these tech news sites and how MonkeyLearn can be used for filtering these crawled articles by whether they are about startups or not. We want to create a dataset of startup news articles that can be used for studying trends later on.
+
+On the second post, we will create text classifiers that do analysis on the actual content of the startup articles. Is it a news about acquisition? Fundraising? Product launch?
+
+Finally, on the third post we will use the data we got here, and the classifiers from the second post, to answer our questions.
+
+So, let’s get started! Today, we will:
+
+Our goal is to analyze a lot of tech articles covering a certain topic — startups. This means that we have to download these articles first. In fact, since we want to do historical analysis of industry trends, we need to get all the articles ever published in TechCrunch, VentureBeat, and Recode.
+
+The process to get the articles is pretty similar for all of these tech sites (and other news sites as well), so we’ll only go over how it can be done with TechCrunch. You can find the full code for this project here. If you are new to Scrapy, check out the official tutorial and our previous post on Scrapy.
+
+The first step is getting access to all the articles the site has ever published. Most news sites have an archive, but it can be hidden away. Finding it usually involves snooping around a little bit. Some sites you can access the archive by date, like site.com/yyyy/mm/dd (as is the case of TechCrunch and VentureBeat archive). Other sites could be somewhere like site.com/archive (as is the case of the Recode archive). Usually, the archive is a variation of this, but every website is different. And always remember: Google is your friend.
+
+In the archive we already have the article title and date, but we want the full text. Since this preview only shows part of the text, we’ll have to visit every individual article’s page in order to get it. We also can see one of the tags, but articles usually have several.
+
+Alright, we have found the archive for TechCrunch, and it has a page per day. This means that, if we want to get all the articles ever published on the site, we have to get the archive page for every day since they started publishing articles (2005-06-11). With Scrapy, this is pretty simple:
+
+We are overriding start_requests in order to get the URLs for the pages. Every time Scrapy needs a new page to download, it will call the next item returned by this method. We also defined a generate_url method, which will return the URL of a page given a date and (optional) a page number. This will come in handy later because for some days, there is more than one archive page.
+
+Afterwards, we define parse . This method is called for each Request. It will parse all the articles contained within the Response, and then go to the next page for that date. In order to have access to that info later on, we pass as metadata the date and the page number (which will always be 1 at first, but parse will call itself with the next pages). The corresponding Response object will then contain these attributes, and we can access them.
+
+The way this works is pretty straightforward: using an xpath selector we get the URL for every article on this page, which we then send to parse_article. Afterwards, the function calls itself with the next page. It’s important to note that we are straight up requesting the next page, without knowing if there actually is a next page. If there isn’t, the site will just return 404 and Scrapy will discard it by default.
+
+Now the only step left is parsing each article and getting the content, but we have to define a couple of things first: Items and Loaders.
+
+In order to save the content of an article, we need to define an Item that describes the fields that we want to fill. In this case, we want to get all the relevant content of an article:
+
+This means we will create a Scrapy Item (in items.py)with the fields title, text, and tags. In addition, we will also save an article’s publishing date, and its URL.
+
+Also, we will use loaders in order to populate the items. What are loaders you ask? To quote the official docs, “Items provide the container of scraped data, while Item Loaders provide the mechanism for populating that container”. What this means is that, instead of putting strings directly in the Item object like we did before, we call the loader which does it for us.
+
+This makes it much easier to process the data, since we’re not doing it by hand in the spider anymore. Instead, we just tell the loader what processing we want to be done for the data that is fed into each field. We strongly suggest reading the explanation for this feature here.
+
+This is what the TechCrunch loader looks like:
+
+We have a general processor for all the fields (title, subtitle, and so on) and a specific one for tags, since there are several of them and we want to get them all. More on this later.
+
+This will make more sense with the parse_article method in the spider. Remember that this is called for each article page, and we want it to create an Item object with the content of the article.
+
+In order to understand what’s going on here, let’s look for example at how the tags are parsed: //div[@class="loaded acc-handle"]/a/text()  is a list of all the tags that the article has (in this case, ['Culture', 'Meme', 'Instagram', 'evolutionary psychology', 'Europe'] ). Because of the way the page is laid out, if you try that xpath in scrapy shell, each tag will come with preceding and trailing whitespace (tabs, spaces, newlines). We remove that with unicode.strip for each item of the list. Then, we join the list into a string using Join(separator=u';') . This will return 'Culture; Meme; Instagram; evolutionary psychology; Europe' , which is what we will save in our CSV file.
+
+Loaders are a very useful and powerful tool that saves a lot of work. You don’t have to do all this processing manually since the Loader just does it for you, and it’s very easy to reuse them in similar spiders (in this case, the ones for the other websites).
+
+Check out the finished TechCrunch spider here! In that repository there are also (very similar) spiders for VentureBeat and Recode as well. To run it, use scrapy crawl techcrunch -o itemsTechCrunch.csv, which generates a CSV file containing all the articles ever published in TechCrunch. It will take a while to run though, since in the 12 years its inception the site has published more than 150.000 articles.
+
+Cool, we now have a lot of news articles. What now?
+
+When we started out, we said we wanted to know what’s going on in the startup world based on what the tech press says. And here we have our first problem to solve: not all of these articles are about startups! In fact, most of them aren’t, since the world of tech isn’t all about startups.
+
+Skimming through the scraped data, you do find articles about startups, but also about established companies like Apple, Microsoft, Google or Samsung. You also find completely unrelated things like the latest podcast, a cool youtube video, internet drama, and so on. So, in order to do any type of analysis about startups, first we need to create a classifier that can tell whether an article is about a startup in the first place. Then we’ll use it to filter out the articles that don’t interest us.
+
+This problem isn’t as trivial as it may seem at first, since it’s pretty hard to define what a ‘startup’ even is, and even though for many it’s obvious, there are some articles that walk the line. In most cases, it’s very clear. It’s usually an article about a new, small-ish company, developing a new and exciting product. That is definitely in. Then there are articles about big, established companies like Microsoft. Those are definitely out.
+
+However, we will encounter cases where it’s less clear: let’s say that Microsoft acquired a startup. Is that article about startups, or not? In our case, we will make the decision to say that yes, it is about startups, although it’s arguable that it could be excluded.
+
+These kinds of decisions have to be made throughout the creation of the module, and they have to be consistently followed, else creating confusion in the classifier.
+
+Alright, so let’s create a classifier to solve this problem! For more in-depth advice on text classifiers check out this guide.
+
+If you have never done so, it’s as easy as going the MonkeyLearn Dashboard and clicking Create Module on the navbar on top. Afterwards you’ll answer some questions about the new module: Basic info like name and type, what the module will be doing (Web scraping and Topic Categorization), and what the text it will be working with is like (News articles and English language).
+
+Check this out if you want to see the creation of a module step by step.
+
+Now that we have an empty classifier, let’s add to the tree the categories we want. This category tree will pretty simple since what we want to do is given a tech news article, answer the question “is this article about a startup company or not”? So, every article belongs in one of two categories: startup, or everything else (let’s call that one not_startup).
+
+To add new categories, simply click on the root category and select add child. After you add both categories, your category tree will look like this:
+
+Now we have a category tree, but we have no tagged data! That’s no good, we can’t train if we don’t have any training examples. And this time, we don’t have tagged data like we did when we analyzed hotel reviews, so we’ll have to tag it ourselves. Reading articles and tagging them one by one sounds tedious, but it’s not as bad as you might think at first.
+
+First, we have to take a random sample from the full dataset and save it as a new CSV file that we can use for tagging training data. We also do some processing on the columns, discarding the fields we saved that MonkeyLearn doesn’t need (URL and date) and joining the text fields into a single column.
+
+Done! You can also find in the repository the untagged training dataset we created. It’s important we take a random sample instead of just taking a sequence of articles straight from the dataset, since you risk not representing it accurately. Doing this would be like doing a survey for a whole city in a single neighborhood: you’ll know a lot about that neighborhood, but unless all the other neighborhoods in the city are exactly the same, your data will be useless for making claims about the population of the entire city.
+
+Now, we just have to upload that file to the classifier we made and we are ready to start tagging. We are going to use MonkeyLearn’s interface for tagging the dataset, but you can use whatever you find more comfortable.
+
+That’s just a  matter of going to the Samples tab and choosing Upload. When prompted to choose a file type, select CSV. Then, browse for the training_set.csv  file we created earlier. Afterwards, you’ll be shown a preview of the file.  Just choose Use as text for the only column, which means that we will be using the concatenated article title, text and tags as the text for training the classifier.
+
+Within the Samples tab we are presented with a listing of all the samples that we just uploaded. For each one of these, we want to assign a category. This means that for each sample we will ask the question: is this article about a startup, or not?
+
+Now it’s time we start tagging our data. You can read the full sample by clicking on it. When going through a dataset, you should always read enough to be sure what category it belongs to, else you risk adding bad samples to your dataset and causing confusion to your machine learning model.
+
+You can also navigate entirely with the keyboard: move around with the arrow keys and view a sample with keystroke “v”. Open the full shortcuts list by pressing “h” or “?”. Using the keyboard greatly improves the speed of categorization, since you don’t lose time hunting around with the mouse pointer.
+
+After reading the sample, select it, go to Actions and choose Move selected samples. (You can also move categorize in bulk, by selecting several at the same time).
+
+The category tree will pop up and there you can choose what category the selected sample belongs to:
+
+How many samples to tag? That depends on the problem you are solving. It’s a good idea to tag part of the dataset, test it out (both with MonkeyLearn’s metrics, seen in the next section, and with your own, unseen data), tag some more, and see if it improves. Rinse and repeat until you are satisfied with the results.
+
+If afterwards, you end up adding more data besides these original 500 samples, be mindful of duplicates. It’s important to avoid having duplicates in the model, since it will generate a weaker classifier either due to confusions or overfitting.
+
+Let’s say you have been at it for a while, and now have 100 tagged samples. Naturally, you want to see how you’re doing. You can train the module with the data you already have! Just go to the Tree tab and click Train, and MonkeyLearn will train the classifier using the 100 samples you already categorized and ignoring the other 400 untagged samples.
+
+MonkeyLearn will show its metrics, and you can test it out with your own examples. You can continue improving the module by tagging more of the sample data, adding data from other sources, fixing the confusions, or checking out the training parameters. Check out this guide for more handy advice on how to improve the model.
+
+If you are satisfied with the results, the module is always ready for integration, from the API tab.
+
+You can check out the classifier we made here. It has almost 700 tagged samples, and MonkeyLearn reports an accuracy of 80%. This is pretty good for a topic with such a gray area (it isn’t clear for many articles to which category they belong to, like we said before).
+
+Let’s try the classifier out!
+
+You can go to the API tab to see how you can use this module to classify a list of texts.
+
+As an example, let’s classify the last 100 items of the scraped CSV we created:
+
+You can print this result to the notebook and check it out, or save it again as a CSV file and open it as a spreadsheet. Or if you’re feeling lazy, just check out the already completed notebook here.
+
+Here you have different options:
+
+You can go to the Classify Text section and just paste a text and classify a single text or go to the Classify File and upload a CSV file with a list of articles to be classified.
+
+If you like to use Google Spreadsheets, you can use our Google Spreadsheets Plugin to classify a list of articles one per row and get the classification in a new column.
+
+If you are a Zapier user, you can use MonkeyLearn within Zapier and connect with many other services. For example, you could create a zap to trigger when new articles are published in TechCrunch through a RSS feed step. Then classify the article content with MonkeyLearn and finally store the new article and its classification in a Google Spreadsheet or just send you an alert to your email account. If you want to have early access to our Zapier integration, just drop us a line to hello@monkeylearn.com
+
+Today we scraped all the articles ever published in TechCrunch, VentureBeat and Recode, and we filtered out the ones that aren’t about startups. We will use this dataset for further analysis in future posts!
+
+This same outline can be followed to create a filter on any other topic a piece of text can cover: gather the data you want to be filtered, get a random sample, and tag it to train a classifier. You could make a similar filter that discards clickbait articles, or spam, or for anything else that could be ruled undesirable.
+
+Next time around we’ll create new classifiers that can analyze startup news content more in-depth to get insights about the industry and its change over time.
+
+How has startup fundraising changed through the years? Acquisitions? Which industries are more popular for startups now, when compared to 3 years ago?
+
+All these questions we will answer with machine learning, stay tuned!|||
+
+On this post we will analyze hundreds of thousands of articles from sites like TechCrunch and VentureBeat to discover insights into the industry of startups

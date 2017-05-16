@@ -1,0 +1,82 @@
+I recently helped a client with serious PostgreSQL problems. Their database is part of an application that configures and monitors large networks; each individual network node reports its status to the database every five minutes. The client was having problems with one table in particular, containing about 25,000 rows — quite small, by modern database standards, and thus unlikely to cause problems.
+
+However, things weren’t so simple: This table was growing to more than 20 GB every week, even though autovacuum was running. In response, the company established a weekly ritual: Shut down the application, run a VACUUM FULL, and then restart things. This solved the problem in the short term — but by the end of the week, the database had returned to be about 20 GB in size.  Clearly, something needed to be done about it.
+
+I’m happy to say that I was able to fix this problem, and that the fix wasn’t so difficult. Indeed, the source of the problem might well be obvious to someone with a great deal of PostgreSQL experience. That’s because the problem mostly stemmed from a failure to understand how PostgreSQL’s transactions work, and how they can influence the functioning of VACUUM, the size of your database, and the reliability of your system. I’ve found that this topic is confusing to many people who are new to PostgreSQL, and I thus thought that it would be a useful to walk others through the problem, and then describe how we solved it.
+
+PostgreSQL, like many other modern relational databases, uses a technology known as multiversion concurrency control (“MVCC”).  MVCC reduces the number of exclusive locks placed on a database’s rows, by keeping around multiple versions of each row. If that sounds weird, then I’ll try to explain. Let’s start with a very simple table:
+
+Now let’s add 1 million rows to that table:
+
+Now, how much space does this table take up on disk? We can use the built-in pg_relation_size function, but that’ll return a large integer representing a number of bytes. Fortunately, PostgreSQL also include pg_size_pretty, which turns a number into something understandable by computer-literate humans:
+
+What happens to the size of our table if we UPDATE each row, incrementing x by 1?
+
+If you’re new to MVCC, then the above is probably quite surprising. After all, you might expect an UPDATE query to change each of the existing 1 million rows, keeping the database size roughly identical.
+
+However, this is not at all the case: Rather than replace or update existing rows, UPDATE in an MVCC system adds new rows. Indeed, in an MVCC-based system, our queries never directly change or remove any rows. INSERT adds new rows, DELETE marks rows as no longer needed, and UPDATE performs both an INSERT and a DELETE.
+
+That’s right: In an MVCC system, UPDATE doesn’t change existing rows, although we might have the illusion of this occurring.  Every time you UPDATE a table, you’re doubling its size.
+
+At this point, many newcomers to PostgreSQL are even more confused: How can it be that deleted rows don’t go away? And why would UPDATE work in such a crazy way? And how can all of this possibly help me?
+
+The key to understanding what’s happening is to realize that once a row has been added to the system, it cannot be changed. However, its space can be reused by new rows, if the old row is no longer accessible by any transaction.
+
+This starts to make a bit more sense if you realize that every transaction in PostgreSQL has a unique ID number, known as the “transaction ID.” This number constantly increases, providing us with a running count of transactions in the system. Every time we INSERT a row, PostgreSQL records the first transaction ID from which the row should now be visible, in a column known as “xmin.” You an think of xmin as the row’s birthday. You cannot normally see xmin, but PostgreSQL will show it to you, if you ask for it explicitly:
+
+In an MVCC-based system, DELETE doesn’t really delete a row.  Rather, it indicates that a row is no longer available to future transactions. We can see an initial hint of this if, when we SELECT the contents of a table, we ask for not only xmin, but also xmax — the final transaction (or “expiration date,” if you like) for which a row should be visible:
+
+We can see that each of these rows was added in the same transaction ID (187656). Moreover, all of these rows are visible, since their xmax value is 0. (Don’t worry; we’ll see other xmax values in a little bit.)  If I update some  of these rows, we’ll see that their xmin value will be different:
+
+The rows with ID 1 and 3 were added in transaction 187668, whereas the rows with ID 2 and 4 were added in an earlier transaction, number 187665.
+
+Since I’ve already told you that rows cannot be changed by a query, this raises an interesting question: What happened to the rows with IDs 1 and 3 that were added in the first transaction, number 187665?
+
+The answer is: Those rows still exist in the system! They have not been modified or removed. But the system did mark them as having an xmax of 187668, the transaction ID in which the new, replacement rows are now available.
+
+Transaction IDs only go up. But you can imagine a hypothetical time-traveler’s database, in which you could move the transaction ID down, and see rows from an earlier era. (Somehow, I doubt that this would be a very popular television series.)
+
+The thing is, we don’t need a hypothetical, time-traveler’s database in order to see such behavior. All we need is to open two separate sessions to our PostgreSQL database at the same time, and have each session open a transaction.
+
+You see, when you BEGIN a new transaction, your actions are hidden from the rest of the world — and similarly, modifications made elsewhere in the database are hidden from you.  You can thus have a situation in two different sessions see completely different versions of the same row, thanks to their different transaction IDs.  This might sound crazy, but it actually helps the database to run smoothly, with a minimum of conflicts and locks.
+
+So, let’s open two different PostgreSQL sessions, and take a look at what happens.  In order to distinguish between them, I used the \set command in psql to make PROMPT1 either “Session A>” or “Session B>”. Here’s session A:
+
+And here is session B:
+
+At this point, they are identical; both sessions see precisely the same rows, with the same xmin and xmax. Now let’s modify the values of two rows in session A:
+
+What do we see now in session A?
+
+Just as we would expect, we have two new rows (IDs 1 and 3), and two old rows (IDs 2 and 4), which we can distinguish via the xmin value.  In all cases, the rows have an xmax value of 0.
+
+Let’s return to session B, and see what things look like there.  (Note that I haven’t committed any transactions here!)
+
+That’s right — the rows that session B sees are no longer the rows that session A sees.  Session B continues to see the same rows as were visible when it started the transaction. We can see that the xmax of session B’s old rows is the same as the xmin of session A’s new rows. That’s because any transaction after 187670 will see the new row (i.e., with an xmin of 187670), but any transaction started before 187670 will see the old row (i.e., with an xmax of 187670).
+
+I hope that the picture is now coming together: When you INSERT a new row, its xmin is the current transaction ID, and its xmax is 0.  When you DELETE a row, its xmax is changed to be the current transaction ID.  And when you UPDATE a row, PostgreSQL does both of these actions.  That’s why the UPDATE I did earlier, on all of the rows in the table, doubled its size.  (More on that in a moment.)
+
+This allows different transactions to work independently, without having to wait for locks. Imagine if session B wants to look at row with ID 3; because of MVCC, it doesn’t need to wait to read it.  Heck, session B can even change the row with ID 3, although it’ll hang until session A commits or rolls back.
+
+And indeed, another benefit of MVCC is that rollbacks are trivially easy to implement: If we COMMIT session A and roll back session B, then session A’s view of the world will be the current one, for all following transactions.  But if we ROLLBACK session A, then everything is fine; PostgreSQL keeps track of the fact that session A was rolled back, and that we should actually be using (until further notice) the rows with an xmax of 187670.
+
+As you can imagine, this can lead to some trouble. If every UPDATE increases the number of rows, and every DELETE fails to free up any space, every PostgreSQL database will eventually run out of room, no? Well, yes — except for VACUUM, which is the garbage-collecting mechanism for PostgreSQL’s rows. VACUUM can be run manually, but it’s normally run via “autovacuum,” a program that runs in the background, and invokes VACUUM on a regular basis.
+
+VACUUM doesn’t free space from your PostgreSQL database. Rather, it identifies rows whose xmin is greater than the current transaction ID, and thus marks those rows as available for re-use. PostgreSQL thus keeps track of not only the current transaction ID, but also the ID of the earliest still-open transaction. So long as that transaction is open, it needs to be able to see the rows from that point in time.
+
+Don’t confuse VACUUM with VACUUM FULL; the later does indeed clear out space from a PostgreSQL database, but locks the database while it’s doing so. If you have a serious 24/7 application, then VACUUM FULL is a very bad idea. The regular autovacuum daemon, albeit perhaps with a bit of configuration, should take care of identifying which rows can and should be marked for deletion.
+
+In the case of my client’s problem, my initial thought was that autovacuum wasn’t running. However, a quick look at the pg_stat_user_tables view showed that autovacuum was running on a regular basis.
+
+However, VACUUM will mark a row as eligible for reuse if no other transactions can see it. (After all, if a session remains open, then it still needs to see those old row versions.)  Meaning that if a transaction remains open from the time the system starts up, VACUUM will never identify any rows as eligible for reuse, because there is still an open transaction whose ID is lower than the xmax of the deleted rows.
+
+And this is precisely what happened to my client: It turns out that their application, at startup, was opening several transactions with BEGIN statements… and then never committing those transactions or rolling them back.  None of those transactions led to a lock in PostgreSQL, because they weren’t executing any query that would lead to a conflict. And autovacuum was both running and reporting that it ran on each table — because it had indeed done so.
+
+But when it came time to mark the old rows as eligible for reuse, VACUUM ignored all of the rows in the entire database, including our 23,000-row table — because of the transaction that the application had opened at startup. It didn’t matter how many times we can VACUUM, whether it was done manually or automatically, or what else was running at the time: All of the old versions of every row in our table were kept around by PostgreSQL, leading to a massive disk usage and database slowness. Stopping the application had the effect of closing those transactions, and thus allowing VACUUM FULL to do its magic, albeit at the cost of system downtime. And because the application opened the transactions at startup, any fix was bound to be a temporary one.
+
+My client was a bit surprised to discover that the entire database could encounter such problems from an open transaction that was neither committed nor rolled back. However, I hope that you now see why the space wasn’t reclaimed, and why the database acted as it did.
+
+The solution, of course, was to get rid of those three open, empty transactions at startup; once we did that, everything ran smoothly.
+
+Transactions are a brilliant and useful invention, but in PostgreSQL (and other MVCC systems), you shouldn’t be holding onto open transactions for too long. Doing so might have surprisingly unpleasant consequences. Commit or rollback as soon as you can — or you might find yourself with a database accumulating gigabytes full of old, unnecessary rows.|||
+

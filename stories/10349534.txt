@@ -1,0 +1,51 @@
+The Mystery Machine: End-to-end performance analysis of large-scale internet services – Chow et al. 2014
+
+Google’s Dapper paper is very well known, but Facebook’s Mystery Machine seems to be much less well known – and that’s a shame because I have a hunch the approach could be very relevant to many people.
+
+Facebook’s Mystery Machine can measure end-to-end performance from the initiation of a page load in a web browser, all the way through the server-side infrastructure, and back out to the point where the page has finished rendering. Doing this requires a causal model of the relationships between components (happens-before). How do you get that? And especially, how do you get that if you can’t assume a uniform environment for instrumentation?
+
+Facebook isn’t like that. And nor are many other companies internal systems….
+
+So instead, Facebook infer causal relationships from the regular logs produced by application components:
+
+And this is quite handy because pretty much everything already generates logs. Facebook relies on a minimum of common content for log messages: a request identifier, a host identifier, a host-local timestamp, and a unique event label. The output from all logs is aggregated into a UberTrace service.
+
+UberTrace consistently samples a small fraction of requests for end to end tracing. Trace data is written to Scribe, Facebook’s distributed logging service, and the logs are stored in tables in a data-warehousing infrastructure called Hive. The Mystery Machines runs batch Hadoop jobs over the data to infer causal relationships.
+
+The Mystery Machine (TMM) pre-processes log records to turn them into segments – the execution interval between two separate log records for the same task. Then TMM begins the process of identifying causal relationships. It starts by assuming that everything causes everything, by generating all possible hypotheses for casaul relationships among segments. Then it works through the corpus of traces and rejects a hypothesis if it finds a counterexample in any trace.
+
+There are three types of relationship that TMM infers:
+
+This of course all relies on some global understanding of time, whereas log records will have been written using local time:
+
+Since all log timestamps are in relation to local clocks, UberTrace translates them to estimated global clock values by compensating for clock skew. UberTrace looks for the common RPC pattern of communication in which the thread of control in an individual task passes from one computer (called the client to simplify this explanation) to another, executes on the second computer (called the server), and returns to the client. UberTrace calculates the server execution time by subtracting the latest and earliest server timestamps (according to the server’s local clock) nested within the client RPC. It then calculates the client-observed execution time by subtracting the client timestamps that immediately succeed and precede the RPC. The difference between the client and server intervals is the estimated network round-trip time (RTT) between the client and server. By assuming that request and response delays are symmetric, UberTrace calculates clock skew such that, after clock-skew adjustment, the first server timestamp in the pattern is exactly 1/2 RTT after the previous client timestamp for the task.
+
+UberTrace makes multiple estimates in this manner, and uses the one that yields the lowest observed RTT.
+
+Figure 2 in the paper shows a nice illustration of TMM at work. It is in essence a sieve-based algorithm.
+
+1.3 million requests gathered over 30 days confirm this hypothesis: “As the number of traces analyzed increases, the observation of new counterexamples diminishes, leaving behind only true relationships. Note that the number of total relationships changes over time because developers are continually adding new segments to the pipeline.”
+
+It took about 2 hours on a Hadoop cluster to analyse 1.3M requests sampled over a 30 day period. The computation was parallelized to make it feasible to run every night as a batch job. This allows the inferred causal dependencies to evolve alongside the deployed system:
+
+Given the inferred casual model, TMM performs three different types of performance analysis: critical path, slack, and anomaly detection.
+
+The critical path is defined to be the set of segments for which a differential increase in segment execution time would result in the same differential increase in end-to-end latency. The Mystery Machine calculates the critical path on a per-request basis. It represents all segments in a request as a directed acyclic graph in which the segments are vertices with weight equal to the segment duration. It adds an edge between all vertices for which the corresponding segments have a causal relationship. Then, it performs a transitive reduction in which all edges A → C are recursively removed if there exists a path consisting of A →B and B → C that links the two nodes. Finally, The Mystery Machine performs a longest-path analysis to find the critical path from the first event in the request (the initiation of the request) to the last event (which is typically the termination of some JavaScript execution). The length of the critical path is the end-to- end latency of the entire request. If there are equal-length critical paths, the first discovered path is chosen.
+
+In normal operation TMM is asked to calculate the critical path for large numbers of traces and aggregate the results. “For instance, we might ask how often a given segment falls on the critical path or the average percentage of the critical path represented by each segment.”
+
+Slack is what you get when you are not on the critical path…
+
+Slack results are typically aggregated over a large number of traces.
+
+One special form of aggregation supported by The Mystery Machine is anomaly analysis. To perform this analysis, it first classifies requests according to end-to-end latency to identify a set of outlier requests. Currently, outliers are defined to be requests that are in the top 5% of end-to-end latency. Then, it performs a separate aggregation of critical path or slack data for each set of requests identified by the classifiers. Finally, it performs a differential comparison to identify segments with proportionally greater representation in the outlier set of requests than in the non-outlier set. For instance, we have used this analysis to identify a set of segments that correlated with high latency requests. Inspection revealed that these segments were in fact debugging components that had been returned in response to some user requests
+
+The paper closes with two extended examples of using the analyses performed by TMM to gain improved understanding of Facebook systems. Firstly for critical path analysis of the Facebook home page on the web, and secondly for reducing latency.
+
+The global view provided by TMM helps to focus effort in the right places:
+
+The second case study is interesting because it uses The Mystery Machine to perform early exploration of a potential performance optimization—differentiated service—without undertaking the expense of implementing the optimization.
+
+Slack reported on previous requests turns out to be a good predictor of slack on future requests (a hypothesis also validated using TMM). Given this prediction, it’s possible to improve average latency:|||
+
+The Mystery Machine: End-to-end performance analysis of large-scale internet services - Chow et al. 2014 Google's Dapper paper is very well known, but Facebook's Mystery Machine seems to be much less well known - and that's a shame because I have a hunch the approach could be very relevant to many people. Current debugging and…

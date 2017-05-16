@@ -1,2 +1,50 @@
-|||
+Big Data Problems
+
+ Quantcast’s competitive edge lies in our ability to process vast amounts of data efficiently. We have hundreds of pipelines running on our hardware, processing over 30PB per day. We got to 30PB per day over the years by constantly finding new optimizations. Recently, with the cluster backlog growing and engineers starting to tap their fingers waiting for results, we faced an occasion to invent another one. We targeted an improvement to shave 10-20% off of our compute costs while reducing our storage size by several hundred terabytes. This scale of improvement would allow us breathing room necessary to either optimize additional pipelines or scale our cluster.
+
+Here’s what we did.
+
+Getting to the Root
+
+ Our commitment to instrumentation in our infrastructure aided our search for potential improvements. We keep detailed logs of every map-reduce step we run, tracking the mapper class, reducer class, job name, and cluster time. These logs revealed our most expensive pipelines, and thus which would yield the biggest gains.
+
+We quickly zeroed in on one particular pipeline—let’s call it Hercules. Hercules was one of our most expensive jobs, produced one of the largest datasets, and output data upon which much of our advertising business depends. Improving the internals of Hercules would improve not just its performance, but the performance of downstream pipelines as well.
+
+The second tool in our toolbox was our map-reduce profiler. This statistical profiler takes periodic stack-traces on every mapper and reducer, then aggregates the data, letting you know how much CPU time is spent within a given call. Analyzing the most expensive steps involving Hercules, we found our culprit: nested records being serialized and deserialized using native Java serialization.
+
+The Perils of Nested Structures and Java Serialization
+
+ Serialization is crucial to any software company doing long-term data storage at scale; you need to reliably write your data to the filesystem and load it back into your programming language later. Serializing records is such a common problem that there is a host of ways to go about it, including Protobuf, Thrift, ORC, Avro, Kudu, and Parquet. At Quantcast, we use a proprietary format simply called a rowfile.
+
+Our code is written in Java — and we could’ve just used internal Java serialization — however, this is inefficient for a number reasons. First, Java serialization relies on one of the slowest parts of Java —reflection. Reflection involves inspecting the class of an object at runtime and making decisions based on those facts. For instance, it can determine whether a List is an ArrayList or LinkedList. Unfortunately, using reflection can be incredibly slow because the Java compiler and runtime environment are unable to optimize execution.
+
+Secondly, Java serialization produces very bulky outputs. Each serialization contains all of the data required to deserialize. When you’re writing billions of records at a time, recording the schema in every record massively increases your data size.
+
+Rowfiles were designed to address these issues. Each Row knows the type of its fields and writes the values directly to bytes. The schema is written once on each file in a metadata header. This allows us to change schemas and read files even without knowing the class definition.
+
+What we found when digging through the Hercules profiling data is that we were still using java serialization in some places. In particular, we were serializing the raw input rows using native serialization, converting it to a string, and saving it into a single String field. This operation was taking 50% of the cluster time for some key steps, and reading out the raw input row also proved expensive. Some quick tests showed that using rowfile serialization instead and leaving everything else untouched would yield significant benefits.
+
+The Devil is in the Details
+
+ We knew that we wanted to replace the Java serialization with Rowfile serialization; the compute and space speedups were too big to ignore. However, the exact details still had to be worked out. Rowfile serialization does not keep a fixed schema around; instead, it relies on metadata to know what data corresponds to which fields. Just saving the raw bytes would render us unable to ever change the input row’s schema—an unacceptable state of affairs.
+
+We convened a group of senior engineers to brainstorm solutions to this problem and threw solutions onto a whiteboard. Most tried to attach the input row schema in some clever way so that we would be able to modify it. Solutions in this class included the following.
+
+These were all novel solutions but faced the same challenge: serializing records disjoint from a schema in a way that allows you to modify the schema is very hard. One of the senior engineers, Kristi Tsukida, realized that Quantcast had solved this problem before, with our rowfiles. She suggested promoting the input row’s columns up to the rows in Hercules. This would allow for schema changes and efficient storage, the reasons we implemented rowfiles in the first place.
+
+
+
+ Implementation
+
+ Implementing these changes took about two months. First, we published new Row definitions for downstream consumers to use. Next, we modified Hercules to write to the new format, and verify the jobs correctness. The final and most time-consuming step were coordinating with all downstream consumers to modify their jobs so that they could read either file format. These changes affected every engineering office, 13 distinct teams, and over 50 pipelines. By working closely with other teams, we were able to deploy this big change with minimal disruption.
+
+Final Results
+
+ Making this change made working with these datasets much easier. What previously required a complex series of incantations now only requires a simple field access. The non-engineer consumers of this data find it much easier to understand what data is available and what it means.
+
+Beyond readability, the effect on our compute cluster has been dramatic. We doubled the overall targets for the optimization, saving 30% of our cluster time and a petabyte of storage. While we were running on our own hardware, in AWS these savings would back out to about a million dollars of EC2 and two million dollars of storage.
+
+How we structure our data is crucial to making our computation efficient. At the scale we operate, improving even a single pipeline can yield huge returns. Doubling down on our core infrastructure and being willing to make big changes gave us the step level improvements we needed to continue to scale.
+
+Interested in making an impact at Quantcast? Learn more about engineering at Quantcast here.|||
 

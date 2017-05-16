@@ -1,0 +1,59 @@
+There is an information system that I administer. The system consists of the following components:
+
+These information systems are installed on several objects. The information system is used actively 24 hours a day by 2 to 20 users at once on each object. Therefore, you cannot perform routine maintenance all at once. So, I have to «spread» SQL Server index defragmentation throughout the day, rather than defragmenting all the necessary fragmented indexes at one stroke. This applies to other operations as well.
+
+The statistics auto-update property is set in the properties of the database. Besides, the statistics are updated on the defragmented index.
+
+About a year ago, I encountered the following problem:
+
+From time to time, all queries were running slow. Notably, the delay time was random. It happened on every object on a random day. Moreover, when I began to analyze how often the delays occur (using the profiler), I found out that they occur every day at a random time. Users just do not always pay attention to them but take them as the only random delay, and then the system works quickly again.
+
+I have reviewed all the slow-running queries. The weirdest thing was that all the queries were running slow at a random time, even the simplest ones, like pulling the last record from a table with several thousand rows.
+
+Further, I performed the following steps:
+
+1.  I analyzed MS SQL Server and Windows Server logs, but couldn’t find the cause of delays.
+
+ 2. I analyzed indexes (fragmentation, etc.), added the missing ones and removed unused.
+
+ 3. I analyzed the queries – some queries were improved.
+
+ 4. I analyzed the tasks in SQL Agent and couldn’t associate the tasks with the delay problem.
+
+ 5. I analyzed the tasks in Task Scheduler and couldn’t associate the tasks with the delay problem.
+
+ 6. Profiler showed the results, but not the cause of delays.
+
+ 7. I performed a check for deadlocks – no long blockings were revealed.
+
+As a result, I spent more than 3 months on the unsuccessful search of the reason of occasional slow-running queries. However, I revealed an interesting fact — instead of the Worker execution indicator, the Elapsed wait indicator increased for all the queries. This fact gave me the idea that something is wrong with the disks. I checked them – everything was fine.
+
+To my surprise, I accidentally revealed that when a query was executed slowly in the application, it ran quickly in SSMS. One article helped in solving the problem (at least it suggested the idea).
+
+In practice, the most important SET option is ARITHABORT, because the default value for this option is different for applications and for SQL Server Management Studio. This explains why you can detect a slow-running query in your application, and then get good speed by executing it in SSMS. The application uses a plan that was built for a set of values that differs from the actual correct values. Whereas if you run the query in SSMS, it is most likely that the cache does not yet have an execution plan for ARITHABORT ON, and therefore SQL Server will build a plan for your current values.
+
+The difference in execution was due to the SET ARITHABORT parameter. For all queries executed in SSMS, this option is enabled, and for queries from the outside (from applications) – disabled. It cannot be enabled even by a simple query for applications:
+
+A crazy idea followed – clearing procedural cache at the time of hangup.
+
+For the subsequent manual check, I need to write the following statement before the query in SSMS:
+
+Thus we will simulate the operation of the application. When the query had been running for a long time, I cleared the procedural cache. And this always helped. Before clearing the procedural cache, the query could run up to 20-30 seconds, and afterward – 0 seconds.
+
+After that, I performed another experiment – cleaning the entire procedural cache for the entire database every hour via SQL Agent:
+
+After that, all queries ran very quickly (less than 0.05 seconds). There were only some occurrences of up to 5-10 seconds of execution, but users did not notice any hangups. Moreover, updating the statistics did not improve the results, so I disabled the statistics update.
+
+After a few more months of study, I discovered that occasional hangups occur when either the cache consumes everything on the server, and no free space is left or there is a free memory, but less than 1 GB of RAM or the MS SQL Server service occupies all the allocated RAM (via Task Manager). But the second event occurred only twice per the entire study.
+
+The fact is that literally everything is written into the cache, while the cache is not always released on time. The problem with the cache was solved using the EmptyStandbyList.exe program.
+
+I configured this application via Task Scheduler to run 1 time every hour. After all the work accomplished, there are no query hangups on all objects for more than half a year now.
+
+The only thing that remains unclear is the rare cases when one query hangups for 5-10 seconds once a month on a random day and at a random time. There were 4 such cases and only on two objects for half a year when the MS SQL Server service occupies all the allocated memory for a short time period.
+
+Basically, there is no need to dig deeper, as users do not notice any hangups and everything works fine, but if anyone has any thoughts, I will be grateful for sharing.
+
+This article was written to help those who come across such problems, as I did not find a comprehensive answer on the Internet, and I spent a lot of time on studying the problem and finding the solution.|||
+
+When a query was executed slowly in the application, it ran quickly in SSMS. Hangups occur when the cache occupies all memory on the server.

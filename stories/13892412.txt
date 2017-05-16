@@ -1,0 +1,28 @@
+This week, I started playing around with the Android platform. I've been eyeing Yeti, an ML dialect that compiles to JVM and features structural typing. Even though I only have very limited experience in ML (mostly just reading the snippets in the Okasaki, and having helped Maya once with some F# code), it has to be better than Java, right?
+
+After getting the hang of Yeti (integrating it into Android's ant build system, writing Hello World, etc.) I wanted to write something more substantial to evaluate the language for serious use. However, yesterday evening I started getting weird errors as soon as I started creating non-trivial closures in member functions. This is the chronicle of how I tracked down the problem with just some rudimentary Java knowledge and lots of reverse engineering.
+
+I'll illustrate the problem with a very small repro case here; however, a large part of the puzzle was actually minimizing the code that still exhibits the bug.
+
+The bug manifested itself by my application crashing with a java.lang.noSuchFieldError exception while running a function defined inside a class method. Here is a simplified version of the code:
+
+And here is the exception I get when trying to run it on the Android emulator:
+
+While that field name, does seem suspicious, disassembling the classfile created by the Yeti compiler with jclassinfo shows there is in fact such a field:
+
+Looking at the types of these two fields, a good working theory is that these correspond to the member variables and in the source. So should be , and thus it's probably accessed by the code compiled from the statement in the function . The error message, then, means there is no field in whatever tries to read it from.
+
+My first hunch was that probably mixes up the closure, so I looked at the disassembled version of both definition of and its usage site:
+
+I looked up the opcodes in the JVM spec and reconstructed what happens. The function gets its closure in the first argument as a list of s and its "real" arguments follow (a single value in this case, represented as a Java ). Both the call site and the function definition seems to agree on this convention, so the problem is not in the two mixing up the protocol.
+
+My next idea was to write the same thing (with packing the closure into an array) in Java and see what it gets compiled into. The code I wrote was:
+
+I've highlighted the only difference in this particular version; in the actual code I was working with, there were more substantial differences related to how stuff is laid out on the stack. At this point, I started to suspect that maybe types are necessary for the JVM at runtime to access fields, so I wanted to test this this theory. That meant taking the compiled version of the Java code and just removing that single instruction.
+
+Unfortunately, the only JVM assembler I could find was Jasmin which uses a somewhat different syntax than jclassinfo, so there was no roundtripping. But based on the handful of examples bundled with Jasmin, I managed to rewrite the program and then try it in the Android emulator.
+
+This experiment immediately validated my suspicion: even though the pointer on the stack points to an object of dynamic type , the JVM needs the static cast before it can find its field. Why it does so I don't know: since JVM only admits single inheritance, the field offsets should be independent of the actual type.
+
+And thus we come to the solution: I wrote a trivial patch to the Yeti compiler to always after unpacking from the closure. Using that patch, my code runs just fine on Android.|||
+

@@ -1,2 +1,120 @@
-|||
+
+
+ 
+
+ The choice to use TLS/TCP in HTTP/2 was not a forgone conclusion. During the pre-HTTP/2 
+
+ 
+
+ In the end folks felt that experience and running code were top tier properties for the next revision of HTTP. That argued for TCP/TLS. Using the traditional stack lowered the risk of boiling the ocean, improved the latency of getting something deployed, and captured the meaningful low hanging fruit of multiplexing and priority that HTTP/2 was focused on.
+
+ 
+
+ Issues that could not be addressed with TCP/TLS 1.2 were deemed out of scope for that round of development. The mechanisms of ALPN and Alternative Services were created to facilitate successor protocols.
+
+ 
+
+ HTTP/2 development consciously constrained its own work in two ways. One was to preserve HTTP/1 semantics, and the other was to limit the work to what could be done within a traditional TLS/TCP stack.The choice to use TLS/TCP in HTTP/2 was not a forgone conclusion. During the pre-HTTP/2 bakeoff phase there was quite a bit of side channel chatter about whether anyone would propose a different approach such as the SCTP/UDP/[D]TLS stack RTC DataChannels was contemporaneously considering for standardization.In the end folks felt that experience and running code were top tier properties for the next revision of HTTP. That argued for TCP/TLS. Using the traditional stack lowered the risk of boiling the ocean, improved the latency of getting something deployed, and captured the meaningful low hanging fruit of multiplexing and priority that HTTP/2 was focused on.Issues that could not be addressed with TCP/TLS 1.2 were deemed out of scope for that round of development. The mechanisms of ALPN and Alternative Services were created to facilitate successor protocols.
+
+
+
+ The chief performance frustration with HTTP/2 happens during higher than normal packet loss. The in-order property of TCP spans multiplexed HTTP messages. A single packet loss in one message prevents subsequent unrelated messages from being delivered until the loss is repaired. This is because TCP delays received data in order to provide in-order delivery of the whole stream.
+
+ 
+
+ For a simple example imagine images A and B each delivered in two parts in this order: A1, A2, B1, and B2. If only A1 were to suffer a packet loss under TCP that would also delay A2, B1, and B2. While image A is unavoidably damaged by this loss, image B is also impacted even though all of its data was successfully transferred the first time.
+
+ 
+
+ This is something that was understood during the development of RFC 7540 and was correctly identified as a tradeoff favoring connections with lower loss rates. Our community has seen some good data on how this has played out "in the wild" recently from both Akamai and Fastly. For most HTTP/2 connections this strategy has been beneficial, but there is a tail population that actually regresses in performance compared to HTTP/1 under high levels of loss because of this.
+
+ 
+
+ QUIC fixes this problem through multistreaming onto one connection in a way very familiar to 7540 but with an added twist. It also gives each stream its own ordering context analagous to a TCP sequence number. These streams can be delivered independently to the application because in-order only applies to each stream instead of the whole connection in QUIC.
+
+I believe fixing this issue is the highest impact feature of QUIC.
+
+
+
+ 
+
+ HTTP/2 starts much faster than HTTP/1 due to its ability to send multiple requests in the first round trip and its superior connection management results in fewer connection establishments. However, new connections using the TCP/TLS stack still incur 2 or 3 round trips of delay before any HTTP/2 data can be sent.
+
+
+
+ In order to address this QUIC eschews layers in favor of a component architecture that allows sending encrypted application data immediately. QUIC still uses TLS for security establishment and has a transport connection concept, but these components are not forced into layers that require their own round trips to be initialized. Instead the transport session, the HTTP requests, and the TLS context are all combined into the first packet flight when doing session resumption (i.e. you are returning to a server you have seen before). A key part of this is integration with TLS 1.3  and in particular the 0-RTT (aka Early Data) handshake feature.
+
+ 
+
+ The HTTP/2 world, given enough time, will be able to capture some of the same benefits using both TLS 1.3 and TCP Fast Open. Some of that work is made impractical by dependencies on Operating System configurations and the occasional interference from middleboxes unhappy with TCP extensions.
+
+ 
+
+ However, even at full deployment of TLS 1.3 and TCP Fast Open, that approach will lag QUIC performance because QUIC can utilize the full flight of data in the first round trip while Fast Open limits the amount of data that can be carried to the roughly 1460 bytes available in a single TCP SYN packet. That packet also needs to include the TLS Client Hello and HTTP SETTINGS information along with any HTTP requests. That single packet runs out of room quickly if you need to encode more than one request or any message body. Any excess needs to wait a round trip.
+
+ 
+
+ 
+
+
+
+
+
+ 
+
+ The circumstances for an operating system generating a RST and how they respond to them can vary by implementation. One common scenario is a server close()ing a connection that has received another request that the HTTP server has not yet read and is unaware of. This is a routine case for HTTP/1 and HTTP/2 applications. Most kernels will react to the closing of a socket with unconsumed data by sending a RST to the peer. 
+
+ 
+
+ That RST will be processed out of order when received. In practice this means if the original client does a recv() to consume ordinary data that was sent by the server before the server invoked close() the client will incur an unrecoverable failure if the RST has also already arrived and that data cannot ever be read. This is true even if the kernel has sent a TCP ack for it! The problem gets worse when combined with larger TLS record sizes as often the last bit of data is what is needed to decode the whole record and substantial data loss of up to 64KB occurs.
+
+ 
+
+ The QUIC RST equivalent is not part of the orderly shutdown of application streams and it is not expected to ever force the loss of already acknowledged data. 
+
+ As many HTTP developers will tell you, TCP RST is one of the most painful parts of the existing ecosystem. Its pain comes in many forms, but the data loss is the worst.The circumstances for an operating system generating a RST and how they respond to them can vary by implementation. One common scenario is a server close()ing a connection that has received another request that the HTTP server has not yet read and is unaware of. This is a routine case for HTTP/1 and HTTP/2 applications. Most kernels will react to the closing of a socket with unconsumed data by sending a RST to the peer.That RST will be processed out of order when received. In practice this means if the original client does a recv() to consume ordinary data that was sent by the server before the server invoked close() the client will incur an unrecoverable failure if the RST has also already arrived and that data cannot ever be read. This is true even if the kernel has sent a TCP ack for it! The problem gets worse when combined with larger TLS record sizes as often the last bit of data is what is needed to decode the whole record and substantial data loss of up to 64KB occurs.
+
+
+
+ The primary goal of HTTP/2 was the introduction of multiplexing into a single connection and it was understood that you cannot have meaningful multiplexing without also introducing a priority scheme. HTTP/1 illustrates the problem well - it multiplexes the path through unprioritized TCP parallelism which routinely gives poor results. The final RFC contained both multiplexing and priority mechanisms which for the most part work well.
+
+ 
+
+ However, successful prioritization requires you to buffer before serializing the byte stream into TLS and TCP because once sent to TCP those messages cannot be reordered in the case of higher priority data presenting itself.  Unfortunately high latency TCP, requires a significant amount of buffering at the socket layer in order to run as fast as possible. These two competing interests make it difficult to judge how much buffering an HTTP/2 sender should use. While there are some Operating System specific oracles that give some clues, TCP itself does not provide any useful guidance to the application for reasonably sizing its socket buffers.
+
+ 
+
+ This combination has made it challenging for applications to determine the appropriate level of socket buffering and in turn they sometimes have overbuffered in order to make TCP run at line rate. This results in poor responsiveness to the priority schedule and the inability for a server to recognize individual streams being canceled (which happens more than you may think) because they have already been buffered.
+
+ 
+
+ The blending of transport and application components creates the opportunity for QUIC implementations to do a better job on priority. They do this by buffering application data with its priority information outside of the transmission layer. This allows the late binding of the packet transmission to the data that is highest priority at that moment.
+
+ 
+
+ Relatedly, whenever a retransmission is required QUIC retransmits the original data in one or more new packets (with new packet identifiers) instead of retransmitting a copy of the lost packet as TCP does. This creates an opportunity to reprioritize, or even drop canceled streams, during retransmission. This compares favorably to TCP which is sentenced to retransmitting the oldest (and perhaps now irrelevant) data first due to its single sequence number and in-order properties.
+
+
+
+ QUIC is not inherently either a user space or kernel space protocol - it is quite possible to deploy it in either configuration. However, UDP based applications are often deployed in userspace configurations and do not require special configurations or permissions to run there. It is fair to expect a number of user space based QUIC implementations.
+
+ 
+
+ Time will tell exactly what that looks like, but I anticipate it will be a combination of self-updating evergreen applications such as web servers and browsers and also a small set of well maintained libraries akin to the role openssl plays in distributions.
+
+ 
+
+ Decoupling functionality traditionally performed by TCP from the operating system creates an opportunity for deploying software faster, updating it more regularly, and iterating on its algorithms in a tight loop. The long replacement and maintenance schedules of operating systems, sometimes measured in decades, create barriers to deploying new approaches to networking.
+
+ 
+
+ This new freedom applies both QUIC itself, but also to some of its embedded techniques that have equivalents in the TCP universe that have traditionally been difficult to deploy. Thanks to user space distribution packet pacing, fast open, and loss discovery improvements like RACK will see greater deployment than ever before.
+
+ 
+
+ Userspace will mean faster evolution in networking and greater distribution of the resulting best practices.
+
+
+
+The IETF QUIC effort is informed by Google's efforts on its own preceding protocol. While it is not the same effort it does owe a debt to a number of Google folk. I'm not privy to all of the internal machinations at G but, at the inevitable risk of omitting an important contribution, it is worth calling out Jim Roskind, Jana Iyengar, Ian Swett, Adam Langley, and Ryan Hamilton both for their work and their willingness to evangelize and discuss it with me. Thanks! We're making a better Internet together.|||
 

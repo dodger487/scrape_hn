@@ -1,0 +1,59 @@
+This is chapter one of a two part series on Remote Code Execution (RCE) vulnerability hunting in Unitrends. Fixes to these bugs are available in the latest Unitrends update.
+
+The exploits for the Unitrends vulnerabilities mentioned in this security research series can be found on the Rhino Security GitHub page.
+
+Unitrends is self-labeled as “all-in-one enterprise backup software for any IT environment,” complete with a webserver interface to manage your network. While much of the proprietary information is obfuscated as a PHP shared object library, the webserver files are viewable when logging into a trial Virtual Machine (VM) Unitrends provides. The default password for these installations is unitrends1 unless otherwise specified. This blog series will detail how I discovered several vulnerabilities in the Unitrends application, including three remote code execution bugs.
+
+Bug hunting regardless of the platform has two basic forms – blind and non-blind fuzzing. A blind fuzzer would be something like BurpSuite Pro’s Scan Whole Site function which sends a list of inputs based on insertion points and monitoring the application’s response. Since we have the source code, one option is to use one of the many great PHP scanners that exist; however, open-source scanners tend to produce an overbearing amount of results and if you’re on a budget, using a paid scanner isn’t an option.
+
+The general formula we follow is:
+
+In looking for key function calls we’d like to exploit – and because the web application is written in PHP – we’ll begin searching for the functions that can execute code remotely on the system. From the php docs this includes exec, shell_exec, system, passthru, pcntl_exec, popen and backtick operators. If any user input pushed to one of these function calls is unfiltered or filtered poorly, code execution on the machine would become possible. Let’s use find and grep to hunt down where these are being called.
+
+Trimmed output from the result of find.
+
+From the picture above, we’ve tracked down a few interesting looking files – /api/includes/system.php and /api/includes/restore.php. For systems.php it seems like a password change is being issued through popen, while the restore.php looks to be doing some file management.
+
+We’ll look at both files, but for now we’ll analyze the systems.php file more closely.
+
+From the above output, let’s take a closer look at the systems.php file. Within the file we’ll see a function called change_system_password with the following code:
+
+The problematic function is api/includes/systems.php. If webserver is root (ala $res = trim(shell_exec(‘echo $UID’))) then the system trusts the user passed as valid. Since the web application conducts user management through passwd, root is required to change another user’s password.
+
+From the comment, this function handles password changes for the system users (those found in /etc/passwd) through a popen command. Since this can be done from the web application interface, the problem arises when the webserver is running as root (which is the case for Unitrends appliances before 9.0.0). You can pass a malicious user such as `sleep 10` which issue a popen with the argument “/usr/bin/passwd –stdin `sleep 10`”. Since the statement in backticks is executed before the password change, the server sleeps ten seconds.
+
+To find where this function is called, we use grep as above to search for calls made to change_system_password and find it’s called directly from /recoveryconsole/bpl/password.php.
+
+The file reads as follows:
+
+The script simply grabs the variables issued by the $_REQUEST variable and passes them to our vulnerable function. The only caveat here is in the header.php file which relies on an “AuthToken” header to be passed with the request. This token is issued upon your first login and set in the “token” cookie. All that’s left is to craft the request with the AuthToken header with the requisite $_REQUEST variables as above and exploit the application. Below shows a python wrapper around this process and making the webserver request our attacking machine.
+
+Since changing the system password had a critical vulnerability, I then decided to look closer at the change password functionality of web application users in general. Password management is done on the Users class model, which shows that when a put request is issued to this class we reach our destination. Below is the vulnerable code snippet from the Users class model. Submitting a PUT request with the ‘force’ parameter sets the password, bypassing the normal access control.
+
+To reach our vulnerable code we look for each new instantiation of the Users class model by grepping for “new Users”. Doing so yields only one file with four results, in /api/includes/appliance.php. Within the file, a short function is declared which states:
+
+All that remains is to grep for where “update_users” is being called, which is done from the main /api/index.php file. Following the switch-case control flow of the API index file, we can hit it through issuing a PUT request to /api/users/$UID/ to change the user identified by $UID password.
+
+One way to start looking for unrestricted file uploads is to look for file writes done in an unsafe manner. Doing a similar find and grep, we note the following results:
+
+Traversing each of these paths, the one of interest here is ./recoveryconsole/bpl/reports.php. Investigating the fopen, we find that it’s a part of a simple function called saveReport, which takes a file and contents, and writes the contents to the file. Next, we find that saveReport is called from another switch/case scenario using the following code:
+
+There are a few things to note here from the code. The first thing here is that a user controls variables $reportType, $contents and $basename variables. This means that we have control over what is being written in saveReport but not necessarily where. The “where” of the file write is determined by the function createReportName, which shows the following:
+
+For createReportName we control the $baseName and $type variables. We can gain control of the directory written to, even if we don’t own the $directory (since $baseName isn’t sanitized for bad characters). If we’re then to pass $baseName as ../../../../../../../../../../../../../var/www/html/tempPDF/test1234 and a $type variable of “php,” this will create the filename $directory . ‘/’ . ../../../../../../../../../../../../var/www/html/tempPDF/test1234$date.php. Then it will write the $contents variable (which we control) to the newly created PHP file, resulting in code execution. The reason for the tempPDF directory file write is that this directory is web accessible and writable by the webserver agent. When the request completes, we will see the filename returned to us in an XML document for us to access directly. Reading the source of reports.php shows that issuing our GET request directly to the PHP file will be enough to reach this function, and no other api back-tracing is required.
+
+The URL shows the query parameters being fed except contents variable, which has system($_GET[‘e’]); ? . When the request completes, we see our report file being output to the tempPDF directory. All that’s left is to navigate to the page and execute the code.
+
+A python wrapper was made for this exploit as well and is shown below.
+
+This bug was discovered through fuzzing Unitrends parameters, without source code review. When logging into the application there are a few anomalous behaviors; one of these is when a user connects to the Unitrends web interface, session tokens live on indefinitely as long as your requests originate from that IP address. This led into further investigation of the “token” cookie issued that governs your authentication with the application. The cookie must be URL decoded and base64 decoded to reveal several colon separated values. For example:
+
+After fuzzing this cookie we determine that format is roughly as follows:
+
+The next logical step was to log into a low-level account (with access to no shares) and see if we could escalate to root. Indeed, when you change the UID to 1, base64/URL encode and re-submit your cookie, the account now has access to everything root does from the web interface.
+
+As a side note, the log file can be manipulated to write to an arbitrary file and conduct a file overwrite, but it was yet to be seen how it could lead to code execution.
+
+In chapter two of this series, we’ll review another remote code execution vulnerability which required more analysis than these two examples. We’ll walk step-by-step on how to reach the vulnerable function, outline a flaw in the main support.unitrends.com domain (which leaked customer information) and give the disclosure timeline.|||
+
+Details vulnerability hunting and the discovery of several bugs in Unitrends application, including 3 remote code execution resulting in three CVEs.

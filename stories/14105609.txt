@@ -1,0 +1,54 @@
+Casting to generic interfaces that use covariance or contravariance is two orders of magnitude slower than normal casts in C#. This means casting to is two orders of magnitude slower too. This result was quite unexpected and very surprising.
+
+In this post, I investigate the cost of casting to implementations, interfaces, generic interfaces, covariant interfaces, and contravariant interfaces. I delve into the IL code to see if it holds any answers. Finally, I demonstrate that these results are not merely theoretical and that they also apply to .
+
+My previous post on micro-benchmarking the three ways to cast safely made Mike "curious about the cost of casting a result from a dictionary that stores objects in a different type than what is required". He went on to do his own benchmarks and found that "casting is EXPENSIVE!". Mike's results show that accessing a value from a dictionary takes 21ns, casting it takes 63ns, and doing both takes 86ns.
+
+Mike's results made me curious, is casting really that much more expensive than a dictionary lookup? To investigate, I repeated Mike's experiments and obtained similar results. This was very surprising: in my experience with optimizing tight loops, I've often seen dictionary lookups dominate the cost, but I've never seen cast operators dominate the cost.
+
+I proceeded to reimplement Mike's code and found that casting was now a negligible part of the cost. What was the relevant difference between Mike's code and my code? The answer is contravariance. Mike's code was casting to an interface of type , while I was casting to an interface of type .
+
+To investigate the cost of casting, I used BenchmarkDotNet to micro-benchmark the cost of casting to the implementation, an interface, a generic interface, a covariant interface, and a contravariant interface.
+
+Here is the code I used:
+
+I ran all the benchmarks in this post on both 64-bit with RyuJIT and 32-bit with LegacyJIT. While the absolute results differed, the relative performance was very similar. Therefore, I'll just present the results on 64-bit with RyuJIT:
+
+These results show that the cost of casting to the implementation is tiny, the cost of casting to an interface is higher, and the cost of casting to a generic interface is higher again. These results are as you would expect.
+
+What is shocking, is the cost of casting to a covariant or contravariant interface. The cost of these is more than two orders of magnitude higher than casting to the implementation.
+
+At the IL level there are three distinct situations for the six benchmarked methods.
+
+doesn't involve any casting at all, as the value is already of the required type, so no cast methods appear in the IL code.
+
+In and , the target class does not involve generics, so the cast appears as in the IL code.
+
+In , , and , the target class involves generics, so the cast appears as in the IL code.
+
+Unfortunately, the IL code holds no answers for why casts involving covariant or contravariant interfaces are so slow. The answer probably lies at the JIT level.
+
+This doesn't just apply to covariant and contravariant interfaces that you define. It also applies to those defined by libraries and the .NET framework. For example, is covariant and therefore, casting to is slow.
+
+Here is some code that benchmarks casting to :
+
+And here are the results:
+
+These results show that just like casting to a covariant or contravariant interface, the cost of casting to is more than two orders of magnitude higher than casting to the implementation.
+
+In typical real-world code, you're unlikely to encounter this at all. Normally, you have an implementation of and you need to call a method that requires or you need to return an . In both cases, there is no need to cast at all, and therefore, no cost.
+
+In the odd case where you really do need to cast to , the cost is not particularly significant. You can cast to about ten million times per second.
+
+The one case you should watch out for is repeated casting in a tight loop. When that happens, you need to look out for casts involving covariant or contravariant interfaces. For example, looking up values in and casting to . The cost of casting here is approximately three times greater than the dictionary lookup.
+
+The cost of casting to generic interfaces that use covariance or contravariance is two orders of magnitude higher than normal casts in C#. This also affects library and framework types like .
+
+While unlikely to impact your code, there are situations where it can become a bottleneck. So be wary of casting to covariant and contravariant interfaces in tight loops.
+
+There is nothing in the IL Code to indicate why casting to covariant and contravariant interfaces is so much less performant. If you know why it's slower, please share in the comments.
+
+Update (14th April 2017): Mike has experimented further and found that implicit casting has the same performance as not casting. That's because implicit casting doesn't involve casting at all. If you check the IL code that corresponds to Mike's code, you'll find that neither nor call , but obviously does.
+
+This means that if you call a method that expects an with a more specific , there is no need to cast and therefore, no cost. Similarly, if you call a method that expects an with a more general , there is no need to cast and therefore, no cost. This is further evidence that you're unlikely to encounter the cost of casting covariant and contravariant interfaces in real-world code.|||
+

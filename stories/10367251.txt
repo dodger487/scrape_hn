@@ -1,0 +1,70 @@
+At eBay, we take site speed very seriously and are always looking for ways to allow developers to create faster-loading web apps. This involves fully understanding and controlling how web pages are delivered to web browsers. Progressive HTML rendering is a relatively old technique that can be used to improve the performance of websites, but it has been lost in a whole new class of web applications. The idea is simple: give the web browser a head start in downloading and rendering the page by flushing out early and multiple times. Browsers have always had the helpful feature of parsing and responding to the HTML as it is being streamed down from the server (even before the response is ended). This feature allows the HTML and external resources to be downloaded earlier, and for parts of the page to be rendered earlier. As a result, both the actual load time and the perceived load time improve.
+
+In this blog post, we will take an in-depth look at a technique we call “Async Fragments” that takes advantage of progressive HTML rendering to improve site speed in ways that do not drastically complicate how web applications are built. For concrete examples we will be using Node.js, Express.js and the Marko templating engine (a JavaScript templating engine that supports streaming, flushing, and asynchronous rendering). Even if you are not using these technologies, this post can give you insight into how your stack of choice could be further optimized.
+
+To see the techniques discussed in this post in action, please take a look at the accompanying sample application.
+
+Progressive HTML rendering is discussed in the post The Lost Art of Progressive HTML Rendering by Jeff Atwood, which was published back in 2005. In addition, the “Flush the Buffer Early” rule is described by the Yahoo! Performance team in their Best Practices for Speeding Up Your Web Site guide. Stoyan Stefanov provides an in-depth look at progressive HTML rendering in his Progressive rendering via multiple flushes post. Facebook discussed how they use a technique they call “BigPipe” to improve page load times and perceived performance by dividing up a page into “pagelets.” Those articles and techniques inspired many of the ideas discussed in this post.
+
+In the Node.js world, its most popular web framework, Express.js, unfortunately recommends a view rendering engine that does not allow streaming and thus prevents progressive HTML rendering. In a recent post, Bypassing Express View Rendering for Speed and Modularity, I described how streaming can be achieved with Express.js; this post is largely a follow-up to discuss how progressive HTML rendering can be achieved with Node.js (with or without Express.js).
+
+A page that does not utilize progressive HTML rendering will have a slower load time because the bytes will not be flushed out until the complete HTML response is built. In addition, after the client finally receives the complete HTML it will then see that it needs to download additional external resources (such as CSS, JavaScript, fonts, and images), and downloading these external resources will require additional round trips. In addition, pages that do not utilize progressive HTML rendering will also have a slower perceived load time, since the screen will not update until the complete HTML is downloaded and the CSS and fonts referenced in the section are downloaded. Without progressive HTML rendering, a server/client waterfall chart might be similar to the following:
+
+The corresponding page controller might look something like this:
+
+As you can see in the above code, the page HTML is not rendered until all of the data is asynchronously loaded.
+
+Because the HTML is not flushed until all back-end services are completed, the user will be staring at a blank screen for a large portion of the time. This will result in a sub-par user experience (especially with a poor network connection or with slow back-end services). We can do much better if we flush part of the HTML earlier.
+
+A simple trick to improve the responsiveness of a website is to flush the head section immediately. The head section will typically include the links to the external CSS resources (i.e. the tags), as well as the page header and navigation. With this approach the external CSS will be downloaded sooner and the initial page will be painted much sooner as shown in the following waterfall chart:
+
+As you can see in the chart above, flushing the head early reduces the time to render the initial page. This technique improves the responsiveness of the page, but it does not significantly reduce the total time it takes to make the page fully functional. With this approach, the server is still waiting for all back-end services to complete before flushing the final HTML. In addition, downloading of external JavaScript resources will be delayed since tags are placed at the end of the page (assuming you are following best practices) and don’t get sent out until the second and final flush.
+
+Instead of flushing only the head early, it is often beneficial to flush multiple times before ending the response. Typically, a page can be divided into multiple fragments where some of the fragments may depend on data asynchronously loaded from various back-end services while others may not depend on any asynchronously loaded data. The fragments that depend on asynchronously loaded data should be rendered asynchronously and flushed as soon as possible.
+
+For now, we will assume that these fragments need to be flushed in the proper HTML order (versus the order that the data asynchronously loads), but we will also show how out-of-order flushing can be used to further improve both page load times and perceived performance. When using “in-order” flushing, fragments that complete out of order will need to be buffered until they are ready to be flushed in the proper order.
+
+As an example, let’s assume we have divided a complex page into the following fragments:
+
+Each fragment is assigned a number based on the order that it appears in the HTML document. In code, our output HTML for the page might look like the following:
+
+The Marko templating engine provides a way to declaratively bind template fragments to asynchronous data provider functions (or Promises). An asynchronous fragment is rendered when the asynchronous data provider function invokes the provided callback with the data. If the asynchronous fragment is ready to be flushed, then it is immediately flushed to the output stream. Otherwise, if the asynchronous fragment completed out of order then the rendered HTML is buffered in memory until it is ready to be flushed. The Marko templating engine ensures that fragments are flushed in the proper order.
+
+Continuing with the previous example, our HTML page template with asynchronous fragments defined will be similar to the following:
+
+The data provider functions should be passed to the template as part of the view model as shown in the following code for a sample page controller:
+
+In this particular example, the “search results” async fragment appears first in the HTML template, and it happens to take the longest time to complete. As a result, all of the subsequent fragments will need to be buffered on the server. The resulting waterfall with in-order flushing of async fragments is shown below:
+
+While the performance of this approach might be fine, we can enable out-of-order flushing for further performance gains as described in the next section.
+
+Marko achieves out-of-order flushing of async fragments by doing the following:
+
+Instead of waiting for an async fragment to finish, a placeholder HTML element with an assigned is written to the output stream. Out-of-order async fragments are rendered before the ending tag in the order that they complete. Each out-of-order async fragment is rendered into a hidden element. Immediately after the out-of-order fragment, a block is rendered to replace the placeholder DOM node with the DOM nodes of the corresponding out-of-order fragment. When all of the out-of-order async fragments complete, the remaining HTML (e.g. ) will be flushed and the response ended.
+
+To clarify, here is what the output HTML might look like for a page with out-of-order flushing enabled:
+
+One caveat with out-of-order flushing is that it requires JavaScript running on the client to move each out-of-order fragment into its proper place in the DOM. Thus, you would only want to enable out-of-order flushing if you know that the client’s web browser has JavaScript enabled. Also, moving DOM nodes may cause the page to be reflowed, which can be visually jarring to the user and result in more client-side CPU usage. If reflow is an issue then there are tricks that can be used to avoid a reflow (e.g., reserving space as part of the initial wireframe). Marko also allows alternative content to be shown while waiting for an out-of-order async fragment.
+
+To enable out-of-order flushing with Marko, the attribute must be added to each tag, and the tag must be added to the end of the page to serve as the container for rendered out-of-order fragments. Here is the updated tag for the search results fragment:
+
+The updated HTML page template with the new tag is shown below:
+
+In combination with out-of-order flushing, it may be beneficial to move tags that link to external resources to the end of the first chunk (before all of the out-of-order chunks). While the server is busy preparing the rest of the page, the client can start downloading the external JavaScript required to make the page functional. As a result, the user will be able to start interacting with the page sooner.
+
+Our final waterfall with out-of-order flushing will now be similar to the following:
+
+The final waterfall shows that the strategy of out-of-order flushing of asynchronous fragments can significantly improve the load time and perceived load time of a page. The user will be met with a progressive loading of a page that is ready to be interacted with sooner.
+
+To allow HTML to be served in parts, chunked transfer encoding should be used for the HTTP response. Chunked transfer encoding uses delimiters to break up the response, and each flush results in a new chunk. If gzip compression is enabled (and it should be) then flushing the pending data to the gzip stream will result in a gzip data frame being written to the response as part of each chunk. Flushing too often will negatively impact the effectiveness of the compression algorithm, but without flushing periodically then progressive HTML rendering will not be available. By default, Marko will flush at the beginning of an block (in order to send everything that has already completed), as well as when an async fragment completes. This default strategy results in efficient progressive loading of an HTML page as long as there are not too many async fragments.
+
+For improved usability and responsiveness, there should not be a long delay between rendered HTML being displayed to the user in the web browser and behavior being attached to the associated DOM. At eBay, we use the marko-widgets module to bind behavior to DOM nodes. Marko Widgets supports binding behavior to rendered widgets immediately after each independent async fragment, as illustrated in the accompanying sample app. For immediate binding to work, the required JavaScript code must be included earlier in the page. For more details, please see the marko-widgets module documentation.
+
+It is important to note that as soon as a byte is flushed for the HTTP body, then the response is committed; no additional HTTP headers can be sent (e.g., no server-side redirects or cookie-setting), and the HTML that has been sent cannot be “unsent”. Therefore, if an asynchronous data provider errors or times out, then the app must be prepared to show alternative content for that particular async fragment. Please see the documentation for the marko-async module for additional information on how to show alternative content in case of an error.
+
+The Async Fragments technique allows web developers to maximize the benefits of progressive HTML rendering to produce web pages that have improved actual and perceived load times. Developers at eBay have found the concept of binding HTML template fragments to asynchronous data providers easy to grasp and utilize. In addition, the flexibility to support both in-order and out-of-order flushing of async fragments makes this technique applicable for all web browsers and user agents.
+
+The Marko templating engine is being used as part of eBay’s latest Node.js stack to improve performance while also simplifying how pages are constructed on both the server and the client. Marko is one of a few templating engines for Node.js and web browsers that support streaming, flushing, and asynchronous rendering. Marko has a simple HTML-based syntax, and the Marko compiler produces small and efficient JavaScript modules as output. We encourage you to try Marko online and in your next Node.js project. Because Marko is a key component of eBay’s internal Node.js stack, and given that it is heavily documented and tested, you can be confident that it will be well supported.
+
+Patrick Steele-Idem is a member of eBay’s platform team who enjoys writing open-source software and improving how web applications are built. He is the author of RaptorJS, a suite of open-source front-end power tools that are being used within and outside eBay. You can follow Patrick on Twitter at @psteeleidem.|||
+

@@ -1,0 +1,48 @@
+
+
+ The stealth message here was that there’d been a mass layoff, and as such, I’m no longer at MathElf. (Aside: which means, for the moment at least, I’m available for contract work: cadamson@subfurther.com).
+
+While I’m not about to slam my ex-employer, I do want to get in a word about a key technology we used that left me cold. As the tweet indicates, this is gonna be about RxSwift.
+
+First, let’s clarify our terms. We’re not talking about the much-ballyhooed React Native, which despite the name is not native at all, but rather is a way to write iOS apps in JavaScript, continuing a rich tradition of tools (Xamarin, Sencha Touch, RubyMotion, etc.) popular among hotshot developers who consider themselves too good for Apple’s languages and frameworks.
+
+However, React Native is indeed part of the broader umbrella of “Reactive programming”, and specifically, RxSwift is a Swift implementation of the ReactiveX APIs. These all address the idea that imperative programming is a poor fit for systems that process a lot of asynchronous events — UI interactions, network API calls or other lengthy processes that have been put on other threads, unplanned events like losing network connectivity, etc. And these are things that happen a lot in mobile apps!
+
+It’s not like iOS isn’t meant to deal with asynchronous events. In fact, it has lots of different techniques… all mutually incompatible, owing to the long development of the Cocoa and Cocoa Touch APIs over the years, and the legacy of Objective-C. Consider:
+
+As you can see, this is kind of a mess. And it doesn’t even capture everything (there are other one-off asynchronous APIs like preparing for storyboard segues, to say nothing of the use of function pointers as “callback procs” in the lower-level C APIs).
+
+All of the above techniques are largely meant for the Objective-C of 10 years ago, before we had blocks, so we had to call back to known method names. More modern iOS/Mac APIs will let you just send in a block (or a Swift closure) and say “when the thing happens, run this.” Apple frameworks introduced after Obj-C got blocks tend to prefer this approach over delegation, target/action, or KVO. For example, the various animation methods have a parameter that takes a block to be executed once the animation finishes.
+
+The block stuff feels more modern and is easier to use, and when I’m writing fresh Swift code and need to provide asynchronous callbacks, my default technique is to accept a closure and execute that when needed. I even use this in iOS 10 SDK Development to indicate when our podcast feed parsing is done. Here’s the pseudo-code summary of this quick-and-dirty technique.
+
+(caveat: if the closure does anything with , you’ll want to capture with and probably do the “weak-strong dance” (ie, guard let strongSelf = self else { return } ) so you don’t create a retain cycle between the calling object and ‘s property).
+
+So now let’s look at how ReactiveX deals with this. In Rx, things that change over time are offered as observables. These represent variables that can and do change over time, or event processors like dispatching button taps, or results of long-running tasks like network calls, whatever. The observable is actually a sequence, so you can do things like hang a Swift off the end of it to only process events that pass some sort of test.
+
+Code interested in these events typically subscribes to the observer, with a call like , which takes four optional closures, representing what to do 1) on each event, 2) when the observable sequence completes (if it ever does), 3) when an error occurs, 4) when the observable is disposed. There are shorter versions, but this is the gist of it.
+
+If this were all there were to it, this wouldn’t really be much different than my property above. But what’s distinctive about Rx is a large suite of operators, that can be chained together.
+
+Example of this: let’s say you are waiting on two separate and unrelated asynchronous events before taking some action, like if you have to wait for your user’s data to load and for the user to tap a button to move past a start screen. With the naive approach, you might have to hold on to – and -type properties, and then have the foo-handling closure check for and vice versa. Ugly.
+
+In Rx, you would do something like . The operator waits until both observables have generated one value, and then provides both to your closure when either changes.
+
+This eliminates patterns of event handling that you just know are gross when you write them, but you’ve never had a better way to deal with. Plus, being able to write a smaller number of more-focused closures lets you eliminate the boilerplate of things like callback method signatures. And in my experience, developers can be counted on to commit almost any crime in the name of “reducing boilerplate.”
+
+So, where’s the rub? For starters, it takes a long time to get the hang of Rx, both to get into its mindset (it sucks when you just need to get the current value of something, but it’s an observable, so there’s no real concept of a “current” value). And then there are all the operators. Follow that link to the operators that I linked a few paragraphs back. There are over 70 of them. Rx is practically a domain-specific language for event processing. Even if you kind of figure there must be a way to say “skip duplicate events” or “combine similar observables into one big one”, it’ll be a while before you can remember the names of those operators off the top of your head (the correct answers are and by the way, and note that is actually very different from ).
+
+Now maybe event processing is so important that it deserves and needs its own language, but it ends up being a big hill to climb when you start (and when you bring new developers onto a project). In practice, RxSwift code often looks like this:
+
+What that’s doing is to get events from fooObservable, get the property from each foo event, unwrap it (in this example, assume is optional, so processing will end here if it’s ), only take one event from this chain, call this object’s method with , and finally use a to dispose of the Rx chain’s resources when the observable dies.
+
+In practice, there are lots of ways to mess this up. Are you right to only want one event? What if you forget to capture weakly? The worse problem is when your closure is never called: setting breakpoints in this code will do nothing, so it’s a hair-pulling exercise to figure out if is not producing events, or if your chain is screwing them up somehow.
+
+There are also challenging concepts beyond the operators that you’ll have to master, such as understanding the difference between “hot” and “cold” observables, and Rx-ifying your unit tests, which often requires wrangling the main-thread scheduler that emits events (or, worse, needing to explicitly take an parameter in your code, so that you can get it to work with a test scheduler).
+
+Oh, and when all’s said and done, RxSwift doesn’t actually unify all the disparate asynchronous patterns listed above. That’s on you to wrap for yourself, although RxCocoa does take care of most UIKit classes, exposing things like button taps as observables, and binding table models to observables you provide. Still, you’ll inevitably be writing a lot of your own Rx wrappers if you insist on Rx’ifying all the things, like segues and notifications.
+
+In my experience, Rx turns out to be far more costly than it would originally appear from the propaganda. I can’t speak for my ex-employer of course, but my own takeaway is that 1) adopting Rx can take way longer than you’d expect, 2) RxSwift seems to really slow down the Swift compiler (possibly because of having to do a bunch of type inference through those chains of Rx operators).
+
+I’ve been around long enough to be really wary about programming paradigm fads. When I was editing java.net, we had an 18-month period when Aspect-oriented programming was all the rage, and we ran lots of articles about how adopting AspectJ and this new way of coding would be cleaner and, of course, eliminate boilerplate. Well, that was then and this is now, and I just had to check to see if AspectJ even still exists (it does). That was an idea that didn’t really prove its worth, and has been left behind. I’m not at all convinced that Rx is going to catch on beyond the aesthetes, because in my experience it’s hard to write, hard to read, hard to debug, and slows me down terribly.|||
+

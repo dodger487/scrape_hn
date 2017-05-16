@@ -1,0 +1,276 @@
+Delightfully useless epiphany: Suppose the null-byte is an electron. Then, provides an infinite supply of electrons and has an infinite appetite for them. Let's call these devices and , respectively.
+
+In this model, a UNIX pipe acts like a wire, that is, a conductor with parasitic capacitance. If the pipe is connected to , its pipe buffer in kernel space quickly fills up with null-bytes, and the pipe acts like a negatively charged metal plate. If it is connected to , the pipe buffer is drained, and the pipe acts like a positively charged metal plate.
+
+Pipes may thus carry logic signals: A pipe that is filled with null-bytes corresponds to a logic zero, and a pipe that is completely empty corresponds to a logic one. A pipe that contains some null-bytes, but is neither full nor empty, corresponds to a voltage in the undefined range, and will act as a one or a zero depending on how we measure it.
+
+So how do we measure it? In order to build logic, we're going to need some kind of transistor. Consider the field-effect transistor: An enhancement-mode nMOSFET allows electrons to pass from the source pin to the drain pin when a logic one is present at the gate pin. Conversely, a pMOSFET allows electrons to pass from the drain pin to the source pin when a logic zero is present at the gate. However, no current flows through the gate pin; like a charged balloon sticking to the ceiling, the electrons at the gate just sit there and affect the transistor by means of the electromagnetic force.
+
+Pipes have flow control: Writes to a full pipe will block, as will reads from an empty pipe. Hence, our MOSFET would need to sense whether a read or write would block, without actually performing the read or write operation. As far as I know, no standard UNIX command can be forced into this role, but we can write such a program from scratch easily enough:
+
+This program acts like a gated . It connects to a named pipe, and senses whether it currently holds a logic one or a logic zero. Depending on the mode of the program (as indicated by a dash character in front of the argument), this will either enable or disable the continuous transfer of bytes from standard input (presumably a pipe or ) to standard output (presumably a pipe or ). The call to ensures that no process will starve in situations where pipes have multiple readers and/or writers. The number is the Linux pipe capacity, as documented in .
+
+When the gate voltage is in the undefined range, our MOSFET program will conduct regardless of mode. Thus, whenever a signal switches, there will be a brief period of chaotic activity until the system settles down into a known state, just like with real CMOS circuits.
+
+Using only pipes and our small MOSFET program, we should be able to construct arbitrarily complex digital circuits. Let's start with a simple NAND gate, here in the form of a shell script:
+
+We can test it by creating three named pipes, connecting them manually to or using , which behaves like a diode, and connecting the output to something that acts like a buzzer or LED:
+
+You'll want to do after each run.
+
+Note that we use such that it will continuously ring or flash (depending on whether the terminal has an audible or visible bell) when the output is low, that is, when both and are connected to .
+
+This is clearly not practical for large designs, so we could benefit from some kind of control panel program with buttons and indicators: panel.c
+
+You don't have to read the code, it's pretty straightforward. But download it and try it out! Each argument corresponds to a named pipe which is treated like a button when prefixed with a dash, and like an indicator otherwise.
+
+This is what it looks like for the NAND scenario:
+
+The inverted indicates that is currently high. By moving the cursor (the brackets) you can select any button and toggle its value using the space key. Press to quit the program. Don't forget to kill all processes when you're done.
+
+The next step is to implement a full adder (a 1-bit adder with carry in and carry out). Now, of course, every combinational function can be realised using NAND gates, but that's not very transistor efficient. This is how a typical CMOS full adder is constructed:
+
+Note how temporary fifos are created ( , , , ) with unique suffixes based on the current process ID (the special variable expands to the PID of the shell).
+
+Now we can cascade four full adders into a 4-bit adder and play with it using the control panel:
+
+The reason for having a  pipe which is connected to the electron supply via , rather than just using directly, is that our MOSFET program only works if the gate input is a proper pipe. That's because actually allows you to write data into it, just like , so if we hook it up directly to a gate, it's going to behave like an undefined signal.
+
+This is what the 4-bit adder setup looks like when calculating the sum of five and seven:
+
+Twelve looks about right. Clearly, we're approaching something useful here.
+
+Let's pause for a moment and consider which role the pipes play in this system. They form some kind of network fabric that allows our MOSFET instances to communicate, and yet the information being communicated is not transmitted through the pipes, because the pipes just provide an infinite series of completely predictable null-bytes. In contrast, the actual information is transmitted through the flow control mechanism of the pipes. This is akin to modulated carrier waves such as a brief break that propagates backwards through a line of moving cars on a road.
+
+What's fascinating about this, is that flow control information can travel across a pipe in either direction. The null-bytes always travel from the writing end to the reading end, but just as the writer may signal the reader by filling an empty pipe, the reader may signal the writer by draining a full pipe. The communication is half-duplex however, because the reader and the writer would get in each other's way if they tried to do this simultaneously.
+
+One critical building block is still missing. Combinational logic is all very well, but large digital designs tend to consist of a number of interconnected state machines. In order to build state machines, we need to be able to keep track of the current state as bits in some kind of memory.
+
+A convenient type of memory is the D-flip flop. It can be implemented in a number of ways, and we'll go for a variant that uses TSPC (true single-phase clocked) logic. This design is interesting because it relies on the parasitic capacitance of the wires, so when used in a real integrated circuit it requires a minimum clock frequency to work, otherwise the bits stored in the registers become corrupt through leakage currents. Our pipe capacitors are ideal in the sense that there's no leakage at all. The buffers hold their contents until the pipe is destroyed.
+
+Like we did with the full adder, we'll tack on an inverter at the end in order to get the same polarity at the output and input; in a real design, we'd just as often want the output signal inverted, in which case the extra inverter is unnecessary, which is why it's not considered to be a canonical part of the flip flop.
+
+The operation of this flip flop is quite elegant. Suppose is low, so that the first stage becomes a regular inverter. Then, = = . The last stage is also an inverter, so let's assume we have = = . These two stages are separated by an inverter that has been split into two halves by the second clocking transistor. Suppose ≠ , so that = = = , which would not be possible if the split inverter were a regular inverter. The upper half of the split inverter can only pull to a high level, but affects a transistor in the final stage which only turns on when provided with a low gate voltage. Conversely, the lower half of the split inverter can only pull to a low level, but affects a transistor which only turns on in response to a high gate voltage. The upshot of this is that might be disconnected from whatever power rail was driving it, but as long as there is no leakage current, it retains its previous voltage. When the clock toggles, a similar phenomenon takes place in the left half of the circuit, while the right half behaves like a regular inverter, and the value of propagates one step to the right.
+
+Note that the register will power up in an unknown state, possibly a metastable one. It must be cleared by explicitly clocking in a logic zero.
+
+Now we should be able to construct a working state machine. To keep it simple, we'll transform the 4-bit adder into a 4-bit accumulating machine. The current state is kept in a 4-bit register, its value represented by ( , , , ). The next state is calculated by adding a user-supplied 4-bit number to the current state. At every positive clock edge, the flip flops shift in the new bits provided by the adder, causing a state transition to take place.
+
+And if you try it, you'll find that it runs like clockwork.
+
+So there it is. We've been able to construct gates and flip flops using nothing but UNIX pipes and our small MOSFET tool. We may now proceed to design any digital circuits we want: Processors, memories, entire computers... The world is ours to conquer!
+
+As long as we don't run out of PIDs.
+
+Some images courtesy of wikimedia commons: [1] [2] [3] This article is published under the Creative Commons Attribution-Share Alike license.
+
+Disclaimer: I am not responsible for what people (other than myself) write in the forums. Please report any abuse, such as insults, slander, spam and illegal material, and I will take appropriate actions. Don't feed the trolls. If there is a NAND, people will build computers. I've seen that effect with Minecraft. But using unix pipes is just awesome, too :D sysctl kernel.pid_max to boost available pids on linux! The default is just a legacy limit on linux - some old tools will break if you increase it past 65535. wow, a replacement for vhdl in (mostly) sh.... the mind boggles. If there is a NAND, people will build computers. I've seen that effect with Minecraft. But using unix pipes is just awesome, too :D 
+
+Came here to mention Minecraft. As someone who's built some logic gates in the game I should point out that the basic unit in Minecraft is actually the NOR gate, not NAND gate, but this doesn't make much difference as both of those are functionally complete, meaning anything can be built using them. The Apollo Guidance Computer, for example, was built entirely from NOR gates, while I believe modern computers tend to be based on NANDs. Came here to mention Minecraft. As someone who's built some logic gates in the game I should point out that the basic unit in Minecraft is actually the NOR gate, not NAND gate, but this doesn't make much difference as both of those are functionally complete, meaning anything can be built using them. The Apollo Guidance Computer, for example, was built entirely from NOR gates, while I believe modern computers tend to be based on NANDs. I made more gates (out of just NANDs, as I don't understand how to use the MOSFETs yet)!
+
+
+
+Usage:
+
+./<gate>.sh A B Q
+
+A = Input 1
+
+B = Input 2 (if applicable)
+
+Q = Output
+
+
+
+--Begin AND---
+
+#!/bin/sh
+
+A=$1
+
+B=$2
+
+Q=$3
+
+C=tmp.and.t0.$$
+
+mkfifo $C
+
+./nand.sh $A $B $C &
+
+./nand.sh $C $C $Q
+
+---End AND---
+
+---Begin OR---
+
+#!/bin/sh
+
+A=$1
+
+B=$2
+
+Q=$3
+
+C=tmp.or.t0.$$
+
+D=tmp.or.t1.$$
+
+mkfifo $C $D
+
+./nand.sh $A $A $C &
+
+./nand.sh $B $B $D &
+
+./nand.sh $C $D $Q
+
+---End OR---
+
+---Begin NOR---
+
+#!/bin/sh
+
+A=$1
+
+B=$2
+
+Q=$3
+
+C=tmp.nor.t0.$$
+
+D=tmp.nor.t1.$$
+
+E=tmp.nor.t2.$$
+
+mkfifo $C $D $E
+
+./nand.sh $A $A $C &
+
+./nand.sh $B $B $D &
+
+./nand.sh $C $D $E &
+
+./nand.sh $E $E $Q
+
+---End NOR---
+
+---Begin NOT---
+
+#!/bin/sh
+
+
+
+A=$1
+
+Q=$2
+
+
+
+./nand.sh $A $A $Q
+
+---End NOT---
+
+---Begin XNOR---
+
+#!/bin/sh
+
+A=$1
+
+B=$2
+
+Q=$3
+
+C=tmp.xnor.t0.$$
+
+D=tmp.xnor.t1.$$
+
+E=tmp.xnor.t2.$$
+
+F=tmp.xnor.t3.$$
+
+mkfifo $C $D $E $F
+
+./nand.sh $A $B $C &
+
+./nand.sh $A $C $D &
+
+./nand.sh $B $C $E &
+
+./nand.sh $D $E $F &
+
+./nand.sh $F $F $Q
+
+---End XNOR---
+
+---Begin XOR---
+
+#!/bin/sh
+
+A=$1
+
+B=$2
+
+Q=$3
+
+C=tmp.xor.t0.$$
+
+D=tmp.xor.t1.$$
+
+E=tmp.xor.t2.$$
+
+mkfifo $C $D $E
+
+./nand.sh $A $B $C &
+
+./nand.sh $A $C $D &
+
+./nand.sh $B $C $E &
+
+./nand.sh $D $E $Q
+
+---End XOR--- Oh I think I am feeling queasy after trying to understand this. You sir, are a genius! Incredible work, and congrats for being in hackaday. (=
+
+M. A pipe is not a wire... it is more like a diode. A pipe is not a wire... it is more like a diode. I think it acts as a piece of metal here. It can be charged by writing, discharged by reading.
+
+cat command transfers charge from one piece of metal to another... I think it acts as a piece of metal here. It can be charged by writing, discharged by reading.cat command transfers charge from one piece of metal to another... I can see this getting very out of hand, love it :) Using the DUP System http://dupsystem.org/ you could turn this into a distributed computation and also avoid running out of PIDs simply by adding more PCs ;-). DUP might also simplify your specification of the links and you could use it to re-use definitions of logic circuits (by embedding calls to 'dup' within a DUP program). Next step: pipe-based microprocessors ;-) Now you just need to build a complete computer out of this which will run INTERCAL. Is this only for fun, which I salute, or am I missing something? We use (physical) NANDs to run pipes which we use to... construct NANDs?! :D Brilliant work, I am just curious - what this could bee used for? Very nice!!
+
+
+
+but:
+
+
+
+/dev/zero > /dev/null does not make 1/0 but produce a resistance with a current flow of Y b/s
+
+
+
+try:
+
+
+
+dd if=/dev/zero of=/dev/null count=204800
+
+the flux of "current" is finite...and very low!!!
+
+This mean that the wire it's a very resistive to the flown of "electrons" (bits generated by the difference of potenzial by /dev/zero and /dev/null).
+
+
+
+This involve that the logic emulation is like a time based simulation where the clock is the limit of the flown velocity, assuming 1/0 infinite with a dt very long (dI/dt should be Inf in case of wire from /dev/zero to /dev/null)
+
+
+
+mutek
+
+
+
+mutek@inventati.org Perpetual computers anyone? Does nobody see that, with enough skill, one could get one of these to run an operating system, capable of creating symbolic pipes. Think what could happen then... with unlimited memory, infinite computers, within one another, could occur.
+
+
+
+Dunno the implications, but cool nonetheless. This is incredible. Very good work. I will be building. This is mind-boggling. Very nice work indeed!
+
+Posted by @aruslan with unlimited memory, infinite computers, within one another, could occur. 
+
+Each nested computer uses more resources to perform the same work as the outer computer. Contrary to the implication of unlimited memory, you will eventually be constrained to the pointer where you will have insufficient memory to nest further. Each nested computer uses more resources to perform the same work as the outer computer. Contrary to the implication of unlimited memory, you will eventually be constrained to the pointer where you will have insufficient memory to nest further. So you used some hundred million REAL transistors to build a handful of virtual ones? :) Can somebody say Inception? Interesting discussion. I was lost a while ago, but that's because I do software, not hardware. Great article! For those who may want to know a bit more Theory on transistors, please feel free to read this article: (this is more about SSDs, but it's still relevant!): http://www.anandtech.com/show/5067/understanding-tlc-nand/2|||
+

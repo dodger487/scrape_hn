@@ -1,0 +1,85 @@
+Many of our customers are building useful services using our webhook feature—but unfortunately, others are not. Often we hear that no one on their team is proficient enough to write a service that can ingest a webhook payload and do something with the data. That leaves them either hoping to get cycles from their development team (unlikely) or continuing to do without.
+
+But what if you could write your own web services? How many routine tasks that involve taking data from system A and inputting it into system B could you automate?
+
+Learning to code well enough can be a major skill in your tool chest and a major asset for optimizing security processes in your organization. In this post, I'm going to walk you through a tutorial that will get you started on the road to writing your own web services using Python Flask.
+
+Specifically, I'm going to walk through the creation of a simple Python Flask app that provides a RESTful web service. The service will provide an endpoint to:
+
+But before I jump in, keep a couple of things to keep in mind. First, I will not be bothering with any sort of frontend display functionality, so you don't need to worry about HTML or CSS. Second, my organization follows Flask's own suggested organization. I am going to skip the single module pattern and go straight to the Packages and Blueprints models.
+
+There is a large range of Flask tutorials. On one hand, there are tutorials that explain how to build small, simple apps (where the entire app fits in a single file). On the other hand, there are tutorials that explain how to build much larger, complicated apps. This tutorial fills a sweet spot in the middle and demonstrates a structure that is simple, but which can immediately accommodate increasingly complex requirements.
+
+The structure of the project that I'm going to build, which comes from Explore Flask, is shown below:
+
+I'll start the discussion with the top-level files that are useful to me as I build the service:
+
+Gunicorn.conf.py: This is a configuration file for the Gunicorn WSGI HTTP server that will serve up this app. While the application can run and accept connections on its own, Gunicorn is more efficient at handling multiple connections and allowing the app to scale with load.
+
+Requirements.txt/requirements.osx.txt: The app's dependencies are listed in this file. It is used by the pip utility to install the needed Python packages. For information on installing dependencies, see the Setup section of this README.md.
+
+Threatstack-to-s3.py: This is the application launcher. It can be run directly using "python" if you are doing local debugging, or it can be passed as an argument to "gunicorn" as the application entry point. For information on how to launch a service, see README.md.
+
+The app package is my application package. The logic for the application is underneath this directory. As I mentioned earlier, I have chosen to break the app into a collection of smaller modules rather than use a single, monolithic module file.
+
+The following four usable modules defined in this package are:
+
+Note: app.views and app.models do not provide anything and their __init__.py files are empty.
+
+The app module has the job of creating the Flask application. It exports a single function, create_app(), that will create a Flask application object and configure it. Currently it initializes application blueprints that correspond to my application views. Eventually, create_app() will do other things such as initialize logging, but I'm skipping that now for clarity and simplicity.
+
+Before discussing the remaining three modules, I'll talk about what views and Flask blueprints and then dive into the app.views.s3 module.
+
+Views: Views are what the application consumer sees. There's no front end to this application, but there is a public API endpoint. Think of a view as what can and should be exposed to the person or thing (e.g., the consumer) who is using this application. The best practice is to keep views as simple as possible. If an endpoint's job is to take data in and copy it to S3, make it perform that function, but hide the details of how that was done in the application models. Views should mostly represent the actions a consumer wants to see happen, while the details (which consumers shouldn't care about) live in the application models (described later).
+
+Flask Blueprints: Earlier I said that I am going to use a Packages and Blueprints layout instead of a single module application. Blueprints contain a portion of my API endpoint structure. This lets me logically group related portions of my API. In my case, each view module is its own blueprint.
+
+Modular Applications with Blueprints documentation on the Flask website.
+
+Explore Flask is a book about best practices and patterns for developing web applications with Flask.
+
+The threatstack-to-s3 service takes Threat Stack webhook HTTP requests in and stores a copy of the alert data in S3. This is where I store the set of API endpoints that allow someone to do this. If you look back at app/__init__.py, you will see that I have rooted the set of endpoints at /api/v1/s3.
+
+I used this path for a few reasons:
+
+In app.views.s3, I am providing a single endpoint for now, /alert, which represents the object I'm manipulating, and that responds only to the HTTP POST request method.
+
+Remember: When building APIs, URL paths should represent nouns and HTTP request methods should represent verbs.
+
+I'm a fan of typing brevity and consistency. I could have done this the following way to import the model modules:
+
+But that would mean I'd be using functions like:
+
+I could have done this as well:
+
+However, this would break when I create the s3 Blueprint object a few lines later because I'd overwrite the s3 model module.
+
+Now I'll walk through the app endpoint and function associated with it.
+
+The body of the function is pretty simple:
+
+Before discussing the remaining modules, I'll talk about models, which are how to talk to the services I'm using, such as Threat Stack and S3.
+
+Models describe "things," and these "things" are what I want to perform actions on. Typically, when you search for help on Flask models, blogs and documentation like to use databases in their examples. While what I'm doing right now isn't far off, I'm just storing data in an object store instead of a database. It's not the only sort of thing I might do in the future with the data received from Threat Stack.
+
+Additionally, I've chosen to skip an object-oriented approach in favor of a procedural style. In more advanced Python, I would model an alert object and provide a means of manipulating it. But this introduces more complexity than is needed for the given task of storing data in S3 and also makes the code more complicated for demonstrating a simple task. I've chosen brevity and clarity over technical correctness for this.
+
+The app.models.threatstack module, as you can guess, handles communication with Threat Stack.
+
+The functions put_webhook_data() and put_alert_data() have a lot of duplicate code. I haven't refactored them because it's easier to see the logic before refactoring. If you look closely, you'll realize that the only difference between them is how the alert_key is defined. I'll focus on put_webhook_data():
+
+I start by getting the alert time. Threat Stack has sent the alert time in milliseconds since the Unix epoch, and that needs to be converted into seconds, which is how Python handles time. I take that time and parse it into a string that will be the directory path. I then join the top-level directory where I store webhook data, the time-based path, and finally the alert ID to form the path to the webhook data in S3.
+
+Boto 3 is the primary module in Python for working with AWS resources. I initialize a boto3 client object so I can talk to S3 and put the object there. The s3_client.put_object() is fairly straightforward with its Bucket and Key arguments, which are the name of the S3 bucket and the path to the S3 object I want to store. The Body argument is my alert converted back to a string.
+
+What I have now is a functional Python Flask web service that can take a Threat Stack webhook request, get the alert's detail, and archive it in S3. It's a great start, but there's still more to be done for this to be production ready. Immediately you might be asking, "What happens if something goes wrong?" There's no exception handling to deal with issues such as communication failures with Threat Stack or S3. I intentionally omitted it to keep the code clear. There's also no authorization key checking. This means that anyone can send data to it. (And since I don't do any error checking or exception handling, they can crash the service.) There's also no TLS encryption handling. That's something I'd leave up to Nginx or Apache, which would be the webserver fronting this application. All these and more are issues you need to tackle before putting this web service into production. But for now this is a start that should help you become more comfortable as you start building your own services.
+
+View the GitHub repository for Threat Stack to S3 service.
+
+Because the application goes through revisions, review the version used in this article.
+
+Check out Tom's new tutorial on exception handling in Python Flask.
+
+This article originally appeared on the Threat Stack blog. Reposted with permission.|||
+
+What if you could write your own web services? Get started on the road to writing your own web services using Python Flask with this tutorial.

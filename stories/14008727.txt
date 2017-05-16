@@ -1,0 +1,113 @@
+Imagine a small Docker Swarm. The old school Swarm, not swarm-mode. On this Swarm cluster we run a myriad of different microservices that all communicate with each other in mysterious ways (some hold permanent connections to others and communicate in protobuf, some just make spurious HTTP requests to others etc).
+
+All this communication is facilitated by a single overlay network spanning all the underlying Docker hosts. Inside this network services discover each other using DNS names (provided by Docker internal DNS) — not full featured service discovery, but close enough for our needs, and simple.
+
+The services themselves are fairly static and managed entirely using docker-compose against the Swarm remote API. The end result is an entertainment platform integrating many different third-parties and serving a web portal to the user. Life was good and simple.
+
+A couple of weeks into production we started seeing some anomalies: public endpoints into the platform, that we were monitoring from an off-site location, were getting the occasional timeout, users had trouble logging in, some functionality of the portal was not loading etc.
+
+All the functionality that was failing, was backed by different microservices running on the Swarm. So naturally we inspected all the logs and monitoring data we had about the affected services and found nothing conclusive, other than the fact that everything seemed to be pointing at a networking issue.
+
+We use Datadog for monitoring our Docker hosts. An agent runs on each host and gathers “classic” metrics (CPU, memory, network utilization etc) from the hosts themselves, but also for each container — therefore we should have a pretty good overview of the resource usage for the entire platform and for each component. Surprisingly, we were utilizing barely any resources at all during the incidents — surely this wasn’t going to be as simple as a good old run of the mill overloaded service.
+
+The failures were intermittent and didn’t follow any kind of pattern. What made it worse from a debugging standpoint, was the fact that the incidents occurred rather seldom — sometimes once or twice a week — and lasted for only a couple of minutes. The only things to go by were events in the monitoring system about an endpoint or another not being reachable or the odd log line from a service, reporting that it had reached a timeout connecting to another particular service instance and tried to fail over to another instance instead.
+
+How does one go about debugging these sorts of things? The only thing we were sure about was that it was a networking issue (since it affected services that shared no code base and were even written in different languages).
+
+In the following paragraphs I’ll detail some of the steps we took and what we learned in the process (some of it might be useful in debugging similar issues in the future).
+
+We were already collecting network interface counters on the Docker hosts, but were wondering whether we should do the same for the interfaces inside containers. Datadog only collects bytes_recv and bytes_sent metrics for each container. It gets these by figuring out the PID of the main process of each container on the host and then reads the file /proc/$PID/net/dev containing the following:
+
+/proc/$PID/net/dev contains counters for all the network interfaces inside the network namespace of the target process. But why are there two eth interfaces inside a container?
+
+Docker actually creates a separate interface for each network, that a container is connected to. In our case this is our overlay network (eth0) and the host network (eth1) — since containers also need to access things like the Internet, for example, and they do this through the host network.
+
+The Datadog agent (as of this writing) only reads the bytes columns for eth0. As you can see quite a lot more detail could be collected by modifying the agent to also collect dropped and erroneous packets or values for other network interfaces. For our investigation however, we chose not to rewrite the agent, mostly because we confirmed that none of the dropped or error counters were increasing on any of our containers during the incidents and concluded that this data would not help us in the current case. Still your use case might be different and another metric collection utility called telegraf actually collects all of these counters for each container and interface.
+
+Another hypothesis we had was that maybe we were running out of TCP connections somewhere in the stack (one of our services was misbehaving, creating lots of new connection in a very short period). It turns out that none of our tools were tracking TCP connections by default. The Datadog agent can be configured to collect TCP connection counts on the hosts, but as far as we know, no tool gathers this sort of information per container. So we hacked together our own script to parse metrics from /proc/net/netstat.
+
+From there you can get A LOT of information about the TCP state machine inside the kernel and tracking everything is probably overkill. Most setups would probably benefit just by tracking TCP connection counts that are in different states (ESTABLISHED, TIME_WAIT, CLOSING etc) per container.
+
+Naturally we are keeping up to date with the release notes of the Docker engine and Linux kernel. So every time we read something was fixed in the networking code, that could be relevant to us, we also planned an update. We are lucky enough to have an identical staging environment where we can test out such things, before rolling them into production.
+
+The thing with updating a Docker engine in production is that, depending on your setup, it probably requires some downtime. While you can in theory carry out the update without even having to restart the containers running on that engine, there are some caveats to this described in the official documentation. One of the biggest caveats being:
+
+Granted, we were not running swarm mode, but still didn’t bother with the live restore even with the old stand-alone Swarm, because of the reasoning below.
+
+In my mind having to restart all the containers on one specific Docker host because of an update, is definitely not a showstopper. Ideally you should architect your Swarm in such a way that you can tolerate the failure of at least one host anyway. This of course implies having fully redundant services on the Swarm and appropriate fail-over mechanisms in place. Having such an architecture makes it possible to update the entire cluster node by node. However, we did choose not to carry out the updates this way, but opted for a full downtime update of the entire Swarm cluster instead.
+
+A Docker Swarm works by storing network and other state information in a distributed key-value store. Different stores might use different mechanisms to guarantee the consistency of this state information — most use some kind of quorum mechanism. The newer swarm mode doesn’t require an external store for this at all, but implements one itself, right in the Docker daemon. The distributed nature of these key-value stores allows the state stored inside them to be preserved in case one or more of the nodes hosting the store go offline.
+
+Such persistent state, while being desirable in almost any other circumstance, presented a theoretical problem for us. At this point in the story we still had no idea what was causing our interruptions. For all we knew, the source of the problem could actually have been in the networking state, that was generated by a bug in the previous version of Docker. Even if we upgraded to a newer version, that didn’t contain our elusive bug anymore, we would still be propagating around the potentially buggy state from the previous version of Docker.
+
+We also have had some bad experiences before with nodes in a swarm failing (hard power failure). After such failures we have seen inconsistencies in the networking state information that needed manual cleanup, even after the faulty nodes has been restored. At one time we had to manually
+
+each container that was running on the faulty node, before they could be started again.
+
+Because of this we opted to take down the entire Swarm cluster and cleanup all state contained in it on each update — this was the only way we could be 100% sure. We ran the following script to cleanup all Docker state (except images) on each host:
+
+Before I can explain the actual underlying cause of all our misery, we need to have a quick overview of how Docker sets up multi-host overlay networking. We’ll focus only on how containers connected to the same overlay network are configured to communicate with each other, conveniently leaving out intra-network communication or how networking state is managed and synchronized between the underlying hosts (which is actually the difficult part).
+
+Let’s see how an overlay network facilitates communication between containers A1, B1, A2 and B2 running on two different Docker hosts dockerhost1 and dockerhost2.
+
+Lets call the overlay network testnet and have it represent the virtual subnet 10.0.0.0/24. The containers attached to this network will have addresses assigned to them from this subnet.
+
+All the components of an overlay network can be seen below:
+
+Let’s start from the top and move our way down:
+
+At this point we were collecting more network statistics, than we knew what to do with. Even after updating Docker several times and trying to hunt for bugs in it’s source code the problem persisted — every once in a while some containers would just drop out of the overlay network, only to return fully functional a couple of minutes later.
+
+One night we got “lucky”: the issue persisted for long enough to have a look at it in it’s raw form. Several containers, all running on the same Docker host, were exhibiting connection problems. When trying to ping these containers from any other container in the overlay network, about 80% of packet loss ensued.
+
+Armed with the newly acquired Docker networking knowledge, I tried to have a look inside the overlay network’s namespace. For this there is a handy little utility called nsenter. Which can be used to run any binary in a specified namespace. Docker keeps “handles” to the network namespaces it manages at /var/run/docker/netns on each host. To enter a particular overlay network’s namespace you’ll need to know the ID of the network and then feed the appropriate network namespace handle containing the correct ID to nsenter:
+
+Without specifying a binary, you’ll get a shell that is running inside the network namespace of the overlay network (try some basic commands like ip addr to be sure).
+
+After having looked at all the interface and TCP metrics available from the /proc filesystem and verified that nothing was out of the ordinary, I looked at was was happening at the netlink layer:
+
+A lot of activity was happening related to the MAC addresses of the affected containers. It seemed as though there were continuous changes occurring in the forwarding table of br0, where on one second the bridge “thought” that a particular container was accessible through the vxlan1 interface and a split second later through a local veth interface.
+
+Since we still had a site to run, I restarted the affected containers and everything went back to normal — connectivity was once again established and the torrent of activity in the netlink layer quieted down as well.
+
+It seemed that we had a new symptom, although at first these events in the netlink layer seemed like part of normal operation. Even when everything was working fine, there was always a steady baseline of events such as:
+
+To monitor these events, I simply started a screen session inside the overlay network’s namespace and piped them all into the system journal with an identifying tag.
+
+After gathering this new data for some time, we found a definite correlation between our service interruptions and the count of events at the netlink layer.
+
+Another pattern we observed was that during every outage, all the affected containers were always running on a single Docker host ( not always on the same host in the Swarm, though). This helped us narrow our investigation down further, as explained in the next section.
+
+Coming back to our hypothetical Swarm setup, we can observe that there are actually two fundamentally distinct cases for communication in an overlay network:
+
+In both cases the communication would start out the same (assuming A1 already knows the IP address of the other container):
+
+Let’s have a look at the forwarding table of vxlan1 on dockerhost1 (inside the namespace of testnet):
+
+Why are there entries to local containers defined? The MAC addresses in bold belong to containers A1 and B1. Surely they should be reachable from veth23 and veth32 respectively and have nothing to do with vxlan1.
+
+Remember how vxlan1 sends out ARP replies of behalf of remote containers? Looking at the forwarding table above, does this mean that vxlan1 also answers on behalf of A1 and B1 that are local to dockerhost1?
+
+That’s exactly why we are seeing these pairs of messages in the output of ip monitor:
+
+Thanks to this configuration, every ARP request, that gets sent out from a local container targeting the IP of another local container, gets two ARP replies — one from vxlan1 and from from the actual interface! (We verified this by running tcpdump on eth0 inside container A1)
+
+Each time one of these ARP replies goes through br0, the bridge updates itself about the whereabouts of the sending MAC address. Turns out that 99% of the time this works just fine, because the ARP reply from the actual interface seems to arrive later (meaning that br0 will configure forwarding correctly). Things start to happen when for whatever reason vxlan1 gets the last word. This seems to cause some kind of strange looping, during which ARP requests and replies get sent all over the place, causing the affected containers to just drop out of the network - until everything stabilizes once again.
+
+So it turns out, that there really can be too much of a good thing — this time in the form of too many ARP replies. There literally seems to be a conditional missing somewhere in the source code of Docker, that does forwarding table and ARP setup for local containers on a host. Unfortunately, after combing through the source code of the overlay driver, we couldn’t find it.
+
+We did however figure out a workaround to be used until we can migrate all our services to swarm mode, that doesn’t contain this bug anymore. The workaround is as simple as deleting the static ARP entries of the vxlan1 interface for all containers local to a particular host:
+
+You can use this one-liner on each host in an overlay network to find all the local containers from the forwarding table of vxlan1 and delete their static ARP entries:
+
+The networking issue described in this post affects overlay networks built on top of Docker engines configured to use a separate cluster store ( — — cluster-store option for the daemon). As of this writing there is still an open issue on Github (https://github.com/docker/docker/issues/29024).
+
+The new and integrated swarm mode, does not suffer from this bug. Overlay networks created on top of swarm mode, seem to configure all the low level interface details correctly.
+
+We have been wanting to move over to using swarm mode for quite some time, but were holding off mainly because we wanted to be sure it would fix our issue (which meant figuring out the underlying issue in the first place). Since the new swarm mode (as of version 1.13) also supports deploying services from composefiles, there is really nothing standing in the way anymore.
+
+In general we have been quite successful with running Docker in production — for us at least the benefits definitely outweigh the hiccups we have been having. Debugging this issue gave us a chance to understand some of the inner workings and really appreciate all the little details that Docker manages for us, in order to provide isolated networking between things that are essentially glorified Linux processes.
+
+As a side benefit, going through this lengthy debugging odyssey turned up numerous places in our own components where improvements can be implemented — in a sense you could say that the entire ordeal had a positive effect on overall platform robustness.|||
+
+Imagine a small Docker Swarm. The old school Swarm, not swarm-mode. On this Swarm cluster we run a myriad of different microservices that all communicate with each other in mysterious ways (some hold…

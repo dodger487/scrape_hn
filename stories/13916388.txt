@@ -1,0 +1,47 @@
+TL;DR: Having HAProxy configurations reloaded almost constantly due to dynamic backends is bad and can cause unreliability in the system. However this can be avoided if backend configs are “close-to-static”. The good news is this can be achieved even if you have 100+ microservices at scale.
+
+If you’ve been working closely with a microservices architecture or are generally interested in the topic, this post is just for you. We at Wrapp have adopted such an architecture and we host 100+ microservices over 50+ hosts. This post will take you through the reliability challenges we faced with our implementation of a microservices architecture and the one we have now transitioned to that helped us produce a more stable, performant and reliable system.
+
+As discussed in an earlier article, our services run inside docker containers and communicate over a REST based HTTP protocol. From our experience, as containers come and go, we observed a lot of unreliability in the system mainly due to the service discovery model we had in place. This model triggered a configuration change in HAProxy followed by a reload each time such an event occurred. These events occurred mainly when services were deployed or when hosts were being launched or terminated. Working in a rapidly changing environment where you have frequent deploys throughout the day reloads were bound to occur thereby causing temporary disruptions in how services communicated with each other.
+
+In this article, my definition of unreliability corresponds to the communication failures between services where they become unavailable to handle requests. In our system, this unavailability takes the form of a HTTP 503 report from our proxy. In such situations we have experienced temporary system failures and sometimes even downtime. To further emphasize my point above, following are two graphs showing the amount of HAProxy reloads on a daily basis from the first part of January and another showing the collective amount of service unavailability in the form of HTTP 503s for the same period.
+
+Hence from a reliability point of view, this approach to service discovery seemed impractical and unfit for use in our microservice architecture.
+
+From the graphs it was evident that at least HAProxy reloads had some correlation with the number of HTTP 503s we’ve seen over time. We also knew that the reloads only happened when there were changes in HAProxy’s configuration so we thought that if these configurations remained the same most of the time it would minimize the amount of reloads and HTTP 503s as well.
+
+Keeping the configuration the same would mean to keep the backend servers for a service constant (or close to that). If we included all hosts registered in the cluster for which the service belonged to as backend servers then it would not matter so much when containers of the service were launched or terminated as they would be scheduled over the same set of hosts residing in that cluster. If we configure the health checks the right way, HAProxy would automatically blacklist those servers where the service was not running.
+
+Thus during deploys to a service, the configuration would remain the same and we should not see any reloads from HAProxy. Following is an example of such a configuration for a service named users that resides in one of the clusters. The scaling factor for this service is 3 (for zone availability) and let’s say there are 5 EC2 instances registered to this cluster. Thus, the configuration for this service would look like:
+
+Note: All our services have a DNS A record that resolves to a local internal IP of the form 192.168.x.x on the host system. This is possible since we have defined these IPs to point to the loopback device on each host. For each service we bind HAProxy to this IP on port 80 so that it becomes easy to communicate to the service such that we only need to make a request to it via its DNS name and not care about it’s port.
+
+So out of the 5 servers, health checks would fail for 2 of them where the service was not running and would be blacklisted. HAProxy would then only route requests to the remaining healthy servers.
+
+Additionally, by centralizing these configurations to a dedicated cluster of HAProxy hosts, it would further reduce configuration changes for cases where hosts were launched or terminated. The setup would comprise of service hosts and haproxy hosts where the service hosts would only communicate to the HAProxy cluster. Once the request is received by one of the HAProxy host it would forward the request to the relevant backend server. The routing would be done based on the Host header. Following are examples of HAProxy configurations for the service and haproxy hosts:
+
+Note: The IPs 10.0.10.192, 10.0.11.157 and 10.0.10.135 represent the HAProxy hosts and the HAProxy processes running on these hosts listen on port 12121. Any other port number would work too.
+
+Note: The backend servers for the users service would still contain all hosts in the cluster for which the service is running.
+
+Now if any of the service hosts were launched or terminated the configuration would change only in the HAProxy hosts thereby reducing the amount of reloads and disruptions in service-to-service communication.
+
+Following are two graphs in comparison to the ones above showing the amount of HAProxy reloads and service unavailability in the form of HTTP 503s over an extended time period before and after deploying our new service discovery model.
+
+According to the above graph, during the experimental phase, although our new model showed substantial improvements, after some days we went down partially for about 3 days on Jan 31, Feb 02 and Feb 03. There were seemingly random HTTP 503s from different services and different hosts without any explanation. There was also an unexpected delay in the network traffic for no reason we could think of. We suspected that the HAProxy servers which were running on t2.large instance types were not equipped to handle the load from all the hosts. So we replaced them with 3 c4.xlarge instance types. After recycling them, the problem went away but after a while the very same day we faced the same issue again.
+
+After hours of debugging, we noticed very random temporary delays in network traffic in some of the hosts and after a while it suddenly went away. We searched a bit on Google for random network delays in c4.xlarge instances and we came across a forum stating that the default network driver that was shipped with Ubuntu 14.04 was broken for new instance types such as c4.xlarge or m4.large. It was recommended to upgrade to Ubuntu 16 and install ixgbevf driver version 2.14.2 or above. We had no time for an upgrade as that would probably put in more variables into the equation of random errors. So we thought it was best to switch back to m3.large instance types. After doing so we saw a drop of HTTP 503s compared to what it looked like before.
+
+The following graph shows how it looked if we excluded those dates.
+
+This was fun and we learnt quite a lot in making our system, in particular service discovery, more reliable. We learnt that the effect of large amounts of HAProxy reloads can cause disruptions in service communications. Minimizing it produced a more reliable system. In the article I’ve showed one of the ways to minimize it by having close to static backend server configurations.
+
+This can be further improved by putting the HAProxy hosts behind an ELB and configuring the service hosts to point to the DNS of the ELB instead of the HAProxy IPs. Then if any of the HAProxy hosts is launched or terminated, it would not trigger a reload of the HAProxy process on the service hosts.
+
+Although HAProxy is quite good, perhaps it would be better if it could handle more dynamic configurations preferably in memory without having it to reload or restart. Perhaps some proxies like traefik could do this quite well.
+
+A few takeaways from this post would be to have good monitoring and visualization tools that can help you answer the following questions — Is there a problem? If so, what is the nature of the problem? Is there a pattern to these problems? What time did it start occurring and on which hosts did it occur? Sumo Logic, Librato and Sensu are some of the tools we’ve used that have helped us greatly in this regard.
+
+Lastly, keeping the technology stack simple is great. The fewer the dependencies the better.|||
+
+TL;DR: Having HAProxy configurations reloaded almost constantly due to dynamic backends is bad and can cause unreliability in the system. However this can be avoided if backend configs are “close-to…

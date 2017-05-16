@@ -1,0 +1,24 @@
+One primitive that can tell us the initialization part of story is plain old Java array. It needs to be initialized too, and its length is variable, which lets us see what is going on at different sizes. With that in mind, let us construct this benchmark:
+
+It makes sense to run with the latest JDK 9 EA (the follow up test below requires it), with to minimize GC overhead, and to keep most of the heap for these new allocations. Without further delay, this is what you will get on a good development desktop (like mine i7-4790K, 4.0 GHz, Linux x86_64), when all 8 hardware threads are busy:
+
+One can see that the allocation takes around 20 ns (single-threaded is much lower, but this average is skewed by hyper-threads), which goes gradually up to 40 us for 100K array. If you look at the allocation rate, then you will see it saturates at around 12 GB/sec. These experiments form the basis for other performance tests, by the way: it is important to understand the order of memory bandwidth / allocation rate you can pull off on a particular machine.
+
+Can we see what code dominates the execution time? Of course we can, again, with JMH’s . For , it will print out the hottest code like this:
+
+You may find this code shape familiar from "TLAB Allocation" and "New Object Stages" issues in the series. What is interesting here, is that we have to initialize much larger chunk of array data. For this reason, we see the inlined sequence on x86 — which repeatedly stores the given number of given byte — and seems most effective on recent x86-s. One can spy with a little eye that there is also an initializing loop for small arrays (smaller or equal of 8 elements) —  has upfront startup costs, so smaller loop is beneficial there.
+
+Can we guesstimate what would the performance be, if we somehow avoid initialization? The compilers are routinely coalesce system and user initialization, but can we get no initialization at all? Granted, it would serve no practical purpose to have uninitialized object, because we will still fill it with user data later — but synthetic tests are fun, am I right?
+
+Turns out, there is an method that allocates uninitialized arrays, so we may use it to see the benefits. is not Java, it does not play by Java rules, and it sometimes even defies the JVM rules. It is not the API for the public use, and it is there for internal JDK use and JDK-VM interoperability. You can’t have it, it is not guaranteed to work for you, and it can go away, crash and burn without telling you.
+
+Oh yeah, touching the memory to push the metadata out. The cycles accounting is skewed towards the prefetches, because they are now paying the most of the cost for pre-accessing memory for upcoming writes.
+
+One might wonder what toll that exerts on GC, and the answer is: not that much! The objects are almost all dead, and so any mark-(copy|sweep|compact) GC would breeze through the workload like this. When objects start surviving at TB/sec rate, the picture gets interesting. Some GC guys I know call these things "impossible workloads" — because they both impossible in reality, and impossible to deal with. Try to drink from a firehose to learn this in practice.
+
+Anyhow, we can see that with pure allocations, GCs are surviving fine. With the same workload, we can see what are the apparent application pauses, by using JMH’s profiler. It runs a high-priority thread and records the perceived pauses:
+
+So, it had detected around 84 pauses, the longest is 14 ms, while the average is about 6 ms. Profilers like these are inherently imprecise, because they contend on CPUs with workload threads, they get into the mercy of OS scheduler, etc.
+
+In many cases, it is better to enable the JVM to tell when it stops the application threads. This can be done with JMH’s profiler, which records the "safe point", "stop the world" events when all application threads are stopped, and VM does its work. GC pauses are naturally the subset of safepoint events.|||
+

@@ -1,0 +1,55 @@
+We’re big fans of Electron here at Nylas. It’s allowed us to iterate quickly across platforms using the best of modern web standards. Since Electron is built on top of Chromium we get some great debugging tooling from Chrome Developer Tools. Usually these are enough for our purposes, but when bugs get weird, we need to go one level down, and look under the hood.
+
+This post will focus on a recent bug with SQLite and how we utilized LLDB to find the root cause of Nylas Mail mysteriously and intermittently crashing.
+
+First you need Electron without symbols stripped. If you run on the prebuilt downloaded Electron, you’ll get hex garbage in your stacks.
+
+Start by building Electron from source. This isn’t as bad as it sounds! Follow the instructions for Mac, Win, or Linux.
+
+On Mac it’s as simple as: . Just make sure you’re on the latest OSX and have the latest XCode properly installed.
+
+Once you have Electron built, you can forevermore use your new debug executable to launch your app instead of a precompiled one.
+
+If you have plain javascript dependencies, you can debug them as normal through the inspector panel. However, if you’re using native modules, sometimes the issue can be deep inside the compiled code of that module.
+
+In our case, we had a strong hunch that the source of our bug was in SQLite. Code executing here doesn’t show up in the inspector console (except as an unhelpful grey bar). Even with our debug version of Electron, we need to make sure that our native node module also has symbols. By default when you native node modules, they’ll strip symbols making low-level debugging almost impossible.
+
+You need to rebuild native modules with debug flags.
+
+Here’s how we did it for SQLite:
+
+All those environment variables we set before the are necessary to make sure we’re using Electron’s headers. Please read up about Using Native Node Modules if that’s foreign to you.
+
+Now we’re ready to launch the app & have all debug symbols available! 🎉
+
+Launch your app with the debug version of Electron we previously built:
+
+Now let’s attach or to your app!
+
+The first trick is finding the correct process ID to attach to. Your app will likely have two or more processes. In our case, we knew our bug was coming from a particular process because it would blow the memory sky high. 😬
+
+Once attached, it’ll bring your process to a screeching halt. At this point you can look at the backtrace, explore stack frames, and much more. Read the full LLDB documentation to find out everything you can do.
+
+The trick was to have stop at just the right time when our bug happened. For intermittent bugs this is frequently difficult. While you can use a combination of chrome inspector breakpoints and lldb breakpoints, our bug had an (un)fortunate property of causing the whole app to mysteriously crash when it reared its head. When this happened, we attached lldb.
+
+Now that we’re in lldb, attached to the right process, and stopped in the middle of our mysterious crash, let’s look around.
+
+Since we rebuilt SQLite with debug flags, we now get obviously sqlite-related stacktraces in some of our threads and frames. Let’s dive into those further:
+
+Next we pick the thread and frame that has sqlite in it:
+
+We zero in on: . By taking a quick look through the sqlite source code, that function stood out as one that likely has frame variables that can tell us what we want.
+
+Finally, we use the fact that lldb is fully interactive and use existing sqlite functions to print out the value of suspicious variables. In our case we wanted to know what query was running when the app hung.
+
+AH HA! That’ll do it… Selecting several GB of message data at once will hang sqlite and crash the app when it runs out of memory. Some piece of our code unexpectedly, and intermittently, queried sqlite with invalid limits.
+
+LLDB, chrome developer tools, and sound development practices are all parts of our toolkit. Each one serves a slightly different purpose and we’re always learning something new about how to improve our debugging skills and the improving the quality of Nylas Mail. Going forward we have a couple of ideas on where to take this next.
+
+Instruments is a very powerful debugging tool. It’s possible to connect this same electron stack and get timelines of memory allocation, disk access, and much more.
+
+All of this setup could be automated and generalized for any Electron app. Building an Electron debugger wouldn’t be too far off. Imagine having a tool like Instruments but specifically built for Electron Apps. We think that would be amazing.
+
+Thanks to Mark Hahnenberg for contributing the lldb expertise for this work!|||
+
+Looking under the hood

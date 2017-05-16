@@ -1,0 +1,41 @@
+Automating the distribution of secrets and credentials to components of an infrastructure is a hard problem. We know how to encrypt secrets and share them between humans, but extending that trust to systems is difficult. Particularly when these systems follow devops principles and are created and destroyed without human intervention. The issue boils down to establishing the initial trust of a system that just joined the infrastructure, and providing it access to the secrets it needs to configure itself.
+
+In many infrastructures, even highly dynamic ones, the initial trust is established by a human. An example is seen in Puppet by the way certificates are issued: when a new system attempts to join a Puppetmaster, an administrator must, by default, manually approve the issuance of the certificate the system needs. This is cumbersome, and many puppetmasters are configured to auto-sign new certificates to work around that issue. This is obviously not recommended and far from ideal.
+
+AWS provides a more flexible approach to trusting new systems. It uses a powerful mechanism of roles and identities. In AWS, it is possible to verify that a new system has been granted a specific role at creation, and it is possible to map that role to specific resources. Instead of trusting new systems directly, the administrator trusts the AWS permission model and its automation infrastructure. As long as AWS keys are safe, and the AWS API is secure, we can assume that trust is maintained and systems are who they say they are.
+
+Using the AWS trust model, we can create fine grained access controls to Amazon's Key Management Service (KMS). KMS is a service that encrypts and decrypts data with AES_GCM, using keys that are never visible to users of the service. Each KMS master key has a set of role-based access controls, and individual roles are permitted to encrypt or decrypt using the master key. KMS helps solve the problem of distributing keys, by shifting it into an access control problem that can be solved using AWS's trust model.
+
+Since KMS's inception a few months ago, a number of projects have popped up to use its capabilities to distribute secrets: credstash and sneaker are such examples. Today I'm introducing sops: a secrets editor that uses KMS and PGP to manage encrypted files.
+
+A few weeks ago, Mozilla's Services Operations team started revisiting the issue of distributing secrets to EC2 instances, with a goal to store these secrets encrypted until the very last moment, when they need to be decrypted on target systems. Not unlike many other organizations that operate sufficiently complex automation, we found this to be a hard problem with a number of prerequisites:
+
+Daniel Thornton and I brainstormed a number of ideas, and eventually ended-up with a workflow similar to the one described below.
+
+The idea behind SOPS is to provide a wrapper around a text editor that takes care of the encryption and decryption transparently. When creating a new file, sops generates a data encryption key "Kd" that is itself encrypted with one or more KMS master keys and PGP public keys. Kd is used to encrypt the content of the file with AES256-GCM. In order to decrypt the files, sops must have access to any of the KMS or PGP master keys.
+
+SOPS can be used to encrypt YAML, JSON and TEXT files. In TEXT mode, the content of the file is treated as a blob, the same way PGP would encrypt an entire file. In YAML and JSON modes, however, the content of the file is manipulated as a tree where keys are stored in cleartext, and values are encrypted. hiera-eyaml does something similar, and over the years we learned to appreciate its benefits, namely:
+
+Below are two examples of SOPS encrypted files. The first one in YAML, the second one in JSON:
+
+As you can see on each key/value pair, only the values are encrypted and keys are kept in clear. It can be argued that this approach leaks sensitive information, but it’s a tradeoff we’re willing to accept in exchange for an increased usability.
+
+OpenPGP gets a lot of bad press for being an outdated crypto protocol, and while true, what really made look for alternatives is the difficulty to manage and distribute keys to systems. With KMS, we manage permissions to an API, not keys, and that's a lot easier to do.
+
+But PGP is not dead yet, and we still rely on it heavily as a backup solution: all our files are encrypted with KMS and with one PGP public key, with its private key stored securely for emergency decryption in the event that we lose all our KMS master keys.
+
+That said, nothing prevents you from using SOPS the same way you would use an encrypted PGP file: by referencing the pubkeys of each individual who has access to the file. It can easily be done by providing sops with a comma-separated list of public keys when creating a new file:
+
+GnuPG can be a little obscure when it comes to managing the keys that have access to a file. While its command line is powerful, it takes a few minutes to find the right commands and figure out how to provide access to a new member of the team.
+
+In SOPS, managing master keys is easy: they are simply stored as entries of the document under sops->{kms,pgp}. By default, that information is hidden during editing, but calling sops with the "-s" flag will display the master keys in the editor. From there, add new keys by creating entry in the document, or remove them by deleting the lines.
+
+Rotating data keys is also trivial: sops provides a rotation flag "-r" that will generate a new data key Kd and re-encrypt all values in the file with it. Coupled with in-place encryption/decryption, it is easy to rotate all the keys on a group of files:
+
+Something that should be done every few months for good practice ;)
+
+SOPS has the ability to use KMS in multiple AWS accounts by assuming roles in each account. Being able to assume roles is a nice feature of AWS that allows administrator to establish trust relationships between accounts, typically from the most secure account to the least secure one. In our use-case, we use roles to indicate that a user of the Master AWS account is allowed to make use of KMS master keys in development and staging AWS accounts. Using roles, a single file can be encrypted with KMS keys in multiple accounts, thus increasing reliability and ease of use.
+
+SOPS is available on Github at http://github.com/mozilla/sops and on Pypi at https://pypi.python.org/pypi/sops. We are progressively reaching a stable stage, with a goal to support Python 2.6.6 to 3.4.|||
+
+Automating the distribution of secrets and credentials to components of an infrastructure is a hard problem. We know how to encrypt secrets and share them between humans, but

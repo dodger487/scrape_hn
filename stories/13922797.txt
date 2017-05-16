@@ -1,0 +1,70 @@
+Let’s look at a simple, constrained test case. Suppose I want to render a very large number of oriented boxes. That makes for a rather boring scene, yes, but there are legitimate use cases in which I might want to do it. I might have a deferred renderer that’s rendering light bounding volumes, or maybe I’m doing an object space AO technique like Oat, Shopf, and I published in ShaderX7, under the title: “Deferred Occclusion From Analytic Surfaces”. Or, maybe I’m rendering lots of bounding volumes for occlusion culling. Let’s just pretend for a moment that this is an important workload. How do I do this as fast as possible?
+
+For our experiments, we’ll render the boxes using a simple pixel shader the uses derivative trickery to extract a normal, and then does diffuse lighting. This is only really to give us something interesting to see and to make sure that we didn’t mangle the geometry:
+
+We’ll also pick a viewpoint so that most of the boxes are off screen. I’ve repeated this for all boxes offscreen and gotten essentially the same result. You can find all of the code here. I built it on my laptop using VC++ express 2013. If you’re lucky, it might work.
+
+Let’s consider three ways of rendering the boxes:
+
+An oriented box can be defined by a 3×4 transform matrix which deforms a unit cube into the box of interest. The columns of this matrix contain the center and axes of our box, as shown below:
+
+So, let’s just render a bunch of instanced cubes. We have one unit box mesh, and a buffer packed full of transform matrices, and we use an ordinary instanced drawcall on it. Our vertex shader looks like this:
+
+I’m using float4s and dot products instead of a float3x4 matrix type, because TBH I can never keep N and M straight in my head, and the dot products are just easier on my brain.
+
+Let’s do the same thing, except let’s not use instancing. The reasons for this will become clear shortly. Now, we don’t want to go doing one drawcall per box, because that would just introduce more overhead. We also don’t want to duplicate the same unit cube 250K times. That would consume unnecessary bandwidth. Instead, we’ll do this by generating a gigantic index buffer and doing SV_VertexID math. We know that cube i will reference vertices 8*i through 8*i+7, so we can figure out our own local instance and vertex ID from a flat index buffer. The only drawback is that now we need to fetch our vertex and instance data explicitly:
+
+Let’s think outside the box about our boxes for a second. What is it that we have to do in order to draw a box? We need to compute the clip space positions of each of its 8 vertices. That’s all. So far, we’ve done this by doing a pair of matrix multiplications. We deform a unit cube into our oriented box, and then apply our view-projection matrix to the result. Like so:
+
+If we account for the fact that our vertex coordinates are all +-1, then we can boil the world matrix down to a series of vector adds and subtracts, like so:
+
+Now we can exploit the distributive property of matrix multiplication and factor out the view-projection transform, like so:
+
+The geometric interpretation of this is that instead of expanding our box in world-space, and then transforming the results to clip space, we instead pre-transform its basis vectors and center-point, and then do the expansion in clip space. By factoring things this way we can eliminate quite a few subexpressions.
+
+The final piece of the puzzle is to minimize the number of verts that our GS emits. Some clever individual figured out how to represent a cube using a 14 vertex strip. That’s a considerable improvement over the 24 verts we might emit if we did it 2 triangles at a time. Here is the full geometry shader:
+
+Here is the DX bytecode for our uninstanced vertex shader:
+
+If we count flops, we find that our vertex shader contains 28 flops. A dp4 is a mul followed by 3 mads, and a mad is one flop regardless of what marketing people would like you to believe. Multiply that by 8, and we get a total of 224 flops per box to transform a box. We’ve only got 8 verts so the post TnL cache will remove the duplication.
+
+Here is the geometry shader:
+
+If we look at just the math, our total here is 108 flops per box. I’m going to assume that the driver will get rid of those idiotic movs, but it’s hard to tell how much those ’emit’ things actually cost. Still, we’re only emitting 56 dwords, so even if its around one ‘flop’ per dword, we’re still going to get a really nice speedup, or so we think.
+
+I’ve run this on three different machines. An Nvidia GTX 670, an old AMD A10 APU (Radeon HD7760G, a VLIW-4 chip), and the Haswell Graphics chip in my personal laptop (Core i3-4010U). In fairness to AMD and Nvidia, I’m not using their latest and greatest architectures, so the comparison isn’t exactly fair, and I’d be happy to post updated results as I receive them. Still, my point here is to illustrate the pitfalls of geometry shaders, not to turn this into some sort of IHV shootout. These GPUs serve that purpose well enough. Results are normalized below so that nobody looks bad:
+
+The first thing we notice is that instancing sucks. If you are rendering a very small number of verts per instance, you want to do it without instancing, because all three geometry pipelines take a hit. Especially those poor blue fellas. This result is just plain irritating. In order to avoid whatever silly bottleneck this is, it’s necessary for us to create a redundant index buffer and add a few spurious instructions to the vertex shader. It’s counter-intuitive, and a tad wasteful. They probably need to flush the post-transform cache between instances, but they could at least try and mitigate this by adding a few instance ID bits to the cache tag. I’ll put up with a lower maximum index value if that helps.
+
+The second thing we notice is that our GS idea was not as clever as we thought. On both the AMD and Nvidia parts, our clever idea, which was supposed to cut our workload in half, has instead hurt us. To understand why, let’s dig a little deeper.
+
+At this point we really need to see some actual shader assembly, but unfortunately, only one architecture lets us do this. So, I’ll do what I do during my day job. I will assume that everybody’s hardware is exactly the same as GCN, and make all of my shader design decisions accordingly. If the blue and green teams are made nervous by that, then perhaps they should start listening to my incessant whining and give me an offline bytecode compiler. 🙂
+
+Here’s the GCN shader. The syntax looks different from what you’re used to, because I’m using my renegade disassembler.
+
+By looking at the disassembly we can see something interesting. The shader is writing all of its output to memory. That’s right. Every vertex we emit from an AMD geometry shader has to make a round-trip through memory. Now, before you go bashing AMD for this, think about why it is they might be doing this.
+
+The API requires that the output of a geometry shader be rendered in input order. The fixed-function hardware on the other side is required to consume geometry shader outputs serially. This creates a sync point. If we want to process multiple primitives in parallel, it is necessary for GS instances to buffer up their outputs so that they can be fed in the correct order to whoever is consuming them. The more parallelism, and the more verts our GS emits, the more buffering we need.
+
+Recall that GPU shader pipelines operate in SIMD fashion. The amount of buffering we need is determined by the SIMD width. AMD’s SIMD is 64 threads wide, which means that in our case they must buffer 14336 bytes for every GS wave. For Nvidia, it’s 7168 bytes per warp. On a state of the art R9 with 40 CUs, we need at least 160 waves just to keep all of the schedulers occupied, which translates to over 2MB of buffering, and you’ll still need more than that because 1 per SIMD is not enough to run well.
+
+There are only two places this buffering can exist. It’s either on chip, in a cache somewhere, or its off chip, in DRAM. If you put it on chip, you need to throttle the number of concurrent warps based on the amount of space you have, and if you put it off chip, it’s going to take that much longer for the consumer to get it, which means that unless the shader is really, really expensive there is no way you’ll be able to avoid being stalled on it. Back in the DX10 era, Nvidia went the on-chip route, and AMD went the off-chip route. I don’t think that either is particularly happy with the results.
+
+Conversely, the vertex shader way, even though it does 2x as much work, only produces 16 bytes per thread, which translates to 1024 bytes/wave (AMD), or 512 (nv). By using a GS, we replace a large number of low-bandwidth threads with a small number of high bandwidth threads, and even though we perform less work, we still lose, because we’re not able to parallelize it as well.
+
+This is my own speculation. I’d be curious to hear how close to the mark I am.
+
+After a thorough perusal of their linux graphics docs, it seems that their GS works by blocking threads. Each thread generates its output, puts in registers, and waits its turn to feed it downstream. If an EU has a GS thread that is blocked at the sync point, it can start executing another GS thread while the first one is waiting. As long as the GS threads are doing a goodly amount of computation, the machine stays busy. I speculate that Intel gets away with this for two reasons:
+
+1. Unlike the competition, Intel’s shader hardware has a full set of registers dedicated to each hardware thread. The red and green team each lose thread occupancy if a shader has a lot of register pressure, but not the blue team, they just exploit their ridiculous process advantage and pack the little suckers in, and then stop worrying about it. Our shader has quite a bit of register pressure in it, but that doesn’t hurt Intel’s concurrency one bit. Their enormous register file functions as a big on-chip buffer.
+
+2. Intel’s shader EU’s are interesting in that they can operate in a variety of modes. They’re 8 wide, and can run in SIMD-8 mode (where each 8 threads issue one operation), or SIMD16 mode (where 16 threads issue from back to back registers), or SIMD4x2 mode, where 2 threads each issue 4 operations. SIMD4x2 is used in Haswell for VS and GS, and I suspect that its the main reason for the awesomeness. Intel is only running two GS invocations at a time, and is replacing data-parallelism with instruction level parallelism, which means that their per-thread bandwidth is a measly 448 bytes, an order of magnitude lower than everybody else’s.
+
+These two factors together mean that Intel doesn’t suffer nearly as badly from the sync point. It takes much, much less time to consume 448 bytes than 14336, which means that the wait time is bearable, and there are plenty of threads available to cook new batches while the old ones are blocked.
+
+Even though it is possible to implement geometry shaders efficiently, the fact that two of the three vendors don’t do it that way means that the GS is not a practical choice for production use. It should be avoided wherever possible.
+
+It is flawed, in that it injects a serialized, high bandwidth operation into an already serialized part of the pipeline. It requires a lot of per-thread storage. It is clearly a very unnatural fit for wide SIMD machines. However, this little exercise has made me wonder if it can’t be redeemed by spreading a single instance across multiple warps/wavefronts, squeezing ILP out of a DLP architecture. Perhaps I’ll try and write a compute shader that does this.
+
+Unfortunately, even if I did find a way to express my shader this way, it’s still not possible for me to USE such a shader as a GS. The APIs don’t permit it. In the future, perhaps we want a lower level model there, something like, “Here are N compute threads responsible for M input primitives.”, where N and M are both application-defined knobs. Food for thought, at least.|||
+

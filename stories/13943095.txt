@@ -1,0 +1,116 @@
+Hi, I’m Mark Nottingham. I currently co-chair the IETF HTTP and QUIC Working Groups, and am a member of the Internet Architecture Board . I usually write here about the Web, protocol design, HTTP, and caching. Find out more .
+
+A long, long time ago, I wrote some tests using XmlHttpRequest to figure out how well browser caches behaved, and wrote up the results.
+
+Fast forward more than a decade, and much has changed; there are lots of new browser engines, and browser testing has taken off at Web Platform Tests.
+
+For the past few years I’ve been promising Anne that I’d help Fetch with HTTP caching, and as part of finally doing that over the last week or two, I needed to integrate some tests into WPT. The results are interesting – and browser caching is looking better!
+
+Below are my observations. It’s important to note that the tests are still evolving a bit (and not “official” yet), and that I’m likely to add more over time. I’m going to be opening bugs against browsers and, when appropriate, changing the tests and opening bugs against the specs.
+
+Make sure you read the caveats; one thing I’ll add here is that these tests are through the lens of Fetch; that should give a good indication of how the browser will behave, but it’s not definitive (e.g., see this issue). I’ve only tested Firefox, Safari Tech Preview (Safari release doesn’t support Fetch yet) and Chrome; Edge apparently doesn’t use its cache at all for Fetch .
+
+UPDATE: Mike Bishop at Microsoft suggested trying the Insider build with some flags turned on, and that did the trick (thanks, Mike!), so I’ve added results for Edge below (and if I say “all browsers tested”, it includes Edge). As with Safari Tech Preview, I suspect this is how the cache behaves for non-Fetch requests in the stable build.
+
+The core mechanism in HTTP caching is freshness – i.e., allowing the server to specify a lifetime when the response can be reused.
+
+There are two basic ways to explicitly specify freshness; with the response header, and the response directive.
+
+All of the browser caches tested honour both, and do so correctly; if the response is fresh, it comes from cache, and if it is stale, it doesn’t. They also correctly prefer over when both are present.
+
+If is invalid (e.g., the string ), they’ll consider the response stale – unless there’s a .
+
+in responses bypasses all tested browser caches correctly, and in responses will correctly get stored, but checked on each request.
+
+Of course, browsers caches aren’t necessarily the only caches in between the origin server and fetch(); the origin server itself, CDNs, reverse proxies, intercepting proxies and forward proxies all might implement a cache as well. That means that the browser’s cache needs to take account of the header when calculating freshness; it represents how much time the response spent in these other caches.
+
+All of the tested browser caches include in their calculation of handling , with one hiccup; Firefox will return a stale response if you make a request for it immediately after the cache is populated (if you wait a second or two, it will go back to the network). I can speculate as to why this might be, but I’ll raise an issue to be sure.
+
+In summary – this is good; we can rely on browser caches to get the basics right. In particular, it’s not necessary to put a salad of directives into your response to cache-bust; and work perfectly well.
+
+If a response doesn’t have explicit freshness information like or , HTTP still allows it to be cached using what’s called heuristic freshness. This means that the cache can guess a freshness lifetime, and it’s useful because servers often don’t assign an explicit freshness lifetime to responses, harming efficiency. Web caching never would have gotten started without it.
+
+However, the response has to allow this. Some status codes allow it by default; e.g., , , and . If the status code doesn’t allow it, it can be explicitly turned on using .
+
+Usually, caches calculate the actual freshness lifetime to use with ; if it’s a long time ago, they have higher confidence that the resource won’t change soon, so they assume a longer lifetime.
+
+All tested browser caches apply heuristic freshness to . All except Edge also apply it to and responses.
+
+Safari also applies it to , , , , and – all of the status codes allowed by HTTP.
+
+None of the tested browsers applied heuristic freshness to a status code that HTTP disallows it with, and none of them used it with an unknown status code in conjunction with .
+
+Again, the basics are good here. It might be helpful if browsers applied heuristic freshness to more responses (especially ), but people should be specifying explicit freshness (and avoiding s on their subresources!) anyway.
+
+The lack of support for using to flag unknown status codes for heuristic caching is a little disappointing, but not really surprising.
+
+Validation allows a cache to check with the server to see if a stale stored response can be reused.
+
+All of the tested browsers support validation based upon and . The tricky part is making sure that the response is correctly combined with the stored response; specifically, the headers in the update the stored response headers.
+
+All of the tested browsers do update stored headers upon a , both in the immediate response and subsequent ones served from cache.
+
+This is good news; updating headers with a is an important mechanism, and when they get out of sync it can cause problems.
+
+Because a request can change state on the server, it’s important to invalidate the contents of the cache when this happens, so that the user sees the freshest response. For example, if you post a comment, you want to see that comment in the resulting Web page when you get redirected to it.
+
+HTTP specifies that caches should be invalidated when unsafe request methods are used and the response is successful – i.e., a or status code. Unsafe methods include POST, PUT and DELETE, as well as unknown status codes.
+
+When this happens, caches are required to invalidate the URL that the request was made to, as well as any and URLs that the response might have.
+
+All tested browsers correctly invalidate the requested URL for POST, PUT and DELETE requests. Firefox also invalidates upon unknown methods; Safari, Edge and Chrome do not. Likewise, Firefox also correctly invalidates the and URLs; Safari, Edge and Chrome do not.
+
+All of the browser caches seem to ignore the response status code; they’ll invalidate (if they support invalidation in the test scenario) even if the request was unsuccessful. This isn’t critical, it just means that they’re a tiny bit less efficient then they could be.
+
+Hopefully, Safari, Edge and Chrome will get to parity with Firefox here.
+
+In HTTP, any status code with a freshness lifetime (e.g., from ) can be cached. This assures that new status codes can get the benefits of caching without waiting for caches to be updated.
+
+Chrome does this for all status codes tested; it will cache not only but also , and even , as long as they have explicit freshness information.
+
+Firefox caches a couple, like and , but it doesn’t cache many others; , , , , , , , , , or all goes straight to the network, even though they had explicit freshness information.
+
+Safari caches more of them, only balking at , the status codes and all three unknown status codes ( , and ).
+
+Edge only caches ; other tested status codes aren’t served from cache, even with explicit freshness information.
+
+Ideally, Edge, Firefox and Safari will see Chrome’s example and update; if it works for Chrome, it’s hard to argue that it’s going to cause compatibility issues.
+
+HTTP also allows the request to contain information that influences cache behaviour, in the request header directives.
+
+For example, , , and do what they sound like; they put boundaries on the age, staleness and freshness of the response used, respectively. This needs to take into account not only the and response headers, but also the response header (see above).
+
+Of the tested browsers, Firefox supports , and in requests, both with a simple freshness lifetime, and when the header is present.
+
+Safari supports only; if there is any other value, or an header in the response, seems to be ignored in requests. It also supports (both with and without an response header), but not .
+
+Chrome only supports in requests, and only with the value . It does not support or .
+
+Edge doesn’t support , or in requests. Worrisomely, it doesn’t even pay attention to .
+
+Additionally, HTTP defines to indicate that the cache should be bypassed completely for this request (and its response). Only Firefox and Edge seem to support in requests.
+
+means something slightly different than you might think; it allows use of the cache, but forces the request to go to the origin server to validate any stored response. All tested browser caches support it.
+
+Finally, allows you to ask to see if something is in the cache, but if it isn’t, to abort the request and return a response instead. None of the browser caches tested supported it – possibly as a way to make cache probing just a little bit harder.
+
+The interop story here isn’t great, but Firefox is doing great work at least.
+
+HTTP lets servers specify that the cache key depends on more than just the URL by using the header, which lists the request headers whose values should be added to it. This secondary cache key enables things like caching compressed content, and generally in supporting content negotiation.
+
+The good news is that all browser caches tested support correctly; the correct response is used, even when a two- or three-way header is sent.
+
+Importantly, they also do the right thing when one of the ing request headers is missing from the request.
+
+The one hiccup I saw was that all tested browser caches would only store one variant at a time; i.e., if your responses contain and you get two requests, the first with and the second with , the second response will evict the first from cache.
+
+Whether that’s a problem depends on how you use ; if you want to reuse cached responses with old values, it might reduce efficiency. However, that doesn’t seem like a common use case; it’ll be interesting to see if there’s any impact on Client Hints.
+
+Overall, though, it’s a great relief that support is in such good shape; it was a real problem not that long ago. Although Edge hasn’t been tested yet…
+
+HTTP caches are allowed to store partial content – whether that’s explicitly retrieved with a request and conveyed in a response, or because the connection dropped before the entire response was received.
+
+I created a few partial content tests, but support seems to be poor in the tested browser caches; only Safari showed any positive results, and that was only the most simple test.
+
+How problematic this is depends on your use case, but it’s definitely a niche; this won’t affect the vast majority of developers, since the most common uses for partial content are PDFs and video.|||
+

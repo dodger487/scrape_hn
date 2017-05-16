@@ -1,0 +1,111 @@
+In the March 2017 Android Security Bulletin, Google released a patch to CVE-2017-0510, a critical severity vulnerability in Nexus 9 we discovered and responsiblity disclosed a few months ago. This vulnerability has a very unusual attack vector – headphones. By exploiting this vulnerability we managed to leak stack canaries, derandomize , conduct a factory reset, and even access , allowing for communication with internal System-on-Chips (SoCs) through I C.
+
+In their BlackHat 2013 paper, Michael Ossmann & Kyle Osborn showed that multiplexed wired functionality exists in several mobile phones. Their research mainly focused on the USB socket. In the paper, they presented interesting results on various variants of Galaxy Nexus. For example, they showed that with Galaxy Nexus running CyanogenMod (CM), one could get access to the (see next) together with an unprivileged shell. More severely, on Samsung Galaxy S3 running CM they have also got a root shell. Ossmann & Osborn also briefly documented multiplexed audio connectors, noting that Nexus 4 has a interface hidden in its headphone jack, a functionality which is enabled if the voltage on the pin exceeds some threshold.
+
+Fast-forward to 2017, nowadays it’s a well known fact that the Nexus devices (Pixel too) have this kind of functionality in their headphone jack. There are multiple examples of people building and documenting their cables.
+
+We were curious, so Sagi Kedmi (@sagikedmi) suggested we would also assemble our own cable. We decided to go with the standard FTDI232RL breakout board:
+
+We then tested it over recent Google devices, running the latest available build with a locked bootloader (BL):
+
+All but Pixel C had the multiplexed functionality. It should be noted some devices also required us to enable via a proprietary command (e.g ). To our surprise, Nexus 9 behaved quite differently, having extra functionalities beyond debug messages, and beyond the .
+
+In the next sections we will study some internals behind the vulnerability and its security impact.
+
+When we first booted up Nexus 9 with the cable attached, we noticed something familiar:
+
+Similarly to what Ossman & Osbord have shown on older Android devices, one could access the on Nexus 9 as well, although without a shell on (production) builds. It should be noted that the functionality is enabled even if the cable is inserted when the platform is up.
+
+The (Fast Interrupt Request) debugger module which we can apparently access in Nexus 9 is implemented mainly by fiq_debugger.c and tegra_fiq_debugger.c in the tegra kernel tree.
+
+Whenever a keystroke is sent to the device via , an is generated, which eventually (and probably after visiting some ARM Monitor mode code) reaches that dispatches the relevant command handler.
+
+In order to speed-up the work of the researcher, the interface provides a command:
+
+The list of available commands clearly indicates the attacker may exfiltrate a lot of sensitive information by interacting with the . For example, the attacker can dump the process list:
+
+By using the command, for example, it’s possible to view the kernel log (similar to other Nexus devices), and receive an unprivileged shell (not on production ( ) builds – on , builds only!)
+
+Using the / / commands allows the attacker to dump the registers, and when falling under the kernel context, the call stack too. Unlike a normal debugger we cannot modify memory and/or place breakpoints, however since the preempts, the dumped information will be of an arbitrary process. In order to validate this assumption, we first created a tiny app that sets one of the registers to in an infinite loop:
+
+We expected that we will eventually hit the context of the app’s process, with . Indeed:
+
+Our next step was to prove we can leak something more sensitive – the Stack Canary value of Zygote, which is shared between all Android apps. (Due to the fact all Android apps are forked from Zygote without an exec syscall.).
+
+We first created a small app that dumps the canary to logcat:
+
+And the canary was:
+
+We then created a small PoC that dumps the registers in a successive manner. Eventually we fell under the context of a stack-protected function – reg contains the canary value!
+
+Disassembling near under shows that it belongs to the function. Indeed is assigned with value:
+
+It is no surprise that being able to view arbitrary CPU contexts with addresses included is bad news for , which is in charge of randomizing various addresses, such as of the heap, stack, shared libraries and the executable image itself.
+
+In this post we will focus on libraries only, although it should be fairly safe to claim that this vulnerability significantly weakens for all of the above. As mentioned before, by exploiting this vulnerability one can preempt an arbitrary process, and dump the CPU registers. For example, here is a registers’ dump for :
+
+Viewing the value of the register, in this case, clearly reveals some information. However, in order to conduct a practical attack against , we need to deduce to which library this address belongs and what its base address is.
+
+As for the first part, a statistical approach can be taken. We could calculate, a priori, the hit frequency of each loaded library (with respect to the app). While we did not perform that experiment, we have a strong feeling that the empirical distribution will have a low entropy.
+
+Back to the example, this address falls under , the runtime. We assume that there is a high probability to preempt the process (via FIQ) when it visits that library, although unconfirmed. Equipped with this knowledge, how can one derandomize the base address of ?
+
+We can see that ’s least significant 12 bits, which are unaffected by , are . We can then take this dynamic information and search for all of the instructions with the relevant addresses – unfortunately there are a lot. Despite that, there are maybe additional registers we can leverage. For example, the link register – . This has led to our next experiment: by using we statically searched for all functions that contain an xref from an address that ends with or (the -1 and multiple instruction sizes are because of ), and that have an instruction at an address that ends with .
+
+This script yielded only 6 results under (rebased at zero), significantly reducing the entropy:
+
+One can then reduce the results even further. We made a short experiment, rebooted the device several times a recorded the mapped location of :
+
+We can notice, even without getting into the fine details of the address mapping algorithm, that the 19 least significant bits, , are shared among all reboots. Thus we can take that into consideration, and re-run our script, this time with : (We also rebased the image to .)
+
+This implies the following base address: , and indeed:
+
+Since is loaded by , and due to the Android app forking model, it will be loaded into all apps under the same virtual address.
+
+It’s also worth noting that if one still receives multiple candidates, they can be reduced even further. For example, by leveraging other registers, or creating a heat-map within the library itself together with contextual information, as it is possible that hit process does not even (transitively) call some of these candidates.
+
+Conversely, finding no candidates at all, indicates that we chose the wrong libary (e.g. the called code is not of , but rather of another lib loaded by the preempted process, or of the application itself).
+
+Interestingly, the provides a command, which should provide access to the Linux SysRq interface. Despite that, hitting after the platform has loaded returns nothing:
+
+Digging into the code which handles the FIQ command, reveals the reason:
+
+By instrumenting the kernel we witnessed that when the platform is up, both and are 0, thus returns . The value of the latter can be set to 1 by providing a kernel parameter (which is not provided on Nexus 9, thus the value is 0):
+
+The default value of , however, is 1:
+
+Therefore something must change the variable’s value to 0, and indeed, this is done by an Android init script ( ):
+
+The proc file is backed by code under , that eventually toggles . Hence there is a short window of time at which is enabled – during the kernel’s boot, before the script is executed. Indeed:
+
+The interface provides additional commands beyond the . For example, we can change the kernel logging level in order to leak more debugging messages:
+
+Moreover, a lucky attacker can also dereference some registers:
+
+Our next step was trying to understand if we are limited to the prompt, or there are some more hidden gems.
+
+The Nexus 9 bootloader has two modes: and , which can be interchanged via the bootloader UI:
+
+We noticed that when we entered the mode, another prompt was received via (through the headphones jack):
+
+It can be seen that through this interface we can trigger many interesting operations. From the attacker’s prespective, however, it is very unlikely that the victim would plug-in the headphones while the device is in the mode. As explained above, normally, when the victim plugs-in the malicious headphones, the latter will be able to interact with the , implemented by the platform. So how can the attacker force a reboot to from the ? The answer is, unsurprisingly, 42:
+
+Great, we can now easily access the interface via .
+
+By having access, the attacker can interact with I C accessible SoCs. Detecting the available SoCs can be done using the command. The following shows the devices which listen on I C bus :
+
+For example, and are the read/write addresses of the , implemented on an SoC. , as the name implies acts as an energy-efficient proxy between the main CPU and the actual sensors. It communicates with both ends using I C (different buses). Since the bootloader supports programming via I C, our ultimate goal was to replace the SensorHub firmware via I C, just like the platform driver does. Unfortunately we soon found out it was not possible because booting STM32F4 to its bootloader requires being able to reset the SoC while the and pins are set to 1 and 0, correspondingly, but we cannot control these pins via . Out of curiosity, we digged in the SensorHub driver, CwMcuSensor to see how it performs the firmware upgrade. Indeed it enables the pin, via (the other pin is probably pulled-down):
+
+Although we miserably failed to flash , we still wanted to interact with it via I C, proving that we can communicate with internal chips. Therefore we examined its firmware in order to find a few interesting I C registers. Returning the firmware version is done by reading from register :
+
+This indeed corresponds to the firmware image’s footer: . We then managed to access an actual sensor – the Light Sensor, through SensorHub. In order to do so, we first enabled it (writing to register ), and then read its value (register ):
+
+Lastly, the attacker can also trigger a factory reset, simply by rebooting with :
+
+Better back-up your data before connecting those suspicious headphones!
+
+Google has patched the vulnerability by reducing the capabilities of the . When the platform is up, it’s no longer possible to dump the registers nor reboot with an parameter (preventing reboots into and Factory Resets):
+
+Issuing now results in a normal reboot. As one can see, some commands are still available.|||
+
+A critical severity vulnerability in Nexus 9 (CVE-2017-0510) with a very unusual attack vector - headphone jack. Exploiting this vulnerability allows one to leak stack canaries, derandomize ASLR, conduct a factory reset, and even access HBOOT, allowing for communication with internal System-on-Chips (SoCs) through I2C.

@@ -1,0 +1,67 @@
+In this post, we discuss how CUDA has facilitated materials research in the Department of Chemical and Biomolecular Engineering at UC Berkeley and Lawrence Berkeley National Laboratory. This post is a collaboration between Cory Simon, Jihan Kim, Richard L. Martin, Maciej Haranczyk, and Berend Smit.
+
+Nanoporous materials have nano-sized pores such that only a few molecules can fit inside. Figure 1 shows the chemical structure of metal-organic framework IRMOF-1, just one of the many thousands of nanoporous materials that have been synthesized.
+
+Nanoporous materials have many potential engineering applications based on gas adsorption: the process by which gas molecules adhere to a surface. In this case, the walls of the material’s pores form the surface to which gas molecules stick. Figure 2 shows the unit cell of the IRMOF-1 crystal structure and the corresponding depiction of IRMOF-1 as a raveled-up surface.
+
+If we could unravel and flatten out the surface of IRMOF-1 in Figure 2, the surface area contained in a single gram of it could cover more than a soccer field! This provides a lot of surface area on which gas molecules can adsorb. These high surface areas are part of the reason that nanoporous materials are so promising for many engineering applications.
+
+In the words of Omar Yaghi, one of the pioneers of metal-organic framework chemistry, these nanopores can serve as parking spaces for gas molecules; one aim is to use nanoporous materials to store natural gas for passenger vehicles. Natural gas is an abundant fuel source, but compared to gasoline, which is a liquid, the molecules in natural gas are very far apart. Thus, we would need an enormous fuel tank to hold enough natural gas to drive the same distance as we can with a full tank of gasoline. By packing the fuel tank with a nanoporous material, molecules in natural gas will stick to the surface and thus can be stored at a greater density than the gas phase at the same pressure and temperature.
+
+Another engineering application of porous materials is to separate gaseous mixtures. The idea here is that one species in the gas mixture is attracted to the walls more strongly than the other species, causing it to preferentially adsorb and leave the other components behind. For example, these porous materials could be used to capture the greenhouse gas carbon dioxide from the flue gas of coal-fired power plants and subsequently sequester it underground, where it cannot instigate climate change. Another gas separation application is to remove radioactive noble gases from used nuclear fuel reprocessing off-gas.
+
+An exciting aspect of these materials is their chemical tunability; chemists can design these materials at the molecular level. By changing the molecular building blocks in their synthesis, chemists can in principle synthesize billions of different materials. For example, metal-organic frameworks are synthesized by combining organic molecules called linkers with metals or metal clusters that serve as nodes; these nodes and linkers self-assemble in solution to form a 3D coordination network—the metal-organic framework structure. See Figure 3. By changing the identity of the linker and metal node, chemists have synthesized over 10,000 different metal-organic frameworks to date.
+
+The question that we address in our research is, out of the billions of possible nanoporous materials, which ones are the best for storing natural gas, removing noble gases from used nuclear fuel, or capturing carbon dioxide from flue gas? Synthesizing all of these materials and testing them in the laboratory for each of these engineering applications is an impractical approach because of constrained resources and time; synthesizing and characterizing a single material can take months!
+
+On the other hand, mathematical models for the energetics of the interactions between gas molecules and atoms of the crystal structure allow us simulate the adsorption of gases using the laws of thermodynamics. We can then use computer simulations to predict, for example, how much natural gas, which is mostly methane, a given material will adsorb. For example, Figure 4 shows that simulations of the amount of methane adsorbed in IRMOF-1 at different pressures recapitulate experimental measurements.
+
+Using computer simulations, we can rapidly and cost-effectively test a material for how much gas it will adsorb. In a high-throughput computational screening, we simulate gas adsorption in large datasets of material structures to identify the best for a given engineering application. By looking at the top-ranked materials according to simulation, experimental efforts are focused on only the most promising candidates. We can also reveal limits to performance and elucidate relations between structure properties and performance with the data that we generate in a high-throughput computational screening.
+
+Molecular simulations are computationally intensive, and the number of material structures that we are testing in silico is rapidly expanding. In our recent work, we screened a database of over half a million nanoporous material structures for natural gas storage using molecular simulations. For simulating gas adsorption in such a large number of materials, fast, parallelized computer code written in CUDA to run on GPUs accelerates our research progress dramatically.
+
+We now show how to run a simple molecular simulation of gas adsorbing into a nanoporous material at very low pressures. As an example, we will consider the adsorption of methane, the major component in natural gas, which is a simple molecule that we can model as a soft sphere. We will compare a CPU algorithm parallelized with OpenMP to a parallelized algorithm on a GPU written in CUDA C++.
+
+The amount of methane adsorbed at low pressures can be modeled with Henry’s law:
+
+where is the pressure and is the Henry coefficient. Thus, the amount of methane adsorbed in a given material at low pressure is characterized by its Henry coefficient.
+
+The Henry coefficient is given by the equation:
+
+The function is the energy of a methane molecule centered at coordinates in the crystal structure; and are the universal gas constant and temperature, respectively. The brackets denote an average over space. The function is called the Boltzmann factor. Thus, the Henry coefficient is the average value of the Boltzmann factor inside the unit cell of the structure, divided by RT.
+
+This average over space (an integral) can be computed with a Monte Carlo algorithm. For each Monte Carlo sample, we insert a methane molecule at a uniformly random position in the structure and calculate the Boltzmann factor. We need to perform hundreds of thousands of such particle insertions to thoroughly explore the space inside the structure and obtain a statistically sound average Boltzmann factor.
+
+The Monte Carlo algorithm to compute the Henry coefficient is embarassingly parallel since each insertion is completely independent of all others. In our parallel implementation on the GPU, each thread generates a random position inside the structure, computes the Boltzmann factor of a methane molecule at that position, and stores it in an array in Unified Memory. On the host, we then compute the average Boltzmann factor in this array for the Henry coefficient. For example, by using many thread blocks with 256 threads each, we can perform thousands of insertions in parallel on the GPU. Now, let’s translate this strategy into CUDA code.
+
+First, we write a device function that computes the Boltzmann factor of a gas molecule at position inside the structure.
+
+To generate the uniformly random positions inside the structure on the device, we use the cuRAND library. The following code sets up the random number generator on the device as taken from the cuRAND documentation.
+
+We define a kernel, , which uses the cuRAND device API to generate a 3D position and then compute the Boltzmann factor for that point.
+
+We then perform thousands of insertions in parallel by launching a number of thread blocks per multiprocessor on the GPU. After each kernel launch we sum the Boltzmann factors for that launch, and iterate until we have computed as many Monte Carlo samples as required. Finally, after the CUDA kernel has run, we compute the average Boltzmann factor from the running sum.
+
+The full CUDA code for our simple simulation of the adsorption of methane is available on Github. So, how fast is this CUDA code? For benchmarking, we varied the problem size—the number of Monte Carlo particle insertions used to calculate the Henry coefficient of methane in IRMOF-1—and looked at the throughput, the number of insertions performed per run time. We used a Tesla K40m GPU for the CUDA code with four thread blocks per multiprocessor with 256 threads each. The scaling of throughput with problem size is shown in Fig 5 (green circles).
+
+For comparison, we wrote a C++ code parallelized using an OpenMP parallel for loop ( ), found here. The blue curve in Fig 5 shows the performance of the OpenMP-parallelized code using 32 threads on 2 16-core Intel(R) Xeon(R) CPUs.
+
+For ~29 million Monte Carlo insertions, the throughput for the CUDA code is 40 times that of the OpenMP-parallelized code!
+
+The full codes including details of how the crystal structure is represented and how energy is calculated for this example is on Github here. Parallelization strategies for more complicated molecular simulations beyond computing the Henry coefficient are in Ref. [6].
+
+While GPUs were originally developed for computer graphics, they are now being used by scientists to help solve important engineering problems. The performance gains from parallelizing our molecular simulation codes in CUDA have facilitated our efforts to computationally evaluate large databases of nanoporous material structures for several applications, including:
+
+[2] C. Simon, J. Kim, D. Gomez-Gualdron, J. Camp, Y. Chung, R.L. Martin, R. Mercado, M.W. Deem, D. Gunter, M. Haranczyk, D. Sholl, R. Snurr, B. Smit. The Materials Genome in Action: Identifying the Performance Limits to Methane Storage. Energy and Environmental Science. (2015) DOI
+
+[3] C. Simon, R. Mercado, S. K. Schnell, B. Smit, M. Haranczyk. What are the best materials to separate a xenon/krypton mixture? Chemistry of Materials. 2015. DOI
+
+[4] Lin, L. C., Berger, A. H., Martin, R. L., Kim, J., Swisher, J. A., Jariwala, K., … & Smit, B. (2012). In silico screening of carbon-capture materials. Nature materials, 11(7), 633-641.
+
+[5] Kim, J., Lin, L. C., Martin, R. L., Swisher, J. A., Haranczyk, M., & Smit, B. (2012). Large-scale computational screening of zeolites for ethane/ethene separation. Langmuir, 28(32), 11914-11919.
+
+[6] Kim, J., Martin, R. L., Rübel, O., Haranczyk, M., & Smit, B. (2012). High-throughput characterization of porous materials using graphics processing units. Journal of Chemical Theory and Computation, 8(5), 1684-1693.
+
+We acknowledge funding from the U.S. Department of Energy, Office of Basic Energy Sciences, Division of Chemical Sciences, Geosciences and Biosciences under Award DE-FG02-12ER16362. i.e., the Nanoporous Materials Genome Center. Thanks to Mark Harris for help with optimizing the codes and displaying performance.|||
+
+In this post, we discuss how CUDA has facilitated materials research in the Department of Chemical and Biomolecular Engineering at UC Berkeley and Lawrence Berkeley National Laboratory.

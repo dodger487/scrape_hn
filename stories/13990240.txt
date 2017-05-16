@@ -1,0 +1,85 @@
+If you have tried building offline-first capabilities into your apps, you have experienced the limitations of common methods like caching and manual replication. In this video Adam Fish, Director of Product at Realm, and Sergey Bondari, Mobile Architect at Concur, discuss the pros and cons of common offline-first development methods while proposing a new approach.
+
+If you’ve ever needed to know how another piece of code works, or have been at the mercy of someone else’s bugs, you can always look at the source code… unless you don’t have it. In this talk, Conrad covers many concepts & tools that can used to reverse-engineer existing apps, as well as debug other libraries and even your own code. He even demonstrates the art of reverse engineering on Lyft’s iOS app, injecting code into it and inspecting its network traffic. Using Conrad’s techniques, you can expose the code behind any app on the App Store.
+
+I’m Conrad Kramer, an iOS developer at Workflow, and I will discuss reverse engineering of iOS apps. Basically, reverse engineering is trying to understand how something works based on only the end result. In context of an iOS app, this means finding out how an app works just by the .app you download from the App Store, without its source code.
+
+There are two pain points when you’re doing reverse engineering.
+
+So, the first thing you do when you’re reverse engineering is you come up with questions like, “Why does this bug occur? What component do they use in their UI?” For instance, if you’re curious about whether an app uses a collection view or table view, you can actually ask that question and answer it. “What does their REST API look like?” You can actually just find out how their API works.
+
+I decided to start with a test subject, Lyft’s iOS app, because it’s written entirely in Swift. First thing is, what questions are we going to ask about the Swift app? Suppose I’m curious about the REST API or I want to write my own Lyft client on another platform or on web, I can look at how their API works and ask, “How does their URL scheme work?” This is a particularly relevant question because a lot of you make iOS apps and you want to be able to deep link into Lyft. This allows you to request this specific ride type to a specific location, things like that. It’s especially relevant for Workflow because it is an automation tool, and we integrate with many different apps. As a result, I get to do this all the time. In particular, Lyft’s URL scheme isn’t public yet.
+
+The Lyft app itself is a .IPA file that you download from iTunes — essentially a ZIP file. It has a bunch of metadata, like the Info.plist, along with assets, images, localized strings, and more things like that. It also has the executable, which is where all the fun stuff is — the compiled code. In addition it has many frameworks, because Lyft writes in Swift which encourages modules.
+
+The Lyft app is a complete black box. We can’t really see into it, but we can get peeks into it from certain angles. One way to do so is to look at all the network traffic that Lyft app sends out to the Lyft server. This allows us to see not only how they are interacting with their API, but also to see what information about you they’re sending up to the servers — most of which is harmless such as analytics.
+
+Then we can also inject code, which is really cool. Basically, when the app is running, you can poke and prod their living objects. And when it isn’t running, we can actually try to look at how the .app, that executable file, is structured, and look at their code through a certain lens.
+
+Charles is an HTTPS proxy tool that you set to intercept traffic before it goes to the Internet. We can use this to see everything that goes from the Lyft app.
+
+Lyft actually encrypts its traffic with SSL, but this is really easy to get around using something called man-in-the-middle attack in Charles, which substitutes its own certificate in there, and since it’s trusted by the iOS device, it’ll decrypt the normal HTTP traffic and present it.
+
+Lyft sends your location to the server repeatedly while you use the app. Ride requesting and canceling rides also shows up in Charles, with the pretty-print version of the JSON sent and the response with the ride ID. Using Charles, you can see everything the app is doing with the Internet.
+
+The next tool, which is really cool, is called Cycript. It requires a jailbreak to inject code into other people’s apps. Cycript allows you to inspect other people’s code, but you can also use it for your own apps. It’s an Objective-C and JavaScript hybrid, but it ends up being such that you can just type Objective-C code into a terminal and it runs in the app. It has a much nicer REPL than LLDB. Although it can’t break, set break points, or anything of the sort, it’s great at running code. You can just type code like this, which is almost Objective-C:
+
+After I SSH into my jailbroken iPhone 6, open Lyft, and run Cycript, I can use the choose function to just get any instance of a class in the runtime, such as view controllers and analytics classes. Also, as developers, be sure to set ACLs to prevent access to certain API keys. If the app can get it, Cycript can get it.
+
+You may also modify views within the app. For instance, turn the “Request Ride” button to green by finding it’s memory address using UIApp.keyWindow.recursiveDescription, and then typing:
+
+The Cycript terminal even has tab completion as well. This kind of tweaking is actually not only cool for reverse engineering purposes, but you can use this to debug your own app if you want to quickly test a new color, for instance.
+
+Q: To debug your own app with Cycript, does the device need to be jailbroken?
+
+Conrad: For your own app, it actually doesn’t. On cycript.org there are instructions on how to embed the tool in your own app, which you can connect to and debug like I just demonstrated.
+
+Next, we’ll take a look at the actual code, when the app is not running. This is a little bit more involved and requires a jailbreak, but with some practice it gets easy. Because we can re-sign things for devices, Apple encrypts apps on the store so they won’t be able to be shared with different people. However, if the device is jailbroken, apps can be decrypted. I have a repo I forked from someone else called dumpdecrypted. The author wrote this so you could dump an app, and I forked it so it supports all frameworks as well, which is useful because now everything has frameworks.
+
+To use it, you simply clone it, use , and run it on apps on my jailbroken phone. I ran it on Lyft and the tool just decrypts all of it, so if you look at all the files, you see all of the frameworks appended by . The interesting ones among them are Lyft, LyftKit, and LyftSDK, but we can see that the app also uses SocketRocket, Stripe, Pusher, Mixpanel, and more.
+
+To analyze our dump and see the actual code, we use a tool called IDA, which is similar to Hopper or class-dump, if you’re familiar with them. When building an app, Xcode creates an executable, which is comprised of assembly code. IDA pretty-prints the assembly within the executable and connects the dots, so you can see like a graph of the assembly code of the application. Although IDA is expensive, its free version does almost everything you need, essentially everything but 64 bit.
+
+To find the URL scheme Lyft uses, we can use the search bar within IDA and simply type in . Objective-C is much nicer in tools like these since it’s transparent about how it works, and tools also haven’t updated to Swift well. Swift assembly is more verbose and it’s class information is tougher to extract, but with some practice looking at this assembly you eventually learn how to find what you’re looking for.
+
+Using IDA’s graph view, we find , which is mangled as you can see. However, we can read , , and within it among a bunch of random stuff in between. That random stuff is interestingly enough declarative, although not well documented. In a Friday Q&A on Mike Ash’s blog, all of this mangling is explained, such as meaning it’s a Swift symbol, meaning its a function, being the module name, and more.
+
+To determine the URL scheme based on what we can see, we need to think like the developers.
+
+A URL scheme is structured like so:
+
+We’re looking to find what the is and the types of it could take. Exploring how deep linking works, I found a Swift protocol, so things that adhere to it represent links. By searching in IDA, I can find different types of request objects in a convenient class cluster such as , , , , and so on.
+
+Since we’re curious how to launch a ride, we can take a look at Lyft’s class in there somewhere, and look into how that works. To do this, you don’t even need to know assembly, you just need to know how to search and scan the assembly for what you need. If you look at French long enough and you don’t know French, you’re going to understand something out of it eventually. Most of what IDA displays appears completely foreign, and this is actually my first attempt at reverse engineering Swift and I can still get the basic idea.
+
+By browsing through the graph of , I’m able to identify different strings such as “pickup”, “[latitude]” and “[longitude]”, “destination”, and more. IDA also displays “ridetype”, which after some experimenting with different URLs turned out to be the action. By looking into “ridetype”, we can see “lyft”, “lyft_line”, “lyft_plus”, and “access”, which are the ride types.
+
+Constructing these different URL parts and experimenting with requests, I found that the scheme to requesting a ride is:
+
+Now that I figured out how it works, and I can then integrate this into Workflow. That is how to do binary analysis. Although it seems complex and intimidating, it’s not that hard to just go in and try to pattern match when thinking like a developer.
+
+Q: Would pinning certificates help against man-in-the-middle attacks?
+
+Conrad: SSL pinning is a technique that people can use to prevent man-in-the-middle attacks. This is really good for preventing them in practice, in un-jailbroken iPhones across the world, and it’s very effective at this. Twitter, for instance, pins their SSL certificates. However, for reverse engineering with Cycript, it can easily be bypassed. AFNetworking’s SSL pinning, for instance, has a property called , which you can just open Cycript with it and set that to . If the iPhone is jailbroken and someone has control over it, there’s really no way to protect against people simply looking at traffic. If it’s not jailbroken, it is good protection.
+
+Q: What do you recommend about string obfuscation using tools such as cocoapods-keys?
+
+However, you can’t hide a string forever. For example, in Cycript, you can swizzle, and just circumvent obfuscation. It’s never a guaranteed production, but it is a good counter-measure in some cases.
+
+Q: How does class-dump differ from dumpdecryped?
+
+Conrad: They’re actually different tools. dumpdecrypted will take an App Store encrypted binary and make it not encrypted. Then class-dump can work on an unencrypted binary to get the interface files for Objective-C, similarly to IDA. It doesn’t work with Swift, unfortunately.
+
+Q: Do the GitHub libraries that expose Apple’s frameworks such as this one also use class-dump?
+
+Conrad: Yes, Apple’s framework’s are unencrypted and can easily be class-dumped. This means that people put Apple’s private interfaces on GitHub and you can quickly go through those, which can be handy.
+
+Q: Are there any legal issues with this type of reverse engineering? Does Lyft frown upon tapping into their private code and APIs?
+
+Conrad: Legally, I don’t believe there to be too much recourse, but check that on per-case basis. You probably want to talk to the partners that you’re working with with URL schemes, and so far, we do that with all the people we work with. For instance, I just discovered this recently and will discuss this with Lyft, and integrate it upon approval. There are definitely ethical concerns with exposing other people’s internal stuff. However, this helps us developers keep apps from nefarious activity — this type of reverse-engineering exposed Twitter’s uploading of all of the apps installed on your device to their server, for instance. It therefore goes both ways — reverse-engineering is just a tool that should be used properly.
+
+Q: What would the process of checking out the disassembly of Apple’s frameworks be like?
+
+Conrad: The process for this is kind of similar to the one I demonstrated, but you don’t need a jailbroken iPhone for it. iTunes actually gets the symbols from the device when plugging in your phone. You can just find that directory in Xcode, named something like “device symbols”, and open Apple’s frameworks in IDA or class-dump to analyze them. They are unencrypted and available to use, which is incredibly handy when fixing UIKit bugs in iOS betas or swizzling patches like I had to do.|||
+
+If you've ever needed to know how another piece of code works, or have been at the mercy of someone else's bugs, you can always look at th…

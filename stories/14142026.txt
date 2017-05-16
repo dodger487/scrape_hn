@@ -1,0 +1,110 @@
+It’s easy to delete a table in Amazon DynamoDB, and that means that it’s easy to delete one by accident, too. Fortunately, you can minimize the risk of accidentally deleting a table using AWS Identity and Access Management (IAM), which provides authentication and access control for DynamoDB.
+
+As a managed service, DynamoDB is fully integrated with IAM. You can use IAM to tailor access control to resources and operations in DynamoDB. Using IAM roles, policies, and groups, you can implement a security configuration to ensure that DynamoDB resources are only accessed and modified the way you want. This approach includes preventing accidental table deletion.
+
+For our purposes—preventing accidental table deletion—we will use IAM roles to control access to the DynamoDB DeleteTable operation. This approach requires the user to take an extra step to delete a table: Switch to a special IAM role. In other words, users won’t be able to delete a table by simply invoking the DeleteTable operation. They will have to assume a different IAM role first. This step will prevent accidental deletion of a table.
+
+In this blog post, we show how to disable the operation, create a special “delete table” role, attach it to an IAM group that should have permissions, and then use the role. We also show how to add a requirement to the role to use multi-factor authentication (MFA), and how to prevent role switching in the console.
+
+To demonstrate this, we will use the following example: a DynamoDB table, Foo, and an IAM group, FooAdmin, that grants users access to it via the IAM policy . This policy allows the DeleteTable operation, which means that the members of FooAdmin can delete the table Foo.
+
+In this example, an IAM user, bob, is a member of FooAdmin, and therefore has the permissions needed to delete the table Foo. For the sake of brevity, we will assume that no other users or groups have access to the table Foo or have permissions to delete it. We want the members of FooAdmin to still be allowed to delete the table Foo—just not by accident.
+
+Here are the steps we will take to create a new role, where members of FooAdmin will have to switch to this role in order to delete the table, Foo:
+
+Next, we’ll get into the relevant details of each step.
+
+To prohibit the operation, we will use the following IAM policy:
+
+This policy explicitly denies the operation for all tables, as indicated by the “*”. This approach is recommended in production environments, where we don’t want to take any chances. It has the effect of taking away the operation for all tables. Thus, users covered by this policy no longer can delete any tables. We use an explicit “deny” because it takes precedence over “allow,” so we don’t have to worry about an existing “allow” creating an opening in our wall.
+
+We can put this policy into effect in a few different ways:
+
+Whichever option we choose, members of the FooAdmin group won’t be able to delete any tables. One benefit of having a dedicated policy for this statement is visibility—a standalone policy is easier to find and see, and therefore manage, than a statement buried inside a larger policy. Enforcing a “do not delete table” business rule becomes a matter of attaching our DynamoDBNoDeleteTable policy to the appropriate IAM group or groups, rather than editing one or more existing policies.
+
+2. Create a Dedicated “Delete Table” Role
+
+ Now that we have denied access to the DeleteTable operation for all of our tables, we’ll create a role that will allow deleting our table, Foo. We will first create a policy that defines the access permissions for the role, stating that the operation is allowed for Foo. This kind of policy is called an access policy, because it defines access to resources and actions on them. We will also create a trust policy for the role, which defines the trusted entities that we will allow to assume the role. The trust policy will actually be created for us during the process of configuring and creating the role. We can modify the trust policy later, after it has been created.
+
+2a. Create an Access Policy for the Role
+
+ First, we will create a policy named DeleteTableFoo that grants permission to the operation for the Foo table. The policy looks like this:
+
+AWS-REGION and AWS-ACCT are placeholders for the actual AWS Region and account number, respectively.
+
+The action allows the deletion of all Amazon CloudWatch alarms associated with the table. If you used the AWS Management Console to create a table, the console created CloudWatch alarms for that table by default. If you later delete the table using the console, and select the option Delete all CloudWatch alarms for this table, without the statement, the console prints a warning message. This statement suppresses that warning. (The table will still be deleted.)  CloudWatch does not have any specific resources, so “*” is always used for the resource parameter.
+
+Note that the policy doesn’t grant any other permissions. Thus, users who assume the role must switch back to their “normal” role to do anything else. This approach prevents users from making any mistakes that might otherwise occur.
+
+Next, we create the role and attach the policy we just created (DeleteTableFoo) to the new role.
+
+In the Roles section of the IAM console, choose Create New Role. For the role name, type DeleteTableFoo. In the next step, choose Role for Cross-Account Access, and then Provide access between AWS accounts you own.  Type your AWS account number in the box provided.
+
+In this example, we are providing access within the same account. However, you can provide multiple accounts with access to the role. You can do this later, if needed, by editing the role’s trust relationship.
+
+For added security, choose the option to require multi-factor authentication (MFA). By choosing this option, you require that users must provide multi-factor authentication to receive access to the role.
+
+Finally, attach the new policy to the role. Review your work, and then choose Finish.
+
+If you want to edit the role’s trust policy, choose the Trust Relationships tab in the role window, and then choose Edit Trust Relationship. Our trust policy looks like this:
+
+Note the following about the policy:
+
+This trust policy is only half of the trust relationship involved in using roles. On the side of the account granting access to the role (the grantor side), the trust policy specifies the trusted entity (or entities). In other words, the trust policy specifies the account or accounts that will have access to the role. The second half of the trust relationship is the trusted entity side, which grants the users or groups within the trusted account permission to assume the role. This second half is detailed in “3. Grant Permissions to Assume the Role,” below.
+
+Suppose that we want to allow switching to this role in the console. To do this, we attach one more policy to it: AmazonDynamoDBReadOnlyAccess. This AWS-managed policy is required for the DynamoDB console to work correctly.
+
+If we don’t want to allow switching to this role in the console, we can explicitly disable this. To do so, we need to add an external ID to the trust policy. To add this, add a condition with an external ID of your choosing to the Condition part of the trust policy:
+
+The presence of an external ID disables console access for the role, so the only ways to assume the role are by using the AWS Command Line Interface (AWS CLI) or API. We will show how to assume the role in the CLI later in this post.
+
+We have to do one last thing before we can start using the role: Complete the trust relationship. We do this by granting permissions to assume the role. Because we want the FooAdmin group to have the permissions to assume the role, we attach the following policy to the FooAdmin group:
+
+At this point, users who are members of the FooAdmin group can assume the DeleteTableFoo role and delete the Foo table. If you also chose to require MFA for the role, then those users will be required to use MFA to log in and then switch to the role. If you chose to use an external ID to disable switching to the role in the console, your users will have to use the CLI or API to assume the role and then delete the table.
+
+For more details about this topic, see Granting a User Permissions to Switch Roles in the IAM User Guide.
+
+Now we have our special role, DeleteTableFoo, ready for use. Users in the FooAdmin group can now assume the role and delete the Foo table. We will show two ways to accomplish this: in the AWS console, and using the AWS CLI.
+
+To make it easier for users to get started, we can give them the “switch role” URL for the DeleteTableFoo role. You can find this in the Summary page for the role in the AWS console (choose IAM, Roles, then DeleteTableFoo). The role URL will look like this:
+
+Note the URL parameters in the role: the account alias (my-account-foo) and the role name (DeleteTableFoo). You can use the format of this URL to manually construct the link. For more information, see Providing Information to the User in the IAM documentation.
+
+Make sure to log in before using this URL. In this example, suppose that user bob logs in, and that bob is a member of the FooAdmin group. Then, when the user bob goes to this URL, the browser displays the Switch Role login page:
+
+To proceed, choose Switch Role. If there are any errors, verify the following:
+
+After you assume this role for the first time, you will be able to use Role History to switch between roles, as shown following.
+
+When you have assumed the role, the login menu displays the active role, along with the user name you are currently using, and the AWS account ID. There is also an option to switch “back to bob”—choose this option if you want to switch back to your original user ID.
+
+Role History in the user login menu shows the roles that you have recently assumed:
+
+You can now switch to the role again, go to the DynamoDB console, and delete the Foo table. Because we attached the policy to the role, the DynamoDB console displays all the tables present. However, it will only let you do one thing: Delete the Foo table.
+
+To use the AWS CLI, you must ensure that it is configured properly. (For more on how to do this, see Configuring the AWS CLI in the CLI documentation.) You can then use the CLI to assume the role and delete the Foo table. To do this, you need to configure a profile for the role.
+
+The AWS CLI docs cover this topic in detail in Assuming a Role, but here is the short version:  You configure the profile in your  ~/.aws/config file as follows, replacing the AWS-ACCOUNT placeholder with your account number:
+
+To get role_arn, go to the Summary page in the IAM console. You need to have permissions to access IAM in order to do this. Otherwise, you’ll have to ask your administrator for role_arn, and some of the other values here.
+
+The property source_profile is the profile for my user, bob. Note that bob is in the FooAdmin group, and therefore has the privileges to assume the role. If bob happens to be my default profile, I can use source_profile = default instead.
+
+If the role is configured to require MFA, you need to set the property mfa_serial. To get the value for this, go to the Security Credentials tab in the IAM console, navigate to Users and then bob, and copy the value of Assigned MFA device. Finally, if you decide to disable switching the role in the console, you need to set the property external_id to the value of the external ID you used in the role configuration.
+
+That’s it—we are now set up to assume the role and delete the table in the CLI, like so:
+
+Success! We received the response with a and its field set to DELETING. Notice how we assumed the role by specifying the profile we just configured, deletetablefoo.
+
+Also, note that we were prompted for the MFA code, which we are required to provide. If we had tried to delete the table without specifying the correct role profile, we would have received the following error:
+
+The default profile is the user bob, which does not have the permissions required to use the operation. Thus, the attempt fails as desired. (Failing to specify the correct MFA code will also result in an error.)
+
+In this post, we learned how to use IAM effectively to protect our DynamoDB tables from accidental deletion. We used the IAM roles to control table deletion, and showed how to apply additional security by requiring MFA for the role. We also showed how to prevent role switching in the console, by simply adding an external ID to our role configuration.
+
+In our example, we never granted any permissions directly to a user. Using IAM groups, rather than users, is considered a best practice—even if there is only one user in the group. Another best practice is the principle of least privilege, where you grant only the permissions required to get the job done.
+
+It is also worth emphasizing that you can configure roles so they can be assumed by various trusted entities, including other accounts or federated users. To learn more, see Creating IAM Roles in the IAM documentation.
+
+Finally, while this post is specific to DynamoDB, you can use roles to protect sensitive resources with any of the AWS services that work with IAM. For example, you might require special protections for specific Amazon EC2 instances and control over who can invoke StopInstances and TerminateInstance operations on them. Or we might want to create a role for a specific IAM task, such as adding a user to a certain group. These are just a few examples that take advantage of the power of roles to delegate access to resources in a way tailored for specific purposes.|||
+

@@ -1,0 +1,43 @@
+This blog shares some column store database benchmark results, and compares the query performance of MariaDB ColumnStore v. 1.0.7 (based on InfiniDB), Clickhouse and Apache Spark.
+
+The purpose of the benchmark is to see how these three solutions work on a single big server, with many CPU cores and large amounts of RAM. Both systems are massively parallel (MPP) database systems, so they should use many cores for SELECT queries.
+
+This blog post shares the results for the Wikipedia page counts (same queries as for the Clickhouse benchmark). In the following posts I will use other datasets to compare the performance.
+
+Although all of the above solutions can run in a “cluster” mode (with multiple nodes), I’ve only used one server.
+
+This time I’m using newer and faster hardware:
+
+I’ve loaded the above data into Clickhouse, ColumnStore and MySQL (for MySQL the data included a primary key; Wikistat was not loaded to MySQL due to the size). MySQL tables are InnoDB with a primary key.
+
+All of the solutions have the ability to take advantage of data “partitioning,” and only scan needed rows.
+
+Clickhouse has “primary keys” (for the MergeTree storage engine) and scans only the needed chunks of data (similar to partition “pruning” in MySQL). No changes to SQL or table definitions is needed when working with Clickhouse.
+
+As we can see here, ClickHouse has processed ~two billion rows for one month of data, and ~23 billion rows for ten months of data. Queries that only select one month of data are much faster.
+
+For ColumnStore we need to re-write the SQL query and use “between ‘2008-01-01’ and 2008-01-10′” so it can take advantage of partition elimination (as long as the data is loaded in approximate time order). When using functions (i.e., year(dt) or month(dt)), the current implementation does not use this optimization. (This is similar to MySQL, in that if the WHERE clause has month(dt) or any other functions, MySQL can’t use an index on the dt field.)
+
+Apache Spark does have partitioning however. It requires the use of partitioning with parquet format in the table definition. Without declaring partitions, even the modified query (“select count(*), month(date) as mon from wikistat where date between ‘2008-01-01’ and ‘2008-01-31’ group by mon order by mon”) will have to scan all the data.
+
+The following table and graph shows the performance of the updated query:
+
+With 1Tb uncompressed data, doing a “GROUP BY” requires lots of memory to store the intermediate results (unlike MySQL, ColumnStore, Clickhouse and Apache Spark use hash tables to store groups by “buckets”). For example, this query requires a very large hash table:
+
+As “path” is actually a URL (without the hostname), it takes a lot of memory to store the intermediate results (hash table) for GROUP BY.
+
+MariaDB ColumnStore does not allow us to “spill” data on disk for now (only disk-based joins are implemented). If you need to GROUP BY on a large text field, you can decrease the disk block cache setting in Columnstore.xml (i.e., set disk cache to 10% of RAM) to make room for an intermediate GROUP BY:
+
+In addition, as the query has an ORDER BY, we need to increase max_length_for_sort_data in MySQL:
+
+*Spark does not support UPDATE/DELETE. However, Hive supports ACID transactions with UPDATE and DELETE statements. BEGIN, COMMIT, and ROLLBACK are not yet supported (only the ORC file format is supported).
+
+ColumnStore is the only database out of the three that supports a full set of DML and DDL (almost all of the MySQL’s implementation of SQL is supported).
+
+Yandex ClickHouse is an absolute winner in this benchmark: it shows both better performance (>10x) and better compression than
+
+ MariaDB ColumnStore and Apache Spark. If you are looking for the best performance and compression, ClickHouse looks very good.
+
+At the same time, ColumnStore provides a MySQL endpoint (MySQL protocol and syntax), so it is a good option if you are migrating from MySQL. Right now, it can’t replicate directly from MySQL but if this option is available in the future we can attach a ColumnStore replication slave to any MySQL master and use the slave for reporting queries (i.e., BI or data science teams can use a ColumnStore database, which is updated very close to realtime).|||
+
+This blog shares some column store database benchmark results, and compares the query performance of MariaDB ColumnStore v. 1.0.7 (based on InfiniDB), Clickhouse and Apache Spark.

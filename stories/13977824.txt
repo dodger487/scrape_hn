@@ -1,0 +1,77 @@
+This post is going to help save you money if you're running a Rails server. It starts like this: you write an app. Let's say you're building the next hyper-targeted blogging platform for medium length posts. When you login, you see a paginated list of all of the articles you've written. You have a model and maybe for to do tags, you have a model, and for comments, you have a model. You write your view so that it renders the posts:
+
+See any problems with this? We have to make a single query to return all the posts - that's where the comes from. Say that there are N posts returned. In the code above, as the view iterates over each post, it has to calculate - but that in turn needs another database query. This is the N+1 query problem - our initial single query (the 1 in N+1) returns something (of size N) that we iterate over and perform yet another database query on (N of them).
+
+If you've been around the Rails track long enough you've probably run into the above scenario before. If you run a Google search, the answer is very simple -- "use includes". The code looks like this:
+
+This is still textbook, but let's look at what's going on. Active Record uses lazy querying so this won't actually get executed until we call or or . When we do that two queries get executed, the first one for posts makes sense:
+
+Active Record will pass in user_id and limit and offset into the bind params and you'll get your array of posts.
+
+The next query you'll see may look something like this:
+
+Notice anything wrong? Bonus points if you found it, and yes, it has something to do with memory.
+
+If each of those 20 blog posts has 100 comments, then this query will return 2,000 rows from your database. Active Record doesn't know what data you need from each post comment, it'll just know it was told you'll eventually need them. So what does it do? It creates 2,000 Active Record objects in memory because that's what you told it to do. That's the problem, you don't need 2,000 objects in memory. You don't even need the objects, you only need the count.
+
+The good: You got rid of your N+1 problem.
+
+The bad: You're stuffing 2,000 (or more) objects from the database into memory when you aren't going to use them at all. This will slow down this action and balloon the memory use requirements of your app.
+
+It's even worse if the data in the comments is large. For instance, maybe there is no max size for a comment field and people write thousand word essays, meaning we'll have to load those really large strings into memory and keep them there until the end of the request even though we're not using them.
+
+Now we've got a problem. We could "fix" it by re-introducing our N+1 bug. That's a valid fix, however, you can easily benchmark it. Use in development on a page with a large amount of simulated data. Sometimes it's faster to not "fix" your N+1 bugs.
+
+That's not good enough for us, though -- we want no massive memory allocation spikes and no N+1 queries.
+
+What's the point of having Cache if you can't count it? Instead of having to call each time, which costs us a SQL query, we can store that data directly inside of the model. This way when we load a object we automatically have this info. From the docs for the counter cache you'll see we need to change our model to something like this:
+
+Now in our view, we can call:
+
+Boom! Now we have no N+1 query and no memory problems. But...
+
+You cannot use a counter cache with a condition. Let's change our example for a minute. Let's say each comment could either be "approved", meaning you moderated it and allow it to show on your page, or "pending". Perhaps this is a vital piece of information and you MUST show it on your page. Previously we would have done this:
+
+In this case the model has a field and calling is equivalent to adding . It would be great if we could have a cache and a cache, but we can't. There are some ways to hack it, but there are edge cases, and not all apps can safely accommodate for all edge cases. Let's say ours is one of those.
+
+Now what? We could get around this with some view caching because if we cache your entire page, we only have to render it and pay that N+1 cost once. Maybe fewer times if we are re-using view components and are using "Russian doll" style view caches .
+
+If view caching is out of the question due to <reasons>, what are we left with? We have to use our database the way the original settlers of the Wild West did, manually and with great effort.
+
+In our controller where we previously had this:
+
+We can remove that and instead build two hashes. Active Record returns hashes when we use . In this case we know we want to associate comment count with each post, so we group by .
+
+Now we can stash and use this value in our view instead:
+
+Now we have 3 queries, one to find our posts and one for each comment type we care about. This generates 2 extra hashes that hold the minimum of information that we need.
+
+I've found this strategy to be super effective in mitigating memory issues while not sacrificing on the N+1 front.
+
+But what if you're using that data inside of methods.
+
+Rails encourage you to stick logic inside of models. If you're doing that, then perhaps this code wasn't a raw SQL query inside of the view but was instead nested in a method.
+
+Or maybe you need to do the math, maybe there is a critical threshold where pending comments overtake approved:
+
+This is trivial, but you could imagine a more complex case where logic is happening based on business rules. In this case, you don't want to have to duplicate the logic in your view (where we are using a hash) and in your model (where we are querying the database). Instead, you can use dependency injection. Which is the hyper-nerd way of saying we'll pass in values. We can change the method signature to something like this:
+
+Now I can call it and pass in values:
+
+Or, if you're using it somewhere else, you can use it without passing in values since we specified our default values for the keyword arguments.
+
+There are other ways to write the same code:
+
+You get the gist though -- pass values into your methods if you need to.
+
+What if you're doing more than just counting? Well, you can pull that data and group it in the same way by using and specifying multiple fields. To keep going with our same example, maybe we want to show a truncated list of all commenter names and their avatar URLs:
+
+The results look like this:
+
+The is the post id, and then we get an entry with a name and an avatar_url for each comment. Be careful here, though, as we're returning more data-- you still might not need all of it and making 2,000 hashes isn't much better than making 2,000 unused Active Record objects. You may want to better constrain your query with limits or by querying for more specific information.
+
+At this point, we have gotten rid of our N+1 queries and we're hardly using any memory compared to before. Yay! Self-five. :partyparrot:. 🎉
+
+If you want to dig deeper into what's going on with Ruby's use of memory check out the Memory Quota Exceeded in Ruby (MRI) Dev Center article , my How Ruby Uses Memory, and also Nate Berkopec's Halve your memory use with these 12 Weird Tricks.|||
+
+This post is going to help save you money if you're running a Rails server. It starts like this: you write an app. Let's say you're building the next...

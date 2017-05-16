@@ -1,2 +1,144 @@
-|||
+In this post, we’ll explore two distinct avenues for attacking the host operating system. In the first part, we’ll discover and exploit vulnerabilities in the communication protocols between the Wi-Fi firmware and the host, resulting in code execution within the kernel. Along the way, we’ll also observe a curious vulnerability which persisted until quite recently, using which attackers were able to directly attack the internal communication protocols without having to exploit the Wi-Fi SoC in the first place! In the second part, we’ll explore hardware design choices allowing the Wi-Fi SoC in its current configuration to fully control the host without requiring a vulnerability in the first place
+
+While the vulnerabilities discussed in the first part have been disclosed to Broadcom and are now fixed, the utilisation of hardware components remains as it is, and is currently not mitigated against. We hope that by publishing this research, mobile SoC manufacturers and driver vendors will be encouraged to create more secure designs, allowing a better degree of separation between the Wi-Fi SoC and the application processor.
+
+Yet, while many of the operations are encapsulated within the Wi-Fi chip’s firmware, some degree of control over the Wi-Fi state machine is required within the host’s operating system. Certain events cannot be handled solely by the Wi-Fi SoC, and must therefore be communicated to the host’s operating system. For example, the host must be notified of the results of a Wi-Fi scan in order to be able to present this information to the user.
+
+In order to facilitate these cases where the host and the Wi-Fi SoC wish to communicate with one another, a special communication channel is required.
+
+Perhaps there’s an easier way? Well, one thing we can always be certain of is that regardless of the communication channel used, the chip be able to transmit received frames back to the host. Indeed, perhaps for the very same reason, Broadcom chose to piggyback on top of this channel in order to create the communication channel between the SoC and the host.
+
+Now, let’s switch over the the host’s side. On the host, the driver can logically be divided into several layers. The lower layers deal with the communication interface itself (such as SDIO, PCIe, etc.) and whatever transmission protocol may be tied to it. The higher layers then deal with the reception of frames, and their subsequent processing (if necessary).
+
+First, the upper layers perform some initial processing on the received frames, such as removing encapsulated data which may have been added on-top of it (for example, transmission power indicators added by the PHY module). Then, an important distinction must be made - is this a regular frame that should be simply forwarded to the relevant network interface, or is it in fact an encoded event that the host must handle?
+
+As we’ve just seen, this distinction is easily made! Just take a look at the ethertype and check whether it has the “special” value of 0x886C. If so, handle the encapsulated event and discard the frame.
+
+Or is it?
+
+Regardless of this little oddity - this brings us to our first question: how can the Wi-Fi SoC and host driver distinguish between externally received frames with the 0x886C ethertype (which should be forwarded to the network interface), and internally generated event frames (which should not be received from external sources)?
+
+question; the internal event channel, as we’ll see shortly, is extremely powerful and provides a huge, mostly unaudited, attack surface. If attackers are able to inject frames over-the-air that can subsequently be processed as event frames by the driver, they may very well be able to achieve code execution within the host’s operating system.
+
+Well… Until several months prior to this research (mid 2016), the firmware made no effort to filter these frames. Any frame received as part of the data RX-path, regardless of its ethertype, was simply forwarded blindly to the host. As a result, attackers were able to remotely send frames containing the special 0x886C ethertype, which were then processed by the driver as if they were event frames created by the firmware itself!
+
+As long as the validation methods in the driver and the firmware remain identical, externally received frames cannot be processed as events by the driver. So far so good.
+
+However… Since we already have code-execution on the Wi-Fi SoC, we can simply “revert” the patch. All it takes is for us to “patch out” the validation method in the firmware, thereby causing any received frame to once again be forwarded blindly to the host. This, in turn, allows us to inject arbitrary messages into the communication protocol between the host and the Wi-Fi chip. Moreover, since the validation method is stored in RAM, and all of RAM is marked as RWX, this is as simple as writing “MOV R0, #0; BX LR” to the function’s prologue.
+
+While there are up to 144 different supported event codes, the host driver for Android, subset of these. Nonetheless, about 35 events are supported within the driver, each including their own elaborate handlers.
+
+As we can see above, the function first allocates an array to hold the total count of events (if one hasn’t been allocated before) and then proceeds to concatenate the encapsulated data starting from the appropriate index (
+
+However, the handler fails to verify the relation between the ! It simply “trusts” the assertion that the is sufficiently large to store all the subsequent events passed in. As a result, an attacker with the ability to inject arbitrary event frames can specify a small
+
+This is all well and good, but how can we leverage this primitive from a remote vantage point? As we’re not locally present on the device, we’re unable to gather any data about the current state of the heap, nor do we have address-space related information (unless, of course, we’re able to somehow leak this information). Many classic exploits targeting kernel heap overflows rely on the ability to shape the kernel’s heap, ensuring a certain state prior to triggering an overflow - an ability we also lack at the moment.
+
+Each “slab” is simply a small region from which identically-sized allocations are carved. The first chunk in each slab contains its metadata (such as the slab’s freelist), and subsequent blocks contain the allocations themselves, with no inline metadata. There are a number of predefined slab size-classes which are used by , typically spanning from as little as 64 bytes, to around 8KB. Unsurprisingly, the allocator uses the best-fitting slab (smallest slab that is large enough) for each allocation. Lastly, the slabs’ freelists are consumed linearly - consecutive allocations occupy consecutive memory addresses. However, if objects are freed within the slab, it may become fragmented - causing subsequent allocations to fill-in “holes” within the slab instead of proceeding linearly.
+
+With this in mind, let’s take a step back and analyse the primitives at hand. First, since we are able to arbitrarily specify any value in , we can choose the overflown buffer’s size to be any multiple of . This means we can inhabit any slab cache size of our choosing. As such, there’s no limitation on the of the objects we can target with the overflow. However, this is not quite enough… For starters, we still don’t know anything about the current state of the slabs themselves, nor can we trigger remote allocations in slabs of our choosing.
+
+It seems that first and foremost, we need to find a way to remotely shape slabs. Recall, however, that there are a few obstacles we need to overcome. As SLUB maintains per-CPU caches, the of the kernel thread in which the allocation is performed must be the same as the one from which the overflown buffer is allocated. Gaining a heap shaping primitive on a different CPU core will cause the allocations to be taken from different slabs. The most straightforward way to tackle this issue is to confine ourselves to heap shaping primitives which can be triggered from the same kernel thread on which the overflow occurs. This is quite a substantial constraint… In essence, it forces us to disregard allocations that occur as a result of processes that are external to the event handling itself.
+
+Regardless, with a concrete goal in mind, we can start looking for heap shaping primitives in the registered handlers for each of the event frames. As luck would have it, after going through every handler, we come across a (single) perfect fit!
+
+//Populate the entry with the sanitised network information
+
+Awesome - looking at the function above, it seems that we’re able to repeatedly cause allocations of size { ). What’s more, these allocations are performed in the same kernel thread, and their lifetime is completely controlled by us! As long as we don’t send an event with the status, none of the allocations will be freed.
+
+Before we move on, we’ll need to choose a target slab size. Ideally, we’re looking for a slab that’s relatively inactive. If other threads on the same CPU choose to allocate (or free) data from the same slab, this would add uncertainty to the slab’s state and may prevent us from successfully shaping it. After looking at allocations for every slab with the same affinity as our target kernel thread, it seems that the slab is mostly inactive. As such, we’ll choose to target this slab size in our exploit.
+
+By using the heap shaping primitive above we can start filling slabs of any given size with  “gscan” objects. Each “gscan” object has a short header containing some metadata relating to the scan and a pointer to the next element in the linked list. The rest of the object is then populated by an inline array of “scan results”, carrying the actual data for this node.
+
+Going back to the issue at hand - how can we use this primitive to craft a predictable layout?
+
+Well, by combining the heap shaping primitive with the overflow primitive, we should be able to properly shape slabs of any size-class prior to triggering the overflow. Recall the initially any given slab may be fragmented, like so:
+
+However, after triggering enough allocations (e.g. (SLAB_TOTAL_SIZE / SLAB_OBJECT_SIZE) - 1) with our heap shaping primitive, all the holes (if present) in the current slab should get populated, causing subsequent allocations of the same size-class to be placed consecutively.
+
+Now, we can send a single crafted SWC event frame, indicating a resulting in an allocation from the same target slab. However, we don’t want to trigger the overflow yet! We still have to shape the current slab before we do so. To prevent the overflow from occurring, we’ll provide a small , thereby only partially filling in the buffer.
+
+Finally, using the heap shaping primitive once again, we can fill the rest of the slab with more of our “gscan” objects, bringing us to the following heap state:
+
+Okay… We’re getting there! As we can see above, if we choose to use the overflow primitive at this point, we could overwrite the contents of one of the “gscan” objects with our own arbitrary data. However, we’ve yet to determine exactly what kind of result that would yield…
+
+However, the function does have a certain obstacle it needs to overcome; any given “gscan” node may be larger than the maximal size of an SKB. Therefore, the node would need to be split into several SKBs. To keep track of this information, the “tot_count” and “tot_consumed” fields in the “gscan” structure are utilised. The “tot_count” field indicates the total number of embedded scan result entries in the node’s inline array, and the “tot_consumed” field indicates the number of entries consumed (transmitted) so far.
+
+As a result, the function slightly modifies the contents of the list while processing it. Essentially, it enforces the invariant that each processed node’s “total_consumed” field will be modified to match its “tot_count” field. As for the data being transmitted and how it’s packed, we’ll skip those details for brevity’s sake. However, it’s important to note that other than the aforementioned side effect, the function above appears to be quite harmless (that is, no further primitives can be “mined” from it). Lastly, after all the events are packed into SKBs and transmitted to any listeners, they can finally be reclaimed. This is achieved by simply walking over the list, and calling “kfree” on each entry.
+
+Putting it all together, where does this leave us with regards to exploitation? Assuming we choose to overwrite one of the “gscan” entries using the overflow primitive, we can modify its “next” field (or rather, must, as it is the first field in the structure) and point it at any arbitrary address. This would cause the processing function to use this arbitrary pointer as if it were an element in the list.
+
+Due to the invariant of the processing function - after processing the crafted entry, its 7th byte (“tot_consumed”) will be modified to match its 6th byte (“tot_count”). In addition, the pointer will then be -d after processing the chain. What’s more, recall that the processing function iterates over the entire list of entries. This means that the first four bytes in the crafted entry (its “next” field) must either point to another memory location containing a “valid” list node (which must then satisfy the same constraints), or must otherwise hold the value 0 (NULL), indicating that this is the last element in the list.
+
+This doesn’t look easy… There’s quite a large number of constraints we need to consider. If we willfully choose the ignore the for a moment, we could try and search for memory locations where the first four bytes are zero, and where it would be beneficial to modify the 7th byte to match the 6th. Of course, this is just the tip of the iceberg; we could repeatedly trigger the same primitive in order to repeatedly copy bytes one position to the left. Perhaps, if we were able to locate a memory address where enough zero bytes and enough bytes of our choosing are present, we could craft a target value by consecutively using these two primitives.
+
+Perhaps, instead, we can choose to ignore the other constraints and focus on the ? Indeed, if we are able to consistently locate an allocation whose data can be used for the purpose of the exploit, we could attempt to free that memory address, and then “re-capture” it by using our heap shaping primitive. However, this raises several additional questions. First, will we be able to consistently locate a slab-resident address? Second, even if we were to find such an address, surely it will be associated with a per-CPU cache, meaning that freeing it will not necessarily allow us to reclaim it later on. Lastly, whichever allocation we do choose to target, will have to satisfy the constraints above - that is, the first four bytes must be zero, and the 7th byte will be modified to match the 6th.
+
+This may solve the problem of affinity, but it still doesn’t help us locate these allocations. Unfortunately, the slab caches are allocated quite late in the kernel’s boot process, and their contents are very “noisy”. This means that even guessing a single address within a slab is quite difficult, even more so for remote attackers. However, allocations which use the large allocation flow (that is, which are created using __get_free_pages) do consistently inhabit the same memory addresses! This is as long as they occur early enough during the kernel’s initialisation so that no non-deterministic events happen concurrently.
+
+After going over the list, we come across one seemingly interesting entry:
+
+Before we can do so, however, we’ll need to make sure that the object satisfies the constraints mandated by the processing function. Namely, the first four bytes must be zero, and we must be able to modify the 7th byte to match the value of the 6th byte. While the second constraint poses no issue at all, the first constraint turns out to be quite problematic! As it happens, the first four bytes zero, but in fact point to a block of function pointers related to the driver. Does this mean we can’t use this object after all?
+
+No - as luck would have it, we can still use one more trick! It turns out that when doesn’t require the passed in pointer to point to the beginning of the allocation. Instead, it simply fetches the pages corresponding to the allocation, and frees them instead. This means that by specifying an address located within the structure that match the constraints, we’ll be able to both satisfy the requirements imposed by the processing function
+
+Putting this all together, we can now simply send along a SWC event frame in order to reclaim the function pointer array, and populate it with our own contents. As there is no KASLR, we can search for a stack pivot gadget in the kernel image that will allow us to gain code execution. For the purpose of the exploit, I’ve chosen to replace the event handler for with a stack pivot into the event frame itself (which is stored in R2 when the event handler is executed). Lastly, by placing a ROP stack in a crafted event frame of type we can now gain control over the kernel thread’s execution, thus completing our exploit.
+
+With that, let’s move on to the second part of the blog post!
+
+Although we’ve seen that the high-level communication protocols between the Wi-Fi firmware and the host may be compromised, we’ve also seen how tedious it might be to write a fully-functional exploit. Indeed, the exploit detailed above required sufficient information about the device being targeted (such as symbols). Furthermore, any mistake during the exploitation might cause the kernel to crash; thereby rebooting the device and requiring us to start all over again. This fact, coupled with our control over the Wi-Fi SoC, makes these types of exploit chains harder to exploit reliably.
+
+That said, up until now we’ve only considered the high-level attack surface exposed to the firmware. In effect, we were thinking of the Wi-Fi SoC and the application processor as two distinct entities which are completely isolated from one another. In reality, we know that nothing can be further from the truth. Not only are the Wi-Fi SoC and the host physically proximate to one another, they also share a
+
+More concretely, let’s take a look at the adoption rate of PCIe in modern mobile devices. Taking Nexus phones as a case study, it seems that since the Nexus 6, all devices use a PCIe interface instead of SDIO. Much in the same way, all iPhones since the iPhone 6 use PCIe (whereas old iPhones used USB to connect to the Wi-Fi SoC). Lastly, all Samsung flagships since the Galaxy S6 use PCIe.
+
+In contrast to these two interfaces, PCIe allows for DMA . This allows PCIe to operate at great speeds without incurring a performance hit on the host. Once data is transferred to the host’s memory, an interrupt is fired to indicate that work needs to be done.
+
+On the transaction layer, PCIe operates by sending small bundles of data, appropriately named “ ackets” (TLPs). Each TLP may be routed by a network of switches, until it reaches the destined peripheral. There, the peripheral decodes the packet and performs the requested memory operation. The TLP’s header encodes whether this is a requested read or write operation, and its body contains any accompanying data related to the request.
+
+Using the memory context, the SMMU is then able to associate the memory operations with the the translation table containing the mappings for the requesting device. Much like a regular ARM MMU, the translation tables are queried in order to translate the input address (either a virtual address or an intermediate physical address) to the corresponding physical address. Of course, along the way the SMMU also ensures that the requested memory operation is, in fact, allowed. If any of these steps fails, a fault is generated.
+
+field, we can also dump the information about each of the rings - including their size, current index, and physical memory address:
+
+For starters, we can see that the memory addresses specified in these buffers seem to be, in fact, physical memory addresses from the host’s memory. This is slightly suspicious… In the presence of an SMMU, the chip have used an entirely different address range (which would have then been translated by the SMMU into a physical addresses). However, merely being suspicious is not enough... To check whether or not the an SMMU is present (or active), we’ll need to set up a small experiment!
+
+Recall that the MSGBUF protocol uses the aforementioned ring buffers to indicate submission and completion of events, for both the RX and the TX paths. In essence, during transmission of a frame, the host writes to the TX submission ring. Once the chip transmits the frame, it writes to the TX completion ring to indicate as such. Similarly, when a frame is received, the firmware writes to the RX submission ring, and the host subsequently writes to the RX completion ring upon reception of the frame.
+
+If so, what if we were to modify the ring address corresponding to TX completion ring in the firmware’s PCIe metadata structure, and point it at an arbitrary memory address? If an SMMU is in place and the chosen memory address is not mapped-in for the Wi-Fi chip, the SMMU will generate a fault and no modification will take place. However, if there is no SMMU in place, we should be able to observe this modification by simple dumping the corresponding physical memory range from the host (for example, by using /dev/mem). This small experiment also allows us to avoid reverse-engineering the Wi-Fi firmware’s implementation of the MSGBUF protocol for the time being, which would no doubt be quite tedious.
+
+To make things more interesting, let’s modify the TX completion ring’s address to point at the beginning of the Linux Kernel’s code segment (0x80000 on the Nexus 6P : see /proc/iomem). After generating some Wi-Fi traffic and inspecting the contents of physical memory, we are presented with the following result:
+
+Aha! The Wi-Fi chip managed to DMA into the physical address range containing the host’s kernel, without any interference! This finally confirms our suspicion; either there is no SMMU present, or it isn’t configured to prevent the chip from accessing the host’s RAM.
+
+Although we could stop here, let’s make one additional small effort in order to get slightly better control over this primitive. While we are able to DMA into the host’s memory, we are doing so rather “blindly” at this point. We do not control the data being written, but instead rely on the Wi-Fi firmware’s implementation of the MSGBUF protocol to corrupt the host’s memory. By delving slightly further, we should be able to figure out how the DMA engine on the Wi-Fi chip works, and manually utilise it to access the host’s memory (instead of relying on side-effects, as shown above).
+
+So where do we start? Searching for the “MSGBUF” string, we can see some initialisation routines related to the protocol, which are part of the special “reclaim” region (and are therefore only used during the chip’s initialisation). Nevertheless, reverse-engineering these functions reveals that they reference a set of functions in the Wi-Fi chip’s RAM. Luckily, some of these functions’ names are present in the ROM! Their names seem quite relevant: “dma64_txfast”, “dma64_txreset” - it seems like we’re on the right track.
+
+Now that we know the format of these metadata structures and have a means to locate them, we can try and search for the instance corresponding to the DMA TX path from the Wi-Fi chip to the host.
+
+Unfortunately, this is easier said than done. After all, we can expect to find multiple instances of these structures, as the Wi-Fi chip performs DMA to and from many sources and sinks. For example, the firmware likely uses SoC-internal DMA engines to perform access the internal RX and TX FIFOs. So how can we identify the correct DMA descriptor?
+
+Recall that each descriptor has an associated “name” field. Let’s search for all the DMA descriptors in RAM (by searching for the DMA function block pointer), and output the corresponding name for each instance:
+
+Great! While there are a few nondescript instances which are probably used internally (as suspected), there are also two instances which seem to correspond to host-to-device (H2D) and device-to-host (D2H) DMA accesses. Since we’re interested in DMA-ing into the host’s memory, let’s take a closer look at the D2H structure:
+
+Note that the RX and TX registers point to an area outside the Wi-Fi firmware’s ROM and RAM. In fact, they point to backplane addresses corresponding to the DMA engine’s registers. In contrast, the RX and TX descriptor ring pointers do, indeed, point to memory locations within the SoC’s RAM.
+
+By going over the DMA code in brcmsmac and the MSGBUF protocol implementation in the host’s driver, we are able to finally piece together the details. First, the host posts physical addresses (corresponding to SKBs) to the chip, using the MSGBUF protocol. These addresses are then inserted into the DMA descriptor rings by the firmware’s MSGBUF implementation. Once the rings are populated, the Wi-Fi chip simply writes to the backplane registers in order to “kick off” the DMA engine. The DMA engine will then go over the descriptor list, and consume the descriptor at the current ring index for the DMA access. Once a DMA descriptor is consumed, its value is set to a special “magic” value (0xDEADBEEF).
+
+Therefore, all we need to do in order to manipulate the DMA engine into writing into our own arbitrary physical address is to modify the DMA descriptor ring. Since the MSGBUF protocol is constantly operating as frames are being sent back and forth, the descriptor rings change rapidly. It would be useful if we could “hook” one of the functions called during the DMA TX flow, allowing us to quickly replace the current descriptors with our own crafted values.
+
+Ah-ha! We managed to DMA arbitrary data into an address of our choosing. Using this primitive, we can finally hijack any kernel function with our own crafted data.
+
+Lastly - the experiment described above was performed on a Nexus 6P, which is based on Qualcomm’s Snapdragon 810 SoC. This raises the question: perhaps different SoCs exhibit different behaviour? To test out this theory, let’s repeat the same experiment on a Galaxy S7 Edge, which is based on Samsung’s Exynos 8890 SoC.
+
+Putting this together, we can extract the Wi-Fi chip’s (BCM43596) ROM, inspect it, and locate the DMA function as described above. Then, we can insert the same hook; pointing any non-consumed DMA RX descriptors at the kernel code’s physical address. After installing the hook and generating some Wi-Fi traffic, we observe the following result:
+
+In conclusion, we’ve seen that the the isolation between the host and the Wi-Fi SoC can, and should, be improved. While flaws exist in the communication protocols between the host and the chip, these can eventually be solved over time. However, the current lack of protection against a rogue Wi-Fi chip leaves much to be desired.
+
+Since mobile SoCs are proprietary, it remains unknown whether current-gen SoCs are capable of facilitating such isolation. We hope that SoCs that do, indeed, have the capability to enable memory protection (for example, by means of an SMMU), choose to do so soon. For the SoCs that are incapable of doing so, perhaps this research will serve as a motivator when designing next-gen hardware.
+
+The combination of an increasingly complex firmware and Wi-Fi’s incessant onwards march, hint that firmware bugs will probably be around for quite some time. This hypothesis is supported by the fact that even a relatively shallow inspection of the firmware revealed a number of bugs, all of which were exploitable by remote attackers.
+
+While memory isolation on its own will help defend against a rogue Wi-Fi SoC, the firmware’s defenses can also be bolstered against attacks. Currently, the firmware lacks exploit mitigations (such as stack cookies), and doesn’t make full use of the existing security mechanisms (such as the MPU). Hopefully, future versions are able to better defend against such attacks by implementing modern exploit mitigations and utilising SoC security mechanisms.|||
 

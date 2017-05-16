@@ -1,0 +1,71 @@
+This post assumes some basic C skills.
+
+Linux puts you in full control. This is not always seen from everyone’s perspective, but a power user loves to be in control. I’m going to show you a basic trick that lets you heavily influence the behavior of most applications, which is not only fun, but also, at times, useful.
+
+Let us begin with a simple example. Fun first, science later.
+
+Simple enough, I believe. I compiled it with no special flags, just
+
+I hope the resulting output is obvious – ten randomly selected numbers 0-99, hopefully different each time you run this program.
+
+Now let’s pretend we don’t really have the source of this executable. Either delete the source file, or move it somewhere – we won’t need it. We will significantly modify this programs behavior, yet without touching it’s source code nor recompiling it.
+
+For this, lets create another simple C file:
+
+So what we have now is an application that outputs some random data, and a custom library, which implements the rand() function as a constant value of 42.  Now… just run random_num this way, and watch the result:
+
+If you are lazy and did not do it yourself (and somehow fail to guess what might have happened), I’ll let you know – the output consists of ten 42’s.
+
+This may be even more impressive it you first:
+
+and then run the program normally. An unchanged app run in an apparently usual manner seems to be affected by what we did in our tiny library…
+
+Yup, you are right, our program failed to generate random numbers, because it did not use the “real” rand(), but the one we provided – which returns 42 every time.
+
+This is not entirely true. We did not choose which rand() we want our program to use. We told it just to use rand().
+
+When our program is started, certain libraries (that provide functionality needed by the program) are loaded. We can learn which are these using ldd:
+
+
+
+What you see as the output is the list of libs that are needed by random_nums. This list is built into the executable, and is determined compile time. The exact output might slightly differ on your machine, but a libc.so must be there – this is the file which provides core C functionality. That includes the “real” rand().
+
+We can have a peek at what functions does libc provide. I used the following to get a full list:
+
+The nm command lists symbols found in a binary file. The -D flag tells it to look for dynamic symbols, which makes sense, as libc.so.6 is a dynamic library. The output is very long, but it indeed lists rand() among many other standard functions.
+
+Now what happens when we set up the environmental variable LD_PRELOAD? This variable forces some libraries to be loaded for a program. In our case, it loads unrandom.so for random_num, even though the program itself does not ask for it. The following command may be interesting:
+
+
+
+Note that it lists our custom library. And indeed this is the reason why it’s code get’s executed: random_num calls rand(), but if unrandom.so is loaded it is our library that provides implementation for rand(). Neat, isn’t it?
+
+This is not enough. I’d like to be able to inject some code into an application in a similar manner, but in such way that it will be able to function normally. It’s clear if we implemented open() with a simple “return 0;“, the application we would like to hack should malfunction. The point is to be transparent, and to actually call the original open:
+
+Hm. Not really. This won’t call the “original” open(…). Obviously, this is an endless recursive call.
+
+How do we access the “real” open function? It is needed to use the programming interface to the dynamic linker. It’s simpler than it sounds. Have a look at this complete example, and then I’ll explain what happens there:
+
+The dlfcn.h is needed for dlsym function we use later. That strange #define directive instructs the compiler to enable some non-standard stuff, we need it to enable RTLD_NEXT in dlfcn.h. That typedef is just creating an alias to a complicated pointer-to-function type, with arguments just as the original open – the alias name is orig_open_f_type, which we’ll use later.
+
+The body of our custom open(…) consists of some custom code. The last part of it creates a new function pointer orig_open which will point to the original open(…) function. In order to get the address of that function, we ask dlsym to find for us the next “open” function on dynamic libraries stack. Finally, we call that function (passing the same arguments as were passed to our fake “open”), and return it’s return value as ours.
+
+As the “evil injected code” I simply used:
+
+To compile it, I needed to slightly adjust compiler flags:
+
+I had to append -ldl, so that this shared library is linked to libdl, which provides the dlsym function. (Nah, I am not going to create a fake version of dlsym, though this might be fun.)
+
+So what do I have in result? A shared library, which implements the open(…) function so that it behaves exactly as the real open(…)… except it has a side effect of printfing the file path :-)
+
+If you are not convinced this is a powerful trick, it’s the time you tried the following:
+
+I encourage you to see the result yourself, but basically it lists every file this application accesses. In real time.
+
+I believe it’s not that hard to imagine why this might be useful for debugging or investigating unknown applications. Please note, however, that this particular trick is not quite complete, because open() is not the only function that opens files… For example, there is also open64() in the standard library, and for full investigation you would need to create a fake one too.
+
+If you are still with me and enjoyed the above, let me suggest a bunch of ideas of what can be achieved using this trick. Keep in mind that you can do all the above without to source of the affected app!
+
+These are only the ideas I came up with. I bet you can find some too, if you do – share them by commenting!|||
+
+This post assumes some basic C skills. Linux puts you in full control. This is not always seen from everyone's perspective, but a power user loves to be in control. I'm going to show you a basic trick that lets you heavily influence the behavior of most applications, which is not only fun, but also,…

@@ -1,0 +1,55 @@
+Birchbox is on a mission to help people all over the world discover new beauty and lifestyle products. Our tech team is working hard to make this mission a reality. This requires us to connect with our customers frequently to surprise and delight them. As our user base increases, there are scalability pains, maintainability pains, and reliability pains.
+
+Communication with users via email is an integral part of any ecommerce company and the same goes for Birchbox. In addition to email notifications about purchases, shipments, and deliveries, we also feature monthly specials and features like Sample Choice. To address this while getting important email stats like open rate, bounce rate, etc., we use a third party email service to send our emails. The issue with using a third party is that we need to make sure our users still get those important emails even when the third party service is down. Sending emails is usually an asynchronous task. A few minutes here and there are acceptable as long as they don’t wait beyond a certain threshold. To deal with these reliability issues, we decided to go with a retry solution using the Python retrying library. Something like:
+
+
+
+ import random
+
+ from retrying import retry
+
+ 
+
+ @retry
+
+ def do_something_unreliable():
+
+    if random.randint(0, 10) > 1:
+
+        raise IOError("Broken sauce, everything is hosed!!!111one")
+
+    else:
+
+        return "Awesome sauce!"
+
+ 
+
+ print do_something_unreliable()
+
+Retrying is a great library. It allows for configurable delays, configurable maximum retries, and retry logic based on exception type, definitely worth looking into. However, the issue with retrying in code like this is that you need to sleep to induce backoffs. Much like how it’s done in the Python retrying library. At various points during our shipping cycle, the volume of outgoing email increases and this sleep-and-retry can cause a bottleneck which ultimately results in failed messages being dropped on the floor.
+
+To fix this, we wanted a system that allowed us to configure non-blocking delays between retries. We started with queues and queue consumers. A system that needs to send an email sends an event to the queue and the queue consumer consumes the event as soon as possible and does the actual sending. The issue with the reliability of third parties is still there but now since things are happening asynchronously we can do something about the failure and still give users a good experience.
+
+We chose RabbitMQ as our queue system. It’s based on AMQP, proven to be scalable and allows for the kind of robust message delivery we were looking for. A couple of additions that RabbitMQ brings to AMQP are DLX (Dead Letter Exchange) and TTL (Time To Live). DLX allows a queue to throw a message to a preconfigured exchange if the message has expired, been NACK’ed (negative acknowledged), or the queue is full. A TTL can be set to allow for message expiration on a per queue basis as well as a per message basis. A big caveat here is that a message is expired only once it reaches the head of the queue. That means a message with a long TTL in the front can stop all the other messages in the queue from expiring.
+
+Using DLX and TTL, we found a solution to our problem. To understand the solution, a basic understanding of RabbitMQ system is required. We encourage checking out RabbitMQ documentation.
+
+Not the easiest of diagrams to follow, we know. Here is how it works in more detail:
+
+The idea is that there are exchanges which receive messages. Queues subscribe to these exchanges with a routing key. Any message coming to the exchange with that key is routed to the subscribed queue. Consumers subscribe to the queues, get messages, and process them. Queues can have a dead letter exchange associated with them as mentioned earlier. RabbitMQ allows creation of exchanges and queues on the fly from consumers.
+
+Say our configurable retry array is [1000, 2000] in milliseconds. This would mean that after the first failure, we wait one second. After the second failure, we wait for two seconds. In the case of more than two failures, the message can be dropped or handled with a hard failure queue to be monitored manually. In the diagram, the PQ (Primary Queue) subscribes to PX (Primary Exchange) using RK (Routing Key) and also a couple more routing keys derived from the retry array. This allows failed messages to roll back into the system seamlessly.
+
+If the consumer fails to process a message because of a third party failure, it will push the message to a waiting exchange with waiting queues subscribed to it. Waiting queues are subscribed with routing keys to make sure all the messages in their first retry go to the first waiting queue and for second retry go to the second queue. Since in RabbitMQ we can create exchanges and queues on the fly, we can create as many waiting queues as we want from the consumer using the retry array and create bindings between waiting exchange and waiting queues.
+
+Messages being posted to waiting exchanges are assigned a TTL based on how many failures occurred and waiting queues are assigned DLX to the PX. This way we induce the message back into the original flow once the timeout expires in the queue. From there on, the message starts following the original course. To figure out which failure it is, RabbitMQ helps us by adding specific error info in the message header which can be read by the consumer of the primary queue.
+
+Waiting queues will have no consumers. They are just meant to allow the messages to wait for a certain amount of time before being re-queued to the primary exchange and become part of the original flow.
+
+All these steps can be seen in action in the Python code here.
+
+This system allows us to configure the number of retries and the delay between each retry. With exchange and queue creations being done on the fly, the configuration can be updated any time and the code can be written to adapt to any configuration. We use a separate queue in case we can’t process the message even after maximum number of retries. This queue is to be looked at manually and fixes made before messages are requeued again.
+
+This is our way of making sure we reach all our customers and provide them with all the surprise and delight we can.|||
+
+Birchbox is on a mission to help people all over the world discover new beauty and lifestyle products. Our tech team is working hard to make this mission a reality. This requires us to connect with our customers frequently to surprise and delight them. As our user base increases, there are scalability pains, maintainability pains,…

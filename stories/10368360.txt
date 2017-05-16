@@ -1,0 +1,60 @@
+From time to time, people come to us with a problem, "Our queries cancelled on standby servers, and we enabled hot_standby_feedback, but queries on standby get cancelled. Why?". Indeed, after reading the documentation, it may seem that the feedback solves query cancelling problems, and if it is enabled the conflicts will disappear. However, this is not true. In this article we take a look at the feedback, how it works and which problems it is intended to solve.
+
+
+
+hot_standby_feedback - Specifies whether or not a hot standby will send feedback to the primary or upstream standby about queries currently executing on the standby. This parameter can be used to eliminate query cancels caused by cleanup records, but can cause database bloat on the primary for some workloads. Feedback messages will not be sent more frequently than once per wal_receiver_status_interval. The default value is off. This parameter can only be set in the postgresql.conf file or on the server command line.
+
+
+
+As seen from the description, standby server sends information about queries which are currently running on it. What kind of information? By default the feedback is disabled, in which case wal receiver process sends only information about which parts of the transaction log are written, flushed and replayed (see To begin with let us turn to the official documentation hot_standby_feedback - Specifies whether or not a hot standby will send feedback to the primary or upstream standby about queries currently executing on the standby. This parameter can be used to eliminate query cancels caused by cleanup records, but can cause database bloat on the primary for some workloads. Feedback messages will not be sent more frequently than once per. The default value is off. This parameter can only be set in the postgresql.conf file or on the server command line.As seen from the description, standby server sends information about queries which are currently running on it. What kind of information? By default the feedback is disabled, in which casesends only information about which parts of the transaction log are written, flushed and replayed (see pg_stat_replication view for details). To send feedback, enable the option and reload postgres.
+
+Now we take a look into postgresql source, particularly on the code of the wal receiver process. This process runs on standby server and receives WALs from master server. We search src/backend/replication/walreceiver.c for the function XLogWalRcvSendHSFeedback. WAL receiver process use this function for sending feedback. It sends feedback only when following conditions are met:
+
+Feedback send interval specified in wal_receiver_status_interval. Before sending feedback the oldest xmin is to be determined: it is the ID of the oldest transaction which executes longer than others transactions (see GetOldestXmin function in src/backend/storage/ipc/procarray.c for details). Note, while searching oldest xmin, PostgreSQL checks all currently running transactions and all logical replication slots. Slots have their own values of xmin and catalog_xmin. Xmin is the oldest transaction ID which retention for this database is needed by this slot. Catalog_xmin is the oldest transaction which affects the system catalogs that should retain in the database for this slot. VACUUM cannot remove tuples deleted by any later transaction.
+
+When the id of the oldest transaction is determined, the
+
+is subtracted from this value.
+
+parameter is a means to postpone the VACUUM, it is a parameter in the earlier versions of
+
+that is now replaced by feedback:
+
+vacuum_defer_cleanup_age - Specifies the number of transactions by which VACUUM and HOT updates will defer cleanup of dead row versions. The default is zero transactions, meaning that dead row versions can be removed as soon as possible, that is, as soon as they are no longer visible to any open transaction. You may wish to set this to a non-zero value on a primary server that is supporting hot standby servers, as described in Section 25.5. This allows more time for queries on the standby to complete without incurring conflicts due to early cleanup of rows. However, since the value is measured in terms of number of write transactions occurring on the primary server, it is difficult to predict just how much additional grace time will be made available to standby queries. This parameter can only be set in the postgresql.conf file or on the server command line.
+
+is equal to the oldest transaction id running on the standby minus
+
+, or the oldest transaction id that is needed for logical replication slot minus
+
+But that's not all, now we need to take into account the
+
+, because it may happen that the epoch has changed, and transactions counter was restarted. To do this, we take the value of the next transaction and compare it to the
+
+is greater than the next transaction, then the epoch value is decreased.
+
+Now we have to construct our feedback message and send it to the master. To do this, initialize a blank message, add the label which says that the this message is feedback, then add current timestamp,
+
+. Now send the message to the master, using
+
+) function. At this point, the
+
+Next, the message will be accepted by
+
+that is running on the master or an upstream server.
+
+value will be recorded in the WAL sender's internal structure
+
+. Every postgres backend has it's own structure. In the future, when the vacuum occurs, and before the vacuuming relation, the oldest transaction will also be determined (with the function
+
+that we already know) and the WAL senders's
+
+will be also taken into account. The calculated
+
+will be used to check tuple visibility in any open transactions. If the tuple is still
+
+seeing at least one transaction, it cannot be vacuumed.
+
+acts as an intermediary for standby and if the vacuum has to process tuples which are visible on standby transactions, it will be forced to skip these tuples.
+
+does nothing with conflict resolution of streaming replication and its only purpose is to avoid queries cancellation on standby in the case the vacuum on master server cleans something up.|||
+

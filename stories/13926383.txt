@@ -1,0 +1,41 @@
+The “S” in SQL, does not stand for “Synchronized“. But if it did, would it be unreasonable? After all, SQL is used primarily to facilitate sharing of data between multiple clients, so that they end up working with “the same” data. Don’t worry, I am not trying to propose a new expansion of the acronym! I was just thinking about synchronization in web applications recently. I think it is interesting and useful to look at an RDBMS as a provider of synchronization mechanisms. This is a write-up about several ways in which an SQL database can be used to synchronize the execution of programs running as separate processes (presumably on separate hosts), which connect to that database.
+
+At the time of writing this, it is often the case that web applications connect to an RDBMS and use it as its primary data store. It is probably useful to make it clear that the techniques presented below really apply to any system with multiple processes (presumably on different hosts) accessing the same resources (broadly speaking) or executing the same application code, at the same time. So it is not necessarily an application that responds to HTTP requests, even though I called it a web application above. It is not a good idea to use these strategies for synchronization of execution within one instance (process) of an application, as there are better alternatives there, depending on the runtime system used. All of the examples below, assume that READ COMMITTED transaction isolation level is used and that autocommit is on.
+
+Only once or at most once requirements come up often. We need to prevent our application from processing the same request or event more than once. One example can be a periodic task that queries the database for a list of users we need to send some email notification to, and then fires a “send email” task for each user. The task that discovers the users that need to be notified is run in a response to an event that’s created by a scheduler every X seconds. Each email sending task should of course check that the notification was not sent before, before proceeding with sending it. But if the check is just a simple , like in this example of an email sending task:
+
+Then we will still end up with the same email being sent multiple times if the email sending task is run more than once, at the same time, for the same user. This can happen when the workers that process the events created by the scheduler are all down for the duration of X seconds for example. When they come back up, there are two “discover” tasks being started at the same time, and these tasks both start an email sending task for the same user, twice. Both email sending tasks enter the block at the same time and send an email.
+
+Many RDBMS-es provide a way to inspect how many rows were updated, when an statement results in actual changes to the data. This, together with the fact that queries are atomic and support conditional updates, can be used to create guards that will prevent from executing an operation more than once. Consider this code:
+
+We can use it in a following way to improve our email sending task (let’s assume that executes a conditional where user is marked as being notified only if they aren’t already marked as notified, and returns number of rows changed):
+
+Now can be executed multiple times in parallel and the email will be sent at most once ( can still fail to actually send an email!).
+
+It is also possible to use SQL’s constraint for making sure that a particular event is processed at most once. Borrowing from the email sending example above: if each user receives multiple emails, one after another, and each one is a follow up on the previous one, then each email notification can be linked (using and constraints) to the previous one. In a setup like this, if the is triggered using the id of the previous successfully sent notification, then we can attempt to the next notification row before sending out the email. The constraint on the foreign key, won’t let us insert the “next” notification more than once and will guarantee that the email is sent at most once.
+
+Some RDBMS-es provide a FOR UPDATE locking clause in the query. It can be used to create locks. If such query is executed during a transaction, other transactions will need to wait until the end of that transaction, before they can modify the -ed rows or them.
+
+Let’s say our application, in response to a specific request:
+
+We can exploit , to do this in a way that will prevent double -ing to our application, which can result in the external service being incorrectly called more times than it should be. Consider this SQL, with comments performing the role of application pseudo-code, for handling our request.
+
+-- We're using "col1 IS NULL" below as an example condition that qualifies the -- request (and our database row) for further processing. -- Now check if the above query returned a row: -- If it didn't, "END;" the transaction and don't process the request further. -- If it did, send a request to the external service based on the data in the row. -- Based on the response from the external service, update the row (or not).
+
+This solution guarantees that only one process at a time can perform the request to the external service and the update of each of the rows from our table (given that there is no other code that performs said updates). If there are more processes trying to execute this code for the same row, they will need to wait for the “first” transaction to finish, before they can the row. And when that happens it may be the case that the does not return any rows (assuming READ COMMITTED transaction isolation level).
+
+So this seems to be getting the job done in this example. However, it may not be the best idea in the world to exploit in this way. There are several reasons:
+
+I think it is very important that the examples above represent how SQL can be used to synchronize code execution in a very particular scenario that is represented by each of the examples. If the data model and the specific problem match, then it can be useful to use SQL for synchronization. I have found that it is especially useful and “clean” in scenarios when the synchronization bit is just something extra, that can be gained simply by not ignoring the results of an query for example.
+
+I came across the django-db-mutex project, which provides a generic lock on top of an RDBMS. Acquiring a lock works roughly like this (a table with a datetime field and a varchar field is introduced):
+
+Basing the removal of expired locks on the value of time from the system clock of the db client, might lead to some locks being incorrectly removed though, when the clocks differ across different application nodes. Not to mention that these clocks are not monotonic. But maybe this approach might be useful for locking in some projects, when occasionally running the “critical” section more than once at the same time is acceptable.
+
+SQL can be used for synchronization of code execution in multi-process systems. It is especially useful when the synchronization bit comes naturally (for free), simply as a result of using SQL in a particular scenario. Because every use case is different.
+
+All of the synchronization strategies presented above use a single source of truth (point of failure) - a single server RDBMS. If you’re looking for solutions with better availability guarantees, this article about distributed locking looks like a very good starting point.
+
+I hope you have found this interesting. Please don’t treat this as expert advice or knowledge, but rather like musings about SQL and web applications. Please contact me if you have comments or would like to share experiences related to this topic.|||
+
+How to use an RDBMS to synchronize your web application

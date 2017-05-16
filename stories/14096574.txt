@@ -1,2 +1,50 @@
-|||
+The following article has been contributed by Alexander Graf, Principal Software Engineer at SUSE.
+
+Every piece of hardware, every electronic device comes with so-called firmware–software that is deeply embedded in the piece of hardware, that provides the low-level control program for the device, and that is necessary to get the “machine to run”. The firmware for most x86 systems and arm64 servers usually adheres to the Unified Extensible Firmware Interface (UEFI) specification, which defines a software interface between the pre-boot environment and the firmware. And it is typically based on a common code stream from Intel called Tianocore (simply put, all the BIOSes–be it AMI, Phoenix, you name it–have Tianocore as their centerpiece).
+
+The firmware usually includes drivers for certain devices, such as the SATA and USB controllers. Now, into most modern systems, you can also plug a PCI (Express) card (which is a standard type of connection for internal devices in a computer, and allows for high bandwidth communication between the device and the motherboard, or other hardware). However, to use the card during bootup (network boot, HDMI output, etc.) you need additional drivers that are not included in the firmware. Those drivers are stored inside of a so-called Option ROM which “sits” on the PCI card itself.
+
+The Option ROM contains a UEFI-compatible driver that the firmware can use for network boot, if your PCI card is a network adapter, or to display graphics on the screen connected to your graphics card.
+
+Usually, Option ROMs are supplied as x86_64 binaries. This implies that you can’t use these binaries on a 64-bit ARM (AArch64) system, as the AArch64 and x86_64 architectures have different instruction encodings. Think of them as two people speaking completely different languages–like Xhosa and Samoan–and who have never heard each other’s language before.
+
+So, while you can plug a PCI network card into your shiny new ARM server, you still won’t be able to boot from the card. And if you plug a graphics card into an ARM-based desktop machine, you won’t see anything on the screen until Linux is loaded. Needless to say, this is not an ideal situation.
+
+Or in other words: this is frustrating and needs to be changed! Hence, during the latest Linaro Connect event in Budapest, Ard Biesheuvel from Linaro and I drafted up a plan how to make Option ROMs work also on AArch64.
+
+UEFI drivers and applications work by sharing a single big flat address space and data structures. Simplified, a “disk object” looks like this:
+
+The semantics of this data structure are private to the driver and the components that use it. Any driver and application can define arbitrary data structures with arbitrary semantics of which field is a function pointer over actual data.
+
+Working on the project, we made several important discoveries:
+
+Because x86_64 and AArch64 are so similar in their data structures, we don’t have to convert anything between them–they are simply compatible out of the box. This means that the only problem we have to deal with are function pointers into x64_86 code. Since AArch64 CPUs can not execute x86_64 code natively, we need to make sure that calls into x86_64 code get redirected into an emulator.
+
+This is where No-eXecute (NX) comes into the picture. NX is a technology that allows an operating system to limit execution to certain memory regions. Whenever a call is made into a protected region, the CPU doesn’t execute the code but traps it and raises an exception that can be handled.
+
+Being able to use this functionality is the key factor for success, the “door opener” for our project. It allows us to declare the x86_64 code regions as no-execute and install a handler that deflects the call and its arguments into emulator glue code. The emulator glue code can then convert the function call arguments from AArch64 to x86_64 and invoke
+
+ the emulator that runs until one of the following scenarios occur:
+
+1) Call into a region outside of the x86_64 code region.
+
+In this case, we convert the function arguments from x86_64 to AArch64 and invoke the AArch64 function on behalf of the x86_64 code, then continue with x86_64 code.
+
+We save a special return address cookie as very first return address when entering an x86_64 function. When detected, this cookie notifies the glue code that we’re finished emulating the function.
+
+Using this simple logic, we are now able to execute arbitrary x86_64 Option ROMs on AArch64 systems. So far we have tested it with NVIDIA graphics card and iPXE network ROMs.
+
+As mentioned before, since most firmware implementations follow the UEFI specification, and are based on Tianocore, the proposed solution should work with practically any existing Option ROM.
+
+ While the bulk of the project has been completed, there are still several things that need to be done.
+
+1) Licensing. We are currently working on re-licensing two GPL files to LGPL to allow firmware vendors to include the code in their firmware. We are mostly there though.
+
+UPDATE April 9th, 2017: Good news – the licensing questions are solved, re-licensing to LGPL is done for all files!
+
+2) More testing. We’d like to encourage the ARM community to offer plug fests, participate in plug fests, extend testing coverage, and work with PCI card vendors to make this a plug-and-play solution.
+
+3) Getting patches upstream. We need to extend Tianocore with object loader overrides to load an x86_64 binary. The main hurdle to get these patches upstream is that we need to provide official specifications how emulator modules are working. But this is work in progress.
+
+So, this is the current status of our project. If you would like to get more details, just have a look at the GitHub repository. Please share your feedback with us. And of course, we are happy to get any support in spreading the word about this new technology that might revolutionize ARM adoption.|||
 

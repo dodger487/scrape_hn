@@ -1,0 +1,72 @@
+On the weekend of March 18th-19th I and a few of my fellow UBC students Gareth Ellis, Alexander Hoar, and Jeffrey Doyle worked together (and lost a ton of sleep) for the hackathon nwHacks 2017. One of the new and more prominent sponsors of the event was Cockroach Labs, creators of the distributed database CockroachDB, and we thought it'd be fun to work on a project involving CockroachDB and shoot for the "Best Use of CockroachDB" sub-contest they were running (and giving out a nice cash prize!).
+
+CockroachDB is a SQL database that sets itself apart from other relational database systems by being distributed and really fault-tolerant. Leveraging the Raft algorithm for assuring consensus across nodes in a cluster, it's able to create a CP (consistent and partition-tolerant) system while at the same time being Highly Available (source). When I installed it for the first time in the days leading up to the hackathon I was surprised at how easy it was to set up a cluster (just set up an instance and let the other instances with the first one!) and use the admin interface present on each node. We decided to do a project that would exemplify CockroachDB's strengths by stress-testing a cluster, attempting to disrupt the consistency of the system.
+
+Our project is DESTROY ALL ROACHES!! (GitHub repo) a Javascript-based game where you kill cockroaches on screen by remaining in close proximity to them. Each cockroach actually corresponds to an actual instance of CockroachDB running in the server's backend (where all of the cockroaches are part of the same cluster). Every time the player kills a cockroach, the web server executes a command on the particular instance that the cockroach was associated with. The server spawns new cockroaches (and new instances) depending on the ratio between how many cockroaches were killed and how many cockroaches have been spawned at the beginning of the game session.
+
+Our project was quite challenging to implement and is built upon quite a few hacks, which was expected given that we are completely misusing CockroachDB on purpose. I'm really proud of the four of us for being able to finish each of our parts of the project, and integrate all of them together, within 24 hours.
+
+I'll describe our project, going up the stack from our management of the CockroachDB cluster to the actual game logic.
+
+We really misused CockroachDB. Since we're stress testing, the only thing we really need to -do- with cockroach is to start instances (keeping track of their PIDs), load data into them, and kill the processes running CockroachDB instances. The CockroachDB libraries are mostly for using Cockroach rather than managing it, so we didn't need to use those. All of the backend management is done by the webserver calling a few specially crafted bash scripts that would call commands.
+
+Here's probably the most important script we made, which is starting a cluster. We start CockroachDB instances in the same cluster. A single node is kept as a "special node" for accessing the admin web interface (more on this soon), and find and output the PIDs of the rest of the instances. Be warned, there's some (I don't even understand it; Gareth was the one who wrote this).
+
+Gareth also wrote a script that starts up an instance and joins it to a particular cluster, passing in the port number CockroachDB as an argument.
+
+We ran into some difficulty when trying to run the scripts on macOS because their command doesn't produce the same output as Linux's.
+
+By the way: when we say "kill processes", we really mean it. Not even allowing the roaches the dignity of a . When Gareth walked over to the CockroachDB sponsor booth to ask some questions, they recommended him to use the graceful command, but he calmly responded to them, "we don't want to do that."
+
+The backend is a server with , primarily using socket.io to communicate with the front-end. Node actually provides a really neat library, which made it rather easy to actually run the bash scripts that we wrote. I was in charge of this portion of our project and it was fun to be able to work on these particular challenges.
+
+We keep a global object that keeps track of the PIDs of the cockroaches for each website user, as well as other game-specific metrics like the number of cockroaches spawned and the number of cockroaches that have been killed.
+
+Only a single page is actually served ( ) and the rest of our logic is done via Socket.IO communication. Here's the basic structure of our backend, briefly outlining each of the events that we handle and emit to the front-end:
+
+There's also some interesting things we tried for about nine hours before deciding to not include them in our final demo. We were originally planning to decide whether or not to spawn a new roach by parsing data from the Admin API, accessible from the single node that we keep away from the main game, where we hoped we could get statistics about data consistency and cluster status.
+
+It turned out that while CockroachDB's admin interface is really nice, their JSON API endpoints were completely undocumented, it being only used in internal services. We got some help from my friend Tristan Rice, one of the organizers of the event and a former CockroachDB intern, to find the API and its endpoints (some of which he wrote!).
+
+We had a bunch of different ideas of which metrics to use for the game's decision-making but never found something that was able to spawn roaches at the rate that we wanted. Our best bet was checking the data replication, but even that idea had to be scrapped for the final demo because of problems encountered with spawn rate. Additionally, checking the API every few seconds and managing the associated timeouts introduced some new layers of complexity and bugs to the app. I was pretty sad to scrap that part of the project, but the problems were expected given that we were doing a lot of things with Cockroach that we weren't supposed to. In the end, we decided to spawn a new roach on the death of an existing one if the number of cockroaches killed was 10% of the total ones spawned.
+
+The actual game is implemented in EaselJS and the UI is primarily built using Google's Material Design Lite. Alex basically did all of the game mechanics, and I'm still kinda stunned that we were able to include so many interesting components within such a short period of time.
+
+I didn't have much to do with the actual game mechanics, so I can mostly comment from an outsider's perspective. The actual game mechanics are surprisingly rich -- I expected the game to just be a tech-demo kind of game where you click on a cockroach and it dies, but Alex actually ran with some interesting ideas about how the game should work.
+
+Cockroaches come in waves, and to kill them you stay within a certain radius of them. We implemented a way for the player to die if they actually physically touch a cockroach, but we left the final demo without death to simply showcase the integration with our backend.
+
+Alex didn't have to care that much about how the game was communicating to the backend, because he simply left a bunch of callbacks for cockroach death and spawning for Jeff to implement for all back-end communication.
+
+As for the actual layout of the game, the four of us bounced around a bunch of ideas about what to include in the areas actually surrounding the main game's element. We considered such lofty ideas like displaying stats that we would pick out from the admin JSON API, or even a live cluster-wide log. We decided against those two ideas because the admin JSON API was really hard to work with, being undocumented, and it turns out that getting meaningful logs across the whole cluster is really really hard.
+
+As seen in the video, we ended up deciding on simple "Created / Destroyed" tallies on the top of the game and an of the admin interface for node status. It worked out pretty well in the end -- when we were showing the game to people who would come by our booth, they were always surprised when we scrolled down, revealing that the innocent little cockroach-killing game they were playing was actually an act of brutality against a database cluster.
+
+It being a hack built on messy decision after messy decision, many things went wrong. A lot of the stuff about what we were able to solve was described in the description of our tech stack above.
+
+Here's some of the stuff that I noticed that's still wrong with the app.
+
+We still weren't able to implement a good way to measure data consistency across the cluster. We weren't able to find where in the admin JSON API we could find stats about that.
+
+A solution that we came up with close to the end of the hackathon (but weren't able to implement) was trying to access the actual database from one of the nodes in the cluster, doing a query on the table and checking how many entries are still there.
+
+In addition to implementing this, though, we would've needed to test it out to see if it actually generated meaningful data that we could use; perhaps that's something best left for further exploration.
+
+The way the app works doesn't allow you to have a cluster that's distributed across multiple machines. Everything in the app works by keeping track of the PIDs of the CockroachDB instances, and nothing else.
+
+My gut feel is that out of the issues I'll be listing here this is the easiest one to fix -- just keep track of more information. However, I can't really estimate how much work it would be to keep track of a distributed cluster and how that'll affect the rest of the app.
+
+Only in hindsight did I realize that not all of our app's features work if you're not playing the game on the same computer, mostly because the admin interface works by including an iframe to a URL. We only keep track of the http port of the admin interface and tack to the end of it to use as our source.
+
+I actually don't know how to solve this problem. I wouldn't expose the admin interface, so perhaps the best solution is to do a live capture of the admin interface and stream a video, but that seems less effective than figuring out how to collect stats from the API.
+
+We didn't end up winning the prize, but judges and fellow participants who came by our booth really seemed to like it, and overall we still had a blast making this and learned a ton. Regardless of all of the app's shortcomings and messiness, we were able to finish an interesting and functional project, which I consider a great success! I've failed to make projects work at hackathons before so this success was a nice turn of events.
+
+This was the first hackathon project I tried where the team tried to do a really ridiculous project; other projects I've done were straightforward, business-minded kinds of apps, and developing those at hackathons can get less interesting after doing it the first three times or so.
+
+I'm happy that the four of us were able to experiment with a piece of new software, think of a really weird idea, and still be able to pull off something neat. I feel like I haven't attended enough hackathons where the focus wasn't so hyper-directed at making marketable products and more about having fun while programming the weirdest and hackiest pieces of software.
+
+Hackathons as a concept have gotten some flak for being counter-productive and missing the mark when it comes to innovation, but I still find them worthwhile if only for the purpose of being able to hack with friends. In my experience as a university student, I generally don't have unlimited free time for my side projects because of school, and when I do have time I generally do my side projects alone. Hackathons are a really easy way for friends to set a date to just jam out and code for a couple of days together; and the kind of synergy that I experience during those weekends is what makes me able to stay up all night coding.
+
+All in all, this was the nicest project that I ever built that calls bash scripts from node.js.|||
+

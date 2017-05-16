@@ -1,0 +1,178 @@
+The vulnerability (CVE-2017-2641) allows an attacker to execute PHP code at the vulnerable Moodle server. This vulnerability actually consists of many small vulnerabilities, as described further in the blog post.
+
+Moodle is a very popular learning management system, deployed in many universities around the world, including top institutes such as MIT, Stanford, the University of Cambridge, and Oxfords’ University.
+
+ These statistics, along with the fact Moodle stores a lot of sensitive information, such as grades, tests, and students private data, makes it a critical target, and the main reason I audited it.
+
+A user is required to exploit the vulnerability. It does not matter which capabilities it has (i.e. student, teacher) as long as it is not a guest.
+
+This vulnerability works on almost all Moodle versions deployed today, as seen in the Vulnerable Versions section.
+
+ I recommend all Moodle administrators to apply the security patch.
+
+“3.2 to 3.2.1, 3.1 to 3.1.4, 3.0 to 3.0.8, 2.7.0 to 2.7.18 and other unsupported versions.”
+
+Part 1 – The Problems of Having Too Much Code
+
+Moodle is an extremely large system. It contains thousands of files, hundreds of different components and approximately two million lines of PHP code.
+
+ As such, it is obvious different developers wrote different parts of the code, even if those parts interact with each other.
+
+In the following white paper, I will demonstrate how having too much code, too many developers, and lacking documentation can lead to critical logical vulnerabilities.
+
+ Keep in mind that logical vulnerabilities can and will occur in almost all systems featuring a large code base. Security issues in large code bases is of course not Moodle specific.
+
+A clear case of “same feature, different code” can be observed at the built-in Ajax mechanism of the system.
+
+Moodle is featuring a dynamic Ajax system, which allows different components to use the system’s built-in Ajax interface.
+
+ The way Moodle does that is by using “External Functions”. Each component that wishes to use the built-in Ajax mechanism is registering its own “External Function”, specifying the component being called, the function name and the privileges required to use it.
+
+Later, when components wish to use the Ajax interface, they can simply call the “service.php” file, supplying the name of the external function they have registered earlier.
+
+ That way Moodle is allowing component developers to use its built-in Ajax interface, saving them the trouble of writing a new one by themselves.
+
+The problem starts when Moodle’s core developers has started using this interface too.
+
+Not so long ago, if a component needed to change the user’s preferences through an Ajax request, it called the “setuserpref.php” file, specifying the name and value of the property it wanted to change.
+
+ This can be viewed in the following code:
+
+In the middle of the code, at the highlighted line, we can see that Moodle is trying to make sure the preference that needs to be changed is defined in the “ajax_updatable_user_prefs” array, which defines which preferences can be changed via Ajax.
+
+ This makes a lot of sense as Moodle does not want malicious attackers, such as us, to change anything that could prove to be critical.
+
+Although most of the user preferences can be changed via other measures, even if not through the Ajax interface, Moodle’s developers tried to think ahead and prevented any future abuse of this mechanism.
+
+That was true, until the external function “update_user_preferences” has been added.
+
+ This function was added to replace the old “update_users” function, which could “potentially [be] used to update any user attribute”, which is obviously a very bad thing; and, as the old function was only used to update user’s preferences anyway, there was obviously no need to allow it to change anything else.
+
+The main difference between the old function and the new one, is that the old function could not be accessed through the Ajax interface, while the new one could, as the supposedly dangerous feature – the ability to change every user attribute, has been removed.
+
+On top of that, they implemented a proper privilege check, so even if an attacker could exploit something using user preferences, it will be able to exploit it only on its own user.
+
+ But that doesn’t really matter if these preferences are later used inside an “eval” or an “exec” call, right? It doesn’t matter which user is exploiting the dangerous function as long as it’s being exploited.
+
+But let’s not get ahead of ourselves and have a look at the code of this function:
+
+By looking at the code, we can see that we can only edit our own preferences because of the privileges check.
+
+ But still, something is missing. Although the code makes sure we are only editing our own user preferences, it doesn’t check which preference we are changing, contrary to the other Ajax page responsible for changing user preferences – “setuserpref.php”.
+
+A classic example of how different developers, at different times, with different needs in mind write different code for the exact same functionality.
+
+ This time, they assumed user preferences could not be exploited in any malicious way. They assumed it’s unexploitable.
+
+There’s a reason user preferences are considered unexploitable. They literally have almost no impact in terms of how to system operates – they are not used in DB queries, they are not defining any components, and the only thing they somewhat impact is GUI part of the system, and even then, only in a miner way.
+
+So, what can we do?
+
+ Well, let’s have a look at how the GUI parts of the system function.
+
+Moodle is using a Blocks mechanism to allow components to display relevant data to the user. These blocks can be added and removed by the user.
+
+One of these blocks – “course_overview”, is used to display the user a list of its enrolled courses. In order to store the order of the courses he enrolled into, The Course Overview block mechanism is using a specific user preference called “course_overview_course_sortorder”. This preference store a list of all courses IDs the user has enrolled into, ordered by the time he enrolled into them.
+
+This list separates the course IDs using a comma, so the following line of code is used to split the list:
+
+But what happens if that preference is empty? In that case, the block mechanism is trying to retrieve the legacy preference, “course_overview_course_order”, which again contains a list of all courses IDs, but in a rather different way.
+
+ This time, in order to retrieve to IDs the block mechanism actually executes:
+
+An unserialize call. What a surprise.
+
+ Another classic example of how legacy code and backwards compatibility can compromise your entire system if you still use it, and how different developers from different times can implement the exact same feature using completely different ways.
+
+For us, this means we can now exploit an Object Injection attack.
+
+ Unfortunately, because of the Moodle is filtering user input, there are some limitations about what we can injection:
+
+These limitations lead to a pretty difficult Object Injection. Yet, I did write RCE in the title, didn’t I?
+
+Part 3 – Taking the Fun Out of Object Injections
+
+Because of the specified limitations, we can only use public properties of already included classes. We can’t also use any code that relies on any protected or private properties as well, as they will be initialized as their default value or, most of the time, just a NULL.
+
+This really narrows our attack surface. Almost all classes use protected properties in some way, and most of them doesn’t feature any public properties at all.
+
+The first step is to understand exactly which magic PHP methods we can use.
+
+ We can obviously call “__wakeup()”, which is called when the object is unserialized, and “__destruct()”, which is called when the object is destroyed, but can we call another very popular method – “__toString()”?
+
+Well, if we’ll look at the code that’s being executed right after our payload is unserialized we will see that our unserialized payload is treated as an array:
+
+This function tries to join our unserialized array members into one big happy string. But, if one of our members was actually, say, an Object, its “__toString()” method would have been called.
+
+So we can not only execute one object’s “__toString()” method, we could execute how many of them as we’d like.
+
+But what could we possibly do with a “__toString()”?
+
+ Well, let’s have a look at how the “attribute_format” abstract class implemented its own “__toString()” method:
+
+Looks simple, right? Let’s look at one code flow we can access by calling the “determine_format()” method of the class “feedback”, which inherits from our “attribute_format” class:
+
+See that “is_overridable_item()” call? That’s another method call, but this time using one of the object’s properties as an object.
+
+ Now we are getting somewhere. Because we control the property, we control the object being called, which really expands our attack surface.
+
+ One of the classes implementing the “is_overridable_item()” method is the “grade_item” class
+
+Following a series of method calls, we eventually arrive to the “update” method:
+
+As can be seen, the “update” method is responsible for updating the database with the data stored in the object. It’s using the property “table” as the table name to update and the data is derived straight from the object own properties.
+
+So, basically, that’s a win. Using our object injection, we could update any row we’d like in the entire database. We could update administrator accounts, passwords, the site configuration, and basically whatever we want.
+
+That being said, there are a few limitations of how we can update:
+
+But why do we even care about SQL Injections? We can already update whatever we want. Right?
+
+Wrong. We can update everything we’d like as long as we know the ID of the row we want to update.
+
+ So, if for example we are trying to update the administrator’s password, we either need to guess its user ID, or just brute-force every account in the database. And as we are 1337 h4x0rs, we are trying to minimize the impact on the server as much as possible.
+
+So, first, we don’t want to start changing passwords for every user in the system. In fact, we don’t want to change anyone’s password, as this will probably be pretty suspicious.
+
+ In order to bypass that we could add our user as another administrator in the system by changing the “site_admins” configuration value, stored in the “config” table.
+
+But how can we guess the ID of that specific configuration in the table?
+
+ Well, we can’t. But we can try to change the WHERE SQL statement somehow.
+
+To do that, we will need to use an SQL Injection after all. As we can’t exploit any of the data fields, we will have to inject our SQL in the table name itself, which is not being escaped anywhere.
+
+But that raises another problem – before the UPDATE statement is executed, Moodle is querying the database for the column names and types of our specified table.
+
+This means we will have to make the same SQL Injection work both on the SELECT statement, which should return the correct data for the table, and the UPDATE statement, which should update the “site_admins” configuration value.
+
+Let’s have a look at both statements:
+
+It is clear the only injection point we have in both tables is the table name.
+
+One way to exploit this SQL Injection is by starting a multiline comment (/*) after the table we wish to update, and close it in one of our data parameters. That way our data could contain our altered WHERE statement, filtering the data by the configuration name instead of its ID.
+
+ So, our payload thus far looks like this:
+
+But how can we insert a comment in the table name and still make both the SELECT statement and UPDATE statement to work?
+
+ Clearly, the UPDATE statement will not work because of the added apostrophe after the table name, and the select statement will not work because we can’t open a multiline comment without closing it in SQL.
+
+What happens if we will insert the multiline comment into our table name without closing the string, and then just continue the WHERE condition using another OR statement?
+
+ I mean, something like this:
+
+While the SELECT statement is pretty much self-explanatory, the UPDATE statement probably needs a bit more explanation.
+
+ Allow me to display it the way MySQL will parse it:
+
+As you can now clearly see, we’ve commented out everything between the table name and the first data value we control. That way, we can use SQL statements only on the UPDATE statement, without effecting the SELECT statement.
+
+We then just set the configuration value to whatever we want, preferably our user ID, and then just add our improved WHERE statement, filtering the table based on the configuration name. Finally, we add a single-line comment in order to remove the built-in WHERE statement, and that’s it. We successfully exploiting the same SQL Injection on two different queries.
+
+So, all we have to do now is wait for the configuration cache to refresh, which should happen every day or so, or just force refresh it ourselves by removing the configuration value of “allversionshash”, which stores a SHA-1 hash of all the core files in the system. Changing the value of this configuration will make Moodle think it went through a firmware update and just refresh the entire cache for us.
+
+After gaining full administrator privileges executing code is as simple as uploading a new plugin or template to the server.
+
+So, after exploiting some false assumptions, an Object Injection, a double SQL Injection and a permissive Administrator dashboard, we finally won. We executed code on the server.|||
+

@@ -1,0 +1,38 @@
+This blog came about because an old friend is trying to figure out how Java can do aggressive loop and inlining optimizations, while allowing the loading of new code and setting breakpoints… in that optimized code.
+
+Safepoint. I’m still confused because I don’t understand what is the required state at a safepoint that can’t be ensured at any random point of execution.  What is in-flight that must be permitted to complete? Given a cycle-by-cycle map you can find all the pointers at *any* cycle – is safepointing just a way to reduce the volume of pointer-locating info?
+
+Reducing OOP-map volume happens, is useful – but is not the main thing being achieved.
+
+It’s flipping backwards from the machine state to the language architected state, unwinding from super-aggressive optimization to reach the theoritical Java (or C/C++) language state at some points.  Toooo expensive to preserve that mapping line-by-line, call-by-call, execution-point-by-execution-point. So you keep the mapping at a few places, and optimize the bejeebers out of things in-between.  If somebody wants to:
+
+then you need to stop the physical machine (actual CPU/Mill) at some place where you can find all the language architected pieces.  This mapping is far more complex than the oop/no-oop mapping for GC… but isn’t why you make it rare.  You make it rare because you have to hang onto all the language state at these safepoints, but don’t need it between safepoints.
+
+An example might help:
+
+So intent is to run awhile… then somebody sets a breakpoint… and wants to inspect “sum”, or change “i” in the debugger, then continue execution.  What’s the machine code look like, with no safepoints?  Something like this (bogus X86-like assembly code, pardon non-perfection):
+
+But actually, with some loop unrolling:
+
+Now I want to break on the “sum += A[i]” line… where is that, exactly, in that unrolled loop?
+
+And which register contains “i”?  (Hint: none of them).
+
+Do I even want to keep a shadow copy of “i” in parallel with my “A” pointer I’m rolling through the loop?  It’s pure overhead, unless I breakpoint and want to have some place to read “i”…. but even then I cannot *change* this shadow “i” because it won’t change my “A” pointer.
+
+What about changing N?  Do I have enough info in the register mapping to describe all possible kinds of updates I might want to do to register RC when I tweak N?  This example is simple, but optimizing compilers can do hella complex code changes.
+
+How does a Safepoint help here?  Well, for starters it points out that I do indeed need some way to find “i”, and if I change it then propagate those changes back into the loop.  Lets look at this code with a Safepoint in it.
+
+So I added 1 op in my hot loop to compute “i” on the fly.  Not too expensive; 1 clock per cache-line of data.  In general we end up keeping alive what is otherwise programmatically dead “just in case” the user stops the running code and wants to inspect (dead) variables – but this is cheap.  Just spill ’em off to stack somewhere and flag ’em in the Safepoints variable map.
+
+How do we trigger the Safepoint?  Easiest way is to have the safepoint code test some thread-local bit for a “stop” bit, and if found… stop.  If we have to stop we might have a lot of cleanup to do, but stopping is rare so the cost (of mostly not stopping) is low.  There’s lots of ways to make the safepoint check cheap.  Here’s one that depends on keeping a 2Meg (TLB-sized) window above the stack pointer mapped in or out – perfect for an X86 TLB:
+
+How do we use the Safepoint?  Once we’ve stopped the running thread mid-loop, we expect the trap handler to have saved off all the registers.  Later we can inspect the register map to find “i” or “sum”.  Note that a Java-level query cannot ask for our “RA” register – as it’s the sum of “&RA” and “i*8” and isn’t visible at the language level – so “RA” does not appear in the Safepoint’s map.
+
+How do we change “i” or “N” and have it All Just Work?  Basically, we re-enter a clone of the loop from above…. a clone specially made to be re-entered at any iteration.  The loop setup code in the clone will rebuild “RA” and “RB” and any other intermediate state as needed, before falling into essentially the same code as the normal loop (and indeed they might be shared here!).  Or in other words – since the optimizer did something complex to build “RA” from “&A” and “i” – have the optimized do it again for any arbitrary new “i”.
+
+The general plan is simple (from the optimizing compiler’s point-of-view): Safepoints are treated like a function-call only taken on a very very rare execution path.  Safepoints take as inputs all visible language-level state, including the state of all inlined function calls, and generally are assumed to update all memory state but not any local vars (if you are also hacking local variable state via the debugger interface, then we need to go a step further and deopt/reopt – leading to the loop clone mentioned above).
+
+With this magical “low frequency function call” in hand, the optimizer attempts the best optimizations it can, subject to the normal constraints that the call arguments are available somehow.|||
+

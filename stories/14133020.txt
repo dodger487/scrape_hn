@@ -1,0 +1,41 @@
+Scaling a web application requires numerous database upgrades, each potentially requiring downtime. I’m going to tell you a story about Contactually, and the lessons we’ve learned during a few of these upgrades.
+
+Early last year, we switched from Unicorn to Puma, a multi-threaded web server. During our initial rollout, we were seeing intermittent spikes in Request Queueing. During root cause analysis, we zeroed in on spikes in Postgres Queue Depth, which is where read and write queries are queued until Postgres is able to complete them and return a response to the client.
+
+Additionally, we wanted to upgrade our RDS instances from Postgres 9.4 to 9.5 to take advantage of new features and improvements.
+
+When the spike in the Postgres Queue Depth occurs, it ties up Puma threads which are waiting for their answer from the database. When enough of these occur, all threads on all servers are stuck waiting from an under-performing database. This means there are no threads available to handle new HTTP requests that are coming in.
+
+These new HTTP requests that can’t be worked on sit in the Puma request queue for so long that they timeout before any of the threads are able to address them. It’s worth mentioning that scaling up the number of web servers would only exacerbate the problem because it would increase the load on an already under-performing database.
+
+Additionally, these Postgres Queue Depth spikes cause background jobs to take much longer than ordinary. In some cases, these jobs can timeout depending on application specific logic.
+
+The number of provisioned IOPS with Amazon RDS represents the number of concurrent read and write operations your instance can support.
+
+At the time, the average Postgres Queue depth we supported was around 20. We calculated this using Amazon’s recommended calculation:
+
+By upgrading to 15,000 IOPS, we could support a Postgres Queue Depth of 30. Since the majority of our Postgres Queue Depth spikes were between 20 and 30, we felt confident in our plan to increase IOPS and upgrade versions of the database.
+
+Additionally, RDS had recently released support for Postgres 9.5.2, which boasts substantial read and write performance boosts.
+
+A few days before the planned upgrade, we ran a simulation of what the upgrade would be like by restoring a production backup to a temporary RDS instance with the same size/configuration as the actual node we would be upgrading, and performing the upgrade on that node. That simulation took about 20 minutes.
+
+Numerous details emerged during these dry runs that were critical in minimizing the downtime during the production upgrade. Each detail or adaptation to our original plan was documented so we had a full playbook on the morning of the upgrade. No surprises wanted at 3am!
+
+Based on these simulations, we set aside a window between 2–4 hours of downtime early one Saturday morning (off-peak hours for our business) to perform the upgrade.
+
+During our dry runs, a few critical pieces of the plan revealed themselves through pouring over documentation, as well as trial and error. Our key takeaways:
+
+The first part of our upgrade, increasing IOPS, went off without a hitch and didn’t have any measurable impact on performance of our production instances.
+
+For the version upgrade, we planned for 2–4 hours of downtime and ended up taking 2 hours 15 minutes. Based on our dry runs, this was right in our expected window.
+
+Before taking the database instances offline, we manually scaled our backend job processing workers (we use Sidekiq) down to zero and put the application in maintenance mode. Naturally we wanted to prevent jobs from being run in a state we knew they would definitely fail. This lead to an expected queue build up that had to be drained after the databases were back up and running.
+
+In order to quickly warm up the database after a cold reboot, we initiated calls on all tables in all databases. This critical, quick action helps the query planner make better decisions after an upgrade operation where has never been run before on a new node.
+
+After confirming query performance was where we expected it to be, we started to slowly scale backend workers back up to work off the backed up queues.
+
+Over time and subsequent database upgrades, this general pattern has been successful for us. We’ve continued to refine and narrow in on the specifics of our upgrade playbook after each upgrade.|||
+
+Scaling a web application requires numerous database upgrades, each potentially requiring downtime. I’m going to tell you a story about Contactually, and the lessons we’ve learned during a few of…

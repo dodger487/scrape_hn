@@ -1,0 +1,76 @@
+This post is part 1 of a 3-part series about tuning Elasticsearch Indexing. This series focuses specifically on tuning Elasticsearch to achieve maximum indexing throughput and reduce monitoring and management load.
+
+As a starting point, assume that you start Elasticsearch, create an index, and feed it with JSON documents without incorporating schemas. Elasticsearch will then iterate over each indexed field of the JSON document, estimate its field, and create a respective mapping. While this may seem ideal, Elasticsearch mappings are not always accurate. If, for example, the wrong field type is chosen, indexing errors will occur.
+
+For this post, we will be using hosted Elasticsearch on Qbox.io. You can sign up or launch your cluster here, or click "Get Started" in the header navigation. If you need help setting up, refer to "Provisioning a Qbox Elasticsearch Cluster."
+
+
+
+No data store with secondary indexes is truly schema-less, and Elasticsearch is no different. While it doesn't require you to define your data structure up front, it does derive a schema from your documents structure and makes decisions on how to index them based on that. In that respect, Elasticsearch indexes your data using an implicit schema, rather than an explicit schema.
+
+Thus, indexing decisions are quite important, and they have big impact on how you can search your data. If it's a string field, should it be tokenized and normalized? If so, how? If a numeric field, what precision is required? There are many more field types like date-time fields, geospatial shapes, and parent/child relationships that require special care.
+
+Do not analyze, store, or even send data to Elasticsearch that you do not need for answering search requests. In particular, double check the content of mappings that you do not define yourself (e.g., because a tool like Logstash generates them for you). Do we plan to index large amounts of data in Elasticsearch? Or we are already trying to do so, but it turns out that throughput is too low? If your search requirements allow it, there are many techniques for optimization in the mapping definition of our index. This tutorial will list a collection of tips and ideas to increase indexing throughput with Elasticsearch.
+
+For analyzed fields, use the simplest analyzer that satisfies the requirements for the field. Or maybe you can even go with not_analyzed?
+
+Fields of type string are, by default, considered to contain full text. That is, their value will be passed through an analyzer before it is indexed, and a full-text query on the field will pass the query string through an analyzer before searching.
+
+The two most important mapping attributes for string fields are index and analyzer.
+
+The default value of index for a string field is analyzed. If we want to map the field as an exact value, we need to set it to not_analyzed:
+
+The other simple types (such as long, double, date, etc.) also accept the index parameter, but the only relevant values are no and not_analyzed because their values are never analyzed.
+
+analyzer: For analyzed string fields, use the analyzer attribute to specify which analyzer to apply both at search time and at index time. By default, Elasticsearch uses the standard analyzer, but you can change this by specifying one of the built-in analyzers, such as whitespace, simple, or english.
+
+The field contains the original JSON document body that was passed at index time. The field itself is not indexed (and thus is not searchable), but it is stored so that it can be returned when executing fetch requests such as get or search. Although it is very handy to have around, the source field does incur storage overhead within the index. For this reason, it can be disabled as follows:
+
+Users often disable the field without thinking about the consequences and then later regret it. If the field is not available, then a number of features are not supported:
+
+If you are using the field, there is no additional value in setting any other field to _stored. If you are not using the field, set to _stored only the fields that you must. Note, however, that using brings certain advantages such as the ability to use the update API.
+
+An expert-only feature is the ability to prune the contents of the field after the document has been indexed, but before the field is stored. Removing fields from the has similar downsides to disabling , especially the fact that you cannot reindex documents from one Elasticsearch index to another.
+
+The includes/excludes parameters, which also accept wildcards, can be used as follows:
+
+These fields (1,2,3,4) will be removed from the stored field.
+
+We can still search on field, even though it is not in the stored .
+
+The field is a special catch-all field that concatenates the values of all of the other fields into one big string, using space as a delimiter, which is then analyzed and indexed but not stored. This means that it can be searched, but it cannot be retrieved.
+
+The field allows you to search for values in documents without knowing which field contains the value. This makes it a useful option when getting started with a new dataset. For instance:
+
+The field can be completely disabled per-type by setting enabled to :
+
+If the field is disabled, then URI search requests and the query_string and simple_query_string queries will not be able to use it for queries. We can configure them to use a different field with the setting:
+
+Norms store various normalization factors (numbers to represent the relative field length and the index time boost setting) that are later used at query time in order to compute the score of a document relatively to a query.
+
+Although useful for scoring, norms also require quite a lot of memory (typically in the order of one byte per document per field in your index, even for documents that do not have this specific field). As a consequence, if you do not need scoring on a specific field, you should disable norms on that field. In particular, this is the case for fields that are used solely for filtering or aggregations.
+
+Norms can be disabled (but not re-enabled) after the fact, using the PUT mapping API like so:
+
+Norms will not be removed instantly, but they will be removed as old segments are merged into new segments as you continue indexing new documents. Any score computation on a field that has had norms removed might return inconsistent results because some documents will no longer have norms, while other documents might still have norms.
+
+Do you need to store term frequencies and positions, as is done by default, or can you do with less, maybe only doc numbers? Set index_options to what you really need, as outlined in the string core type description.
+
+The index_options parameter controls what information is added to the inverted index, for search and highlighting purposes. It accepts the following settings:
+
+Analyzed string fields use positions as the default, and all other fields use docs as the default.
+
+The text field will use the postings highlighter by default because offsets are indexed.
+
+If you don’t have a natural ID for each document, use Elasticsearch auto-ID functionality. It is optimized to avoid version lookups because the auto-generated ID is unique.
+
+If you are using your own ID, try to pick an ID that is friendly to Lucene. Examples include zero-padded sequential IDs, UUID-1, and nanotime; these IDs have consistent, sequential patterns that compress well. In contrast, IDs such as UUID-4 are essentially random and offer poor compression and slow down Lucene.
+
+Continue on to Part 2 of "How to Maximize Elasticsearch Indexing Performance.''
+
+It's easy to spin up a standard hosted Elasticsearch cluster on any of our 47 Rackspace, Softlayer, Amazon, or Microsoft Azure data centers. And you can now provision a replicated cluster.
+
+Questions? Drop us a note, and we'll get you a prompt response.
+
+Not yet enjoying the benefits of a hosted ELK-stack enterprise search on Qbox? We invite you to create an account today and discover how easy it is to manage and scale your Elasticsearch environment in our cloud hosting service.|||
+

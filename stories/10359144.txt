@@ -1,0 +1,89 @@
+This is the first post in a series on writing a BitTorrent client in Haskell.
+
+I chose Haskell for this project because I wanted to try out some of the features in real use. The synchronous non-blocking I/O and green threads were appealing and so I decided to handle every peer connection in a separate thread… Which leads to Software Transactional Memory to coordinate them. I’ve used it before, but I figured there will be a lot of state and that this will be a good opportunity to evaluate it.
+
+Before we dive deep into managing connections and actual protocol logic, let us first make sure that we speak the data exchange protocols. This post will be all about that. The first one is called Bencode and is used for files and for talking to the tracker. The other is the Peer Wire Protocol and is used by peers to communicate with each other. Both are binary protocols. We’re going to use the well known Attoparsec parser combinator library for Bencoding and Data.Binary for PWP.
+
+At it’s core, Bencoding is very similar to JSON. Even though it’s a binary format, the numbers are encoded in ASCII text so they are unaffected by endianness.
+
+Let’s make a table of raw values and their Bencoded representations.
+
+Now that we understand the possible Bencoded values, we can create a datatype to store them.
+
+I’m using an to store the number. This will handle both sign and arbitrarily large inputs. We will be converting this to an efficient integer type depending on the context later on.
+
+Let’s parse every variant of a value as we go in Attoparsec:
+
+Nothing complicated here, we read the number of characters, the delimiter and finally the raw bytestring.
+
+In this one we scan the surroundings and extract a signed decimal number.
+
+We’re scanning the surroundings again and parsing all the values inside. The function will be revealed in a second. All it does is combine all the parsers.
+
+Here we take care of the surroundings and extract multiple pairs of string-value pairs. Then we use to extract the raw bytestring from our boxed String subtype.
+
+And to combine those variants into a full parser.
+
+Let’s test the parser on a chunk of a file I extracted.
+
+Because multiline input is not convenient in GHCi, I split it up into lines, save it in a file and read it in in the interpreter. After reassembling the input, we can see the parser in action.
+
+Because traversing and extracting data from our structure would involve a ton of pattern matches and nesting, we’ll define lenses to help us with that. I’m using the package. I won’t go into detail here, there are many lenses tutorials out there. We’re only defining traversal lenses, so this should be simple - just look where function is applied.
+
+I’m not an expert on lenses, but this worked pretty well for me so far.
+
+Testing it out in GHCi, let’s continue where we left off in the earlier session:
+
+I have been associating files with Bencoding until this point and it’s time to expand on that.
+
+Those files actually have a strict schema called Metainfo. The structure is documented here.
+
+Lenses for our Bencoded values are convenient, but we can do better by repackaging that data into a simpler data structure with a fixed schema. This will also serve as a validation layer for us, as we’ll see in a second.
+
+While the BitTorrent protocol allows downloading multiple files per torrent, let’s skip that for now. Furthermore, we’ll fetch a subset of the data, just what we need to move on. I’m more interested in getting it to work first, then expanding features.
+
+store -byte SHA1 hashes for each piece. These hashes are used to validate every piece the client downloads.
+
+To extract the data from raw s into those types, I’m using to make this elegant.
+
+I’m serializing back the info dictionary to Bencoding and then hashing it with a SHA1. This is referred to as the Info hash and is used by the protocol to uniquely identify this torrent. We’ll use this later for things like asking trackers about peers and handshaking them.
+
+Messages in the Peer Wire Protocol begin with a 4 byte integer describing the remaining length of the message. Peers use these messages to talk to each other. Some messages exist to modify the state and drive the protocol, while others are used for requesting & transferring data between the peers.
+
+Before I describe each message, let’s see a typical exchange so it’s easier to understand what each message does later on.
+
+When a peer reaches out to another peer, it sets up a TCP connection with that peer. Handshakes are exchanged to identify the protocol, the version, extensions and so on. Bitfields are then exchanged to inform the other peer about our progress. A bitfield is just an efficiently packed array of bits that signifies completion of each piece in the torrent.
+
+These four booleans are enough to coordinate the protocol. Peers start out as choked and uninterested, so how do we get to actually download some data? We first express interest in the other peer, letting him know we want to request some chunks. Then, we wait for the other peer to unchoke us. It’s entirely possible that he never will, depending on his algorithm, the limit of connections, etc. The BitTorrent protocol lets clients decide how to handle these messages. They are free to implement their own algorithms/heuristics. Finally, when the other peer unchokes us, we can request chunks and the other client must respond with data.
+
+Let’s now go over the variants of PWP messages and see their hexdumps.
+
+This is the most basic message used to keep the connections alive. Clients send it periodically.
+
+This message tells the other peer that it’s choked and cannot request any data.
+
+This message tells the other peer that it’s unchoked and may request data.
+
+This message tells the other peer that we are interested in his data. It’s a hint for the other peer to unchoke us.
+
+This message tells the other peer we are not interested in his data anymore. He can choke us to use the upload slot for someone else.
+
+This message tells the other peer that we have completed a piece.
+
+Sends the full bitfield (piece download progress) to the other peer.
+
+In this example, the bitfield indicates all pieces except 14th as completed. A bitfield of 4 bytes could store the status of up to 32 pieces.
+
+It’s interesting to note how small the overhead of the protocol is. The standard advises selecting a piece size (when creating the torrent) so that our Metainfo doesn’t exceed . If we assume there’s of just piece hashes, that makes pieces, which will make the bitfield only bytes. On top of that, this message is sent only once per peer connection.
+
+Requests a chunk of n bytes inside a piece at offset. To download a full piece, the client has to sent out requests like those. The standard practice seems to be to request data at chunks of bytes.
+
+Transfers data to the other peer.
+
+Putting all of that together into a datatype and a instance:
+
+The only thing worth noting here is the use of unsigned 32bit integers as required by the protocol.
+
+We’re now capable of speaking all the required protocols and are ready to initiate some connections. The journey continues in the next post, where we’ll implement the peer monad to handle connections with peers.|||
+
+This is the first post in a series on writing a BitTorrent client in Haskell.

@@ -1,0 +1,159 @@
+In part 1 of this article, we explored the pros and cons of monoliths – or more precisely modular monoliths - as compared to the microservices architecture.   Along the way, we discussed maintainability, transactionality, complexity, scalability, flexibility of implementation and developer productivity.
+
+What we concluded from that discussion was that the architecture you should choose depends, of course, on context.  Two of the most important considerations are shown in figure 1.
+
+If your domain is (relatively) simple but you need to achieve “internet-scale” volumes, then a microservices architecture may well suit.  You must be confident enough in the domain to decide up-front the responsibilities and interfaces of each microservice.
+
+If your domain is complex but the expected volumes are bounded (e.g. for use just within an enterprise), then a modular monolith makes more sense.  A monolith will let you more easily refactor the responsibilities of the modules as your understanding of the domain deepens over time.
+
+And for the tricky high complexity/high volume quadrant, I would argue that it’s wrong to optimize for scalability first.  Instead, build a modular monolith to tackle the domain complexity, then refactor to a microservices architecture as and when higher volumes are achieved.  This approach also lets you defer the higher implementation costs of a microservices architecture until such time that your volumes (and presumably revenue) justify the business case to spend the extra money.
+
+Implementing a microservices architecture correctly can be challenging, but building a modular monolith also needs to be tackled thoughtfully.  In part 1, we identified a number of potential issues:
+
+Here in part 2 of the article, we’re going to explore how to tackle these issues, and we’ll look at an example of a real-world modular monolith on the JVM that leverages a powerful open source framework to manage cross-cutting concerns.
+
+With a modular monolith, we need some way to delineate the boundaries of each module.
+
+Our first option is to use language features – such as packages (Java) or namespaces (.NET) – to group together the module’s functionality, but it isn’t otherwise distinguished from the rest of the application.  There are however no guarantees that there won’t be cycles between those packages/namespaces; if you only use this option, you’re very likely to end up with a non-modular monolith, a big ball of mud.
+
+Instead, we need a bit more structure, allowing build tools to enforce the acyclic dependencies we require between those modules.  Implementing this on the Java platform could be done using a Maven multi-module project; for .NET it would be a single Visual Studio solution with multiple C# or F# projects within.  All this code is recompiled together, but the build tooling (Maven or Visual Studio) will ensure that there are no cyclic dependencies between those modules.
+
+One downside with this second option is that, because all the code is held in a single code repo and is all (re)compiled together, it also must all be (re)tested and it all gets the same version number.  This option doesn’t exploit the fact that, in reality, different modules evolve at different speeds.  Why continually rebuild/retest code that changes only slowly over time?
+
+A third option is therefore to move modules out into their own code repos, and version each separately.  On the .NET platform, we can package each module up as a NuGet package, while on Java we can package as Maven modules.  From the context of the main application that consumes them, these modules are indistinguishable from a third-party dependency.
+
+However, this is also where we need to take care because it’s possible to end up with cyclic dependencies.  For example, suppose that a v1.0 module depends upon an v1.0 module.  If a developer creates a new version v1.1 that references customers v1.0, then we seemingly have the customers and modules mutually dependent upon each other; a cyclic dependency.  This is, of course, a Bad Thing™.
+
+To solve this, we need to decide which direction the dependencies are meant to flow in: is customers module meant to depend on the , or vice versa?  The heuristic here is the stable dependencies principle: unstable (frequently changing) modules should depend on stable (infrequently changing) modules.  In our example, the question becomes: which concepts are more volatile: or ?  If the direction of the dependency is incorrect, then the dependency inversion principle can be used to refactor.
+
+Figuring this out can be quite straightforward.  Some modules may just hold reference data, for example tax rate tables or .  Other modules that are almost but not quite reference data include , and , or maybe (financial) .  Another good example is “filing-cabinets” which just store stuff: for example, or .  In all these cases, other modules will depend on these modules, not the other way around.
+
+We could also take a more scientific approach and turn to our version control history, measuring the relative amount of churn in each module.
+
+Modules that are stable are good candidates to move out of the application’s code repository and into their own repositories.  And once you have moved out modules into their own repo, then they can start being reused in other applications too.
+
+Actually, all we require is that the interface defined by a module is stable.  Whether or not the implementation behind the interface is stable is unimportant.  In fact, it can be a good move to also move modules out whose implementation is still in flux, because it removes some of the code churn from the main repo.  Exploiting this fact does though require that the module’s interface is formally, and not implicitly, defined.
+
+The above is all well and good, but what we also need is an early warning when a cyclic dependency does accidentally get introduced, ideally within our build or CI.  This is achievable.
+
+Let’s go back to the example above: v1.0 à v1.0 while v1.1 à v1.0.  The application itself will link to the latest version of each module, which gives us v1.0 and v1.1 in a cyclic dependency.
+
+This is a dependency convergence problem, more commonly called “JAR (or DLL) hell”.  Figure 2 shows a more common example, where an application uses two libraries that in turn use conflicting versions of some common base library.
+
+If running on the JVM, then this would manifest at runtime with linkage errors; under normal circumstances the JVM only loads one version of a class at a time.
+
+To fix this, Maven’s Enforcer plugin can be configured to flag any dependency convergence issues, if necessary failing the build. The developer can then use section within the (or sometimes dependency <exclusions>) to decide which version of any given common library to run with.  The use of semantic versioning by open source libraries is increasingly common, so if the version difference is only minor (v2.3 vs v2.4) then most likely the higher version can be used without issue.
+
+If using NuGet 3.x, then a similar effect can be achieved by virtue of the “Nearest wins” dependency resolution rule.
+
+That said, some projects, such as Guava, release major versions quite regularly and do delete deprecated API; there’s a chance that it might not even be possible to run the monolith shown in figure 2.  In such a case, you must look to fix that dependency conflict by updating it.  If that’s not an option, you might be able to shade (repackage) the dependency.  If those aren’t options for you, you’ll just have to rework your code somehow to remove the conflict or maybe even the dependency.
+
+For the sake of completeness, we should note that OSGi applications (on the JVM) avoid this problem because each module chain (bundle in OSGi parlance) can be arranged to load in a different classloader.  However, while OSGi has its fans, it’s the exception rather than the rule, and may well lose ground when Java 9 ships with the Jigsaw module loading system.   Jigsaw is no silver bullet though: it very deliberately does not attempt to tackle the dependency convergence issue, instead leaving it as a problem for build tools such as Maven to handle.
+
+To summarize: (on the JVM at least) use Maven’s Enforcer plugin to enforce dependency convergence issues, and where there are conflicts, then clearly handle them with sections and if necessary   Keep these under close review – I’ve started putting mine into an always-active called “resolving-conflicts” so they are more obvious – and always be looking to reduce these exceptions over time.
+
+Just as in a microservices architecture, in a modular monolith, each module is responsible for persisting its own data.  In most cases, these modules will all be using a relational database to store their entities: relational databases still (rightly) rule the roost for many enterprise webapps.  This then provides the “tactical” opportunity to co-locate those tables on a single RDBMS, and thus take advantage of transactions.
+
+In terms of mapping entities in a module to an RDBMS, since each module will have its own namespace/package, this should be reflected in terms of the schema names of the tables (to which the entities within those modules are mapped).  The module/schema should also be used as the value of any discriminator columns for super-type tables (i.e. mapping inheritance hierarchies).
+
+One of the key differences between a domain object model and a relational database is the means by which relationships between entities are represented; in memory, there’s an object pointer, whereas in the database there’s a foreign key attribute.  As figure 3 shows, a naïve mapping of the classes (on the left) to the tables (on the right) can result in the direction of dependencies in effect being the opposite in the database to that of the code.
+
+The places that hold the Customer entity are both the Customers table, and also the Addresses.customer_id column (because that foreign key corresponds to the Customer.addresses field).  Even if the codebase is nicely organized as a set of layered modules with acyclic dependencies, when we look at the RDBMS we have our big ball of mud.
+
+The problem can be fixed though.  To keep all the Customer information in the same schema, we should move the foreign key out of the Addresses table and into a link table, as shown in figure 4.  The performance hit will be negligible.
+
+I would argue that relationships for the tables of entities within the same module don’t need this treatment... but I also wouldn’t argue too hard against you if you wanted to always introduce a link table for all associations.
+
+More involved are polymorphic associations between objects.  For example, we might want to be able to attach to all domain objects.  As shown in figure 5, we can introduce the concept of (an interface) and use concrete implementations to act as the link table.
+
+Each individual will be mapped to two tables, one in the schema, and one in the schema specific to its implementation, for example   The column indicates the concrete subtype.
+
+What’s nice about this mapping is we can still leverage referential integrity between all the tables in the database, while in the code we have a natural use of the Paperclip interface.
+
+The patterns described above show that there are techniques to tackle structural decoupling of the database, but this doesn’t necessarily address behavioural coupling.  In part 1, we identified the problem that a developer working in module A could write a SELECT statement directly querying the tables owned by module B.  How should this be tackled?
+
+The solution used on the monoliths I work on is to make the ORM the way in which database interactions are performed; ad-hoc SELECT statements are verboten.  On the .NET monolith I work on, we use Entity Framework, and each module corresponds to a separate DB Context.  This also handles structural issues; EF only manages foreign keys within the module/DB Context, and we use the polymorphic link pattern described above to handle relationships between modules.  For the Java monolith, we use DataNucleus (which implements JDO and JPA APIs); again, each module has its own persistence context.
+
+You may well ask: what of those use cases where an ORM doesn’t work?  The glib answer is that it’s worth investing the time learning to use the ORM effectively: chances are that it does work, actually.  That said, in both monoliths, we handle special cases – typically where large volumes of data are required from two or more modules - using views which JOIN the tables from the relevant modules.  The ORM neither knows nor cares that the entity is mapped to a view rather than a table.  This is a performance optimization: the view effectively co-locates the business processing with the data.   The view definitions are also trackable as code artefacts in their own right: we can see where we’ve deliberately chosen to subvert module boundaries in order to meet some user goal.
+
+It’s common for a business operation to result in a change of state in two or more modules.  For example, consider an invoicing application where we want to perform an invoice run.  This will mostly modify state only in the i module, creating new and objects.  However, if some customers want their invoices to be sent out by email, then it might as a side-effect create Document objects (in the documents module), and Communication objects (in the communications module).
+
+In a microservice architecture we have no transactions across services, which in general means we must use messages to coordinate such changes.  The system therefore has only eventual consistency, and compensating actions are used to “back out” the change if something goes wrong.  In some systems, this eventually-consistent behaviour can be confusing to the end-user, and to the developer too.  For example, in the CQRS pattern that separates out writes from reads, a change written against one service will not immediately be available to read from another.
+
+For a monolith though, if the backing data stores for the and modules are all co-located in the same RDBMS, then we can simply rely on the RDBMS transaction to ensure that all the state is changed atomically.  From an end-user perspective, everything remains consistent; there are no potentially confusing interim states or compensating actions to worry about.  For the developer, they can expect that writes written to the database will be there to read immediately.
+
+Synchronous behaviour can improve the user experience in other ways too. Imagine that each Customer has a collection of associated , and that one of these is nominated as the one to send invoices to.   Suppose now that the end-user wants to delete that particular   In this case, we want the module to veto the deletion, because that email address is “in use”.  Basically, we want to enforce a referential integrity constraint across modules.
+
+While supporting this use case in a microservice can be complicated, in a monolith we can easily handle the requirement.  One design is to use an internal event bus, whereby the customer module broadcasts the intention to delete the , and allows subscribers in other co-located modules to veto the change:
+
+The underlying technical platform would automatically emit the onto the internal event bus, prior to invoking the delete.  The subscriber can, if required, veto this interaction for the provided email address, if it is in use.
+
+A different, more explicit, design is for the customer module to declare a service provider interface (SPI) and then allow other modules to implement that SPI:
+
+Listing 3: Customer action to delete email address, with validation and an “advisor” SPI
+
+with an advisor class implementing the SPI:
+
+Here the method is a guard called before the delete method; it is used to determine if the delete may be performed for this particular email address.  Its implementation iterates over all injected advisors; a non-null return value is interpreted as the reason that the cannot be deleted.
+
+Here’s another use case. In figure 5 we saw how different modules might provide the ability to attach to their respective entities by way of implementations. One can imagine that the module might contribute an “attach” action that would allow to be attached, but this action should only be made available in the for those entities for which a implementation exists.  Again, the module could discover which entities expose the “attach” action either by emitting events on an internal event bus, or through an SPI service.
+
+The idea here is that the class acts like a mixin or trait, contributing the attach action to all objects.  However, (via the hide method) this action is not shown in the if there is no able to actually attach a document to the particular domain object acting as the context to the mixin.
+
+Whether you build yourself a monolith or a microservices system, you’ll need some sort of platform or framework on which to run it.
+
+For microservice architectures the platform is mostly focused on the network: it needs to allow services to interact with each other (protocols, message encodings, sync/async, service discovery, circuit breakers, routers, etc.) and to be able to run up the system in its entirety (Docker Compose, etc.).  The language to implement any given individual service is less important, so long as it can be packaged, e.g. as a Docker container.  (Of course, the project team must have the appropriate skills in that language for initial development and ongoing maintenance/support).
+
+For monoliths, too, a common platform is required, but here the focus is more on the language and supporting ecosystem.  At a very minimum this will be the technology platform such as Java or .NET.  On top of this you’ll probably also adopt some framework, JEE and Spring being common choices.
+
+Because a monolith’s strength is dealing with complex domains, the underlying platform should pick up as many technical/cross-cutting concerns as possible: security, transactionality and persistence are the obvious ones (there are others, as we’ll see).  Moreover, business modules should not depend on the technical modules; we want to get as close to the hexagonal architecture as possible.
+
+It’s also important for a monolith’s platform to provide tools allowing business modules to be decoupled from each other.  A solution to this for a monolith is remarkably similar to that of a microservice: use an event bus.  The difference is that with a monolith, this event bus is intra-process and is also transactional.
+
+To help make the case for a modular monolith, we end part 2 of this article with a real-world example.
+
+The application in question is called Estatio, an invoicing system for Eurocommercial Properties, a real-estate company that owns and operates (at the time of writing) 34 shopping centres in three European countries.  The source code for Estatio can be found on GitHub.
+
+The underlying technology platform/framework for Estatio is Apache Isis, a full-stack framework for the JVM that handles all the usual cross-cutting concerns such as security, transactionality and persistence.  However, it goes further than this in also automatically rendering domain objects either through a web UI or through a REST API, following the naked objects pattern.  In the same way that an ORM automatically maps/marshals a domain object into a persistence layer, you can think of Apache Isis as mapping that domain object into the presentation layer.
+
+Because the UI is generic, it can be steadily improved/enhanced with no changes to the domain object model.  For example, in a previous release, the Apache Isis viewer was improved to use Bootstrap for styling.  Every application that updated to this release was then “magically upgraded” with the improved viewer.  When capabilities such as maps, calendars or Excel exports have been added, they too are rendered automatically in the UI everywhere that the framework can infer that they apply.
+
+Because interactions to the business domain objects go “through” the generic UI provided by Apache Isis, then a whole bunch of other cross-cutting concerns can also be tackled.  For example, Apache Isis automatically creates a command memento (serializable to XML) for every action invocation or property edit, and this can then be published to an event bus such as Apache Camel as the transaction completes.  It also correlates this command with an audit trail, providing full cause-and-effect traceability of every change made to every domain object.
+
+The framework works by building an internal metamodel (similar to how ORMs work), and this metamodel can be exploited for other purposes than just the generic UI and REST API.  For example, a Swagger interface file can be exported to allow custom UIs to be built against the REST API, while the powerful security module defines roles and permissions with respect to the properties and actions of the domain object types.  The metamodel is also used to generate gettext “.po” files to be translated for i18n.  It’s also possible to define metamodel validators to enforce architectural standards, for example: that every entity in a given module is mapped to the correct database schema.
+
+With the framework handling so many of the technical concerns, the developer is able to focus on the domain, ensuring that it is properly modularized for long-term maintainability.  To help modules stay fully decoupled, the framework supports the concept of mixins, whereby the rendering of a given domain object can include state and behaviour from several modules without there actually being any coupling of the business modules themselves.   The ability to attach Documents to arbitrary objects is a good example; the code in listing 5 above is very similar to the Apache Isis programming model.
+
+Equally important is the provision of an internal event bus.  Rather than have one module directly call another, it can just emit an event which other modules can then subscribe to.  The code listings 1 and 2 are once again examples of how Apache Isis supports this.
+
+Persistence patterns such as support for polymorphic associations (figure 5) are also important.  These are implemented by various open source modules in the Incode Catalog to support generic subdomains such as , and
+
+A further extensive set of modules can be found at Isis Add-ons.  These tackle technical concerns such as security, auditing, and event publishing.  The extensions to the Apache Isis viewer (maps, calendars, PDF, etc.) are also to be found here.
+
+To make both the generic business subdomains and technical add-ons easy to reuse, each is supported by its own demo app and integration tests.  The would-be consumer of these apps can therefore check them out easily to see if they fit requirements.
+
+So much for Apache Isis and its supporting ecosystem; the proof of the pudding is in the eating.  What the technical platform should enable is the ability for the development team to concentrate on the core domain, with that domain broken up into modules.  And so, if you inspect the Estatio codebase you will indeed see that it consists of a number of separate modules.  Figure 7 shows how these depend on each other (diagram generated using Structure101).
+
+In the diagram on the left-hand side of figure 7, each box represents a separate Maven module, and the lines represent dependencies between the modules.
+
+Towards the bottom are utility modules (domsettings, numerator) or modules that contain strictly reference data (country, currency, index, tax, charge).
+
+Moving into the middle we see the agreement, party, financial, asset, assetfinancial and bankmandate modules: neither the structure of these modules nor the data within them changes that often.  By the time we get to budgeting, invoice and in particular lease, we are at the heart of the system; these are the modules that depend most on the other submodules.
+
+The diagram on the right-hand side of figure 7 is almost the same, however the lease module has been expanded into its sub-packages.  Here we can start to see some bidirectional dependencies, suggesting that this code could perhaps be improved.  There are certainly a lot of outbound dependencies, so the module is probably doing too much.  No software is perfect.  Then again, while lease is the largest module in the system, it’s still conceptually small enough for us to work on (“a lease is an agreement between two parties – a tenant and landlord – that calculates invoices”).
+
+Estatio is now almost 5 years old as an application, with its scope set to continue to expand to support further use cases.  But its code base may shrink even as its scope expands: the majority of the modules in Isis Add-ons and Incode Catalog were factored out of Estatio, and we expect to factor out further modules in the future.  And if you cloned its repo today to take a look, you might find it has moved on from the above diagrams.  That’s to be expected; this software is intended to have a long-shelf life, and will continue to evolve.
+
+In part 1 of this article we compared the modular monolith with the microservices architectures, exploring the benefits and weaknesses of both.
+
+We also asked the question: “which architecture should you go for, microservices or monoliths?”  And we answered by asking a different question: “what is it you are trying to optimise for?”  If on balance you’ve decided that the risk of domain complexity outweighs the risk of not being able to scale, then you should have decided to implement a modular monolith.  Hopefully the various techniques and patterns we’ve described here in part 2 will assist.
+
+Technical platforms are important whatever the architecture; there’s no point in reinventing the wheel.  A framework such as Apache Isis will allow you to channel your energies into tackling the complexities of the domain, helping you explore the module boundaries, while mopping up almost all of the technical cross-cutting concerns (including the presentation layer).
+
+We also looked at a substantial open source application, Estatio, that uses Apache Isis as its underlying platform, showing what a modular monolith looks like “in the flesh”.
+
+Neither monoliths nor microservices is a silver bullet; the answer to “which should I go for?” is always “it depends”, and anyone who tells you otherwise is selling you snake oil.  Consider where your system fits with respect to scalability vs. domain complexity, and take it from there.
+
+Dan Haywood is an independent consultant most known for his work on domain-driven design and the naked objects pattern. He is a committer for Apache Isis, a Java framework for building backend line-of-business applications, and which implements the naked objects pattern. Dan has a 13+ year ongoing involvement as technical advisor for the Irish Government's strategic Naked Objects system on .NET, now used to administer the majority of the department's social welfare benefits. He also has 5 years ongoing involvement with Eurocommercial Properties co-developing Estatio, an open source estate management application, implemented on Apache Isis. You can follow Dan on Twitter and on his Github profile.|||
+
+In the age of microservices, "monolith" has become a dirty word. Yet, monoliths, designed with an emphasis on modularity, can be a better solution for complex domains, such as enterprise applications. The second part of this 2-part series covers a practical approach to creating a successful, modular monolith.

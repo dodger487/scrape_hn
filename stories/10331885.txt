@@ -1,0 +1,91 @@
+Recently, I discovered a performance regression on a very common page on Discourse. I spent a fair amount of time debugging and optimizing. I follow a certain methodology while I do this kind of work.
+
+This post is a breakdown on the specific issue I faced with some points you can take back and apply to your next performance debugging session.
+
+The first and most important point to take is that you should pick your battles. Discourse has hundreds of routes, however the vast majority of the server cost is incurred by a handful.
+
+The most important 3 routes for us are "topics/show", "list/latest" and "categories/index". They are the heart of the site and lion share of foreground routes.
+
+"topic/timings", "user avatars" and "drafts" are all background routes, we still want to minimize work on them so servers work less hard and we can host more sites, however slowness there is usually not observed by end users.
+
+I always try to focus first on the most active routes foreground routes, those are the spots where I will invest the most amount of effort optimizing.
+
+To get a good picture of our traffic patterns we use Kibana. To answer the same question you may use Google Analytics, New Relic or some other tool.
+
+We have a Grafana dashboard keeping an eye on our 2 most important routes for every site we run. I visit the dashboard regularly to see how performance is on those routes. Is displaying topics getting faster or slower? It is very important to have long term trends so you can isolate when stuff starts playing up.
+
+Showing topics on 2 particular sites (one is shown) got much slower. Having this information is golden.
+
+This graph is a visible report card on my work towards improving performance. When I see a graph like this my immediate goal becomes restoring old performance characteristics. This is particularly important here since this is our most important route.
+
+During my performance work I generally use rack-mini-profiler and flamegraphs.
+
+rack-mini-profiler is great at getting a good overall picture of activity on a page. In particular, I find it very effective at isolating slow SQL and minimizing SQL calls.
+
+Flamegraphs are awesome at looking underneath the surface and finding hidden costs.
+
+A huge pitfall many can fall into with Rails is doing performance tuning in development mode. There is huge amount of noise and irrelevant costs that are absent in production.
+
+In production a lot less work happens, additionally there is high risk that if I debug performance in development mode I may work on something that has no impact in production... like improving the rendering time of
+
+During my dev work I will cycle between various customer databases, this allows me to have a good feel of performance real customers feel. When debugging a performance problem it is critical to have an exact copy of the database exhibiting the issue, the regression in performance may be due to a customer setting, data anomaly and so on. Doing performance work on a stock development database is like performing an operation with a blindfold.
+
+I listened once to a talk by Charlie Nutter where he was talking about performance. He said the key to fast programs is doing less work. I completely agree with this analysis.
+
+Here are some specific examples of commits I made while debugging this issue.
+
+A typical topic show page on Discourse will spend half the time in SQL.
+
+A typical breakdown for a page being rendered at Discourse is
+
+By running less SQL statements not only do we save the time in SQL, we also save on the Active Record overhead. A huge amount of the time I spend optimizing performance looks at improving SQL, or eliminating SQL calls.
+
+A recent example here would be memoizing a property on an ActiveRecord object to avoid N+1 (commit)
+
+The SQL view in rack-mini-profiler is key at finding SQL to eliminate:
+
+Can these queries be done in once go?
+
+Sometimes the majority of the cost boils down to a single SQL statement, a specific example may be the query we use to track what unread and new posts a user has, this particular query has gone through at least 5 rewrites: (commit)
+
+When profiling I always prefer to profile the common case. For most our sites the most common case is "anonymous" visiting a particular topic.
+
+I usually cheat to enable rack-mini-profiler, run it in production and add a in my authorization method:
+
+By profiling the common case you can find optimizations that may be less obvious.
+
+A classic example is more aggressive caching for anonymous, during my debugging I discovered that a huge portion of the time generating our pages was serializing our view of what a "site" is. This construct lists the categories a user has access to, the groups, site settings an so on.
+
+This particular construct is highly cachable for anonymous, and partially cachable for logged on users.
+
+I introduced a fragment cache to cache parts of it: (commit , commit)
+
+I introduced a full cache for the anonymous case to avoid a huge chunk of work: (commit)
+
+Usually we assume that a commit caused a performance regression, though often the case, this is not always the case.
+
+For example, I recently discovered this issue:
+
+We have this site setting called: , this allows users to add a url for an icon that is included in a meta tag like so
+
+When I was debugging one of the slow sites I noticed a rather odd behavior. When I hit refresh on a page a web request was made to get the page. After the page was loaded a second GET request was made the same URL. This stumped me.
+
+After a long round of debugging I discovered that the link tags were:
+
+The customer set apple icon to nothing, it was their way of communicating they do not care for this feature. But we were rendering a blank href. Chrome and Firefox were dutifully attempting to grab this icon from the relative URL , aka. this page.
+
+This was fixed in (commit)
+
+The nastier the performance problem I hit the more likely I will not arrive at an efficient solution on first go. It is often tempting to just sit at the computer for 10 hours straight nutting out an issue. Unfortunately this is often counter productive. Taking a walk lets me clear my head, de-stress and come up with new novel solutions.
+
+Traditionally people may approach a performance regression with the mindset of:
+
+Instead I prefer to take the approach of
+
+I usually discover what it is that made the code slow during my process of optimizing. Making code fast leads to a very intimate understanding of its performance traits. As a side effect of my latter approach I leave the slow code faster than the baseline when I am done.
+
+Sometimes when strapped for time I will just bisect, hope for the best and move on when I find the hole, but I find it so much more fun to leave the code faster than it was before it regressed.
+
+This approach though takes a lot of time and patience. Not giving up is the key to success.|||
+
+Sam's Spot - Sam saffron's web log

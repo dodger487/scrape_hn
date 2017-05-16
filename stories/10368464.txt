@@ -1,0 +1,54 @@
+Make a Windows program by stuffing bytes into a buffer and writing it to disk: no compiler, no assembler, no linker, no nothing! It was the obvious conclusion of my recent efforts to gain more control over what goes into my executables, and this time I could set every bit exactly as I wanted it. Yes, I am still a control freak.
+
+I began with a simple C program called ExeBuilder to construct the buffer and write it to disk in a file named handmade.exe. ExeBuilder looks like this:
+
+All of the interesting work happens in BuildExe(). This function manually constructs a valid Windows PE header, filling the required header fields and leaving the optional ones zeroed, then creates a single .text section and fills it with a few bytes of program code. The program in this case doesn’t do much – it just returns the number 44.
+
+Sorting out the PE header details and determining which fields were actually required was a chore. All my testing was performed under Windows 7 64-bit edition. If you try these examples on your PC, it appears that earlier versions of Windows were more permissive with PE headers, while Windows 8 and 10 may be more strict about empty PE fields.
+
+Here’s my first implementation of BuildExe(), which makes a nice standard executable with a single .text section containing 4 bytes of code.
+
+The resulting file is 516 bytes. Check to make sure it works:
+
+The executable is built from six data structures, which are numbered in the code’s comments. The cross-references in these structures are sometimes specified as offsets within the file, and sometimes as relative virtual addresses or RVAs. File offsets reflect the executable as it exists on disk, while RVAs reflect how it’s loaded in memory at run-time. An RVA is a run-time offset from the executable’s base address in memory. Getting these two confused will lead to problems!
+
+DOS Header – The only fields that must be filled are the ‘MZ’ signature at the beginning and the e_lfanew parameter at the end (unless you’re actually writing a DOS program). e_lfanew gives the offset to the PE header, which in this case follows immediately after.
+
+PE Header – The true PE header doesn’t contain much, because all the good stuff is in the optional header. The PE header specifies 1 section (the single .text section with the code to return 44), and 208 bytes combined size for the next two sections.
+
+Optional Header – The optional header is only optional if you don’t care whether the program works. Some noteworthy values:
+
+Data Directories – A typical executable would store offsets and sizes for its data directories here, the number of which is given in the optional header. Data directories are used to specify the program’s imports and exports, references to debug symbols, and other useful things. Manually constructing an import data directory is a bit complicated, so I didn’t do it. That’s why the program just returns 44 instead of doing something more interesting that would have required Win32 DLL imports. Handmade.exe does not have any data directories at all.
+
+If you’re wondering why there are 14 data directories each with zero offset and size, instead of just specifying zero data directories, that’s a small mystery. According to tutorials I read, some parts of the OS will attempt to find info in data directories even if the number of data directories is zero. So the only safe way to have an empty data directory is to have a full table of offsets and sizes, all set to zero. However, I found other examples that did specify zero data directories and that reportedly worked fine. I didn’t look into the question any further, since it turned out not to matter anyway.
+
+Section Table – For each section, there’s an entry here in the section table. Handmade.exe only has a single .text section, so there’s just one table entry. It gives the section size as 4 bytes, which is all that’s needed for the “return 44” code. The section will be loaded in memory at RVA 4096, which is also the program’s entry point.
+
+Section Data – Finally comes the actual data of the .text section, which is x86 machine code. This is the meat of the program. The section data must be aligned to 512 bytes, so there’s some padding between the section table and start of the section data.
+
+Here’s what dumpbin says about this handmade executable. Many of the fields are zero or have bogus values, but it doesn’t seem to matter:
+
+Sometimes a picture is worth 1000 words, so I also made a color-coded hex dump of the executable file:
+
+After doing all this, of course my first thought was to try making it smaller. There’s a lot of empty padding between the section table and the section data, due to the 512 byte alignment of sections in the file. There must be some way to shrink or eliminate that padding, right? I tried reducing Opt.FileAlignment to 4, moving the .TEXT section data down to 336, and adjusting sectHdr.PointerToRawData accordingly. All I got for my effort was an error complaining “handmade.exe is not a valid Win32 application.” I’m unsure why it didn’t work. Maybe the OS doesn’t like sections that aren’t 512 byte aligned in the file, no matter what the PE header says.
+
+Then I thought maybe I could reuse the header as the section data. By changing sectHdr.PointerToRawData to 0, I could make the Windows loader use a copy of the executable header as the .TEXT section data. 0 is 512 byte aligned, so there wouldn’t be any alignment problems. It seemed strange, since an executable header is not x86 code, but by stuffing the 4 bytes of code into an unused area of the header and adjusting Opt.AddressOfEntryPoint, I could theoretically patch everything up. Lo and behold, it worked! The new executable was only 340 bytes.
+
+With the 4 bytes of code now stored inside the header, I wondered if I really needed a section at all. The Windows loader will load the header into memory along with all the sections, so maybe I could just eliminate the .TEXT section completely, and rely on the entry point address to point the way to the code stored in the header?
+
+This worked too, but not without a lot of futzing around. After setting PE.NumberOfSections to 0, PE.SizeOfOptionalHeader and Opt.SizeOfHeaders both had to be set to zero. They’re both essentially offsets to section structures, and with no sections, apparently a 0 offset is required. Opt.SectionAlignment also had to be reduced to 2048, and I honestly have no idea why. With those changes, the modified program worked.
+
+With the elimination of the section table, this should have been enough to shrink the executable to 300 bytes, but I found that anything smaller than 328 bytes wouldn’t work. It appeared that the OS assumes a minimum size for the optional header or the data directories, regardless of the sizes specified in the header. So 28 bytes of padding are required at the end of handmade.exe. The 328 byte version of BuildExe() is shown here, with the changes from the previous version highlighted:
+
+328 bytes was pretty good, but of course I wanted to do better. A popular technique seen in other “small PE” examples is to move down the PE header and everything that follows it, so that it overlaps the DOS header. This is possible because most of the DOS header is just wasted space, as far as a Windows executable is concerned.
+
+The PE header can be moved down as low as offset 4 within the file. It must be 4-byte aligned, and it can’t be at offset 0 because then it would overwrite the required ‘MZ’ signature at the start of the file. Doing this is simple: just move everything but the DOS header down by 60 bytes.
+
+The only complication with overlapping the DOS and PE headers this way is with the DWORD at file offset 60. This value is the e_lfanew parameter that gives the file offset to the PE header, so it now must be 4. But due to the overlapping, it’s also the Opt.SectionAlignment parameter that specifies the alignment between sections in memory at run-time. Hopefully Windows is OK with a 4-byte section alignment! It turns out that it’s fine, but only if Opt.FileAlignment is also 4. I’m not sure why.
+
+These changes should have been enough to shrink the file to 240 bytes, but once again the OS seems to require 28 bytes of padding at the end of the file. Here’s the updated 268 byte version of BuildExe():
+
+And another pretty picture, with some color blending going on where data structures overlap:
+
+According to several sources, 268 bytes is the absolute minimum size for a working executable under Windows 7 64-bit edition. There are other tricks that would shrink the header even more, but then I’d just have to add more padding. I can go no further!|||
+

@@ -1,2 +1,83 @@
-|||
+Hello! Today I am at the netdev conference, and this is the second day.
 
+I’m going to write about the Most Exciting Thing from today, which was a great hour-long tutorial about eBPF and XDP by Andy Gospodarek and Jesper Dangaard Brouer. I thought it was so exciting I wanted to write a whole blog post just with my notes from that tutorial.
+
+This tutorial walked us through how to build a simple DDoS prevention XDP filter! This was amazing because there were talks yesterday about how to build DDoS prevention yesterday kind of abstractly, but they showed in this tutorial exactly how you build a simple example and talked about a lot of the details. The application they built had:
+
+They were pretty clear that this is just a demo / example to understand the concepts, not something to immediately start using in production :)
+
+All of the code for this tutorial is on GitHub in their prototype-kernel repo.
+
+eBPF is a virtual machine in the kernel. It’s pretty flexible (you write eBPF programs by writing C code, so you can do a lot!) but there are limitations. Some important limitations/facts to know about eBPF:
+
+XDP is a new system in the kernel, that lets you write custom eBPF programs to filter network packets. We’ll call those “XDP programs”. The XDP programs run as soon as the packet gets to the network driver (so very very quickly).
+
+When an XDP program, it needs to exit with either , , or . There might be more return codes in the future.
+
+They said Ubuntu 16.10 has XDP – IIRC the earliest kernel version with XDP support is 4.8.
+
+For this program, we want both kernel code (the XDP program, which is going to run inside the kernel) and userspace code (for us to run to tell the program in the kernel which IP addresses to block).
+
+You might think that the command line tool would need to run as root (because it’s talking to the kernel), but it turns out that the command line tool works by updating the BPF maps! And the way you update the BPF maps is through a file interface in sysfs ( ). And if you’re updating something through a file, you can just change the permissions / ownership of that file!
+
+So the command line tool to add new IP addresses to blacklist doesn’t need to run as root.
+
+Okay, so what is this BPF map we’re updating? It has type . This map is going to have IP addresses as keys and how many packets we’ve blocked for that IP address as a value. This is a hash that is, well, per cpu. So every CPU has its own map. This means that our userspace tool that reports how many packets have been blocked will need to add up all the values for each CPU.
+
+I think having the map be per CPU is more efficient or something.
+
+So our map has: (the definition is here
+
+So how does this XDP program work?
+
+Almost the first line in this program is (from here)
+
+The beginning of any packet is an Ethernet header. We need to parse that Ethernet header. The really interesting point that they made here is – XDP programs are compiled inside the kernel tree. This means that you have access to all the kernel data structures! And the kernel already has a struct that represents an Ethernet header, so you don’t have to write that much fancy parsing code, you can just reuse that struct from the kernel.
+
+The heart of the XDP program is this part (from line 227): where we look up the source IP address in our BPF map. If it’s there then we increment the value (so that we can know how many packets were dropped!)
+
+This whole program that parses the packet, finds the IP address in the IP header, looks it up in the BPF map, and returns is only 270 lines of C! That seems really reasonable!!
+
+Also there are no loops because this is eBPF and loops aren’t allowed, which makes it even easier to understand.
+
+One very interesting thing that they pointed out is this check:
+
+This is basically making sure that you’re not going outside of the packet. The interesting here is that if you don’t do your bounds checking properly, the kernel will reject your code – since eBPF code is running inside the kernel, it needs to make sure that it’s not accessing any data it shouldn’t. So it somehow does static analysis on your program to make sure it’s not doing anything illegal. That’s super interesting and I would like to learn more about how this works! Let’s keep going, though.
+
+Okay, so we’ve written an XDP program, compiled it to an object file , and we want to get it into the kernel. They said there are 2 ways to do this:
+
+This is the user code linked before.
+
+Basically what I understood in this part is that there is a (userspace) library provided by the kernel for loading BPF code. They copied it out of the kernel and made some changes because they wanted it to be different. bpf_load.c
+
+I’m kind of fuzzy on what’s involved in the userspace part right now but the code is there, so I can read it later if I need to know more. The point is that the program loads the object file into the kernel.
+
+So we wanted to attach this XDP program to a network interface. How do we know if it worked?
+
+When I run on my laptop, I get a list of all network interfaces:
+
+This shows all these settings for the interface, like . If there’s an XDP program running on that interface it’ll also say in there.
+
+Here are some tips they gave!
+
+tip 1: if when your BPF program is running it says in , you should turn on the kernel JIT. Running your BPF code through the JIT will make everything way faster
+
+tip 2: if your ulimits aren’t high enough you’ll run into problems. I’m a little fuzzy on what a ulimit is still but this seems like a good tip. You can look at ulimits with
+
+tip 3: dump out kern.o maps with readelf / objdump to look at them. “It’s just an ELF file, it’s not magic”. when you do, you can see the section with the XDP program and the section with the BPF maps! you can also see the eBPF bytecode in the maps section but it’s not that human readable :)
+
+tip 4: you can use to print debugging message. These don’t actually get printed, but they end up in the kernel tracing system at
+
+tip 6: you can persist your BPF maps when the XDP program is attached/detached.
+
+They wrote a filter that filters all UDP traffic (or some UDP traffic? unclear). They tried implementing the rule in iptables and compared it to their custom XDP approach.
+
+so this XDP program really was more than twice as fast as iptables! Cool!
+
+performance definitely isn’t the only benefit over iptables though – it’s definitely really important that with XDP you can write arbitrary code.
+
+I really liked that this tutorial focused on demystifying how this stuff works – they said it’s really useful to use readelf/objdump to look at the ELF files that are generated along the way to understand how they’re structured.
+
+I still don’t understand everything but this made the idea of writing eBPF programs to make my kernel filter packets seem WAY more concrete/feasible. Probably some things in this post are wrong but I hope you have learned something anyway!|||
+
+How to filter packets super fast: XDP & eBPF!

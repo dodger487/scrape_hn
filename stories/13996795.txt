@@ -1,0 +1,70 @@
+A note to readers: The code samples included within this blog post may trigger alerts from your security software. Please note that this does not indicate an infection or an attack; rather, it is a notification that the code could be malicious if it were live.
+
+In mid-January of 2017 Unit 42 researchers became aware of reports of open-source developers receiving malicious emails. Multiple owners of Github repositories received phishing emails like the one below:
+
+Though there were multiple waves of messages following a similar tactic, each one carried the same malicious .doc file as an attachment (SHA256: 6b9af3290723f081e090cd29113c8755696dca88f06d072dd75bf5560ca9408e). This file contained embedded macro code that executed a commonly observed PowerShell command to download and execute a file.
+
+Figure 1. The attackers used  a common technique to try to avoid static detection by introducing characters which the Windows shell will ignore but static engines will typically see as part of the string.
+
+A more readable version of the PowerShell code is shown below:
+
+On initial inspection, everything appears to follow the same formula as many “traditional” malware campaigns: e-mail lure, malicious attachment, macro, PowerShell downloader, and finally a binary payload (SHA256: 3f73b09d9cdd100929061d8590ef0bc01b47999f47fa024f57c28dcd660e7c22). Examining the payload’s communications caused us to raise our eyebrows.
+
+Dimnie, the commonly agreed upon name for the binary dropped by the PowerShell script above, has been around for several years. Palo Alto Networks has observed samples dating back to early 2014 with identical command and control mechanisms. The malware family serves as a downloader and has a modular design encompassing various information stealing functionalities. Each module is injected into the memory of core Windows processes, further complicating analysis. During its lifespan, it appears to have undergone few changes and its stealthy command and control methods combined with a previously Russian focused target base has allowed it to fly under the radar up until this most recent campaign.
+
+Let us dive right in and have a look at a typical HTTP request from Dimnie to its command and control infrastructure.
+
+Figure 2. Initial HTTP GET request from the compromised client and the server’s reply. The HTTP payload is truncated in this image.
+
+Does this malware use a (now-defunct) Google service to aid its initial phone home? Not quite. Examining the HTTP request, this appears to be an HTTP Proxy request, as described by RFC2616:
+
+Dimnie uses this feature to create a supposedly legit HTTP proxy request to a Google service. However, the Google PageRank service (toolbarqueries.google.com) has been slowly phased out since 2013 and as of 2016 is no longer open to the public. Therefore, the absolute URI in the HTTP request is for a non-existent service and the server is not acting as a proxy. This seemingly RFC compliant request is merely camouflage.
+
+We know what it isn’t, so we will dive deeper to figure out what is happening underneath the camouflage layer. Start by having a look at the DNS request that immediately preceded this HTTP GET request.
+
+Figure 3. DNS request issued prior to the HTTP request above.
+
+It looks pretty normal, but we can see an authoritative nameserver returning an IP address, 176.9.81[.]4, which is highlighted in the image below.
+
+While it may not seem so at first glance, this DNS query is related to the initial GET request to Google. Below is the raw hex of the IP header of the HTTP request above:
+
+Figure 5. Raw Hex of the IP Header from the HTTP GET request for Dimnie’s initial phone home.
+
+The answer (176.9.81[.]4) from the initial DNS request for onechat[.]pw is used as the destination IP for the follow up HTTP request that appears to connect to toolbarqueries.google.com. Sending the request to an entirely different server is not complicated to achieve, but how many analysts would simply see a DNS request with no [apparent] related subsequent traffic? That is precisely what Dimnie is relying upon to evade detections.
+
+Since we have established the HTTP GET request to be largely falsified for camouflage purposes, we can now proceed to pick apart the initial outbound HTTP traffic. The contents of the HTTP GET parameter are reproduced below:
+
+This GET request contains a single piece of data used by the malware: the contents of the “ch” parameter which is base64 encoded.
+
+Decoding the “ch” parameter yields us a AES key which Dimnie uses to decrypt payloads. The attacker uses AES 256 in ECB mode to encrypt payloads which are push to a compromised host and decrypted.
+
+The code below illustrates, in Python, the method we used to derive this key.
+
+Besides the HTTP payload, which is an AES 256 ECB encrypted PE file (after decrypting, SHA256: 6173d2f1d7bdea5f6fe199d39bbefa575230c5a6c52b08925ff4693106518adf), the server reply contains only one other HTTP header that seems to be used by the malware; the Cookie value sent back from the C2 server. This Cookie is a 48 byte, base64 encoded, AES 256 ECB encrypted series of UINT32 values pertaining to the payload (when requested) or outbound data (HTTP POSTs, see next section) as can be seen below (comments appended after //.)
+
+Here is a list of possible types which may be found at offset 0x24:
+
+The values contain a preset, defined size for the payload as well as an expected CRC32 value. Effectively, the Cookie parameter is used to verify the payload’s integrity during the module downloader portion of the malware’s lifecycle. When the Cookie value is included in later C2 traffic, it is primarily used to identify the type of data being sent back to the server and the reporting module.
+
+Data exfiltration by the associated modules is performed using HTTP POST requests to another Google domain, gmail[.]com. However, just like the module downloader portion of the malware, these HTTP requests are hardcoded to be sent to an attacker controlled server. Again, Dimnie attempts to blend in by looking at least somewhat legitimate, although the data exfiltration traffic is far less convincing than that of the module downloads.
+
+Once again, the data is appended to an image header and encrypted using AES 256 in ECB mode. The Cookie value follows the same structure provided in the previous section. This initial push contains system information as can be seen in the decrypted output below (data enclosed in brackets has been edited):
+
+During our analysis, we identified follow on POST requests containing screenshots of the compromised desktop and process activity lists which were encrypted and appended to a false JPEG header as described previously.
+
+Now that we understand how Dimnie retrieves its modules and how it protects them, we can use the derived AES key to decode the observed payloads from our PCAP data. The payloads themselves are never written to disk as they are downloaded and subsequently injected directly into memory. The module ID is stored at offset 0x2C as a 32 byte value in the Cookie field, however to calculate the “true” module ID we must use the following formula using the key found at offset 0x04 in the cookie: uModuleID = uID – uKey. Below is a table of observed module IDs, their functions, and type of information as referenced by the Cookie Header (at offset 0x24):
+
+The self-destruct module, 0x20009, drops and executes the following batch script:
+
+The primary purpose of the modules we’ve observed observed is information stealing and reconnaissance. It should be noted that Dimnie’s modular framework allows for a variety of capabilities to be accessed by its operators, thus the modules observed during the analyzed campaign may not encompass all available functionality.
+
+The global reach of the January 2017 campaign which we analyzed in this post is a marked departure from previous Dimnie targeting tactics. Multiple factors have contributed to Dimnie’s relatively long-lived existence. By masking upload and download network traffic as innocuous user activity, Dimnie has taken advantage of defenders’ assumptions about what normal traffic looks like. This blending in tactic, combined with a prior penchant for targeting systems used by Russian speakers, likely allowed Dimnie to remain relatively unknown.
+
+Customers are protected by IPS, Dimnie is detected as malware by Wildfire, and Autofocus customers can see related samples using the Dimnie tag.
+
+We are also including IOCs for this malware family dating back to 2014 which include domains from DNS lookups (Appendix A) and dropper hashes (Appendix B). IOCs specifically mentioned in this post are included in the next section.
+
+We’ve purposefully omitted legitimate domains and IPs from this listing.
+
+Ignite ’17 Security Conference is a live, four-day conference designed for today’s security professionals. Hear from innovators and experts, gain real-world skills through hands-on sessions and interactive workshops, and find out how breach prevention is changing the security industry. Visit the Ignite website for more information on tracks, workshops and marquee sessions.|||
+

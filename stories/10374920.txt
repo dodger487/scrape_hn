@@ -1,0 +1,167 @@
+For a very long time the only way to extend Ruby with native estensions has been using .
+
+ I don’t have the numbers with me, but I guess is not the first choice for Ruby programmers when they have to pick up a secondary/complentary language.
+
+ So I started investigating the possibility of writing them in other languages, taking advantage of the favorable moment: in the past 3-4 years we had an explosion of new languages that compile down to native code and can be easily used to produce a equivalent shared library that Ruby can pick up and load.
+
+My main goal was to find languages that a Ruby programmer would understand effortlessly or with a minimum investment.
+
+ This first episode will focus on Go.
+
+Up until version 1.4, there was really no point in building a native extension in Go, you’d have to create a proxy function for every Go function being called, at the point that there was literally no benefit compared to writing everything in pure .
+
+ With version 1.5, Go made a step forward, introducing the support for building shared objects; this opens up a lot of new possibilities for writing shared code that gets executed outside the Go environment, including Ruby.
+
+This is all your extension will just be:
+
+Have I already told you that FFI is awesome?
+
+There are a few things you need to pay attention to:
+
+This could be all, but of course it is not.
+
+ Writing a Ruby extensions in a different language is one thing, writing it because the other language really offers some noticeable advantage, is entirely different.
+
+ As a base for this series of articles, I will port the extension.
+
+ I’ve chosen it for very simple reasons:
+
+Even if is great, it is still a dependency, that needs to be installed and maintained.
+
+ extensions are usually self contained and take advantage of the programming interface to build the necessary exported APIs.
+
+ Go has a very good support for interfacing to as you can see in this file
+
+There are some new tricks here, that need an explanation.
+
+ Just before we find what’s called by Cgo, and it’s just code that the compiler put at the beginning of the generated file, as it is, before starting the compilation.
+
+In other words, the generated code will start with
+
+You probably have guessed that the prefix gives access to the world directly from Go, with some added benefit: for example the converts Go native strings to ( ) strings. This function allocates memory, so you must free the memory using .
+
+We do that in , that tells Go to free the memory as soon as the surroinding function returns and is a very common pattern.
+
+ The pointer to the string is declared as because it does not belong to the Go world.
+
+Another thing you might have noticed is the reverse twin function that takes a string and returns a Go string. In this case no memory is allocated, the GC takes care of everything, so no freeing is required.
+
+Some of the code just refers to the programming interface, defined in and related headers.
+
+ For example is a macro for various types of pointers to data structures (from strings to function pointers) and defines a new method.
+
+ It takes four parameters: the class to which the method belongs to (in this case which is the Ruby equivalent of the builtin class), the name of the method (in this case ) a callback and the number of arguments (zero in our case).
+
+Basically we are writing something like
+
+The third argument of is the function that gets executed when the method is invoked on the Ruby side.
+
+ The Go runtime and the code are executed in different threads, with different stacks, it it prohibited to pass a pointer to Go code to , so we can’t take a pointer to a Go function and simly pass it to , because it won’t work.
+
+There is a workaround, we can our Go function and pass the pointer to it instead, after casting it to (the Go equivalent of ): .
+
+ There is only a small problem: does not exists until the files are compiled, so we cannot implicitly refer to it.
+
+ We need to add a forward declaration to tell the compiler we know this function exists and it’s imlpemented somewhere else outside here.
+
+ That’s what the line is for, and it’s a standar declaration for callbacks ( ).
+
+ The rest is quite straightforward:
+
+Take a convert it to a string and then convert the result to a Go string.
+
+If the string is empty or after removing all the unicode spaces on the left side, it is still empty, we found a blank string. Otherwise we return false.
+
+ and are just two #defines that map to a Ruby boolean.
+
+Each extension has an function, and it’s automatically called when the extension is d.
+
+ The name of the function must be , in our case .
+
+Last but not least, to compile our self contained extension, we need to pass some flags to the compiler. We’ll do it using a specific Cgo comment: .
+
+ just before the add these lines
+
+The interpolation codes must be replaced with the actual value.
+
+ I’ve put it there for reference.
+
+ Hint: the output must have extension and not as we did before, othewise Ruby will refuse to laod it.
+
+ In the repo of the gem you can find an ad hoc that will take care of everything.
+
+Now we have a compiled, native, Ruby extension, launch and type
+
+You should see our extension announcing itself by printing .
+
+ It’s time to measure the performances and comment the results.
+
+ After launching , the numbers are:
+
+
+
+ Go is between 2 and 4 times slower than the original Ruby implementation!
+
+Well, first of all Go is not only slower than Ruby, but it’s plateuing, looks like the speed
+
+ of the Go extension is not influenced byt the length of the string, but it’s just going as fast as it can,
+
+ and that is the fastest speed possible.
+
+ A loss in performance was to be expected, Go does not generate binary executable code, but code for its VM generate executable code that have to deal with its runtime internals, it is somewhat in between Java and compiled languages.
+
+ But honestly actually running slower than Ruby code was a real surprise.
+
+ According to this Russ Cox answer, calling from Go has an aoverhead
+
+ similar to calling ten Go functions, looks like Go is one of those languages that can run faster ported code, than calling
+
+ the implementation.
+
+ If every function call counts for ten, it’s no wonder that calling it thousands of time in a tight loop, would cause such
+
+ a tremendous loss in performances.
+
+ To test this assumption, I moved the tight loop from Ruby to the Go extension: I ran the same comparison one thousand times
+
+ inside a Go loop and the same I did on the Ruby side.
+
+ These are the new results:
+
+This time Go ran a bit faster, but with long strings the same slowness arises.
+
+ I suspect the conversions routines from Ruby VALUE to Go strings are responsible for most of the overhead.
+
+ Removing it from the equation gave me much better results (between 300 and 16 times faster than Ruby), but it’s a low level optimization that makes sense only for three lines functions that are called over and over again, like this one.
+
+ These numbers are not to be taken as a real benchmark, they are just the results of a micro benchmark and are not representetive of real performances in a real world application.
+
+ But they clearly show that running Go in a tight loop has a serious performance overhead, while if you delegate to
+
+ Go some heavy lifting work, it can give some performance boost.
+
+Writing Ruby extensions in Go, especially in conjunction with the great library, can be real fun.
+
+ You got the feeling of without any of the drawbacks of writing low level code.
+
+ Writing completely auto contained extensions, it’s a lot more work, but it’s more tedious than hard.
+
+ The situation could improve vastly when someone will wrap the Ruby programming interface in a nice Go package to hide the inheritance and maybe
+
+ write a plugin to automate all the boilperplate code (for example
+
+ exporting the functions to ). But in the end it is still a lot easier than writing pure .
+
+ Perfomance wise though, I’m doubtful that you could have some gain just by rewriting parts of you app in Go.
+
+ It is in fact quite possibly the opposite.
+
+ Go has a performance problem when intercating with and it’s by design.
+
+However, there could be patterns where Go could be really helpful.
+
+ I’m sure Go channles and concurrency are worth exploring.
+
+ Maybe in a next episode.|||
+
+For a very long time the only way to extend Ruby with native estensions has been using C. I don’t have the numbers with me, but I guess C is not the first choice for Ruby programmers when they have to pick up a secondary/complentary language. So I started investigating the possibility of writing them…

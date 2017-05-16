@@ -1,0 +1,43 @@
+Intel’s SGX provides hardware-secured enclaves for trusted execution of applications in an untrusted environment. Previously we’ve looked at Haven, which uses SGX in the context of cloud infrastructure, SCONE which shows how to run docker containers under SGX, and Panoply which looks at what happens when multiple applications services, each in their own enclave, need to communicate with each other (think kubernetes pod or a collection of local microservices). SGXIO provides support for generic, trusted I/O paths to protect user input and output between enclaves and I/O devices. (The generic qualifier is important here – currently SGX only works with proprietary trusted paths such as Intel’s Protected Audio Video Path).
+
+A neat twist is that instead of the usual use cases of DRM and untrusted cloud platforms, SGXIO looks at how you might use SGX on your own laptop or desktop. The trusted IO paths could then be for example a trusted screen path, and a trusted keyboard path. Running inside the enclave would be some app working with sensitive information (the example in the paper is a banking app), and the untrusted environment is your own computer – giving protection against any malware, keystroke loggers etc. that may have compromised it. It might be that your desktop or laptop already has SGX support – check the growing hardware list here (or compile and run test-sgx.c on your own system). No luck with my 2015 Dell XPS 13 sadly.
+
+SGX enforces a minimal TCB comprising the processor and enclave code. Even the processor’s physical environment is considered potentially malicious. In the local setting considered by SGXIO we’re trying to protect the local user against a potentially compromised operating system – physical attacks are not included in the threat model.
+
+At the base level of SGXIO we find a trusted hypervisor on top of which a driver host can run one or more secure I/O drivers. The hypervisor isolates all trusted memory. It also binds user devices to drivers and ensures mutual isolation between drivers. In addition to hypervisor isolation, drivers are also executed in enclaves.
+
+The trusted hypervisor, drivers, and a special enclave that helps with hypervisor attestation, called the trusted boot (TB) enclave, together comprise the trusted stack of SGXIO. On top of the hypervisor a virtual machine hosts the (untrusted, commodity) operating system, in which user applications are run. The hypervisor configures the MMU to strictly partition hypervisor and VM memory, preventing the OS from escaping the VM and tampering with the trusted stack.
+
+(Other, non-protected devices can be assigned directly to the VM).
+
+Secure user apps process all of their sensitive data inside an enclave. Any data leaving this enclave is encrypted.
+
+(Other, non-protected apps can just run directly within the VM as usual).
+
+Creating an encrypted channel (trusted path) between enclaves (e.g., an app enclave and a driver enclave) requires the sharing of
+
+ an encryption key. The authors achieve this by piggy-backing on the SGX local (intra-platform) attestation mechanism (see section 3.1 in this Intel white paper). One enclave (in this case the user application enclave) can generate a local attestation report designed to be passed to another enclave (in this case the driver enclave) to prove that it is running on the same platform.
+
+The previous section described how SGXIO works when everything is up and running. We also need to be able to trust the hypervisor hasn’t been tampered with in the first place, which is achieved via a trusted boot and hypervisor attestation process.
+
+SGXIO requires a hardware TPM (Trusted Platform Module) for trusted booting. Each boot stage measures the next one in a cryptographic log inside the TPM. Measurements accumulate in a TPM Platform Configuration Register (PCR) whose final value reflects the boot process and is used to prove integrity of the hypervisor.
+
+The TB enclave verifies the PCR value by requesting a TPM quote (cryptographic signature over the PCR value alongside a fresh nonce). Once the TB enclave has attested the hypervisor, any driver enclave can query the TB enclave to determine if the attestation succeeded.
+
+So far so good, but we still need to defend against remote TPM cuckoo attacks:
+
+To defend against such cuckoo attacks, the TB enclave also needs to identify the TPM it is talking to, by means of the TPM’s Attestation Identity Key (AIK). And how does the TB enclave get the correct value of the AIK to compare against? This part requires external provisioning… and sounds pretty fiddly in practice:
+
+To prevent an attacker creating additional enclaves under the attackers control and directing legitimate TPM quote or TB enclave approval requests to these enclaves, the hypervisor hides the TPM as well as the TB enclave from the untrusted OS.
+
+After all this work, how does a user know that they’re actually talking with the correct app via a trusted path? The answer relies on presenting a secret piece of information which is shared between the user and the app. For example, once a trusted path has been established to the screen, the app can display the pre-shared secret to the user via the screen driver.
+
+Once more though, we have to rely on an external provisioning mechanism to get the secret in place to start with:
+
+I don’t know what Intel would think about this, but…
+
+All production enclaves need to be licensed by Intel, whereas unlicensed enclaves can be launched in debug mode. Once launched though, the only difference between a debug and production enclave is the presence of SGX debug instructions
+
+ The core of the idea is to intercept all SGX debug instructions in the hypervisor, so that only the trusted hypervisor itself can debug enclaves. See section 7 in the paper for the fine print…|||
+
+SGXIO: Generic trusted I/O path for Intel SGX Weiser & Werner, CODASPY '17 Intel's SGX provides hardware-secured enclaves for trusted execution of applications in an untrusted environment. Previously we've looked at Haven, which uses SGX in the context of cloud infrastructure, SCONE which shows how to run docker containers under SGX, and Panoply which looks at…

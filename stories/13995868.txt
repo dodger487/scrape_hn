@@ -1,0 +1,99 @@
+This is the first in a series of articles intended to provide an in-depth review of a few common architectural patterns that are employed when building complex web applications using React (or sufficiently React-like libraries), as well as some advice for avoiding common issues associated with those patterns.
+
+I confess that I also have a secondary intent. As I was writing, I realized that some of the patterns I’ve used when structuring my applications could be factored out into a separate library that automates good architectural practices. So the ulterior motive of this article is to introduce the library zine, with the hope that you’ll check it out, play around with it if you like it, and maybe even provide me with some feedback about it.
+
+The overall claim that motivates this series is that there’s a particular architectural issue that’s endemic to complex React applications: it can be difficult to manage state dependencies that cut across the structure of the component hierarchy in a way that doesn’t introduce a lot of unnecessary complexity or inefficiency.
+
+In this first part, I’ll introduce a few very basic (and probably familiar) concepts in order to unpack the claim articulated above, then I’ll discuss the most common way of structuring React applications — which I call the naive hierarchical architecture — and finally I’ll describe the complexity issues that arise when using this architectural pattern.
+
+If you’re relatively new to React, you’ll want to read this first part carefully. Otherwise, just skim it to make sure you understand what I mean by state management, distribution and publishing, and that you recognize the complexity problems associated with cross-cutting dependencies from experience before moving on.
+
+In the second part, I’ll discuss an alternative architectural pattern which I call the top-heavy architecture. Then I’ll briefly discuss the relationship between top-heavy architectures and another pattern called Flux, before concluding with a discussion of performance issues that can come up in top-heavy systems.
+
+Even if you’ve used a top-heavy or Flux-y framework before, it’s probably still worth checking out the second part, especially for the discussion of real-world performance issues at the end.
+
+The third part introduces an advanced architectural pattern that refines the top-heavy architecture by introducing what I call articulation points. I describe the approach and discuss how to implement it in a straightforward way using the zine library, then outline an overall architectural strategy based on what was covered in the first three parts.
+
+Finally, the fourth part discusses further refinements to the zine-based articulated architecture, e.g. integrating Flux, using immutable data and adopting a more declarative, dataflow inspired state management system.
+
+But for now, let’s get started with the basics.
+
+The thing that makes a complex web application complex is state. State is variability with consequences. Static web pages don’t change (and aren’t especially complex), but dynamic web apps can re-configure their interfaces in response to state changes in internal variables and data structures.
+
+Throughout this article, I’ll use “information” primarily to mean state information, or information being communicated to one thing about the state of another.
+
+All dynamic components need ongoing access to certain information about state in order to render. A toggle control needs to know if it’s toggled or not and when that state has changed, a spreadsheet cell needs to know its contents and when to update those contents, etc.
+
+State that a component depends on is a state dependency. A state dependency should be distinguished from the DOM state or visual state of the component itself. The DOM that a toggle control manages can be in different states representing “on” and “off”, but the actual Boolean value that determines which state it’s in is the toggle control’s state dependency.
+
+Components can generally be thought of as functions of their state dependencies. Although it’s common in React to distinguish between props and state, props are actually a form of state dependency — they’re a value that the component uses to determine what to render. That said, it’s still useful to distinguish between this.props and this.state based on the fact that the former is an external dependency and the latter is an internal dependency.
+
+We often distinguish between stateful (or smart) and stateless (or dumb) components based on whether they have any internal state. This terminology could be confusing if taken at face value. It’s not that stateful components can change and stateless ones don’t — as we noted, essentially all user interface components can be in different states and have state dependencies. The distinction actually depends on what informs the state of the component and where that information comes from.
+
+If a component’s state is self-contained, which is to say it’s determined by internal variables that the component manages, then the state “lives” in that component and the component is called “stateful”. If the component doesn’t have any internal state, and its state is determined entirely by outside factors that are communicated to it (e.g. props) then we call it “stateless”. Stateless components don’t have any hidden state — they’re static modulo changes to external dependencies. Stateful components are often best thought of as mutable objects, whereas stateless components are a lot more like pure functions.
+
+Many of the choices we make when developing component-based applications come down to where state should live and how it should be communicated.
+
+In particular, for any piece of state data there are three questions to answer:
+
+The choices we make when answering those questions determine the information architecture of our application.
+
+It’s especially important to distinguish between distribution and publishing here. Passing a state dependency to a component through props distributes it to that and effectively publishes its initial state, but after a component has rendered, no state changes that affect that dependency will affect the component until they’re published to the component in some way (e.g. by re-rendering it with new props, or a call to this.setState).
+
+The information architecture we’ve just been discussing is distinct from (though sometimes conflated with) the hierarchy of user interface components.
+
+React components provide a (mostly) declarative way to build a DOM tree. React components stand in for and manage parts of the DOM tree, and consequently they’re arranged in a tree-like hierarchy that aligns with the structure of the DOM. Starting with a root node, each React component renders itself by declaring child nodes (either more React components or virtual DOM markup elements) and passing props down to them.
+
+React strongly suggests a convention for answering at least one of the questions that comes up when making decisions about information architecture: when it comes to distributing information to components, it should be passed down through the component hierarchy at render time via props. The distribution of state information basically always happens through (and is thus coupled to) the component hierarchy.
+
+In React applications, state information tends to flow down the component hierarchy from parent to child through props. Distributing information in any other way is typically much more complicated. In particular it’s hard to pass information back up the hierarchy from child to parent (typically accomplished via callback), and especially between siblings. This will be shown to have important consequences shortly.
+
+Throughout the rest of this article, we’ll pretty much assume that when components don’t manage their own state, the relevant information is distributed to them by being passed down through props.
+
+So that leaves us with two other architectural questions to answer: how do we manage state and how do we publish state changes?
+
+Perhaps the most common way of organizing a React application is using what I call the naive hierarchical architecture, in which the primary driver of state is the internal state of smart components. In React, this is done idiomatically through the internal state variable this.state and its setter method this.setState.
+
+There’s a sense in which state management and publishing are collapsed into a single thing, since using this.setState updates this.state and triggers a re-render, which effectively publishes any changes down the hierarchy to children (and ultimately to the DOM) through updated prop values.
+
+It’s common to see a component manage its own data e.g. by fetching it from the server in a lifecycle method called at mount time, keeping it in internal state and calling this.setState inside of event handlers to mutate it and publish changes down the hierarchy.
+
+This is very simple and it works very well in many circumstances. The primary feature of the naive hierarchical architecture is that it couples state data to particular user interface components very strongly.
+
+This can be a strength, as it aids encapsulation in many circumstances. Self-managing components are typically very self-contained, and there’s less spaghetti code when everything related to fetching, processing and displaying data is co-located. But as we’ll see, it can also become a problem.
+
+The naive hierarchical architecture works best when there aren’t many shared information dependencies — if the only thing that needs to know about some piece of state data is your component (or its direct children) then it makes a lot of sense for that component to manage that state. In the next section, we’ll discuss some problems that can arise when that stops being the case.
+
+Before I discuss drawbacks associated with the naive hierarchical architecture, I should give a small disclaimer: if you’re just making a self-contained component, or your application is very simple, you should definitely consider starting with the naive hierarchical architecture. It’s often just fine. Alternative architectures can be overkill and should be used to address specific problems that arise when your application grows more complex.
+
+One drawback associated with having components manage their own state data is that this couples state management to individual component lifecycles. If some data lives in your component’s local state, then it dies with that component — without further steps to save data, the contents of this.state are lost as soon as the component unmounts. This can lead to a variety of issues, e.g. unnecessarily duplicated data fetches and cases where the interface annoyingly forgets state as soon as it’s not visible.
+
+But the main problem with self-managing components is that they couple all the aspects (management, distribution and publishing) of your information architecture to the user interface component hierarchy.
+
+The shape of the component hierarchy is in large part determined by the layout of the page via the structure of the DOM. Because information is distributed primarily through props in React, the structure of the parent/child relations between your components (as determined by the page layout) strongly affects how easy it is to pass information between them, and thus the one-way (parent to child) constraint on information distribution can have odd effects on how you manage and publish state.
+
+There’s no reason that the structure of state dependencies across your components should match the hierarchical structure of the DOM, and things can get complicated when those two things don’t align.
+
+Things are easiest when you have a component that manages some state and needs to pass it down to one of its descendants. In this case, the component that manages that state can just pass the relevant information along to the dependent components through props, either directly (if the dependent component is a direct child) or through intermediaries if necessary.
+
+Because passing information down the hierarchy is the simplest way to do things in React, we tend to factor things so that parent components manage state and pass it to child components as necessary. But sometimes the structure of the DOM dictates that the child component needs to be involved in managing the state, e.g. if you have a button that affects the state of the component that contains it. In this case, the temptation is to find a way to pass information back up the hierarchy, from child to parent.
+
+This is commonly done through callbacks. For example, a parent component can pass a child toggle control the state of the toggle (“on”/”off”) and a handler that’s called when the toggle is flipped, which triggers a state change in the parent and a re-render of the child with a new state.
+
+But ancestor/descendant relationships only take us so far. Not all components are going to be related in this way. If two sibling components both depend on some state information, they have to get it from their shared parent, even if the parent has no other reason to care about that information.
+
+This kind of state dependency pattern is what I’ll call cross-cutting, because it cuts across the component hierarchy. Moving state from a component to its parent in order to share it with a sibling isn’t usually a big deal, but it illustrates a basic point about the naive hierarchical architecture: it forces the developer to make decisions about how and where state is managed and distributed that are dependent on the structure of the DOM. Furthermore, it introduces complexity when the structure of the DOM doesn’t exactly line up with the structure of information dependencies.
+
+Things can get much worse if the component hierarchy is more complicated and the dependencies cut across bigger parts of it. Under the naive hierarchical architecture, if two components on entirely separate parts of the page and entirely different branches of the component hierarchy share a state dependency, it must be passed to them (in one way or another) through their closest common ancestor.
+
+This is a problem for a number of reasons. It’s a source of complexity, in the Hickean sense: more things are intertwined and dependent on one another than they need to be. It unnecessarily couples the logic and information flow of your application to the structure of the component hierarchy (and thus the layout of the page), and it makes the state structure of your application hard to predict. If you want to see the code that manages some state logic, it’s not obvious where to find it. You might start at a component that’s obviously affected by the state you’re interested in and fail to find any logic that manages it. Instead, you find it passed in from a parent component, and you have to basically work your way up the component hierarchy until you find the component that manages the state you’re interested in. It can be hard to predict exactly where in the hierarchy any given state is going to end up living.
+
+A related problem is that this architecture is unstable and often requires refactoring. If the visual layout changes, the DOM structure and thus the component hierarchy is liable to change, and since the information flow and state logic is bound to that, those will often have to change as well. You might build state logic into a component, then find out that one of its siblings also needs that information and move the logic up the hierarchy, then find out once again that another component on some other part of the page suddenly needs that information and you suddenly have to refactor once again…
+
+In short, the problem with the naive hierarchical architecture is that cross-cutting information dependencies can make things get a little chaotic.
+
+Are there other architectures that aren’t so chaotic, that accommodate cross-cutting information dependencies better? Of course. We’ll cover one in the next installment.
+
+Next up is Part 2: The Top-Heavy Architecture, Flux and Performance|||
+
+This is the first in a series of articles intended to provide an in-depth review of a few common architectural patterns that are employed when building complex web applications using React (or…

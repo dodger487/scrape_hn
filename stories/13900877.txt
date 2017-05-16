@@ -1,0 +1,53 @@
+When we were getting SignifAI off the ground, one of the biggest decisions we had to make right at the beginning was what our stack would be. We had to make a typical choice: use a relatively new language like Go or an old, solid one like Python. There are many good reasons for choosing Go, especially when looking for high performance, but because we already had significant experience with Python, we decided to continue with it. But it’s important to note that our product and infrastructure must support hundreds of thousands of events per second. As we are collecting massive amount of events and data points from multiple sources for our customers. Each event should be processed in real time as fast as possible, so we do care about latency as well. It’s not trivial, especially as we need to minimize our compute costs and be as efficient as possible.
+
+So we were happy to see that, with the recent widespread adoption of Python 3 and the introduction of tasks and coroutines as first-class citizens in the language, Python has recently stepped up its game. Over the past few years, what started with Tornado and Twisted and the introduction of the asyncio module in Python 3 has continued evolving into a new wave of libraries that disrupt and change old assumptions about Python performance for web applications. Teams that want to build blazing-fast applications can now do so in Python nearly seamlessly without having to switch into a “faster” language.
+
+Despite Python’s many advantages, the design of its interpreter comes with what some might consider a fatal flaw: the global interpreter lock, or GIL. As an interpreted language that enables multi-threaded programming, Python relies on the GIL to make sure that multiple threads do not access or act upon a single object simultaneously (which can lead to discrepancies, errors, corruption, and deadlocks). As a result, even in a multi-threaded program that technically allows concurrency, only one thread is executed at a time—almost as if it were, indeed, a single-threaded program. This occurs because the GIL latches onto a thread being executed, periodically releases it, checks to see if other threads are requesting entry, then reacquires the original thread. If another thread wants access, the GIL acquires this second thread instead, thus blocking access to the first, and so on.
+
+Multiple threads are necessary for Python to take advantage of multi-core systems, share memory among threads, and execute parallel functions. In turn, the GIL is necessary to keep garbage collection working and avoid conflicts with objects that would destabilize the entire program. The GIL can be a nuisance, especially when it comes to speed. Often, a multi-threaded program runs slower than the same program executed in a single thread because the threads have to wait for the GIL in order to complete their tasks. These delays in running threaded programs is what makes the GIL such a headache for Python developers.
+
+So why not just get rid of the GIL? As it turns out, that’s not so simple. Early patches in the 1990s tested removing the GIL and replacing it with granular locks around sensitive operations. While this did increase the execution speed for multi-threaded programs, it took nearly twice as long to execute programs with single threads.
+
+Since then, a number of workarounds have come on the market that are effective only to some extent. For instance interpreters like Jython and IronPython don’t use a GIL, thus granting full access to multiple cores. However, they have their own drawbacks, namely problems with supporting C extensions and, in some situations, running even slower than the traditional CPython interpreter. Another recommendation for bypassing the GIL is to use multiple processes instead of multiple threads. But while this certainly allows true concurrency, multiple processes cannot share data, short processes result in excessive message passing, and copies must be made of all information, often multiple times, which slows down the process. Solutions such as NumPy can be used for serious number-crunching by extending Python’s capabilities by moving parts of the application into an external library. NumPy alleviates some of the GIL’s problems, but it, too, has limitations in that it requires a single core to handle all of the execution.
+
+When Twisted and Tornado came on the scene with Python 2 and early versions of Python 3, they presented intriguing possibilities. They don’t get rid of the GIL, but they—similar to Python’s asyncio—are asynchronous networking libraries that rely on non-blocking network I/O. In essence, these libraries use callbacks to run an event loop on a single thread that allows I/O and CPU tasks to be carried out simultaneously. (Even though these tasks don’t interfere with each other, only one task can be carried out a time in the traditional, multi-threaded process—and this takes advantage of the inevitable downtime.) These libraries also allow the thread to context-switch quickly, furthering its efficiency because tasks are carried out as soon as they’re necessary, without lying idle. While Tornado and Twisted technically use threads and coroutines, they exist under the surface and are invisible to the programmer. Because asynchronous libraries solve the CPU context-switching problem, they are able to run much faster than the older methods and thus have become quite popular. Nonetheless, they’re still not perfect. Callback-based asynchronicity results in long chains of callbacks that make it hard to create exceptions, debug problems, or gather tasks.
+
+With their rise in popularity, Twisted and Tornado set the scene for new libraries that have dramatically changed Python by finally enabling very fast processing.
+
+The speed at which Python can execute tasks has skyrocketed with the introduction of a new type of library. Here, we review three of these — UVLoop, Sanic, and Japronto—to examine just how dramatic the change in performance can really be.
+
+UVLoop is the first ultra-fast asynchronous framework, which is a drop-in replacement for Python 3.5’s built-in asyncio event loop. Both Japronto and Sanic which are reviewed in this post are also based on UVLoop.
+
+This framework’s core functionality is basically to make asyncio run faster. It claims to be twice as fast as any other asynchronous Python frameworks, including gevent. Because UVLoop is written in Cython and uses the libuv library, it’s able to create a much faster loop than the default asyncio.
+
+A UVLoop protocol benchmark shows more than 100,000 requests per second for 1 KiB in a test, compared to about 45,000 requests per second for asyncio. In the same test, Tornado and Twisted only handled about 20,000.
+
+
+
+ To make asyncio use the event loop provided by uvloop, you install the uvloop event loop policy:
+
+Alternatively, you can create an instance of the loop manually, using:
+
+Sanic is another very fast and stable framework that runs on Python 3.5 and higher. Sanic is similar to Flask but can also support asynchronous request handlers, making it compatible with Python 3.5’s new async/await functions, which give it non-blocking capabilities and enhance its speed even further.Alternatively, you can create an instance of the loop manually, using:
+
+In a benchmark test using one process and 100 connections, Sanic handled 33,342 requests per second, with an average latency of 2.96 ms. This was higher than the next-highest server, Wheezy, which handled 20,244 requests per second with a latency of 4.94 ms. Tornado clocked in at a mere 2,138 requests per second and a latency of 46.66 ms.
+
+Here’s what an async run looks like:
+
+Japronto is the latest new asynchronous micro-framework designed to be fast, scalable, and lightweight. Officially announced  around January this year. And fast it is: For a simple application running a single-worker process, with one thread, 100 connections, and 24 simultaneous pipelined requests per connection, Japronto claims to handle more than 1.2 million requests per second, compared to 54,502 for Go and 2,968 for Tornado.
+
+Part of Japronto’s magic comes from its optimization of HTTP pipelining, which doesn’t require the client to wait for a response before sending the next request. Therefore, Japronto receives data, parses multiple requests, and executes them as quickly as possible in the order they’re received. Then it glues the responses and writes them back in a single system call.
+
+Japronto relies on the excellent picohttpparser C library for parsing status line, headers, and a chunked HTTP message body. Picohttpparser directly employs text processing instructions found in modern CPUs with SSE4.2 extensions to quickly match boundaries of HTTP tokens. The I/O is handled by uvloop, which itself is a wrapper around libuv. At the lowest level, this is a bridge to epoll system call providing asynchronous notifications on read-write readiness.
+
+We definitely think Japronto is the most advanced framework so far, but it’s pretty young and requires much more work and stability improvements from the community. However – this is definitely something we are excited to be part of.
+
+Here’s an example of Japronto :
+
+Overall, it looks like fast, asynchronous Python might be here to stay. Now that asyncio appears to be a default in Python and the async/await syntax has found favor among developers, the GIL doesn’t seem like such a roadblock anymore and speed doesn’t need to be a sacrifice. But the dramatic shifts in performance come from these new libraries and frameworks that continue building on the asynchronous trend. Most likely, we’ll continue to see Japronto, Sanic, UVLoop, and many others only getting better.
+
+So before moving into a different language in search of faster processing, we encourage exploring the latest capabilities of Python 3.5 and some of the latest modern frameworks described in this post. Oh, and by the way, if you are still using Python 2.x – you are using a legacy version. We highly encourage you to upgrade to the current version (which is the standard).
+
+The main question still pending, however, is how someone can effectively monitor  frameworks and any other highly scaled Python applications in production. In the next blog post, we will review some of our methods of monitoring Python applications in production and some open-source projects in that space.|||
+
+When we started to develop our product, we had to decide which stack to use. Recent widespread adoption of Python 3 made it a no-brainer.

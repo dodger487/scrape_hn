@@ -1,0 +1,112 @@
+In computer graphics there exist many rendering algorithms, i.e. methods to display a virtual scene onto a screen, with various approaches and refinements. But only two main classes of those are currently used at a large scale. After starting to study in the field, I thought about trying to implement both to better grasp how they worked under the hood. This took a bit of time, as I needed to improve my comprehension of the subject and acquire enough background. The two algorithms I focused on are:
+
+I will start by presenting some basics about rendering, and from this build the overall structure of the rasterizer we want to implement. Then, we will dig deeper into the implementation. The code I'll show is a simplified version of my complete software renderer, Ptah. Many resources have been useful while implementing it and writing this article:
+
+To perform rendering, four things are needed: an object represented as the combination of geometry and texture, a way to transform this object, and a screen to store the result.
+
+An object is firstly characterized by its surface geometry. As computers are not good at handling continuous smooth things, the surface is cut into a set of small triangles, in the same way that a series of segments can approximate a curve.
+
+Thus, an object is represented by a mesh, a set of points in 3D space, linked to form faces. We restrain ourselves to triangles because they are guaranteed to be planar (by opposition to quadrilaterals for instance), and they are what GPUs love.
+
+But we need more than just the 3D positions sampled on the surface. In order to acurately light the object, we will need to know the orientation of the surface at each point, caracterized by its normal vector. We will also store two-dimensional texture coordinates (also called UV coordinates) that will help us give color and details to the object using a texure. The grouping of a position and the corresponding normal and texture coordinates will be called a vertex. Thus a mesh is a set of faces, each composed of three vertices, regrouping position, normal and texture coordinates.
+
+A texture is an image used to describe the color and look of the object's surface. The UV coordinates at each vertex can be used to read into it. To be independent of the image size, the coordinates will be expressed in the [0.0, 1.0] range. At a deeper level, a texture is a two-dimensional array of colors, represented as (red, green, blue) triples with values in the range [0.0, 1.0] again.
+
+To render the object, we will have to transform its vertices multiple times, to move it from a frame to another where some computations will be easier to perform. Such transformations can be rotations, scalings, translations or more complex operations. As in linear algebra, change of frames are represented by matrices ; vertices in the new frame are computed by left-multiplying the initial vertices by the transformation matrix.
+
+ As we work with three-dimensional points, one would expect matrices of size 3×3 to be used. But translations could not be represented this way. Thus we rely on a trick called homogeneous coordinates: each 3D point (x, y, z) is turned into a 4D point (x, y, z, 1.0), and transformations are now matrices of size 4×4, the last column being specifically used by translations.
+
+Furthermore, transformations can also be applied to directions (such as the normals). As directions are left unchanged when applying a translation, we express them as 4D directions (x, y, z, 0.0).
+
+Finally, we need to store the result of the rendering algorithm somewhere to be able to display it on screen as an image. We call such storage a framebuffer. It is quite similar to a texture, as it contains a two-dimensional array of colors called the color buffer.
+
+ But we need something else: when drawing objects into the framebuffer, we need to know if they are occluded by parts of the surfaces already drawn. Otherwise we would only overlay the objects one onto another in the order we are drawing them. Thus, for each pixel we need to know the distance from the camera to the surface that give it its color. When drawing a new object which covers this pixel, we simply check if the new distance is smaller than the stored one (we can draw and update the distance) or not. As a result we need a second buffer to store this distance, called the depth buffer.
+
+We now have the basics tools to represent tri-dimensional objects on screen. Before starting any implementation, let us study the path followed by each face of the object while it is rendered.
+
+The main task of the renderer is to project each face of the mesh onto the screen, in order to know where to draw the triangle in the framebuffer. This is done in multiple steps, transforming the vertices from a space to another.
+
+Initially the positions are expressed in the frame in which the object was designed and stored, called model space. By placing the object in a scene (through scalings, rotations and translations), we transform the vertices from model space to world space. This is done through the model matrix, product of the matrices of the aforementioned transformations.
+
+Then we need to express the positions from the point of view of the camera. Objects are transformed from world space to view space, where the camera is at the origin, and is by convention looking towards the z axis the up-axis being y). This is done using the view matrix (that we can generate from the camera position and the point it is looking at in world space, and the camera vertical axis).
+
+As the computer has limited processing power and cannot handle an infinitely large scene, we have to limit the part of the scene that will be rendered: we obviously won't draw what is behind the camera, or too far on the side. But we also have to define a near and a far limits, as shown on the figure below. This is inherent to the classical pinhole camera model used (where the camera is summarized by a point of view and an image plane). This truncated pyramid is called the frustum, and only the triangles inside will be drawn. But what should happen to a face that is halfway inside? The face must be cut, or clipped, to keep only the part of the triangle which is in the frustum. We will get back to clipping later, but it involves computations that would be hard to perform against the sides of the pyramidal frustum. This is the reason why we first move vertices from view space to clip space, where the frustum is transformed into a cuboid centered on the origin point. The transformation is performed thanks to the projection matrix that takes into account the field of view of the camera, the aspect ratio of the final image, and the user-defined size of the frustum.
+
+If we were to perform projection on the (x, y) plane now, we wouldn't get any perspective effect. Indeed, to create a feeling of perspective we need to perform a division that can not be represented as a matrix operation, the perspective division. The projection matrix had a side-effect: the distance of a point to the camera in view space was stored in its w coordinate. If we divide the x, y, and z coordinates by this distance, objects further away from the camera will be made smaller on screen. We are now in the normalized device space, where the frustum was scaled to become the [-1, 1] 3 cube. Once in this space, we will see that we can easily detect faces that are not directed towards the camera, and remove them to speed up rendering ; this operation is called culling.
+
+As a last step, to go to screen space where pixels live, we simply take the (x, y) normalized coordinates of each vertex, and transform them from [-1, 1]×[-1, 1] to the viewport range, i.e. [0, width]×[0, height].
+
+The overall transformation pipeline is recapped above. One can notice that the transformations to go from model space to clip space can be concatenated in one model-view-projection (MVP) matrix. Clipping and perspective division are then performed. After the transformation from normalized device space to screen space, we know at which pixels the three vertices of a given triangle lie ; the only remaining task is to draw it.
+
+To test our implementation, we will use the Stanford dragon model available from the Stanford 3D Scanning repository, cleaned in Blender to lower the number of vertices and add UV coordinates, and converted to an file. The texture was created by myself and can be re-used without any condition.
+
+To simplify the implementation, we will suppose that we have a package providing basic linear algebra types: , , , and , with classic operations (additions, multiplications, scalar and matrix-vector product, ...). You can either implement your own structures, or rely on a library such as simd or Eigen. A few additional methods are implemented into the file, mainly equality operators and helpers to create various transformation matrices.
+
+Using these primitive types we define a few shortcut types, along with structures to represent vertices and faces.
+
+Then, we will suppose that three classes are provided:
+
+These classes are implemented in the files , and , and can be downloaded (alongside ) from the repository for this article. Feel free to tinker with these but remember that they are quite limited and specifically written for this example implementation.
+
+Our implementation will take place in three files:
+
+I have chosen to split functions this way to keep the length and complexity of each file low. Finally, the project architecture is the following:
+
+We can immediately write the overall structure of the main procedure, calling functions for each task that we will implement later.
+
+Even if you are not familiar with the syntax, the pipeline appears clearly. We can now implement each of the helpers functions invoked above. Let's keep clipping, culling and drawing for later : this leaves us with the frame changes applied to the vertices.
+
+The first function transforms the vertices of a face from model space to clip space, simply multiplying them by the model-view-projection matrix. The texture coordinates are preserved, as well as the normals for now.
+
+The perspective division implementation is described below. It is quite verbose, but nothing too complicated. Note that the fourth component (which should normally be 1.0 again after the division), is used to store the dividing value, as it will be needed later in the drawing phase.
+
+The last function performs conversion from normalized device coordinates to screen space coordinates expressed in pixels. Vertices x and y coordinates are sent from [-1, 1]×[-1, 1] to [0, width]×[0, height], and forced to be integers (as they must represent a pixel). The z and w coordinates are kept for the drawing part of the process.
+
+Through these three functions, vertices are properly projected into screen space, ready to be drawn. That is, if they are in the frustum and form a face that is correctly oriented. Removing faces that are not satisfying these criteria will help improve the speed of the rasterizer, giving it less triangles to process.
+
+Once the vertices have been transformed to clip space, it is time to discard those that are outside the frustum. We will first focus on vertices that are towards the near plane. Three cases are present: the face is fully inside the frustum, fully outside, or intersects the near plane ; the last one being obviously the most complex to handle. To decide on which side of the near plane a vertex is, we rely on the fact that the projection matrix set its w component in clip space equal to the distance between the camera and the vertex (i.e. the z coordinate in view space).
+
+ Thus if w < 0, the vertex is behind the camera (as shown below). By extension, if the three vertices have negative w coordinates, the face is fully behind the camera and can be discarded. This allows us to immediatly reject these faces that would otherwise be problematic
+
+Another condition we can infer from the fact that the frustum will be the [-1, 1]3 cube after perspective division is that a point is in the frustum if and only if w > 0, z/w > -1 and z/w < 1, ie |z| < w.
+
+ Thus if the three vertices w values are positives, and the z values satisfy the majoration above, we know the triangle is fully inside the frustum, no clipping is needed. Else, we look at each edge of the triangle, and check if it intersects the plane ; if the two vertices are inside the frustum, the edge is kept ; if both are outside, it is discarded ; else, we cut the edge by computing the position of the intersection and estimating normal and texture coordinates at this new vertex using interpolation. This way, we keep only the part of the edge that lies inside the frustum. Whenever multiple edges of a triangle are in this case, we will get a non triangular face (maybe four or five vertices) ; this face is too complex for the rasterizer and is thus split into a fan of adjacent triangles, all sharing one of the vertices.
+
+We are now left to implement how to clip an edge linking two vertices depending on their respective positions with respect to the frustum near plane. The test conditions have already been covered above, and the interpolation process in itself has nothing special: the coefficients used are based on the depth in clip space and view space.
+
+One could object that clipping with the edges of the screen and the far plane of the frustum have not been covered yet. It is indeed possible to handle them in the same way we handle the near plane, by performing additional edge clipping steps. But I have rather chosen to handle them in a more direct fashion later in the pipeline.
+
+Culling is simpler, and takes place after the perspective division. The idea is that if a face is pointing in the same overall direction as the camera, it will necessarily be invisible (we suppose that faces only have one 'side'). If we suppose that all faces are defined with vertices in the same order (clock-wise for instance), we can easily check if a face is oriented correctly in normalized space. By taking the cross product of the projected triangle sides v - v and v - v on screen, we estimate its area. If the area is positive, the vertices are in the right order and the face is oriented towards the camera. Else, we can discard the face as we are looking at it from behind.
+
+Backface-culling is an extremely useful trick to speed up the rendering with a simple inequality check.
+
+We finally arrive at the last step of our pipeline: drawing the face as a group of pixels in the framebuffer. One of the historical approaches is the scanline algorithm, where a triangle is drawn as a series of horizontal pixels lines ; this method was useful on limited hardware, but we will implement a more modern (and power-hungry) method.
+
+ For each pixel on the screen, we need to decide if it is inside the triangle or not. We can first decrease the number of pixels to test by computing the bounding box of the face. We can furthermore clamp this bounding box against the edges of the framebuffer ; this way, clipping along the sides of the frustum is automatically done, and our program will never try to write a color to a pixel outside of the framebuffer limits. We then iterate over the pixels inside the bouding box. But how should we determine whether a pixel is covered by the triangle or not?
+
+ We use barycentric coordinates, that express any position on the plane as a linear combination of the three vertices positions. For any point P, we can find its barycentric coefficients α, β and ɣ such that P = α v + β v + ɣ v . A property of those coefficients is that they are all positives if and only if the point P lies inside the triangle ; this gives us the desired test.
+
+Next step is depth comparison: the depth at the current pixel can be interpolated from the depth at the three vertices using the same barycentric coordinates. If the computed distance to the camera is smaller than the one currently stored in the depth buffer for this pixel, we can overwrite its color and depth. Additionally, the depth buffer is initially filled with 1.0s. It is the depth of any point lying on the far frustum plane, guaranteeing that no point further away is ever drawn.
+
+ Another issue is that texture coordinates and normals cannot be directly interpolated in the same way as depth, because barycentric interpolation only applies on values that have undergone perspective division. Nevertheless new corrected coefficients can be computed from the barycentric coefficients and the w value we saved earlier, and give us accurate interpolation of UV coordinates and normals. Then we simply read the color for the pixel from the texture, and write it into the framebuffer. In Adding shading, we will see how we can use transformed normals to shade the object.
+
+The computation of the bounding box and its clamping against the framebuffer dimensions is straightforward, as written below.
+
+For a given point P in the (x,y) plane, one can compute its barycentric coordinates knowing the coordinates of the face's three vertices.
+
+This can be immediatly used in our implementation, as follows.
+
+We finally get results as shown below. The look is a bit flat because we have used no lighting information to perform realistic shading yet.
+
+For now, the shading we implemented is quite basic: simply use the color read from the texture. But since the normals are available to us, we could compute diffuse shading for a directional light source using the following formula:
+
+To do this, we first need to transform the normals from model space to world space in the vertex processing step ; to preserve orthogonality between the surface and the normals, they have to be multiplied by the inverse transpose of the model matrix. Usually these computations are done in view space for various reasons, but here we will stay in world space. Below is the new function taking into account the normal transformation.
+
+Then, in the fragment processing step, after reading the color from the texture we compute the diffuse coefficient using the interpolated normal and the light direction (expressed in world space), and apply it before writing the shaded color to the framebuffer. This shows that our pipeline is not really flexible, as any change in shading has to be done directly into the rendering code. In the function, the line where color is read from the texture is replaced by:
+
+Shading adds volume and realism to the scene, as can be seen on the picture below taken from the same point of view as the previous one.
+
+The implementation shown here is not very flexible, and mimics a fixed-function pipeline (all vertex processing and fragment shading steps are imposed and can't be modified). My complete rasterizer Ptah supports programmable shaders for those steps, real-time rendering, multiple framebuffers support, texture filtering, along many other refinements that bring it closer to a rough replicate of real-world APIs like OpenGL. Even there, things are missing: subpixel shading, faster culling, multi-core support... there is fortunately always room for improvements!
+
+Nevertheless, the results obtained are visually good, and the off-line rendering strategy allows us to ignore performance optimizations. Hopefully this article was able to provide you with a good overview of the classic rendering pipeline, as implementing this rasterizer did for me. There was a lot to cover and some details were left out in this post, but feel free to contact me for any further questions or comments. The code used for this demo is available on GitHub, and the full renderer in the Ptah repository.|||
+

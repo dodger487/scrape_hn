@@ -1,0 +1,96 @@
+This post is part 2 of a 3-part series about tuning Elasticsearch Indexing. Part 1 can be found here.
+
+The tutorial series focuses specifically on tuning elasticsearch to achieve maximum indexing throughput and reduce monitoring and management load. Elasticsearch is near-realtime, in the sense that when you index a document, you need to wait for the next refresh for that document to appear in search.
+
+Refreshing is an expensive operation and that is why it’s made at a regular interval (default), instead of after each indexing operation. If you are planning to index a lot of documents and you don’t need the new information to be immediately available for search, you can optimize for indexing performance over search performance by decreasing refresh frequency until you are done indexing.
+
+For this post, we will be using hosted Elasticsearch on Qbox.io. You can sign up or launch your cluster here, or click "Get Started" in the header navigation. If you need help setting up, refer to "Provisioning a Qbox Elasticsearch Cluster."
+
+
+
+Shards of an index are composed of multiple segments. The core data structure from Lucene, a segment, is essentially a change set for the index. These segments are created with every refresh and subsequently merged together over time in the background to ensure efficient use of resources; each segment uses file handles, memory, and CPU. The lucene working behind the scenes is responsible for segment merging, but if not handled carefully it can be computationally very expensive and may cause Elasticsearch to automatically throttle indexing requests to a single thread.
+
+Here, we shall continue our elasticsearch indexing tuning strategy specifically focussing on various indexing configuration settings at cluster as well as index level.
+
+This interval is defined by the setting, which can go either in Elasticsearch configuration, or in each index’s settings. If you use both, index settings override the configuration. The default is 1s, so newly indexed documents will appear in searches after 1 second at most.
+
+Because refreshing is expensive, one way to improve indexing throughput is by increasing . Less refreshing means less load, and more resources can go to the indexing threads.  Thus, depending on your search requirements, you may consider setting the refresh interval to something higher than one second. It can even make sense to temporarily turn off refreshing completely for an index (by setting the interval to -1), e.g., during a bulk indexing run, and trigger it manually at the end.
+
+The update settings API can be used to dynamically change the index from being more performant for bulk indexing, and then move it to more real time indexing state. Before the bulk indexing is started, use:
+
+If you are doing a large bulk import, consider disabling replicas by setting . When documents are replicated, the entire document is sent to the replica node and the indexing process is repeated. This means each replica will perform the analysis, indexing, and potentially merging process. In contrast, if you index with zero replicas and then enable replicas when ingestion is finished, the recovery process is essentially a byte-for-byte network transfer. This is much more efficient than duplicating the indexing process.
+
+Then, once bulk indexing is done, the settings can be updated (back to the defaults for example):
+
+And, a force merge should be called:
+
+The refresh API allows to explicitly refresh one or more index, making all operations performed since the last refresh available for search. The (near) real-time capabilities depend on the index engine used. For example, the internal one requires refresh to be called, but by default a refresh is scheduled periodically.
+
+Segment merging is computationally expensive, and can eat up a lot of disk I/O. Merges are scheduled to operate in the background because they can take a long time to finish, especially large segments. This is normally fine, because the rate of large segment merges is relatively rare.
+
+Kubernetes Series: Understanding Why Container Architecture is Important to the Future of Your Business
+
+
+
+But sometimes merging falls behind the ingestion rate. If this happens, Elasticsearch will automatically throttle indexing requests to a single thread. This prevents a segment explosion problem, in which hundreds of segments are generated before they can be merged.
+
+Elasticsearch defaults here are conservative: you don’t want search performance to be impacted by background merging. But sometimes (especially on SSD, or logging scenarios), the throttle limit is too low.
+
+The default is 20 MB/s, which is a good setting for spinning disks. If you have SSDs, you might consider increasing this to 100–200 MB/s.
+
+If you are doing a bulk import and don’t care about search at all, you can disable merge throttling entirely. This will allow indexing to run as fast as your disks will allow:
+
+Setting the throttle type to none disables merge throttling entirely. When you are done importing, set it back to merge to reenable throttling.
+
+NOTE: The above settings apply only to Elasticsearch 1.X versions. Elasticsearch 2.X removes all index/indices store level rate limiting ( ,   , , ) and cuts over to Lucene's ConcurrentMergeScheduler to automatically manage throttling.
+
+The merge scheduler (ConcurrentMergeScheduler) controls the execution of merge operations when they are needed. Merges run in separate threads, and when the maximum number of threads is reached, further merges will wait until a merge thread becomes available.
+
+The merge scheduler supports the following dynamic setting :
+
+The maximum number of threads that may be merging at once defaults to which works well for a good solid-state-disk (SSD). If your index is on spinning platter drives instead, decrease this to 1.
+
+Spinning media has a harder time with concurrent I/O, so we need to decrease the number of threads that can concurrently access the disk per index. This setting will allow max_thread_count + 2 threads to operate on the disk at one time, so a setting of 1 will allow three threads.
+
+If you are using spinning media instead of SSD, you need to add this to your :
+
+We can also  set it in the index settings:
+
+In order to set it for all existing indices, use :
+
+The translog helps prevent data loss in the event that a node fails. It is designed to help a shard recover operations that may otherwise have been lost between flushes. The log is committed to disk every 5 seconds, or upon each successful index, delete, update, or bulk request (whichever occurs first). Changes to Lucene are only persisted to disk during a Lucene commit, which is a relatively heavy operation and so cannot be performed after every index or delete operation. Changes that happen after one commit and before another will be lost in the event of process exit or hardware failure.
+
+To prevent this data loss, each shard has a transaction log or write ahead log associated with it. Any index or delete operation is written to the translog after being processed by the internal Lucene index. In the event of a crash, recent transactions can be replayed from the transaction log when the shard recovers.
+
+Blog Post: Why Is the Supergiant Packing Algorithm Unique? How Does It Save Me Money?
+
+An Elasticsearch flush is the process of performing a Lucene commit and starting a new translog. It is done automatically in the background in order to make sure the transaction log doesn’t grow too large, which would make replaying its operations take a considerable amount of time during recovery. It is also exposed through an API, though it's rarely needed to be performed manually.
+
+Compared to refreshing an index shard, the really expensive operation is flushing its transaction log (which involves a Lucene commit). Elasticsearch performs flushes based on a number of triggers that may be changed at run time. By delaying flushes, or disabling them completely, you can increase indexing throughput. Just be aware that nothing comes for free, and the delayed flush will of course take longer when it eventually happens.
+
+The following dynamically updatable settings control how often the in-memory buffer is flushed to disk:
+
+We can increase from the default 512 MB to something larger, such as 1 GB. This allows larger segments to accumulate in the translog before a flush occurs. By letting larger segments build, you flush less often, and the larger segments merge less often. All of this adds up to less disk I/O overhead and better indexing rates. Of course, you will need the corresponding amount of heap memory free to accumulate the extra buffering space, so keep that in mind when adjusting this setting.
+
+The indexing buffer is used to store newly indexed documents. When it fills up, the documents in the buffer are written to a segment on disk. It is divided between all shards on the node.
+
+The following settings are static and must be configured on every data node in the cluster:
+
+The setting defines the percentage of available heap memory that may be used for indexing operations (the remaining heap memory will mainly be used for search operations). The default of 10% may be too low if you have lots of data to index, and it may make sense to set it to a higher value.
+
+Consider increasing the node level thread pool size for indexing and bulk operations (and measure if it really brings an improvement).
+
+A single shard, which is a Lucene level, has a limit on the number of concurrent threads that are allowed to perform indexing at the same time. It defaults to 8 in Lucene, but in ES, it is allow to change it using .
+
+We should be smarter about setting the default value for it, specifically in cases where there is a single index being indexed into, with one shard on a node. We already have the index/bulk threads pools to protect and control concurrency, so we can increase that default value in most cases to something more relaxed. Consider increasing the value, especially when there are no other shards on the node (and measure if it pays off).
+
+Continue on to Part 3 of 'How to Maximize Elasticsearch Indexing Performance'.
+
+
+
+It's easy to spin up a standard hosted Elasticsearch cluster on any of our 47 Rackspace, Softlayer, Amazon or Microsoft Azure data centers. And you can now provision your own AWS Credits on Qbox Private Hosted Elasticsearch.
+
+Questions? Drop us a note, and we'll get you a prompt response.
+
+Not yet enjoying the benefits of a hosted ELK-stack enterprise search on Qbox? We invite you to create an account today and discover how easy it is to manage and scale your Elasticsearch environment in our cloud hosting service.|||
+

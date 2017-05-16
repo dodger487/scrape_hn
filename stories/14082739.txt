@@ -1,0 +1,310 @@
+Maybe you'd mock a talking Barbie doll for making the outrageous assertion I've titled this article with: Iteration Is Hard.
+
+After all, it's not hard at all, right?
+
+I've arranged the two sample iterators so it's very obvious what they have in common. The following pseudocode reveals the common underlying principles:
+
+These are both special cases of how one might structure an iterator, both leveraging certain simplifications and convenient code idioms.
+
+While the above shows what they have in common, these two iterators are normally considered to be vastly different. That's because while both allow fast iteration, one of them requires storing links within the data structure itself, and the other requires packing the data in permanent storage in a particular way.
+
+But in both cases, the iterator state is very simple. In the first case, the iterator state is the index of the item within the data structure. In the second case, it *is* the item within the data structure.
+
+[In practice, we should have an iteratorDone() or iteratorFree() function as well, but the implementation of this function will be trivially obvious everywhere in this article--simply free up all resources.]
+
+In theory, almost any iterator is going to fit the above code. Here are the two iterators already considered:
+
+With this in place, it's possible to reuse the same iteration code everywhere. It's even plausible for a language to directly support this kind of iteration, by providing some sort of 'for x in y' function which automatically generates the right calls. Talking about commonly used production languages, with C++, one could introduce an iterator idiom with operator overloading so that one would always write this code, regardless of the iterator implementation:
+
+Is that good or bad? Well, it allows the implementation of the iterator (and the collection) to change without the code needing changing, while still using extremely concise code. Standard caveats about maintainability of operator overloading applies, however.
+
+If that's all there was to iteration, I'd be hard pressed to argue that it was that difficult. But you've probably seen code like this:
+
+What's up with that? And how could I adjust the 'generic' mechanism to allow for this case?
+
+What's "up" with that is that the code is allowing for the case that the item 'cur' is deleted or moved in the list during the call to process(). In other words, don't assume the list is invariant during the course of iteration. The most common place you may have seen such code is when freeing all the items in a linked list, but it gets more interesting when you consider that the above code works even if process() sometimes deletes and sometimes doesn't.
+
+That doesn't seem so bad, does it? How about the equivalent code for indices:
+
+That code isn't very clear, since it's intimately tied to not just the representation but the way deletion works. (This is technically true of the previous code as well, although it simply seems more natural, as, for example, 'process' could free up the memory referenced by 'cur' as well, so the "early dereference" makes sense for that.) Showing that the above loop terminates is complicated, since it depends on the fact that each iteration either increases i or decreases n; this is more apparent in the following code:
+
+Ok, so that's a little gross, but it works, it's fast and efficient, it's not that hard to understand. So what's the big deal?
+
+For a living, I write entertainment software (i.e. computer games). As games get larger and more complicated, modularity and robustness become more important. Abstraction is always good, of course. But as these games get larger and more complicated, the demands they put on the various systems get that much more unpredictable. Our programs have become increasingly data-driven, where almost anything can happen if a non-programming developer sets data appropriately. While our program doesn't have to respond "perfectly", it needs to at least not crash, and we would like a reasonably degree of consistency.
+
+A typical application for an iterator is that I have a list of simulated objects which need processing in the current timeslice. Some objects might decide to delete themselves during their processing; I've already shown how this case is often addressed.
+
+What happens if an object decides to add another object to the list?
+
+It turns out that most iterators are well behaved in this case. They vary as to whether the object will be iterated during this iteration or not (for the linked list, if added at the head, no; for the array, if added at the tail, yes-- although you can iterate backwards through the array to change this behavior).
+
+But what if an object decides to delete some other object? Consider processing objects 0..9 with an index interator:
+
+It deleted 3 items, and processed 8 items--2 was processed before deleting itself, and 1 was processed before it was deleted by 8. So 5 was the only item deleted without processing-- but wait, it should've processed 9 items! Item 7 was never processed!
+
+Clearly, there's a bug with the (never explicitly stated) deletion algorithm above: if an item is deleted that's earlier in the list than our current iterator, it needs to make sure it still processes that now-moved item. You might try imagining a simple hack where in the iteration code it tracks whatever item has been moved, and make sure to make a special call to that one, but it fails if more than one item is deleted. I'll return to how one might implement this correctly later. Suffice it to say, it's hard. (If it iterates backwards, to try to avoid processing just-inserted items, then deletion will move an already-visited item into the to-be-visited section of the array, which may cause it to process an item twice.)
+
+At least the linked-list iterator doesn't suffer from this problem. Since it doesn't move objects around on deletion, it can't accidentally skip them.
+
+On the other hand, since the linked-list iterator keeps a direct pointer to an item, it can 'go wrong' if that item is deleted from the list. That was the reason why we grabbed the 'next' pointer early in the modified linked-list code--because 'cur' could get removed, and its 'next' field might become invalid.
+
+But, wait--now we're squirreling away the 'next' pointer. Suppose the next item got deleted from the list? Then the next pointer we've got points to an item no longer in the list, and its next pointer could be garbage, or could be being used by some other list!
+
+In this context, at least, iteration is hard.
+
+One way we've worked around a host of these sorts of problems is by disallowing deletions. More specifically, deletions are delayed until a special time, during which no iteration is allowed. At this point, objects are deleted and removed from all lists.
+
+This can cause some complications. If an object is "going to be deleted", then other objects need to realize it's no longer "really" alive, and not try to do things they shouldn't do (such as introduce new dependencies on the object).
+
+Furthermore, doing this in general would require putting not just object deletions, but deletions from lists in general on queues. And then the query 'is this item in this list' becomes more complicated--should it check the queues as well?
+
+In practice, I don't think this is a generally acceptable approach. I do think that queueing object deletion (and here, by object, I mean 'simulation objects'--objects that normally have a relatively long lifespan), or something similar, leads to fewer bugs. Other code does have to be somewhat defensive, nonetheless.
+
+Here are properties one would probably demand of any iterator:
+
+In some cases, the first property (never more than once) might be slippable, but most of the time it would be bad. Most cases where it would be ok would be if our processing routine had no side-effects--but that's exactly the case when iterating isn't hard anyway.
+
+Here are some different ways of resolving the ambiguous cases from the above definitions:
+
+Items 5 & 6 are problematic. (6 is a generalization of 5, using the same rule for both insertion and deletion.) They're problematic because client code is likely to expect the invariant "at the time an item is reported, it is on the list". In fact, I would have put that property into the first "mandatory" list, except that I've actually used this approach successfully, so it's worth considering.
+
+Items 1 & 2 are somewhat annoying, as they aren't very well-defined. Well, that's not totally true--it depends on whether the collection is ordered or unordered. For example, if the objects are processed in some sort of priority order, then the deletion rule becomes "if an object is deleted by a higher priority object, it isn't processed", which makes some sense. On the other hand, if they're stored in alphabetical order, it doesn't make much sense at all. The question may become one of the "illusion of simultaneity"--and it is in exactly this case in which "processing all items that were on the list at the beginning of the iteration" makes sense.
+
+In the previous section, I've laid out some ideas about what makes an iterator robust. What really makes it robust is that it doesn't surprise the client. To actually describe implementing them, I'll need to particular some particular definition of robustness. On the principle of least surprise, I will stick to the mandatory properties. However, honing to the principle of least surprise beyond that doesn't seem very valuable, so instead I'll allow allow the details to vary depending on the data structure.
+
+What about this ordering phenomenon? And what how do these things interact when data structures are designed to do more than just iterate?
+
+For the sake of these questions, I will consider the "associative array" or "dictionary" or "symbol table" data structure. This data structure supports the following operations:
+
+I will look at several implementations of this abstract data structure and consider the performance ramifactions. Under this model, while the data structure may internally have some order, it is unlikely to be relevent in the sense of deletions reporting/not-reporting making sense. (I.e. it's more of an alphabetical order rather than a priority order.)
+
+To start with, I want to show the complexity of simply achieving robustness. To this end, assume there's a working implementation of an associative array, and I want to wrap it in another layer which adds robustness to the iterator.
+
+One easy solution is to save off the list of all the items on the list first, and then iterate through them. For the sake of easy exposition, I'll just put this into the client code:
+
+As mentioned before, however, this definition is probably somewhat surprising to clients, as they expect the item to be on the list. I can protect against that, however, by changing the final lines to the following:
+
+There it is. A simple, robust iterator, which can be arranged into the exact same iterator interface, although I'm not bothering with this case. Except it's not quite robust in one case--if the underlying iterator produces items more than once, then the output list still has more than one of each, and if the underlying iterator fails to produce all items, so does this one. Fortunately, all the real iterators I'll consider have the property that if no other operations are performed during an iteration, items will never be reported twice. (I'll give details later.)
+
+[Ok, ok, it's actually not robust in another way--if items are deleted, the actual Item * storage may get freed. The above code needs to actually store the content of the Items (the Key,Value) themselves, not just pointers to them. But this is an easy fix that would make the code less clear for expository purposes.]
+
+So why do I claim it's hard? Well, look back at the 'efficiency' topic. Now look at that 'get' call. Best case, there are now n O(1) hash table lookups in addition to the inherent processing. Worst case, 'get' takes O(n) time, normal iteration takes O(n) time for n items, and the above code takes O(n^2) time.
+
+In addition, we use an extra O(n) space, and the memory management load could be noticeable. (On the other hand, this space usage is actually unlikely to be significant, as many of the data structures we will consider are likely to use even more space to implement a doubly-linked list to provide a fast iterator in the first place.)
+
+Instead of implementing the above, I could provide two iterators to the client. One would be robust, and one would be fast, and it would be up to the client to know whether its code might update the list.
+
+However, this is exactly the sort of thing that leads to problems. As a large program modularizes and decentralizes, things become less predictable. For example, in some of our games, we allow any database change to be watched for by any system, which can then do anything in response, including calling into an extension language. The "programmers" of that extension language don't have the option to go figure out what iterator might be running when their code is called. We just have to be robust all the time.
+
+An example of this sort of efficiency would be the code I described to try to deal with the array index deletion--tracking items that might otherwise get skipped.
+
+Another definition might be that the data structure should have equivalent performance amortized, or at least equivalent performance if a constrained number of random insertions and deletions are made during an iteration--i.e. iteration across n items with no more than f(n) insertions and deletions, where f(n) might be n or lg(n) or whatever.
+
+An even stronger sense of efficiency is that we should get the same performance, not just the same O() performance. For example, if the non-robust data structure supports an operation in g(n) time, we might like our robust one to run in g(n) + O(1) time.
+
+In practice, I'm not going to stick to any strict definition of efficiency. Instead, I'll pursue 'as efficient as possible'. We can generally meet one of the above standards. With linked lists, we can generally meet the last standard, and most other data structures can be augmented with linked lists, introducing an extra O(n) space to the data structure, and O(1) time per operation to update the linked list.
+
+The basic idea for implementing this with the given abstraction for iterators is for the data structure itself to "know" about active iterators over that data structure, and then to update them as appropriate. Thus, assuming iteration is cheaper than insertion/deletion, we pay the costs of maintaining robustness in the already-expensive insert/delete, not in the otherwise efficient iteration, avoiding the problem with n gets above. However, I can't easily describe this for the abstract case, since the idea is to patch up flaws in a particular implementation.
+
+So I will quickly sketch a single example, and then return to the generic abstract case. Suppose I have a linked-list iterator, but I don't squirrel away 'next' in the loop. Instead, I 'register' the address of my iterator at init time. Now, anytime I go to delete an item from this collection, I check for active iterators. If an iterator is pointing to the item I'm about to delete, I advance the iterator now.
+
+This would look something like this:
+
+As you can see, this introduces no overhead on iteration itself, except that every deletion during an iteration incurs an extra O(1), or as is explicit in the code, with n active iterations, there's an extra O(n) cost to delete. Since most programs use an effectively constant number of iterations (i.e. it's normally controlled by code, not data), this is unlikely to be very expensive. (A recursive routine could have a lot of active iterators, though.)
+
+Note that this isn't quite correct, as it stands--during processing, if the current item is deleted, the iterator is advanced, and then after processing the the item, the iteration loop advances again, skipping an item. To use the above code correctly, the generic iteration loop must be revised to:
+
+If the implementation implements insertion at the front only, the linked-list code combined with the above iteration loop actually produces a robust iterator. I'll return to this case some more when we return to specific implementations, not generic ones.
+
+It's possible to continue using the old, more clear and simpler to type iteration loop if the normal iteration functions are wrapped in a somewhat gross monstrosity that automatically advances when iteratorItem() is caled. To avoid changing reasonable semantics for the iterator, iteratorItem should cache the current item, advance, and set a flag. If iteratorItem is called again and the flag is still set, it returns the cached item. When iteratorAdvance is called by the client, it clears the flag. (When delete does an iteratorAdvance, it should not clear the flag.)
+
+For simplicity, I'll just assume the client does the caching. (The other way this code is sometimes written is that the data type itself includes the iteration code, and calls a callback with each item--in which case using the variant loop code is definitely the simpler solution.)
+
+The previous linked-list example suggests a generic solution as well to wrapping the iterator without the up-front copy:
+
+This wrapper robustifies deletions, but it does not inherently produce a robust iterator, as it depends on other semantics of the underlying implementation:
+
+Thus, if one wants to produce an efficient and robust iterator, one must respond to the above issues.
+
+I am not personally aware of any generic way of dealing with the first problem that is reasonably efficient. Basically, you just have to keep a list of which items you've reported so far, and double-check that list. This requires either a hash table or a bit on the object for O(1) performance--although the latter doesn't allow multiple iterators at once. Alternately, a binary search tree or something similar would allow O(lg N) verification, resulting in O(N lg N) iteration, which is hardly efficient. In fact, it resolves down to something much like the original 'copy out the entire list' in terms of storage and performance.
+
+The latter case can be handled in the same way, but it is slightly more efficient. For each iterator, maintain a "hit list", that is, a list of items which might be at risk for being produced twice. That list could be all the deleted items, or all the inserted items. Then each time the iterator is advanced, the item is tested to see if it's on the hit list. This time, however, the hit list is bounded by the number of insertions/deletions which have occurred, not by the length of the list. So if insertions/deletions are rare compared to iterations, performance can be quite acceptable, even with a simple hit list structure.
+
+Here is a sketch of the implementation:
+
+Note that I avoid allowing repeated entries in the hit list, in case the same item is deleted and inserted thousands of times during a single iteration, which would cause significantly more overhead on the iteration. (Although now there's more overhead on the insertion.)
+
+This also points out an alternative solution to the original "just make a copy of the list before processing" approach. Before, to solve the 'what if an item is deleted', I paid significant iteration time overhead doing a get() after every iteration step. Instead, I can only pay that cost if there's been a deletion since the iterator started, by simply recording all the iterators, and setting a flag on them if there's a deletion, which causes them to start checking. Moreover, I could keep a hitlist of all the items which have been deleted, and only get() vs. that list. (However, if an item is deleted and then reinserted, I would get different semantics, unless I also delete items from the hitlist on insertion. Whew, complicated!)
+
+To return to the current generic non-upfront-copy iterator case, if one could find out when the underlying iterator is at risk for reporting items multiple times, then one could at that moment update all the iterator's hit lists with all the items they've output so far, robustifying that case.
+
+But all of this is largely irrelevent.
+
+The case where an item is never reported by the underlying iterator is impossible to fix in a wrapper (except by using the 'collect all items initially', which actually is relying on the fact that it knows certain conditions in which underreporting does not occur).
+
+Since that brings us to the end of the discussion of the generic case, it is probably worth describing some data structures that have this double-reporting and under-reporting behaviors in response to deletions or insertions:
+
+In addition, certain data structures that adjust themselves on 'get' can have similar problems:
+
+I've already described how to implement a relatively efficient linked-list iterator. Since many of the above data structures (hash tables and balanced trees, for example) have problems with underreporting, threading a linked list in is a natural solution to lots of the problems. Therefore, I want to write out very explicit, detailed code for the linked-list case.
+
+Ok, I didn't want to mention it before, but here's a trick you might think would work to avoid having to use the complex iterator loop. Basically, if the current item gets deleted, just step the iterator backwards instead of forwards, thus maintaining the semantics that the iterator is pointing to right before the next item to report. The reason I didn't do it this way before is because (a) it requires a doubly-linked list (since you might need to step back any number of times), and because you run into problems if you step back onto the sentinel when the first item is deleted, since insertions occur after the sentinel.
+
+You could try keeping the pointer one before the current item (i.e. iteratorItem() returns not the item pointed to by the iterator, but the next one after that), so that insertions work right, but this doesn't actually fix insertions after deleting the first item either.
+
+You could probably explicitly have insertions advance any iterator pointing to the beginning of the list. Off the top of my head, this would avoid this class of problems, and I can't think of any new ones introduced.
+
+However I'll just accept having to use the slightly more complex iterator. This is actual compileable code, and I have tested it with the test jig given in the appendix.
+
+I'm not going to write out longer descriptions for hash tables, since as stated, I don't see any way of resolving the missed-item problem other than wrapping with the "build the list upfront" code, or augmenting with a linked list. The latter uses a lot more storage (2 pointers per item for each collection, as opposed to the copy approach which requires one pointer per item for each iterator--normally I have a lot more collections than iterators), but produces a better-behaved iterator. Moreover, this will allow symbol tables which have the same performance for all operations except delete, which has an extra O(m) overhead, with an O(n) iteration.
+
+[It's also possible to make an efficient singly-linked list, of course, but it's slightly more code to write out, and you'll want the doubly-linked code for the above augmentations, since it allows you to delete without searching down the list for the item.]
+
+The Move-To-Front algorithm can be characterized simply as "on a get(), move the gotten item to the front of the list". This ends up making the list an LRU cache.
+
+Unfortunately, Move-To-Front makes things complicated to do "right". Since an item not-yet-visited can be moved to the front, we need to make every get() operation check for this case, and add the item to a pending queue for any iterators that would have missed it. Then deletes need to remove things from the pending queue.
+
+An easier solution is to disable move to front if any iterators are active. Here is an implementation of get() that keeps the iterator robust:
+
+This approach is simple and robust, but will not be very helpful if an iterator is generally active--e.g. if all code is run in response to an iteration over the collection of 'active' objects.
+
+An alternative approach is to augment the linked list with another linked list, just like the binary tree/hash table solutions. Where the main linked list has LRU ordering semantics, the secondary list is there simply for the iterator semantics (e.g. insertions are always at the front).
+
+The more obvious approach is to try to "remember" missed items. However, it is expensive to determine if a given item being moved will be "missed" by an active iterator. This is not the case for an array, instead of a linked list.
+
+The unordered array normally uses a "swap onto deleted item" strategy which can cause missed items. There are several approaches we can use to avoid this behavior:
+
+Building 'missed item' queues is complicated. The second approach seems more palatable, as the items can actually by deleted from the list but replaced with a temporary placeholder. On the other hand, it's possible to imagine client code that runs two iterators over the same data structure, and every time one iterator ends, it is restarted--so there's always at least one active iterator. This would cause this algorithm to never shrink the array, causing performance to suffer after a large number of insertions and deletions.
+
+Of course, if insertions could fill in the placeholders for deleted items, that would bring it back down to a reasonable level. Nonetheless, it would still potentially inflate the cost of operations on the symbol table, since instead of being O(n) they would be O(m) where m is the largest size the table has been since there were no iterators active.
+
+Finally, this approach will introduce problems if items are deleted and then reinserted, since we can't constrain our insertions to occur at a particular location. Therefore, although 'missing item' queues are complicated, they seem to be the only hope for achieving robustness and efficiency simultaneously.
+
+Here is an implementation of an unordered array symbol table with a robust iterator using a missing-item queue. Note that the iterator operates in two stages:
+
+You might wonder why I go to so much work to implement the "efficient" delete, when the delete is O(n) anyway due to the need to search. For one thing, the search is very fast, and the copying around (i.e. moving all the items in an O(n) delete) would not be. Furthermore, as you will see, handling the delete this way provides most of the technology for the next two data structures as well.
+
+This is not a complete, tested program.
+
+Much like a linked-list, an array collection can be modified to move items forward in response to get() so as to cache them at the front. However, to make the operation efficient, the array needs to swap two items. This makes a literal LRU arrangement impossible to implement efficiently. Obvious alternatives, such as "swap to the front", or "swap one forward", will fail to get any performance benefit if the item and the one it is swapping with are continually "gotten".
+
+I suspect, however, that there is a plausible approach which simply involves moving an item a random distance forward--i.e. if it's at location n, then swap it with a random item from 0..n-1. I don't know for sure, but assuming there is some approach that works, all I need to do is to add in code that supports an arbitrary swap of two elements, instead of the above semi-swap on deletion.
+
+If I swap items x and y, x<y, and an iterator is between x and y (but y is not in the inserted-after-iteration-started area), then if no fixup occurs, the current algorithm will fail to report y, and doubly-report x. Failing to report y can be directly handled by adding y to the extraItems list. Unfortunately, there's no good way to prevent the double-reporting of x--except to add a hit list of 'items to avoid double reporting' in addition to the 'additional items to report'. Then the algorithm has to check this list-of-items-to-avoid every time it considers reporting an item, which would incur an unreasonable amount of overhead.
+
+An alternative approach would be to advance the iterator all the way up past y, and add all the intervening elements to the extraItems list. However, this would arbitrarily bloat the extraItems list, e.g. if the first and last item are swapped, turning this into the "copy out the entire list" case.
+
+The list of 'items to avoid double reporting' is the only realistic option, but searching in that list may make iteration quite slow; O(nlogm) after m swaps.
+
+Several times I've made reference to the fact that the iterator I'm providing requires a slightly oddball loop, one in which it is necessary to immediately do an iteratorAdvance before doing other operations on the data structure. I want to describe more clearly what the semantics of this kind of iterator are, and how they stand in relation to a traditional iterator.
+
+Ignoring start/end, the traditional iterator (as I've presented it) has the following semantics:
+
+The above semantics are incomplete, however, as they cannot strictly apply in the presence of deletions. The normal refinement I choose to make here is to modify the semantics of iteratorItem to simply state 'if the item that would currently be reported by iteratorItem is deleted, it is illegal to call iteratorItem without first calling iteratorAdvance'--some of the subtlety of the phrasing is to allow for the possibility of advancing and deleting without ever calling iteratorItem.
+
+Similarly, iteratorDone and iteratorAdvance must be tweaked to make it legal to advance even if the final about-to-be-reported item is deleted; at this point iteratorDone should become true, but iteratorAdvance should be true to avoid code having to use the form:
+
+Now, I've stated several times that in the face of deletions, the natural semantics are hard to maintain without writing an explicit cache layer. So I've introduced an alternate semantics without ever really specifying it, and this might bother you.
+
+In fact, there are several things here that might bother you:
+
+Last question first. An entirely plausible semantics for an iterator might be:
+
+iteratorGetNext can be coded using my iterator functions as:
+
+Interestingly, this definition works for both the "traditional" iterator semantics, and the "new-fangled" iterator semantics that requires the more complex iteration. (You can see that in the way iteratorItem and iteratorAdvance are paired just as in the suggested loop.)
+
+What's wrong with the above approach? Nothing. Why haven't I used it here? Because it sweeps some of the interesting problems under the rug.
+
+Consider code to iterate over two data structures e.g. to merge them. Each iteration, one or the other will be advanced. To do this with the above complex iterator would require explicitly caching them in code:
+
+There's nothing technically wrong with the above code; in fact, the fact that one function call serves three purposes might make you expect it will produce less code. However, that code is wrapped up in a slightly non-obvious caching system which also masks where side-effects are important and what the termination condition is, compared to explicit code using the three-function iterator:
+
+This code is wordier (only because I use the nice short names 'i' and 'j' in the first sample), but slightly shorter, as it doesn't need two copies of each of the iteratorGetNext.
+
+Also, consider an iterator that is shared between several functions, each of which might advance it. Rather than having to introduce a global or passed around variable with the cache, the iterator keeps the current item continually available.
+
+In other words, the three-function iterator semantics I've offered above are more flexible and yet allow the simple one-function iterator to be layered atop it trivially. So that's the iterator worth discussing.
+
+So what are the semantics of the 'complex' iterator?
+
+Let's look at a sequence of actions on an iterator and its collection. First, consider an iterator that actually implements the above semantics correctly (which leaves out all the implementations that require the 'complex' loop); I'll provide commentary on the operations from that perspective. Assume that at every step, iteratorDone() is false (otherwise there'd be a lot of pointless comments about the operations being illegal in that case).
+
+As you can see, these semantics are relatively straightforward. If you perform delete() operations, it can be dangerous to call iteratorItem() afterwards, without first advanceing.
+
+Now, with the alternate semantics (which I haven't yet defined explicitly), here are the dangers for the same code:
+
+To clarify that final note: the final four lines of code produce two different items, but if we only count the first one (considering the second one a bug), then the latter item will never be officially produced (i.e. never produced by the first call to iteratorItem after an advance).
+
+What you can see from the above discussion is that both of the semantics have flaws. One of them is a little more clearly defined, however--don't expect the iterator to "cache" an item that has been deleted. (In fact, that iterator may do so, but since it's no longer in the collection, it's incorrect for it to report it--so I just state that it's illegal to call it in that context.)
+
+The practical upshot is that the "obvious" semantics wants you to do insertions and deletions between calling iteratorItem and iteratorAdvance. The "complex" loop semantics needs insertions and deletions to occur between calling iteratorAdvance and iteratorItem!
+
+Thus, the "complex" loop semantics are more straightforward because if you obey that constraint, there's never a case where it becomes illegal to call iteratorItem. On the other hand, the semantics are less useful, because it's normally in response to calling iteratorItem that one decides to delete or insert items, and this forces the user to cache the item into a variable--shades of the single-function iterator.
+
+Plausibly, the best thing to do is to go ahead and use the single-function iterator if you're expecting insertions and deletions on the data structure.
+
+What about the final of my three points--just what are the semantics for the wacky "complex loop" iterator?
+
+The symbol tables considered so far all have had O(n) get operations. (Well, I did do some handwaving about binary search trees and hash tables.) There are a number of "ordered" symbol tables which have significantly faster get performance, and which can directly support robust iteration without merely threading a linked-list into it.
+
+Consider a balanced binary search tree. By keeping a pointer to the "current" item based on an in-order traversal, there is a well-defined rule to advance to the successor. Even if a rotation is performed on the tree, the same item must still be the successor. Thus, the rotations themselves will not cause a problem. Deletions can be dealt with in the same way as ever (advancing the iterator before deleting an item currently pointed to by it).
+
+The big problem with "ordered" data structures is that inserts can't be constrained to a fixed location, e.g. the beginning as in linked-lists or the end as in the unordered array. Insertions occur whereever is appropriate to maintain the ordering. On the other hand, since an insertion will only ever occur from the same location where the item was deleted, then if an item is deleted and re-inserted, there is no danger of double-reporting, if the code is managed carefully to avoid this case.
+
+On the other hand, this will produce a robust iterator that sometimes produces just-inserted items, and sometimes doesn't, depending on where the iterator was at the time the item was inserted. If this inconsistency is unacceptable, a different strategy must be used, e.g. threading an iteration-oriented linked-list into the data structure. (Because of the use of the cache-the-item-and-immediately-advance loop, the semantics for whether a just-inserted item is reported will not be straightforward as seen from the perspective of the cached item.)
+
+Binary search of an array is an extremely time-and-space efficient search mechanism, likely to be faster in practice than binary search trees; however, an ordered cannot efficiently handle insertions and deletions, which require O(n) time each. If insertions and deletions are rare, however, binary search of an ordered data structure may be the best thing to do.
+
+The iterator state will consist of the index into the array which is the next item to report. (Again, I rely on the "complex" loop, which does an iteratorAdvance() immediately after iteratorItem().)
+
+If an item before the iterator is deleted, the iterator index must be decremented. If an item before the iterator is inserted, the iterator index must be incremented. Items after the iterator will not affect it.
+
+The special case that must be considered for ordered data structures is a deletion of the item currently referenced by the iterator (and possibly several further deletions).
+
+Suppose the items are letters in alphabetical order. Having just produced 'C', the iterator advances to index 3, referencing a 'E', and the following character is an 'F'. At this stage, so long as the next item produced is strictly later in the alphabet than 'C', the algorithm can be considered correct.
+
+So, deleting the 'E' cannot step backwards to 'C' (index=2), since the semantics of the iterator index is that whatever item is currently pointed to will be next reported; 'C' has been reported once and should not be reported again. Thus, the index must be left at '3', which is now 'F'. Inserting either an 'E' or a 'D' is acceptable, since these will be inserted at index 3--but should the iterator advance or not? It's ok if the iterator points at 'D' or 'E', but it's also ok to advance it in this case.
+
+The answer here is subtle, but simple. Suppose we pick the semantics that inserting at the current location does not advance the iterator. This apparently means "it's acceptable to produce on iteration an item which is inserted between the last item produced, and the next item about to be produced." This sounds like legitimate semantics, but it's an incorrect statement of what happens.
+
+Consider the array "ACEF". 'A' and 'C' are produced; index = 3, referring to 'E' (using array indices that start with 1 for expository purposes). 'E' is deleted; index = 3, referring to 'F' in "ACF". 'C' is deleted; since the deletion is to the left of the index, index is decremented; "AF" with index = 2. Now insert 'C'. Index must be incremented to avoid double-reporting C.
+
+The logic is simple: insertions before the currently-pointed-to-item may have been previously produced, and therefore cannot be given the "opportunity" to be doubly-reported. The previous-item-in-the-list is not necessarily the last item produced, as the last item produced may have been deleted.
+
+A plausible alternative would be to track the last key reported. This would allow more consistent semantics (if 'D' were inserted while processing 'C', it would be sure to be reported), but would slow the iterator down, requiring an O(lg n) search for the key in the interesting cases (and potentially all the time). Simply constraining behavior on insertion works adequately with no performance overhead on the iterator.
+
+With the previous analysis in hand, the code is simple to write, and the same analysis informs all ordered data structures, such as binary search trees.
+
+This program has been compiled and tested.
+
+As noted in the previous section, the analysis for how to update an ordered array applies to any data structure with a fixed order. The incrementing and decrementing of the iterator indices in that case corresponded to keeping the iterators pointing at the same item. The only other operation was to advance to the next element in the data structure.
+
+In a tree structure, therefore, a robust iterator requires exactly the same changes as an unordered linked list:
+
+This only works for an inorder traversal of the tree, of course, because it is the inorder properties that a balanced tree tries to maintain during deletions and rotations.
+
+Note that on a deletion, an iterator may have to be advanced at a cost of O(lg n) to find the successor; however, this does not lead to O(m lg n) for the advance. One could try to charge it to the amortized iteration (see discussion below), but it's worth noticing the following simple consideration: at the moment, we're paying O(m lg n), but the only case where we actually pay a lgn factor is when the iterator does point to the item being deleted, and we find its successor. However, on a given deletion, there is only one item being deleted, and only one successor. Thus, once we pay that O(lg n) successor cost once, we shouldn't pay it again finding the exact same successor! Thus, we can keep deletion down to a cost of O(m + lg n).
+
+It is worth noticing, however, that this algorithm may no longer yield an O(n) iteration. (Then again, it might--it depends on the nature of operations being done, and how often they're done.)
+
+Each iteration step involves finding the successor of a node. To do this, if the current node N is a leaf, then we go up the tree. If we ever go up "rightwards" (such that the child we came up from is left-child), we stop and produce that internal node. As long as we go up "leftwards", we continue. If the current node N is an internal node, then we go down and to the right, and then find the leftmost node--go leftward until we reach a node with no left child, and report that.
+
+From the above description, it's clear that no single operation will do more than O(lg n) steps in a balanced tree [one with height O(lg n)]. However, normally iteration is not O(n lg n): each link is followed exactly once downwards, and once upwards, so the number of links followed is O(n), and so is iteration.
+
+However, as soon as we start allowing deletions which change the location of nodes in the tree, we lose our guarantee of only following each link twice. However, it seems likely that we can only take one O(lg n) hit for every insertion/deletion-- that is, the cost of iteration is O(n + (m lg n)) where m is the number of insertion/deletions. Thus we can push this charge onto the insertions and deletions instead, yielding an overall set of costs:
+
+Cost with n items in tree, and m iterators active at time of operation:
+
+Note that this is a larger charge than on the other data structures; however, I'm not sure that this analysis is actually fair--it may be not actually be possible to find worst cases that yield this performance.
+
+The skiplist is yet another ordered data structure. Thus all of the above analysis applies again. Furthermore, finding the successor is an O(1) operation (there is a direct link to it). Therefore, the skiplist provides a very efficient robust iterator, no questions asked. (As noted above, the balanced binary search trees might be efficient, as I'm not sure that my bounds are sufficiently tight.)
+
+This does not mean skip lists should be recommended over tree-oriented ordered data structures, as the skip list has the three problems of: overhead of managing variably-sized data elements, performance overhead of generating random numbers, and the danger of processing data which exposes flaws in the random number generator.
+
+As noted before, if a hash table shrinks and grows, iteration is problematic. With internal chaining, if an item is deleted and re-inserted, it might be doubly reported.
+
+However, if external chaining is used without any rehashing (that is, without shrinking or growing the hash table), and if the external chaining is implemented using an unsorted linked-list, then the hash table has a simple robust iterator. This is because the hash table simply consists of a collection of linked lists, each of which can be iterated, in turn, using the simple robust linked-list iterator.
+
+Insertions must be made to the front of the linked lists. If the iterator is currently on hash #x, and an item is inserted into hash #y, y > x, then the item so inserted will be visited during the iteration--unlike the pure linked-list iterator, which never visits items inserted during iteration. The hash table iterator relies on that property to make sure that an item deleted and reinserted isn't visited twice, by making sure that the list currently being traversed doesn't have the delete-insert problem.|||
+

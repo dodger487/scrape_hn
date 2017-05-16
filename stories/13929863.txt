@@ -1,0 +1,74 @@
+I feel like no matter how many languages I try, I always keep getting drawn back to F#. It's got just about everything I love about functional languages like Elm, Haskell and OCaml, while still giving me access to the mountain of great open source libraries that are available in the .NET ecosystem.
+
+This week, I've been taking a look at Akka.NET, an unofficial (but extremely polished) port of the popular Java/Scala actor framework. It's primarily designed for C#, but they provide an add-on package that exposes a really nice, idiomatic F# API.
+
+As a little exercise for myself (and so my new blog wouldn't be quite so empty!), I thought it'd be fun to try to write a MUD using this API. Given that there's quite a lot of prior art for this, it shouldn't be too hard to get started with, but time will tell if this is a little over-ambitious for a beginner project.
+
+If you're following along at home, make sure you have the Akka and Akka.FSharp packages installed into your project using Nuget or Paket. I'll be committing to GitHub as I go.
+
+View the code for this section
+
+To begin with, let's take a quick look at how to use the Akka.NET F# API by creating a simple actor - all it'll do is say hello or goodbye when it receives a message. If you're already familiar with how to do this, feel free to skip ahead to the next section!
+
+First, we need to create a 'system' - I'm not going to go into too much detail on the actual concepts behind the Akka actor model here (the docs explain it much better than I probably would), but at the most simple level, the system is the structure which co-ordinates all of your actors, managing the thread pool that allows them to do their work.
+
+Next, we'll define the type of message that our actor will respond to. F#'s discriminated unions are perfect for this:
+
+Now here's the fun part - let's define our actor, and spawn it into our system. If you're coming from the C# or Java versions of Akka, you may be used to defining actors as classes - it's certainly possible to do things that way in F# too, but we can be much more functional:
+
+Most of this code will seem familiar if you've written much F# - we define an anonymous function that takes in the actor's mailbox and uses tail recursion to loop, then pass it into the spawning function to create a new instance of the actor. But wait - if this just loops forever, how does it not hang the program?
+
+This is where the actor computation expression comes in - may look like a normal synchronous function, but the wrapper converts it into a continuation-based form that can be suspended when no messages need to be processed. This is similar in nature to the async expressions in the F# standard library, or async/await in C#.
+
+Let's test this out! To send a message to a actor in Akka.NET, you use the method - however, as this is such a common operation, the F# API provides the handy operator, which does the same thing.
+
+Note that we have to call a blocking function like at the end of our program - otherwise it will terminate before our actor gets a chance to respond! There's almost certainly more elegant ways of stopping this from happening, but this is the simplest for now.
+
+All being well, you should get output along the lines of this:
+
+Okay, that's pretty cool, but it's not exactly a MUD, is it? Let's make a start on hooking our actor up to the network. Akka provides an I/O API out of the box; to hook into it, we'll need to define two new actors.
+
+View the code for this section
+
+Let's define another simple actor below our greeter. This time, however, we'll add some code to be run when it gets initialised:
+
+We send a message to the built-in TCP manager, passing it a reference to our actor and a port to bind to. When it's done, it'll reply with a message of its own - so let's get our actor to handle it.
+
+Unfortunately, this is where Akka.NET's C# roots start to show a little bit - rather than using a single discriminated union type for its messages, the TCP manager has a separate class for each. We can work around this without making our code too ugly by using the type test pattern syntax, which allows you to match against types instead of values at runtime.
+
+Note that we have to provide a type annotation for the mailbox, otherwise we get a compile error. Also, since our match expression isn't exhaustive, it's good practice to have a catch-all arm that signals if a message wasn't handled. We'll be able to log this out later.
+
+If you run the program now, you should see the socket get bound successfully! Next, we need to define what happens when someone connects.
+
+View the code for this section
+
+Above the server actor, let's start to define our connection handler.
+
+There's a couple of things to note here:
+
+So, how are we going to translate incoming data into something our greeter actor can understand? We'll need to come up with a protocol - I'm going to keep this as basic as possible and just use this for now:
+
+And here's our code updated to parse data into a , passing it on to the greeter actor:
+
+If the input was more complex, you'd probably be better served using something like FParsec to parse it - if this code starts getting too unwieldy in later posts, I might take a detour into that, but for now, this'll do.
+
+Now we need to update our server actor to create handlers for each new connection. Rather than adding them directly to the root system, we can create a hierarchy by passing the server's mailbox to the spawn function.
+
+Note that we have to give each actor a unique name - here, I'm using the user's IP address and port to generate one. Akka doesn't like the square brackets in IPv6 addresses, so don't forget to strip those out!
+
+With that, all the pieces are in place - if you run your program, and then use to send some messages, you should see the greeter printing out messages to the server console!
+
+View the code for this section
+
+But that's no fun for our user, is it? Let's make a few more changes so our greeter can talk back to them.
+
+Pretty simple - instead of printing the text to stdout, we send it back to the actor which sent us the message. If you recall, that's our connection handler, so we need to teach that how to handle the new message type:
+
+Again, a really simple change! We just write any strings we receive out to the socket. I also added an error message for invalid commands, for completeness' sake.
+
+If you try accessing your server through again, you should now get the greetings returned straight to your console! It's hardly a MUD, but it's a start.
+
+We've now effectively got the 'gateway' into our actor system set up - the server listens for connections, the handlers parse data into strongly-typed messages, and then our greeter handles the actual logic. The important thing to note is that the greeter is totally unaware that it's part of a networked application - if we wanted, we could write a WebSockets endpoint or a unit test that sends messages into it, and we wouldn't have to modify the greeter code at all.
+
+Next time, we'll start implementing some of the actual game on top of these foundations. I look forward to hearing people's feedback - I'm still very much a beginner with Akka, so don't hesitate to let me know if you think bits of the code could have been done better!|||
+

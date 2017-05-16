@@ -1,0 +1,53 @@
+The past few weeks I’ve been testing Amazon Athena as an alternative to standing up Hadoop and Spark for ad hoc analytical queries. During that research, I’ve been looking closely at file formats for the style of data stored in S3 for Athena. I have typically been happy with Apache Parquet as my go-to, because of it’s popularity and guarantees, but some research pointed me to Apache ORC and it’s advantages in this context. In researching ORC, I ran into Apache Carbondata and then I was reminded of my early usage of Apache Avro. All of this helped me realize how complex this world can be when you’re managing your own data. When you have to be opinionated, it requires a new set of knowledge. After researching an experimenting with these four file formats I put this post together as a set of heuristics to use then choosing one. I hope you find it helpful.
+
+I’m assuming most people already know what columnar storage is and what its advantages are. If so you can skip this part.
+
+On it’s surface, you can think of columnar storage as the simple idea that data stored on disk are organized by column rather than by row. Doing this, has some interesting implications, namely it reduces disk I/O and allows for much better compression schemes. These are both great features for large data. Terabytes of data storage is expensive, but much cheaper than using compute and memory, however if we can reduce both we will be much better off. Data will continue to grow and we can’t do anything about that, but we can get smarter about how we store data.
+
+The file formats listed above (with the exception of Avro) are all columnar, so this is a necessary primer. Anyway, the side effects of storing data this way allows for much quicker analytical queries. An analytical query is something like taking all users and calculating the average age. The best way to take advantage of this set up is performing queries that only requires few columns.
+
+With these two advantages comes some disadvantages. Relative to a row store, doing a filter query like: Select * from USERS where user_id in (Some_arbitrary_list_of_users);.
+
+It’s just not designed to do these kind of queries efficiently. Since the IDs aren’t stored with the rest of the data and you’re returning all columns. Also, appending data comes at a cost, and most formats are append only or write once. This means that doing an operation like an Update or Delete is expensive or in some cases impossible. It makes it difficult for these kinds of stores to handle operations like stream ingestion as well.
+
+Each of the file formats I worked with for this post has trade offs and I try to cover them in depth below.
+
+Avro is perhaps the simplest of the four formats because it is not columnar and it’s pretty similar to what most should be accustomed to when dealing with databases like MySQL. Avro’s main goal is to compress data and to do it without losing schema flexibility. For example, you might want to use Hadoop as a document store and keep all of your data as JSON in Avro files for compression, you can do that in Avro. You might have some complex schema that you like to work with and all of it can work with Avro as well. The flexibility of Avro allows you to dream up any number of schemas and still manage to get decent compression.
+
+Another positive (read as might be positive if you like this) is Avro files are dynamically typed. This allows for the schema flexibility and for the RPC support. All together, Avro is a great format for data compression and most compression techniques in Spark will default to this one.
+
+With the positives aside, Avro does come at the expense of some other things. For example, you aren’t going to get the best possible compression when compared to a columnar format. Further, all of the data formats will need row-like traversal for queries. These trade offs might not be a big deal because the schema flexibility is worth taking more space on disk, and you may not have enough data for it to matter very much.
+
+Parquet has a different set of aims than Avro. Instead of allowing for maximum schema flexibility it seeks to optimize the types of schemas you can use to increase query speeds and reduce disk I/O. Parquet attempts to overcomes some of the weaknesses of traditional column stores by allowing nested types in columns. So you could technically have a column that is an array, or a column that’s actually several columns. There is a great talk from Spark Summit about doing just this and I’ve found it helpful in my work.
+
+Parquet has a lot of low level optimizations and a number of details about how it is stored on disk that you can find in the documentation. Parquet is perhaps the most common file format you’ll see in a lot of Spark related projects and it’s what I tend to use as well.
+
+ORC shares the columnar format of Parquet but has some differences. One of the main differences is that it’s strongly typed. ORC also supports complex types like lists and maps allowing for nested data types. As far as compression goes, ORC is said to compress data even more efficiently than Parquet, however this is contingent on how your data is structured.
+
+On top of the features supported in Parquet, ORC also supports Indexes, and ACID transaction guarantees. The last point is very important when considering the number of applications that can benefit from ACID. It’s a bit complex how the ACID transactions work in an append only data format, but you can find out all the details in the documentation if interested.
+
+If you’re using Presto or Athena, ORC is the preferred format. With recent changes to Presto engine, many advantages come from using ORC. Additionally, ORC is one of the few columnar formats that can handle streaming data. ORC also supports caching on the client side which can be extremely valuable.
+
+I’ve really grown to love ORC for any kind of OLAP workload,
+
+Carbondata is the new kid on the block. It is an incubating apache project and based on the Spark Summit talk on it, it promises the efficiency of querying data from a columnar format with ability to also handle random access queries. Carbondata does not have ACID support but it has a host of other features. I wont list them all, but the most important (to me) are Update and Delete support, bucketing and index based optimizations (several).
+
+Update and Delete support are important for many workflows. Append only or write once requires re-writing or overwriting an entire file and the cognitive load can be a bit much coming from a RMBDS world.
+
+Bucketing is an optimization that allows commonly joined columns to be stored in buckets. The underlying implementation details were kind of hard to follow, but I can say that joining two Carbondata files were much more performant than any of the other formats I tried.
+
+Carbondata has multi-layer indexing, meaning the file is indexed the partitions are indexed and even min-max values of columns are also indexed. It makes for pretty speedy queries for analytical workloads. Queries requesting averages, and even some simple lookups were much faster using Carbondata than other formats.
+
+The two downsides I found with Carbondata are that the files don’t compress as small as they do with ORC or Parquet. This is probably because of all the fancy additions and indexes kept in the files. They weren’t as big as Avro files but contingent on the schema they were pretty large.
+
+Carbondata is new and feels a little new with it’s API relative to the other formats. Further, Presto and Athena do not support it yet, making it a non-starter for a lot of projects.
+
+Apache Arrow is still a bit to new to really fit into this world but it’s coming on strong and I imagine it’ll have a lot to contribute to the space.
+
+I made the above table to highlight the differences and similarities between the four formats. I linked to performance studies, but didn’t quote any directly in this post. In the world of distributed computing, it’s far too easy to design tests that are advantageous to a particular platform. I recommend trying each as a pre-cursor to any analytical workload you have.
+
+After working with each of them, I’ve come up with some heuristics to help me. If you’re using Presto or Athena ORC is likely the best format for you. If you’re using Spark Parquet or Avro make the most sense. If you’re using Hive or writing your own MapReduce jobs, then ORC is probably the best option for you as well. If you’re using JSON, you’re only real option is Avro or if you want to build a pipeline to flatten your JSON, you could use any of the other formats.
+
+Overall, each format provides some great optimizations over storing a text file or a csv, but they put all maintenance on the shoulders of data operations. Until next time!|||
+
+Which Hadoop File Format Should I Use? The past few weeks I’ve been testing Amazon Athena as an alternative to standing up Hadoop and Spark for ad hoc analytical queries. During that research, I’ve...

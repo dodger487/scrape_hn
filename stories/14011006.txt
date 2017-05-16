@@ -1,0 +1,71 @@
+You’ve probably read a dozen clear, well-reasoned arguments about why mutability in your code is bad. This is not one of them. Instead, I wrote an unclear, shoddy argument for why it’s bad.
+
+Mutability is bad. To understand why, we have to talk about time.
+
+With any system we build, we generally want it to do two things. First, it should have properties: “How many widgets did customer X buy?” Second, it should take actions: “Send X an email about a widget sale.” We’ll start by restating this in a more obtuse way.
+
+Let’s imagine an extremely simple system consisting of a single counter that holds an integer. The value of the counter makes up the system’s state, a perfect description of that system. If an action does something, there must be a measurable effect. This means that all actions must somehow change the state. Otherwise, there’s no difference between a non-mutating action and no action at all.
+
+By doing this, we’ve now introduced time. The state before the action is different from the state after the action. Conversely, if a system doesn’t have any actions, then the state never changes and time is completely irrelevant to the system. This means that for any kind of system, mutability is equivalent to time-dependence.
+
+That probably sounds like a “so what” statement, but it’s the source of all the headaches and misery associated with mutability. To understand why, we have to talk about time-dependence.
+
+If the system is time-dependent, that means that for any given initial state and list of actions taken, we know the exact state of the system for any given time t. Here’s some “math” about that.
+
+How do we do this? Imagine you increment the counter ten times — that’s ten mutations. Between any two mutations, there’s always some amount of time where the system is stable, whether it’s two microseconds or two years. That creates eleven distinct time periods. We can label the first one, the initial state, as starting at t=0 and then incrementing t by 1 with each mutation, or step.
+
+For a simple system like this, the time-dependence doesn’t cause any trouble. Each state corresponds to a single timespan, aka a single value of time. If we run the system, it’s only going to have one possible path. That’s easy to analyze.
+
+Then we reach concurrent systems and everything breaks down.
+
+Now imagine we have two such counters, running independently. Though each has its own state, we can represent them as two values in a global state [c_1 | c_2]. We increment each once. At t=2 it’s obvious the state will be [1|1]. But what’s the value at t=1? There will be some period of time between one incrementing and the other, so each case represents its own step. But it could be either [1|0] or [0|1], so t=1 is not well-defined.
+
+The simple fix would be to add a second time (let’s call it u) and only increment one of t and u in a given step. Instead of t=2 corresponding to [1 1], t=1 u=1 does instead. Then f(1, 0) = [1|0] and f(0, 1) = [0|1], and we again have a well-defined dependence on time.
+
+Now let’s add a new action to the system: copy. The copy operation sets the value equal to the other system’s counter. If the t counter copies while the u counter increments by 1, what’s the value of the system at f(1, 1)?
+
+Since there are two equally-valid values for f(1, 1), it isn’t defined at all! The state is no longer purely a function of the values of t and u. Now the order of the steps matter because f(<t, u>) may not be the same state as f(<u, t>).
+
+Imagine you have two systems. The t system mutates four times, the u system mutates thrice. There’s (3+4)! possible permutations of those mutations, with factors of 3! and 4! being redundant. In total, there are (3+4)!/(3!4!) = 35 possible end states. Each of them could potentially have completely different behavior and completely different bugs that you need to check. And if there’s two possible starting states, that’s another 35 behaviors ready to hurt you.
+
+That’s why mutability is awful. Mutability leads to temporal dependence, which leads to concurrent systems, which leads to nonnumerical time, which leads to state space explosion, which leads to suffering.
+
+A completely immutable system is independent of time. Which works for some systems, but most things that we care about are time dependent. For example, I’d like to receive my widget some point before I die.
+
+That said, you can reduce mutability and make it less of a problem in your system. Here are some ways to do that.
+
+When you get down to it, mutability is only a problem in concurrent systems. Otherwise, you only have one possible behavior, which means the system is deterministic and you can easily analyze it.
+
+This is the idea behind synchronous programming languages. Everything is tied to a single global clock, and everything simultaneously changes with each tick. It’s often difficult and inefficient to build a completely synchronous system, but they can be practically bug-free, so it’s a good idea for mission-critical systems.
+
+Sometimes we don’t need to make mutations but do anyway. For example, here’s a way to test if a file is writable in bash:
+
+It works, but 1) if the file doesn’t exist, will create it, and 2) if the file does exist, will update the access and modification times. Instead we could do
+
+Which is makes no mutations. We call this a pure function. If we called the former ten times, that’s ten temporal steps. If we call the latter ten times, that’s zero temporal steps. We obviously can’t make everything pure (time’s an asshole), but we can remove unnecessary mutation, and that makes things simpler. It also makes transactional mutations easier to write, which is often the main benefit of pure functions
+
+Take the following pseudocode:
+
+Depending on the implementation, that’s up to one mutation per item. On the other hand, we could reduce the number of mutations to one by writing it in a different way:
+
+Here, the cart is only updated once, at the very end, with all of the new data. I’m informally calling these kinds of mutations, where everything you want to happen takes place in a single step, transactional mutations. That’s because the most widespread example of them is database transactions. When you make a bunch of mutations in a single transaction, either all of them happen or none of them happen. No concurrent systems will see any intermediate state.
+
+Transactional mutations are a subset of atomic mutations, but I’m not gonna go into them because I’m lazy.
+
+We’ve assumed so far that there’s restrictions on when actions can run. If we have two systems with one action each, <a, b> and <b, a> are both possible. In some cases, though, we can design everything so that the ordering is forced. As a pseudocode example:
+
+Even if the updating is two steps, our only behaviors are <u1, u2, a> and <a, u1, u2>. <u1, a, u2> is impossible because we have a lock, so we’ve reduced three possible behaviors to 2.
+
+You’ve reduced your three processes with four steps to three with two steps. Great! Instead of having 35,000 possible behaviors, you only have 90. That’s progress! Still leaves 90 behaviors to check, though. How do you do make sure they’re all safe?
+
+Once again, there are a few different techniques we use. The first is informal reasoning, where you convince everyone else on your team that it’s not a problem. In some cases, this is simple: if two systems don’t affect each other, you can safely ignore the relative order of their mutations. Other cases involve real-world consideration: if two systems operate at vastly different timescales, you can assume the order of mutations is fixed. The problem is we, as humans, make mistakes often, so it’s too easy to mistake a dangerous case is safe or vice versa.
+
+Another tool is testing and simulation, where we run the code and confirm there are no bugs. This doesn’t have as much human error as informal reasoning, but creating the appropriate concurrency conditions is difficult. Testing can find a lot of bugs, but it’s too expensive to cover everything with it.
+
+We also have a middle ground called modeling. Modeling involves creating an abstract representation of the total system and declaring properties all behaviors must follow. The model then exhaustively checks the state space and confirms the properties all hold. It’s not as flexible as reasoning nor as real-world as a good test, but it’s also more foolproof than the former and more comprehensive than the latter. Plus, a good model doubles as documentation — not as clear as actual documentation, but good for getting a quick overview.
+
+Ideally we’d use all three. In practice we widely use informal reasoning and tests, but we don’t really use modeling. I think this is more of a social problem than a technical one, as there are many fantastic modeling tools out there. It’s just a matter of making them more accessible.
+
+You can follow me on Twitter but it’s mostly nonsensical jokes and food pics.|||
+
+You’ve probably read a dozen clear, well-reasoned arguments about why mutability in your code is bad. This is not one of them. Instead, I wrote an unclear, shoddy argument for why it’s bad. With any…
